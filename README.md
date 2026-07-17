@@ -128,20 +128,39 @@ not full root — and creates the veth in `ExecStartPre`.
 
 ## The TUI
 
+Launch it with `python3 -m tgt` (or `tgt`). It's a **live SPAN flow diagram** you
+navigate and drive — packets animate along the veth path in real time as it
+generates, and four tabbed panels handle everything from one screen.
+
 ```
- TGT · Traffic Generation Toolkit
- env: wsl · root · ip:yes
-  Send interface    : tgt0                   ── Live ──
-  PCAP output       : (disabled)             state   : RUNNING
-  Protocols         : modbus, s7comm         packets : 1840
-  Load scenario     : press Enter to pick…   pps     : 50.0
-  Rate (pps)        : 50                      per-protocol:
-  Loop              : yes                       modbus   920
-  ▶ START / STOP    : running…                  s7comm   920
+ TGT · Traffic Generation Toolkit                              ● GENERATING
+ env: wsl · root · ip:yes · service:active
+
+  ╭ TGT ENGINE ──╮        ╭ SEND ────────╮    ╭ MONITOR ─────╮    ╭ SENSOR ──────╮
+  │ modbus ▇▇▇▇  │        │ tgt0         │    │ tgt0-mon     │    │ Claroty CTD  │
+  │ s7comm ▇▇    │──────▶ │ ▶ out        │┈┈▶ │ capture pt   │──▶ │ ingest       │
+  │              │  emit  │ 12,340       │mirror│ ◀ SPAN     │ingest│ ◀ in       │
+  │ 50.0 pps     │        │ packets      │    │              │    │              │
+  ╰──────────────╯        ╰──────────────╯    ╰──────────────╯    ╰──────────────╯
+           •••▶ animated packet flow while generating •••▶
+
+  [ Map ]  Protocols   Settings   Service      │  ─ Live log
+  Send interface   : tgt0                       │  17:52:01 modbus → 502 read regs
+  Monitor (peer)   : tgt0-mon                   │  17:52:01 s7comm job/ack
+  Sensor label     : Claroty CTD                │  17:52:01 built 32 frames/cycle
+  Create veth pair : press Enter                │  …
 ```
 
-Keys: `↑/↓` move · `Enter` / `←/→` change a field · `Space` toggle a protocol ·
-`s` start/stop · `c` clear log · `q` quit.
+- **Map** — pick the send interface, see its veth monitor peer, name the sensor,
+  and create/delete the veth pair right from the UI.
+- **Protocols** — toggle any protocol on/off; live per-protocol counters.
+- **Settings** — scenario, rate, messages, loop, pcap output, endpoints.
+- **Service** — see service status and **save the current selection to
+  `/etc/tgt/tgt.conf`**, then start/stop/restart the background service — the TUI
+  is a full front-end for `tgtctl.sh`.
+
+Keys: `Tab` switch panel · `↑/↓` move · `←/→` or `Enter` change · `Space` toggle a
+protocol · `s` start/stop · `c` clear log · `q` quit.
 
 ---
 
