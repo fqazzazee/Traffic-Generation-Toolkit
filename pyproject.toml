@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tgt-toolkit"
+version = "1.0.0"
+description = "Traffic Generation Toolkit — OT/ICS + IT test traffic onto a virtual interface for SPAN-ingestion testing (e.g. Claroty CTD)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "TGT" }]
+keywords = ["ics", "ot", "modbus", "dnp3", "s7comm", "span", "claroty", "traffic-generator", "scada"]
+classifiers = [
+  "Environment :: Console :: Curses",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+  "Topic :: System :: Networking :: Monitoring",
+]
+dependencies = []   # standard library only
+
+[project.scripts]
+tgt = "tgt.cli:main"
+
+[project.urls]
+Homepage = "https://example.local/tgt"
+
+[tool.setuptools]
+packages = ["tgt"]

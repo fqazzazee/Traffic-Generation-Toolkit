@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# TGT runtime artifacts
+*.pcap
+tgt-*.pcap
+/etc/tgt/
+*.pid
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
