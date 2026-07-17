@@ -140,12 +140,12 @@ generates, and four tabbed panels handle everything from one screen.
  TGT · Traffic Generation Toolkit                              ● GENERATING
  env: wsl · root · ip:yes · service:active
 
-  ╭ TGT ENGINE ──╮        ╭ SEND ────────╮    ╭ MONITOR ─────╮    ╭ SENSOR ──────╮
-  │ modbus ▇▇▇▇  │        │ tgt0         │    │ tgt0-mon     │    │ Claroty CTD  │
-  │ s7comm ▇▇    │──────▶ │ ▶ out        │┈┈▶ │ capture pt   │──▶ │ ingest       │
-  │              │  emit  │ 12,340       │mirror│ ◀ SPAN     │ingest│ ◀ in       │
-  │ 50.0 pps     │        │ packets      │    │              │    │              │
-  ╰──────────────╯        ╰──────────────╯    ╰──────────────╯    ╰──────────────╯
+  ╭ TGT ENGINE ──╮        ╭ SEND ────────╮        ╭ MONITOR ─────╮        ╭ SENSOR ──────╮
+  │ modbus ▇▇▇▇  │        │ tgt0         │        │ tgt0-mon     │        │ Claroty CTD  │
+  │ s7comm ▇▇    │──────▶ │ ▶ out        │    ┈┈▶ │ capture pt   │    ──▶ │ ingest       │
+  │              │  emit  │ 12,340       │ mirror │ ◀ SPAN       │ingest  │ ◀ in         │
+  │ 50.0 pps     │        │ packets      │        │              │        │              │
+  ╰──────────────╯        ╰──────────────╯        ╰──────────────╯        ╰──────────────╯
            •••▶ animated packet flow while generating •••▶
 
   [ Map ]  Protocols   Settings   Service      │  ─ Live log
