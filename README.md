@@ -37,15 +37,7 @@ A SPAN / mirror port delivers a copy of network traffic to a sensor. TGT reprodu
 that on a single host — no real network required — with a **veth pair**: two
 back-to-back virtual NICs. Frames written to one end appear on the other.
 
-```
-        TGT generates                     your sensor captures
-        ┌───────────┐                     ┌────────────────────┐
-        │  tgt run  │ ── frames ──▶ tgt0  │ tgt0-mon ── SPAN ──▶│ Claroty CTD
-        └───────────┘              (veth pair, back-to-back)    │ / tcpdump / Zeek
-                                                                └────────────────────┘
-```
-
-Generate on **`tgt0`**; point your capture tool at **`tgt0-mon`**.
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/c666137f-5360-434d-b6c4-438a1f49ac10" />
 
 ---
 
