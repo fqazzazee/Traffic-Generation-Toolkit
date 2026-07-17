@@ -19,8 +19,9 @@ Built for exercising **Claroty CTD SPAN ingestion** — and any other sensor
 
 - **Zero dependencies.** Pure Python standard library — no scapy, no pip packages to
   build. Runs anywhere Python 3.9+ runs.
-- **Simple TUI.** A keyboard-driven terminal dashboard, plus a full CLI for scripting
-  and CI.
+- **Live flow-diagram TUI.** A keyboard-driven SPAN diagram — map interfaces, toggle
+  protocols, control the service, and watch packets animate along the veth path in
+  real time. Plus a full CLI for scripting and CI.
 - **Real protocol patterns.** Byte-accurate Modbus/TCP, DNP3, EtherNet/IP + CIP,
   S7comm, IEC 60870-5-104, BACnet/IP, OPC UA, plus ARP, ICMP, DNS, HTTP, NTP.
 - **Two output modes.** Send live on an interface (root / `CAP_NET_RAW`), or write a
@@ -43,53 +44,56 @@ back-to-back virtual NICs. Frames written to one end appear on the other.
 
 ## Quick start
 
-### Option A — one-command install & service (recommended)
+**Get it** (no dependencies to install — pure Python 3.9+):
 
 ```bash
-git clone <repo> TGT && cd TGT
+git clone https://github.com/fqazzazee/Traffic-Generation-Toolkit.git
+cd Traffic-Generation-Toolkit
+```
 
+**Easiest — the interactive UI.** One screen does everything: map the interface,
+pick protocols, watch the traffic flow live.
+
+```bash
+sudo python3 -m tgt          # launches the TUI
+```
+
+```
+ TGT · Traffic Generation Toolkit                              ● GENERATING
+
+  ╭ TGT ENGINE ─╮      ╭ SEND ──────╮      ╭ MONITOR ───╮      ╭ SENSOR ────╮
+  │ modbus ▇▇▇▇ │─emit▶│ tgt0       │mirror│ tgt0-mon   │ingest│ Claroty CTD│
+  │ s7comm ▇▇   │ •••▶ │ ▶ out 12340│ •••▶ │ capture pt │ •••▶ │ ◀ ingest   │
+  ╰─────────────╯      ╰────────────╯      ╰────────────╯      ╰────────────╯
+
+  [ Map ]  Protocols   Settings   Service   │  ─ Live log
+```
+
+In the UI: **Map** → `Create veth pair` (Enter), switch to **Protocols** and
+`Space` to pick some, then press **`s`** to start. Point your sensor at the
+monitor end, **`tgt0-mon`**. Full keys: `Tab` panels · `↑/↓` move · `Space`
+toggle · `s` start/stop · `q` quit.
+
+**Headless — three commands:**
+
+```bash
+sudo python3 -m tgt iface create tgt0                        # veth: tgt0 <-> tgt0-mon
+sudo python3 -m tgt run -s ot-baseline -i tgt0 --rate 50     # generate
+sudo tcpdump -i tgt0-mon                                     # capture (or point CTD here)
+```
+
+**As an always-on service — three commands:**
+
+```bash
 sudo ./scripts/tgtctl.sh install     # system deps (python3, iproute2, tcpdump)
 sudo ./scripts/tgtctl.sh register    # writes config + service, creates the veth
-sudo ./scripts/tgtctl.sh start       # start generating in the background
-
-sudo ./scripts/tgtctl.sh status      # check it
-sudo ./scripts/tgtctl.sh logs        # follow output
+sudo ./scripts/tgtctl.sh start       # generate in the background
 ```
 
-Then point your sensor at the monitor interface:
+**No root? Just write a pcap** (works anywhere, replay later with `tcpreplay`):
 
 ```bash
-sudo tcpdump -i tgt0-mon             # or point Claroty CTD at tgt0-mon
-```
-
-Tune what it generates by editing the config, then restart:
-
-```bash
-sudoedit /etc/tgt/tgt.conf           # set TGT_IFACE and TGT_RUN_ARGS
-sudo ./scripts/tgtctl.sh restart
-```
-
-### Option B — run it directly (no service)
-
-```bash
-# Create the SPAN-simulation veth pair (once)
-sudo python3 -m tgt iface create tgt0        # makes tgt0 <-> tgt0-mon
-
-# Generate a steady OT baseline on tgt0
-sudo python3 -m tgt run --scenario ot-baseline --iface tgt0 --rate 50
-```
-
-### Option C — no privileges, just a pcap
-
-```bash
-python3 -m tgt run --scenario ot-full --pcap ot.pcap --count 500
-tcpreplay -i eth0 ot.pcap                     # replay later onto a real SPAN source
-```
-
-### Launch the TUI
-
-```bash
-python3 -m tgt        # or `tgt` after `pip install -e .`
+python3 -m tgt run -s ot-full --pcap ot.pcap --count 500
 ```
 
 ---
@@ -250,6 +254,108 @@ podman run --rm -it --network container:sensor --cap-add=NET_ADMIN --cap-add=NET
 
 The unprivileged fallback always works: generate a pcap and hand it to the sensor
 offline.
+
+### Proxmox — feed a Traffic Analyser VM (SPAN / RSPAN / ERSPAN)
+
+The typical lab: **TGT runs in one VM, the analyser (Claroty CTD, Zeek, Suricata …)
+runs in another.** Pick the mirroring method by where the analyser VM lives:
+
+| Analyser location | Method | How the mirror is carried |
+|---|---|---|
+| Same Proxmox host | **SPAN** (local) | copied to the analyser's port on the host bridge |
+| Another host, same L2 | **RSPAN** | tagged into a dedicated VLAN over the trunk |
+| Another host across a router (L3) | **ERSPAN** | GRE-encapsulated to the analyser host's IP |
+
+```
+        Same host (SPAN)                     Remote host (RSPAN / ERSPAN)
+ ┌──────── Proxmox A ────────┐        ┌─ Proxmox A ─┐        ┌─ Proxmox B ─┐
+ │  TGT VM ─▶ vmbr1 ─mirror─▶ │       │ TGT VM ─▶ vmbr1 ─mirror─▶ VLAN 999 / │
+ │           analyser VM      │       │            or ERSPAN GRE ─▶ analyser │
+ └────────────────────────────┘       └─────────────┘        └─────────────┘
+```
+
+> **Note on the GUI:** Proxmox has no dedicated "SPAN" button. You build the
+> *topology* in the GUI (bridges, VM NICs, VLAN tags); the *mirror session* itself is
+> one command on the host shell. Open vSwitch (OVS) is what gives real
+> SPAN/RSPAN/ERSPAN, so the methods below use an OVS bridge. A simpler no-OVS local
+> option is at the end.
+
+**GUI prep (once per host).** Install OVS on the host shell:
+`apt install -y openvswitch-switch`. Then in the GUI: *node → System → Network →
+Create → **OVS Bridge*** named `vmbr1` (add your physical NIC as its OVS port only if
+the analyser is on another host), and *Apply Configuration*. Attach each VM's NIC in
+*VM → Hardware → Network Device → Bridge `vmbr1`* (set the **VLAN Tag** field here for
+RSPAN). Find a VM's host-side port name with `ovs-vsctl list-ports vmbr1` — it looks
+like `tap<VMID>i0`.
+
+**SPAN — analyser on the same host.** Mirror all bridge traffic to the analyser VM's
+port (run on the host):
+
+```bash
+ovs-vsctl -- --id=@p get port tap<ANALYSER_VMID>i0 \
+  -- --id=@m create mirror name=span0 select-all=true output-port=@p \
+  -- set bridge vmbr1 mirrors=@m
+```
+
+**RSPAN — analyser on another host, same L2.** Mirror into a dedicated VLAN carried
+over the trunk between the two hosts:
+
+```bash
+# on the TGT host:
+ovs-vsctl -- --id=@m create mirror name=rspan0 select-all=true output-vlan=999 \
+  -- set bridge vmbr1 mirrors=@m
+```
+
+Trunk VLAN 999 between the hosts (physical switch + the OVS uplink), keep it unused by
+anything else, and on the analyser host set the analyser VM's NIC **VLAN Tag = 999**
+in the GUI. It then receives the mirrored frames.
+
+**ERSPAN — analyser across an L3 boundary.** GRE-encapsulate the mirror to the
+analyser host's IP:
+
+```bash
+# on the TGT host: create the ERSPAN tunnel port, then mirror to it
+ovs-vsctl add-port vmbr1 erspan0 -- set interface erspan0 type=erspan \
+  options:remote_ip=<ANALYSER_HOST_IP> options:key=100 \
+  options:erspan_ver=1 options:erspan_idx=1
+ovs-vsctl -- --id=@p get port erspan0 \
+  -- --id=@m create mirror name=erspan0 select-all=true output-port=@p \
+  -- set bridge vmbr1 mirrors=@m
+```
+
+On the analyser host, terminate ERSPAN — either an OVS `type=erspan` port with the
+reverse `remote_ip` feeding the analyser's bridge, or just capture GRE (IP proto 47),
+which Wireshark and CTD decode as ERSPAN.
+
+**Manage the mirror:**
+
+```bash
+ovs-vsctl list mirror                  # show active sessions
+ovs-vsctl clear bridge vmbr1 mirrors   # remove all mirrors
+```
+
+Tips: the analyser's capture NIC must be **promiscuous** with the Proxmox **firewall
+off**; `select-all=true` mirrors the whole bridge — to mirror only TGT, use
+`select-src-port`/`select-dst-port` with the TGT tap's Port UUID; ERSPAN needs OVS
+≥ 2.10 with kernel ERSPAN support; and TGT can pre-tag OT traffic with `--vlan <id>`.
+
+**Simpler local option (no OVS) — a hub bridge.** For same-host SPAN without OVS, put
+both VMs on an isolated Linux bridge (`vmbrspan`, no IP, no ports) and turn it into a
+hub so every frame reaches the analyser:
+
+```bash
+# after both VMs are up, on the Proxmox host:
+for p in $(ip -o link show master vmbrspan | awk -F': ' '{print $2}' | sed 's/@.*//'); do
+    bridge link set dev "$p" learning off flood on mcast_flood on
+done
+```
+
+**Then generate** (all methods): point TGT at its bridge NIC — set `TGT_IFACE=eth0`
+in `/etc/tgt/tgt.conf` and `sudo ./scripts/tgtctl.sh restart`, run
+`sudo python3 -m tgt run -i eth0 -s ot-baseline --rate 50`, or pick the interface in
+the TUI's **Map** panel and press `s`. Verify on the analyser with
+`tcpdump -i <nic>` that the Modbus/S7/DNP3 exchanges arrive, then confirm CTD
+classifies them.
 
 ---
 
