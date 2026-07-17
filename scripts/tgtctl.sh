@@ -48,6 +48,17 @@ have_systemd() {
         [ -d /run/systemd/system ] 2>/dev/null
 }
 
+# Verify the tgt package is importable from REPO_ROOT before we register/start,
+# so a wrong path or incomplete checkout fails loudly instead of crash-looping.
+preflight_check() {
+    if [ ! -f "$REPO_ROOT/tgt/__main__.py" ]; then
+        die "tgt package not found at $REPO_ROOT/tgt — run tgtctl.sh from the cloned repo (…/Traffic-Generation-Toolkit/scripts/tgtctl.sh)"
+    fi
+    if ! PYTHONPATH="$REPO_ROOT" "$PY" -c "import tgt" >/dev/null 2>&1; then
+        die "python at '$PY' cannot import tgt from $REPO_ROOT — check the Python version (needs 3.9+) and repo path"
+    fi
+}
+
 # --- dependency install -----------------------------------------------------
 detect_pm() {
     for pm in apt-get dnf yum apk pacman zypper; do
@@ -131,7 +142,9 @@ Environment=PYTHONPATH=$REPO_ROOT
 WorkingDirectory=$REPO_ROOT
 # Create the veth pair before generating (idempotent).
 ExecStartPre=/bin/sh -c 'ip link show "\$TGT_IFACE" >/dev/null 2>&1 || { ip link add "\$TGT_IFACE" type veth peer name "\$TGT_IFACE-mon" && ip link set "\$TGT_IFACE" up && ip link set "\$TGT_IFACE-mon" up; }'
-ExecStart=/bin/sh -c '$PY -m tgt run --iface "\$TGT_IFACE" \$TGT_RUN_ARGS'
+# Self-contained: cd into the repo and set PYTHONPATH inline so the tgt package
+# resolves even if the WorkingDirectory/Environment directives above are ignored.
+ExecStart=/bin/sh -c 'cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" exec $PY -m tgt run --iface "\$TGT_IFACE" \$TGT_RUN_ARGS'
 Restart=on-failure
 RestartSec=3
 # Least privilege: only the caps raw packet I/O actually needs.
@@ -153,6 +166,7 @@ daemon_running() {
 
 daemon_start() {
     daemon_running && { warn "already running (pid $(cat "$PID_FILE"))"; return 0; }
+    preflight_check
     # shellcheck disable=SC1090
     . "$CONF_FILE"
     ensure_veth "${TGT_IFACE:-tgt0}"
@@ -182,6 +196,7 @@ daemon_stop() {
 # --- commands ---------------------------------------------------------------
 cmd_register() {
     need_root
+    preflight_check
     write_default_config
     if have_systemd; then
         write_unit
