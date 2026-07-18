@@ -14,6 +14,8 @@ class RunConfig:
     incident: Optional[str] = None       # famous-incident scenario; overrides profiles
     sprinkle: List[str] = field(default_factory=list)  # incidents mixed into the base
     sprinkle_messages: int = 2           # exchanges per sprinkled incident (keeps it a minority)
+    sprinkle_ratio: float = 0.0          # target malware fraction (0 = one natural cycle)
+    sprinkle_random: bool = False        # pick random variant(s) + jittered placement each cycle
     replay_path: Optional[str] = None    # replay this pcap instead of generating
     replay_realtime: bool = False        # honor original pcap inter-packet timing
     iface: Optional[str] = None          # send target; None => pcap-only
@@ -37,7 +39,9 @@ class RunConfig:
             what = f"env={self.env}"
         else:
             what = f"profiles={','.join(self.profiles)}"
-        if self.sprinkle:
-            what += f" +malware[{','.join(self.sprinkle)}]"
+        if self.sprinkle or self.sprinkle_random:
+            variants = "random" if self.sprinkle_random else ",".join(self.sprinkle)
+            ratio = f"@{self.sprinkle_ratio:.0%}" if self.sprinkle_ratio else ""
+            what += f" +malware[{variants}{ratio}]"
         return (f"{what} iface={target} "
                 f"rate={self.rate}pps {stop} loop={self.loop}")

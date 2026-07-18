@@ -54,11 +54,33 @@ def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
     otherwise-normal traffic.
     """
     base = _build_base(cfg)
-    if cfg.sprinkle:
+    if cfg.sprinkle or cfg.sprinkle_random:
         from . import incidents
-        extras = [incidents.get(k).build(cfg.sprinkle_messages)
-                  for k in cfg.sprinkle if k in incidents.INCIDENTS]
-        base = _sprinkle(base, extras)
+        import random
+        pool = [k for k in cfg.sprinkle if k in incidents.INCIDENTS]
+        if cfg.sprinkle_random:
+            pool = [random.choice(pool or list(incidents.INCIDENTS))]
+        if not pool:
+            return base
+
+        def cycle(i):
+            return incidents.get(pool[i % len(pool)]).build(cfg.sprinkle_messages)
+
+        r = min(max(cfg.sprinkle_ratio, 0.0), 0.9)
+        if r > 0 and base:
+            first = cycle(0)
+            c = max(1, len(first))
+            target = len(base) * r / (1 - r)
+            if target >= c:                 # base big enough: add malware cycles
+                n = max(1, round(target / c))
+                extras = [first] + [cycle(i) for i in range(1, n)]
+            else:                           # base too small: grow it to hit ratio
+                reps = max(1, -(-int(c * (1 - r) / r) // len(base)))
+                base = base * reps
+                extras = [first]
+        else:                               # natural minority: one cycle per variant
+            extras = [cycle(i) for i in range(len(pool))]
+        base = _sprinkle(base, extras, randomize=cfg.sprinkle_random)
     return base
 
 
@@ -86,21 +108,35 @@ def _build_base(cfg: RunConfig) -> List[tuple[str, bytes]]:
 
 
 def _sprinkle(base: List[tuple[str, bytes]],
-              extras: List[List[tuple[str, bytes]]]) -> List[tuple[str, bytes]]:
-    """Spread `extras` frames evenly through `base` so they stay a minority."""
+              extras: List[List[tuple[str, bytes]]],
+              randomize: bool = False) -> List[tuple[str, bytes]]:
+    """Spread `extras` frames through `base` (evenly, or jittered when random).
+
+    Malware frames keep their relative order (so each attack's session stays
+    ordered); only the spacing between injections changes.
+    """
     flat = [item for e in extras for item in e]
     if not flat:
         return base
     if not base:
         return flat
-    interval = max(1, len(base) // (len(flat) + 1))
     merged: List[tuple[str, bytes]] = []
     ei = 0
-    for i, item in enumerate(base):
-        merged.append(item)
-        if (i + 1) % interval == 0 and ei < len(flat):
-            merged.append(flat[ei])
-            ei += 1
+    if randomize:
+        import random
+        prob = len(flat) / len(base)
+        for item in base:
+            merged.append(item)
+            if ei < len(flat) and random.random() < prob:
+                merged.append(flat[ei])
+                ei += 1
+    else:
+        interval = max(1, len(base) // (len(flat) + 1))
+        for i, item in enumerate(base):
+            merged.append(item)
+            if (i + 1) % interval == 0 and ei < len(flat):
+                merged.append(flat[ei])
+                ei += 1
     merged.extend(flat[ei:])
     return merged
 
@@ -171,7 +207,9 @@ class Engine:
                 batch = build_batch(cfg)
                 what = (f"incident {cfg.incident}" if cfg.incident else
                         f"env {cfg.env}" if cfg.env else ", ".join(cfg.profiles))
-                if cfg.sprinkle:
+                if cfg.sprinkle_random:
+                    what += " + malware:random"
+                elif cfg.sprinkle:
                     what += f" + malware:{','.join(cfg.sprinkle)}"
                 self.log(f"built {len(batch)} frames/cycle for [{what}]")
 
@@ -205,6 +243,9 @@ class Engine:
                         break
                 if not cfg.loop:
                     break
+                # random mode: re-roll the variant + placement for the next cycle
+                if cfg.sprinkle_random and delays is None and not self._stop.is_set():
+                    batch = build_batch(cfg)
         finally:
             if sender is not None:
                 sender.close()

@@ -120,7 +120,9 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                    messages: int, env: Optional[str] = None,
                    incident: Optional[str] = None,
                    replay: Optional[str] = None,
-                   sprinkle: Optional[List[str]] = None) -> str:
+                   sprinkle: Optional[List[str]] = None,
+                   sprinkle_random: bool = False,
+                   sprinkle_ratio: float = 0.0) -> str:
     """Serialize a selection into a `tgt run` argument string for the service."""
     parts: List[str] = []
     if replay:
@@ -133,8 +135,13 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
         parts += ["--scenario", scenario]
     elif profiles:
         parts += ["--profile", ",".join(profiles)]
-    if sprinkle and not replay:
-        parts += ["--sprinkle", ",".join(sprinkle)]
+    if not replay:
+        if sprinkle:
+            parts += ["--sprinkle", ",".join(sprinkle)]
+        if sprinkle_random:
+            parts += ["--sprinkle-random"]
+        if sprinkle_ratio and sprinkle_ratio > 0:
+            parts += ["--sprinkle-ratio", f"{sprinkle_ratio:g}"]
     parts += ["--rate", f"{rate:g}"]
     if messages and messages != 5:
         parts += ["--messages", str(messages)]

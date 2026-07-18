@@ -293,11 +293,25 @@ tgt run --env ot-plant      --sprinkle industroyer  -i tgt0   # OT plant + grid 
 tgt run --scenario mixed-site --sprinkle sunburst,mirai -i tgt0   # two variants
 ```
 
-The sprinkled frames are spread evenly through the base (typically a few percent of
-total), so the analyser must pick the needle out of the haystack. In the TUI it's
-**Settings → Sprinkle malware** (toggle) and **variant** (pick the incident); a red
-`⚠ malware: <name>` banner shows while it's armed. Same detection-test-only caveat as
-above applies.
+The sprinkled frames are spread through the base (typically a few percent of total),
+so the analyser must pick the needle out of the haystack.
+
+- **`--sprinkle-ratio FRAC`** sets a fixed malware fraction (0.0–0.9) *regardless of
+  base size* — it scales the amount (growing the base if needed) to hit the target, so
+  `--sprinkle-ratio 0.05` is 5% malware whether the base is tiny or huge. Default `0`
+  keeps one natural minority cycle.
+- **`--sprinkle-random`** picks a random incident each cycle (from your `--sprinkle`
+  list, or all incidents if none given) and jitters where the frames land, so the
+  attack and its timing vary over the run.
+
+```bash
+tgt run --env it-org --sprinkle wannacry --sprinkle-ratio 0.1  -i tgt0   # exactly ~10%
+tgt run --env ot-plant --sprinkle-random --sprinkle-ratio 0.05 -i tgt0   # random attack, 5%
+```
+
+In the TUI it's **Settings → Sprinkle malware** (toggle), **variant**, **random pick**
+and **ratio**; a red `⚠ malware: <name>` banner shows while it's armed. Same
+detection-test-only caveat as above applies.
 
 ### Replay a pcap
 
@@ -333,6 +347,8 @@ tgt run [options]
   -e, --env NAME            modeled environment: it-org | ot-plant | enterprise-mixed
       --incident NAME       famous incident: wannacry | stuxnet | industroyer | …
       --sprinkle NAME[,NAME]  mix incident(s) into the base traffic; repeatable
+      --sprinkle-ratio FRAC   target malware fraction 0.0-0.9 (0 = natural minority)
+      --sprinkle-random       random variant + jittered placement each cycle
       --replay FILE         replay frames from a .pcap instead of generating
       --replay-realtime     honor the pcap's original inter-packet timing
   -i, --iface NAME          send on this interface (needs root)

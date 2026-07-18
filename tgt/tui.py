@@ -48,6 +48,8 @@ class UI:
         self.replay: Optional[str] = None    # pcap to replay (overrides all)
         self.sprinkle_on = False             # mix malware into the base traffic
         self.sprinkle_variant = incidents.all_incidents()[0].key
+        self.sprinkle_random = False         # random variant + jittered placement
+        self.sprinkle_ratio = 0.0            # 0 = natural minority; else target fraction
         self.rate = 20.0
         self.messages = 5
         self.loop = True
@@ -117,11 +119,17 @@ class UI:
         self._clear_modes()             # manual edit => custom protocols
 
     def build_config(self) -> RunConfig:
-        sprinkle = ([self.sprinkle_variant]
-                    if self.sprinkle_on and self.sprinkle_variant else [])
+        # random picks from all incidents (variant ignored); else the chosen one
+        if self.sprinkle_on and not self.sprinkle_random:
+            sprinkle = [self.sprinkle_variant]
+        else:
+            sprinkle = []
         return RunConfig(
             profiles=list(self.selected) or ["modbus"], env=self.env,
-            incident=self.incident, sprinkle=sprinkle, replay_path=self.replay,
+            incident=self.incident, sprinkle=sprinkle,
+            sprinkle_random=self.sprinkle_on and self.sprinkle_random,
+            sprinkle_ratio=self.sprinkle_ratio if self.sprinkle_on else 0.0,
+            replay_path=self.replay,
             iface=self.send_iface, pcap_path=self.pcap,
             rate=self.rate, messages=self.messages, loop=self.loop,
             endpoints=self.ep)
@@ -329,12 +337,17 @@ def _panel_rows(ui: UI) -> List[tuple]:
             preset = f"scenario: {ui.scenario}"
         else:
             preset = "(custom protocols)"
+        variant = ("random" if ui.sprinkle_random else f"⚠ {ui.sprinkle_variant}") \
+            if ui.sprinkle_on else "(enable above)"
+        ratio = (f"{ui.sprinkle_ratio:.0%}" if ui.sprinkle_ratio > 0
+                 else "auto (natural)")
         return [
             ("Preset", preset),
             ("Replay pcap", ui.replay or "(off — Enter to set)"),
             ("Sprinkle malware", "ON" if ui.sprinkle_on else "off"),
-            ("  variant", f"⚠ {ui.sprinkle_variant}" if ui.sprinkle_on
-             else "(enable above)"),
+            ("  variant", variant),
+            ("  random pick", "yes" if ui.sprinkle_random else "no"),
+            ("  ratio", ratio),
             ("Rate (pps)", f"{ui.rate:g}  (0 = max)"),
             ("Msgs / cycle", str(ui.messages)),
             ("Loop", "yes" if ui.loop else "no"),
@@ -347,7 +360,9 @@ def _panel_rows(ui: UI) -> List[tuple]:
         run_args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
                                           ui.messages, env=ui.env,
                                           incident=ui.incident, replay=ui.replay,
-                                          sprinkle=[ui.sprinkle_variant] if ui.sprinkle_on else None)
+                                          sprinkle=[ui.sprinkle_variant] if (ui.sprinkle_on and not ui.sprinkle_random) else None,
+                                          sprinkle_random=ui.sprinkle_on and ui.sprinkle_random,
+                                          sprinkle_ratio=ui.sprinkle_ratio if ui.sprinkle_on else 0.0)
         return [
             ("Status", f"{st.status} ({st.mode})"),
             ("Config file", service.CONF_PATH),
@@ -482,26 +497,40 @@ def _act_settings(stdscr, ui: UI):
             i = 0
         ui.sprinkle_variant = keys[(i + 1) % len(keys)]
         ui.sprinkle_on = True
-    elif r == 4:
+        ui.sprinkle_random = False
+    elif r == 4:                                  # random pick toggle
+        ui.sprinkle_random = not ui.sprinkle_random
+        if ui.sprinkle_random:
+            ui.sprinkle_on = True
+    elif r == 5:                                  # ratio
+        v = _prompt(stdscr, "Malware ratio 0-0.9 (0 = auto)",
+                    f"{ui.sprinkle_ratio:g}")
+        try:
+            ui.sprinkle_ratio = min(0.9, max(0.0, float(v)))
+            if ui.sprinkle_ratio > 0:
+                ui.sprinkle_on = True
+        except (TypeError, ValueError):
+            pass
+    elif r == 6:
         v = _prompt(stdscr, "Rate pps (0 = max)", f"{ui.rate:g}")
         try:
             ui.rate = max(0.0, float(v))
         except (TypeError, ValueError):
             pass
-    elif r == 5:
+    elif r == 7:
         v = _prompt(stdscr, "Messages per cycle", str(ui.messages))
         try:
             ui.messages = max(1, int(v))
         except (TypeError, ValueError):
             pass
-    elif r == 6:
+    elif r == 8:
         ui.loop = not ui.loop
-    elif r == 7:
+    elif r == 9:
         v = _prompt(stdscr, "PCAP path (blank = off)", ui.pcap or "tgt-out.pcap")
         ui.pcap = v if v and v != "(off)" else None
-    elif r == 8:
+    elif r == 10:
         ui.ep.client_ip = _prompt(stdscr, "Client IP", ui.ep.client_ip) or ui.ep.client_ip
-    elif r == 9:
+    elif r == 11:
         ui.ep.server_ip = _prompt(stdscr, "Server IP", ui.ep.server_ip) or ui.ep.server_ip
 
 
@@ -511,7 +540,9 @@ def _act_service(stdscr, ui: UI):
         args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
                                       ui.messages, env=ui.env,
                                       incident=ui.incident, replay=ui.replay,
-                                      sprinkle=[ui.sprinkle_variant] if ui.sprinkle_on else None)
+                                      sprinkle=[ui.sprinkle_variant] if (ui.sprinkle_on and not ui.sprinkle_random) else None,
+                                      sprinkle_random=ui.sprinkle_on and ui.sprinkle_random,
+                                      sprinkle_ratio=ui.sprinkle_ratio if ui.sprinkle_on else 0.0)
         ok, msg = service.write_config(ui.send_iface or "tgt0", args)
         ui.add_log(("saved: " if ok else "error: ") + msg)
     elif r in (4, 5, 6):
@@ -560,7 +591,9 @@ def _draw(stdscr, ui: UI):
     envline = f"env: {env.kind} · {priv} · ip:{'yes' if env.has_ip else 'no'} · service:{ui.svc.status}"
     _put(stdscr, 1, 2, envline, _cattr(C_DIM))
     if ui.sprinkle_on:
-        mal = f"⚠ malware: {ui.sprinkle_variant} "
+        variant = "random" if ui.sprinkle_random else ui.sprinkle_variant
+        pct = f" @{ui.sprinkle_ratio:.0%}" if ui.sprinkle_ratio > 0 else ""
+        mal = f"⚠ malware: {variant}{pct} "
         _put(stdscr, 1, w - len(mal) - 2, mal,
              _cattr(C_RED, curses.A_BOLD | curses.A_REVERSE))
 
@@ -640,7 +673,7 @@ def _loop(stdscr):
         elif c == ord(' '):
             if PANELS[ui.focus] == "Protocols":
                 _activate(stdscr, ui)
-            elif PANELS[ui.focus] == "Settings" and ui.row in (2, 3, 6):
+            elif PANELS[ui.focus] == "Settings" and ui.row in (2, 3, 4, 8):
                 _act_settings(stdscr, ui)
         elif c == ord('s'):
             ui.start_stop()
