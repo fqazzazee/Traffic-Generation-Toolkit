@@ -138,6 +138,45 @@ def test_legacy_fingerprints_on_the_wire() -> None:
     check(len(env.legacy_hosts()) >= 5, "too few legacy/at-risk hosts modeled")
 
 
+def test_incidents_build_and_checksum() -> None:
+    from tgt import incidents
+    for inc in incidents.all_incidents():
+        batch = inc.build(2)
+        check(len(batch) > 0, f"incident {inc.key} produced no frames")
+        for _, f in batch:
+            verify_ip_l4(f, f"incident:{inc.key}")
+        check(inc.category in ("IT", "OT"), f"{inc.key} bad category")
+
+
+def test_incident_signatures_present() -> None:
+    from tgt import incidents
+
+    def blob(k):
+        return b"".join(f for _, f in incidents.get(k).build(2))
+
+    check(b"NT LM 0.12" in blob("wannacry"), "wannacry: no SMBv1 signature")
+    check(b"iuqerfsodp9ifjaposdfjhgosurijfae" in blob("wannacry"),
+          "wannacry: no kill-switch domain")
+    check(b"avsvmcloud.com" in blob("sunburst"), "sunburst: no DGA domain")
+    check(b"jndi:ldap" in blob("log4shell"), "log4shell: no JNDI string")
+    check(b"TRISTATION" in blob("triton"), "triton: no TriStation payload")
+    check(b"P_PROGRAM" in blob("stuxnet"), "stuxnet: no S7 program download")
+
+
+def test_replay_roundtrip() -> None:
+    from tgt import pcapread
+    ep = Endpoints()
+    frames = protocols.dns_flow(ep, 4)
+    with tempfile.NamedTemporaryFile(suffix=".pcap") as tf:
+        with PcapWriter(tf.name) as w:
+            for f in frames:
+                w.write(f)
+        got = pcapread.read_frames(tf.name)
+    check(len(got) == len(frames), "replay: wrong packet count")
+    check(all(g[1] == f for g, f in zip(got, frames)),
+          "replay: frame bytes changed")
+
+
 def test_new_protocols_registered() -> None:
     for key in ("smb", "https", "kerberos", "ldap", "dhcp", "netbios",
                 "enip-id", "s7-id"):

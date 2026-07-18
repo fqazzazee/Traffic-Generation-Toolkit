@@ -29,6 +29,11 @@ Built for exercising **Claroty CTD SPAN ingestion** — and any other sensor
   dozen users, a DC/DNS/file server, Rockwell + Siemens OT cells, HMIs and **legacy
   Windows 2000/XP/7** — with OS/device fingerprints so an analyser can do asset
   discovery and flag vulnerable hosts.
+- **Famous incident scenarios.** Detection-test traffic for WannaCry, Stuxnet,
+  Industroyer, TRITON, SUNBURST, Log4Shell and more — themed hostnames and the
+  network signatures each attack is known by, to validate that your sensor fires.
+- **PCAP replay.** Feed any captured `.pcap` (e.g. a real threat sample) back onto
+  the wire, at a fixed rate or with its original timing.
 - **Two output modes.** Send live on an interface (root / `CAP_NET_RAW`), or write a
   `.pcap` (needs nothing) for offline replay with `tcpreplay`.
 - **One-command setup + service.** `tgtctl.sh` installs system deps and
@@ -242,6 +247,55 @@ config, exactly like scenarios.
 
 ---
 
+## Attack scenarios — famous incidents
+
+TGT can replay the **network signatures of famous IT and OT incidents** so you can
+validate that your analyser/IDS detects them. Each scenario uses **themed hostnames**
+and the ports, protocol abuse, scan and C2-beacon patterns, and public IOC domains
+the real attack is known by.
+
+```bash
+tgt run --incident wannacry     -i tgt0     # SMBv1 EternalBlue + kill-switch DNS
+tgt run --incident stuxnet      -i tgt0     # S7comm PLC STOP + program download
+tgt run --incident industroyer  -i tgt0     # IEC-104 breaker command storm
+```
+
+| incident | year | what it reproduces |
+|---|---|---|
+| `wannacry` | 2017 | SMBv1 MS17-010/DOUBLEPULSAR signature, 445 scan, kill-switch domain lookup |
+| `conficker` | 2008 | MS08-067 SMB spread + DGA C2 domains |
+| `mirai` | 2016 | Telnet (23) default-credential scanning + C2 report |
+| `sunburst` | 2020 | SolarWinds `avsvmcloud.com` DGA + low-and-slow HTTP C2 beacon |
+| `log4shell` | 2021 | `${jndi:ldap://…}` in HTTP headers (CVE-2021-44228) |
+| `stuxnet` | 2010 | Siemens S7comm PLC STOP + program download, SMBv1 propagation |
+| `industroyer` | 2016 | IEC 60870-5-104 breaker control-command storm |
+| `triton` | 2017 | TriStation (UDP 1502) writes to a Schneider Triconex SIS |
+
+`tgt list` prints each incident's detectable signals. In the TUI these are in the
+**Settings → Preset** cycle (shown as `⚠ <name>`).
+
+> **Detection-test traffic only.** These scenarios emit synthetic packets carrying the
+> recognizable *indicators* of each attack — **not** working exploits, shellcode, or
+> malware. Run them only on your own isolated test SPAN, for authorized detection
+> engineering. This is the same idea as an IDS ruleset test pcap.
+
+### Replay a pcap
+
+Bring your own capture — a real threat sample, a lab recording, anything — and put it
+back on the wire:
+
+```bash
+tgt run --replay threat.pcap -i tgt0                 # replay at --rate (default 20pps)
+tgt run --replay threat.pcap -i tgt0 --replay-realtime   # keep original packet timing
+tgt run --replay threat.pcap -i tgt0 --loop          # loop it continuously
+```
+
+Reads classic libpcap (both byte orders, µs/ns timestamps; Ethernet, raw-IP and Linux
+SLL link types). For pcapng, convert first: `editcap -F pcap in.pcapng out.pcap`. In
+the TUI, set **Settings → Replay pcap**.
+
+---
+
 ## CLI reference
 
 ```
@@ -257,6 +311,9 @@ tgt run [options]
   -p, --profile KEY[,KEY]   protocol(s); repeatable  (e.g. -p modbus,s7comm)
   -s, --scenario NAME       load a named scenario
   -e, --env NAME            modeled environment: it-org | ot-plant | enterprise-mixed
+      --incident NAME       famous incident: wannacry | stuxnet | industroyer | …
+      --replay FILE         replay frames from a .pcap instead of generating
+      --replay-realtime     honor the pcap's original inter-packet timing
   -i, --iface NAME          send on this interface (needs root)
       --pcap PATH           write/also-write frames to a pcap file
       --rate PPS            packets per second (0 = as fast as possible)
@@ -472,6 +529,11 @@ performs no scanning, exploitation, or interaction with third-party systems. Onl
 it on networks and interfaces you own or are explicitly authorized to test — and
 prefer the isolated veth pair so generated frames never leave the host.
 
+The **incident scenarios** emit synthetic traffic carrying the *detectable signatures*
+of known attacks (for validating your monitoring) — not functional exploits, shellcode,
+or malware. They are for authorized detection engineering on your own test SPAN, the
+same as running an IDS ruleset test capture.
+
 ---
 
 ## Project layout
@@ -482,7 +544,9 @@ tgt/
   protocols.py   per-protocol payload + flow builders, profile registry
   scenarios.py   curated multi-protocol mixes
   enterprise.py  modeled IT/OT organizations + host OS fingerprints
+  incidents.py   famous IT/OT attack scenarios (detection-test traffic)
   pcap.py        libpcap file writer
+  pcapread.py    libpcap file reader (for --replay)
   sender.py      AF_PACKET raw send + rate limiter
   net.py         environment detection + veth/dummy management
   service.py     read/write service config + start/stop/restart

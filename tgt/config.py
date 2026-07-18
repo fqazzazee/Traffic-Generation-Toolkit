@@ -11,6 +11,9 @@ from .packet import Endpoints
 class RunConfig:
     profiles: List[str] = field(default_factory=lambda: ["modbus"])
     env: Optional[str] = None            # modeled environment; overrides profiles
+    incident: Optional[str] = None       # famous-incident scenario; overrides profiles
+    replay_path: Optional[str] = None    # replay this pcap instead of generating
+    replay_realtime: bool = False        # honor original pcap inter-packet timing
     iface: Optional[str] = None          # send target; None => pcap-only
     pcap_path: Optional[str] = None      # write frames here too/instead
     rate: float = 20.0                   # packets per second (0 = as fast as possible)
@@ -24,6 +27,13 @@ class RunConfig:
         target = self.iface or "(pcap only)"
         stop = (f"count={self.count}" if self.count else
                 f"duration={self.duration}s" if self.duration else "until stopped")
-        what = f"env={self.env}" if self.env else f"profiles={','.join(self.profiles)}"
+        if self.replay_path:
+            what = f"replay={self.replay_path}"
+        elif self.incident:
+            what = f"incident={self.incident}"
+        elif self.env:
+            what = f"env={self.env}"
+        else:
+            what = f"profiles={','.join(self.profiles)}"
         return (f"{what} iface={target} "
                 f"rate={self.rate}pps {stop} loop={self.loop}")
