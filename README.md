@@ -316,59 +316,21 @@ podman run --rm -it --network container:sensor --cap-add=NET_ADMIN --cap-add=NET
     tgt run -s ot-baseline -i tgt0-mon --rate 50
 ```
 
-### Proxmox — feed a Traffic Analyser VM (SPAN / RSPAN / ERSPAN)
+### Proxmox — feed a Traffic Analyser VM (hub bridge)
 
 Typical lab: **TGT in one VM, the analyser** (Zeek, Suricata, Security Onion, Malcolm,
-Claroty CTD, …) **in another.** Pick the method by where the analyser VM lives:
+Claroty CTD, …) **in another, on the same host.** Put both VMs on an isolated Linux
+bridge run as a **hub** — no MAC learning, so every frame floods to the analyser, just
+like a SPAN feed.
 
-| Analyser location | Method | Mirror carried by |
-|---|---|---|
-| Same Proxmox host | **SPAN** | copy to the analyser's port on the host bridge |
-| Another host, same L2 | **RSPAN** | a dedicated VLAN over the trunk |
-| Another host across L3 | **ERSPAN** | a GRE tunnel to the analyser host's IP |
+The `/etc/network/interfaces` file creates the bridge; the VM `tap` ports are created
+dynamically at VM start, so a small hookscript sets the hub flag after each VM boots.
 
-Proxmox has no "SPAN" button: build the *topology* in the GUI, create the *mirror* with
-one command. Open vSwitch (OVS) gives real SPAN/RSPAN/ERSPAN.
-
-**GUI prep (per host):** `apt install -y openvswitch-switch`, then *node → System →
-Network → Create → OVS Bridge* `vmbr1` (add the physical NIC only if the analyser is
-remote). Attach each VM's NIC to `vmbr1` (set **VLAN Tag** for RSPAN). Get a VM's
-host-side port with `ovs-vsctl list-ports vmbr1` (looks like `tap<VMID>i0`).
-
-```bash
-# SPAN — analyser on the same host: mirror the bridge to the analyser's port
-ovs-vsctl -- --id=@p get port tap<ANALYSER_VMID>i0 \
-  -- --id=@m create mirror name=span0 select-all=true output-port=@p \
-  -- set bridge vmbr1 mirrors=@m
-
-# RSPAN — analyser on another host: mirror into VLAN 999 over the trunk
-ovs-vsctl -- --id=@m create mirror name=rspan0 select-all=true output-vlan=999 \
-  -- set bridge vmbr1 mirrors=@m           # set the analyser VM's NIC VLAN Tag = 999
-
-# ERSPAN — analyser across L3: GRE-tunnel the mirror to its host IP
-ovs-vsctl add-port vmbr1 erspan0 -- set interface erspan0 type=erspan \
-  options:remote_ip=<ANALYSER_HOST_IP> options:key=100 \
-  options:erspan_ver=1 options:erspan_idx=1
-ovs-vsctl -- --id=@p get port erspan0 \
-  -- --id=@m create mirror name=erspan0 select-all=true output-port=@p \
-  -- set bridge vmbr1 mirrors=@m
-
-ovs-vsctl clear bridge vmbr1 mirrors        # tear down
-```
-
-The analyser NIC must be **promiscuous** with the Proxmox **firewall off**. ERSPAN needs
-OVS ≥ 2.10; the remote host terminates it (an OVS `type=erspan` port, or capture GRE and
-let Wireshark/your sensor decode ERSPAN).
-
-<details>
-<summary><b>Simpler local option (no OVS) — a hub bridge</b></summary>
-
-Put both VMs on an isolated Linux bridge run as a hub (no MAC learning ⇒ every frame
-floods to the analyser). The `/etc/network/interfaces` file creates the bridge; the VM
-`tap` ports are dynamic, so a hookscript sets the hub flag after each VM starts.
+**1. Create the isolated bridge** (GUI: *node → System → Network → Create → Linux
+Bridge*, or edit the file directly), then `ifreload -a`:
 
 ```
-# /etc/network/interfaces  — then: ifreload -a
+# /etc/network/interfaces
 auto vmbrspan
 iface vmbrspan inet manual
     bridge-ports none
@@ -376,22 +338,40 @@ iface vmbrspan inet manual
     bridge-fd 0
 ```
 
+`bridge-ports none` keeps it isolated (no uplink → traffic never leaves the host);
+`inet manual` gives it no IP — a pure L2 SPAN segment.
+
+**2. Make it a hub** with a Proxmox hookscript. Create `/var/lib/vz/snippets/spanhub.sh`:
+
 ```bash
-# /var/lib/vz/snippets/spanhub.sh  (chmod +x, then attach to BOTH VMs)
 #!/bin/bash
+# After a VM starts, make its SPAN bridge a hub (no learning => floods all ports).
 [ "$2" = "post-start" ] || exit 0
 for p in $(ls /sys/class/net/vmbrspan/brif 2>/dev/null); do
     bridge link set dev "$p" learning off flood on mcast_flood on
 done
 ```
+
+Make it executable and attach it to **both** VMs (whichever boots last re-flips every
+port); it re-applies on every start, so it survives reboots:
+
 ```bash
-qm set <TGT_VMID> --hookscript local:snippets/spanhub.sh
+chmod +x /var/lib/vz/snippets/spanhub.sh
+qm set <TGT_VMID>      --hookscript local:snippets/spanhub.sh
 qm set <ANALYSER_VMID> --hookscript local:snippets/spanhub.sh
 ```
 
-Then attach both VMs' NICs to `vmbrspan` (firewall unchecked), point TGT at its NIC
-(`TGT_IFACE=eth0`), and capture on the analyser with `tcpdump -i <nic>`.
-</details>
+**3. Attach both VMs' NICs** to `vmbrspan` (*VM → Hardware → Network Device*, **firewall
+unchecked**). The analyser's NIC must be **promiscuous** (`ip link set eth0 up promisc
+on`); most sensors set this themselves.
+
+**4. Generate and verify** — point TGT at its bridge NIC (`TGT_IFACE=eth0` in
+`/etc/tgt/tgt.conf`, or `-i eth0` on the CLI, or the TUI's **Map** panel), then confirm
+on the analyser with `tcpdump -i <nic>` that the traffic arrives.
+
+> Not using a hookscript? Just run the `for p in … bridge link set …` loop by hand
+> once after starting the VMs. Verify with `bridge -d link show | grep -A1 vmbrspan` —
+> each port should read `learning off flood on`.
 
 ---
 
