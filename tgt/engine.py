@@ -48,6 +48,9 @@ class Stats:
 
 def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
     """Build one interleaved cycle of frames tagged with their profile key."""
+    if cfg.incident:
+        from . import incidents
+        return incidents.get(cfg.incident).build(cfg.messages)
     if cfg.env:
         from . import enterprise
         return enterprise.get(cfg.env).build(cfg.messages)
@@ -118,15 +121,32 @@ class Engine:
                 self.log(f"writing pcap -> {cfg.pcap_path}")
 
             limiter = RateLimiter(cfg.rate)
-            batch = build_batch(cfg)
-            what = f"env {cfg.env}" if cfg.env else ", ".join(cfg.profiles)
-            self.log(f"built {len(batch)} frames/cycle for [{what}]")
+            delays = None
+            if cfg.replay_path:
+                from . import pcapread
+                frames_ts = pcapread.read_frames(cfg.replay_path)
+                batch = [("replay", f) for _, f in frames_ts]
+                if cfg.replay_realtime and len(frames_ts) > 1:
+                    delays = [0.0] + [frames_ts[i][0] - frames_ts[i - 1][0]
+                                      for i in range(1, len(frames_ts))]
+                self.log(f"replaying {len(batch)} packets from {cfg.replay_path}"
+                         + (" (original timing)" if delays else
+                            f" @ {cfg.rate}pps"))
+            else:
+                batch = build_batch(cfg)
+                what = (f"incident {cfg.incident}" if cfg.incident else
+                        f"env {cfg.env}" if cfg.env else ", ".join(cfg.profiles))
+                self.log(f"built {len(batch)} frames/cycle for [{what}]")
 
             while not self._stop.is_set():
-                for key, frame in batch:
+                for idx, (key, frame) in enumerate(batch):
                     if self._stop.is_set():
                         break
-                    limiter.wait()
+                    if delays is not None:
+                        if delays[idx] > 0:
+                            time.sleep(min(delays[idx], 5.0))
+                    else:
+                        limiter.wait()
                     if sender is not None:
                         try:
                             sender.send(frame)

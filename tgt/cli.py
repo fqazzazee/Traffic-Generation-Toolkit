@@ -18,7 +18,7 @@ from .engine import Engine
 from .packet import Endpoints
 from . import enterprise
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +39,13 @@ def cmd_list(args) -> int:
         if e.legacy_hosts():
             leg = ", ".join(f"{h.name} ({h.fp.label})" for h in e.legacy_hosts())
             print(f"    at-risk: {leg}")
+    from . import incidents
+    print("\nIncidents (famous attacks — detection-test traffic; use with "
+          "--incident):")
+    for inc in incidents.all_incidents():
+        print(f"  {inc.key:14} {inc.name:26} [{inc.category} · {inc.year}]")
+        print(f"    {inc.desc}")
+        print(f"    signals: {'; '.join(inc.indicators())}")
     return 0
 
 
@@ -108,12 +115,23 @@ def _resolve_profiles(args) -> list[str]:
 
 
 def cmd_run(args) -> int:
+    from . import incidents
     env = getattr(args, "env", None)
+    incident = getattr(args, "incident", None)
+    replay = getattr(args, "replay", None)
     if env and env not in enterprise.ENVIRONMENTS:
         print(f"unknown environment: {env}. Try 'tgt list'.", file=sys.stderr)
         return 2
-    if env:
-        profs = ["modbus"]   # unused when env is set
+    if incident and incident not in incidents.INCIDENTS:
+        print(f"unknown incident: {incident}. Try 'tgt list'.", file=sys.stderr)
+        return 2
+    if replay:
+        import os
+        if not os.path.exists(replay):
+            print(f"replay file not found: {replay}", file=sys.stderr)
+            return 2
+    if env or incident or replay:
+        profs = ["modbus"]   # unused
     else:
         try:
             profs = _resolve_profiles(args)
@@ -127,7 +145,9 @@ def cmd_run(args) -> int:
         vlan=args.vlan,
     )
     cfg = RunConfig(
-        profiles=profs, env=env, iface=args.iface, pcap_path=args.pcap,
+        profiles=profs, env=env, incident=incident, replay_path=replay,
+        replay_realtime=getattr(args, "replay_realtime", False),
+        iface=args.iface, pcap_path=args.pcap,
         rate=args.rate, count=args.count, duration=args.duration,
         messages=args.messages, loop=not args.once, endpoints=ep,
     )
@@ -204,6 +224,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--env", "-e",
                    help="modeled environment: it-org | ot-plant | "
                         "enterprise-mixed (see 'tgt list')")
+    r.add_argument("--incident",
+                   help="famous incident scenario, e.g. wannacry | stuxnet | "
+                        "industroyer | triton (see 'tgt list')")
+    r.add_argument("--replay", metavar="FILE",
+                   help="replay frames from a .pcap file instead of generating")
+    r.add_argument("--replay-realtime", action="store_true",
+                   help="honor the pcap's original inter-packet timing")
     r.add_argument("--iface", "-i", help="interface to send on (needs root)")
     r.add_argument("--pcap", help="also/only write frames to this pcap file")
     r.add_argument("--rate", type=float, default=20.0,

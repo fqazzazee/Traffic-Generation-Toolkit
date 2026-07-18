@@ -16,7 +16,7 @@ import curses
 import time
 from typing import List, Optional
 
-from . import enterprise, net, protocols, scenarios, service
+from . import enterprise, incidents, net, protocols, scenarios, service
 from .config import RunConfig
 from .engine import Engine
 from .packet import Endpoints
@@ -44,6 +44,8 @@ class UI:
         self.selected: List[str] = ["modbus", "s7comm"]
         self.scenario: Optional[str] = None
         self.env: Optional[str] = None      # modeled environment (overrides protos)
+        self.incident: Optional[str] = None  # attack scenario (overrides protos)
+        self.replay: Optional[str] = None    # pcap to replay (overrides all)
         self.rate = 20.0
         self.messages = 5
         self.loop = True
@@ -88,27 +90,34 @@ class UI:
             self.svc = service.service_state()
             self._svc_poll = now
 
+    def _clear_modes(self):
+        self.scenario = self.env = self.incident = self.replay = None
+
     def set_scenario(self, key: Optional[str]):
+        self._clear_modes()
         self.scenario = key
-        self.env = None
         if key:
             self.selected = list(scenarios.get(key).profiles)
 
     def set_env(self, key: Optional[str]):
+        self._clear_modes()
         self.env = key
-        self.scenario = None
+
+    def set_incident(self, key: Optional[str]):
+        self._clear_modes()
+        self.incident = key
 
     def toggle_proto(self, key: str):
         if key in self.selected:
             self.selected.remove(key)
         else:
             self.selected.append(key)
-        self.scenario = None            # manual edit => custom
-        self.env = None
+        self._clear_modes()             # manual edit => custom protocols
 
     def build_config(self) -> RunConfig:
         return RunConfig(
             profiles=list(self.selected) or ["modbus"], env=self.env,
+            incident=self.incident, replay_path=self.replay,
             iface=self.send_iface, pcap_path=self.pcap,
             rate=self.rate, messages=self.messages, loop=self.loop,
             endpoints=self.ep)
@@ -118,7 +127,7 @@ class UI:
             self.engine.stop()
             self.add_log("stop requested")
             return
-        if not self.env and not self.selected:
+        if not (self.env or self.incident or self.replay or self.selected):
             self.add_log("no protocols selected")
             return
         if not self.send_iface and not self.pcap:
@@ -195,16 +204,23 @@ def _draw_diagram(win, ui: UI, top: int, w: int):
 
     inner = box_w - 2
 
-    # ENGINE box: active protocols with live bars. In env mode the active list
-    # is the busiest protocols seen from the modeled conversations.
-    if ui.env:
+    # ENGINE box: active protocols with live bars. In env/incident/replay modes
+    # the active list is the busiest labels seen from the generated traffic.
+    mode = None
+    if ui.replay:
+        mode = f"replay:{ui.replay.split('/')[-1]}"
+    elif ui.incident:
+        mode = f"⚠ {ui.incident}"
+    elif ui.env:
+        mode = f"env:{ui.env}"
+    if mode:
         if s and s.per_profile:
             active = [k for k, _ in sorted(s.per_profile.items(),
-                      key=lambda kv: -kv[1])][:4]
+                      key=lambda kv: -kv[1])][:3]
         else:
             active = []
-        _put(win, by + 1, xs[0] + 1, f"env:{ui.env}"[:inner],
-             _cattr(C_GREEN, curses.A_BOLD))
+        _put(win, by + 1, xs[0] + 1, mode[:inner],
+             _cattr(C_RED if ui.incident else C_GREEN, curses.A_BOLD))
         base_row = by + 2
     else:
         active = ui.selected[:4]
@@ -299,7 +315,11 @@ def _panel_rows(ui: UI) -> List[tuple]:
             rows.append((f"{mark} {prof.key}", val))
         return rows
     if p == "Settings":
-        if ui.env:
+        if ui.replay:
+            preset = f"replay: {ui.replay.split('/')[-1]}"
+        elif ui.incident:
+            preset = f"incident: {ui.incident}"
+        elif ui.env:
             preset = f"env: {ui.env}"
         elif ui.scenario:
             preset = f"scenario: {ui.scenario}"
@@ -307,6 +327,7 @@ def _panel_rows(ui: UI) -> List[tuple]:
             preset = "(custom protocols)"
         return [
             ("Preset", preset),
+            ("Replay pcap", ui.replay or "(off — Enter to set)"),
             ("Rate (pps)", f"{ui.rate:g}  (0 = max)"),
             ("Msgs / cycle", str(ui.messages)),
             ("Loop", "yes" if ui.loop else "no"),
@@ -317,7 +338,8 @@ def _panel_rows(ui: UI) -> List[tuple]:
     if p == "Service":
         st = ui.svc
         run_args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
-                                          ui.messages, env=ui.env)
+                                          ui.messages, env=ui.env,
+                                          incident=ui.incident, replay=ui.replay)
         return [
             ("Status", f"{st.status} ({st.mode})"),
             ("Config file", service.CONF_PATH),
@@ -420,40 +442,47 @@ def _act_map(stdscr, ui: UI):
 
 def _act_settings(stdscr, ui: UI):
     r = ui.row
-    if r == 0:                                   # preset cycle: custom → scenarios → envs
+    if r == 0:                        # preset: custom → scenarios → envs → incidents
         scen = [("s", s.key) for s in scenarios.all_scenarios()]
         envs = [("e", e.key) for e in enterprise.all_environments()]
-        opts = [("", None)] + scen + envs
-        cur = ("e", ui.env) if ui.env else ("s", ui.scenario) if ui.scenario else ("", None)
+        incs = [("i", x.key) for x in incidents.all_incidents()]
+        opts = [("", None)] + scen + envs + incs
+        cur = (("i", ui.incident) if ui.incident else ("e", ui.env) if ui.env
+               else ("s", ui.scenario) if ui.scenario else ("", None))
         try:
             i = opts.index(cur)
         except ValueError:
             i = 0
         kind, key = opts[(i + 1) % len(opts)]
-        if kind == "e":
-            ui.set_env(key)
+        {"i": ui.set_incident, "e": ui.set_env}.get(kind, ui.set_scenario)(key)
+    elif r == 1:                                  # replay pcap
+        v = _prompt(stdscr, "Replay pcap path (blank = off)", ui.replay or "")
+        if v:
+            ui._clear_modes()
+            ui.replay = v
+            ui.add_log(f"replay set: {v}")
         else:
-            ui.set_scenario(key)
-    elif r == 1:
+            ui.replay = None
+    elif r == 2:
         v = _prompt(stdscr, "Rate pps (0 = max)", f"{ui.rate:g}")
         try:
             ui.rate = max(0.0, float(v))
         except (TypeError, ValueError):
             pass
-    elif r == 2:
+    elif r == 3:
         v = _prompt(stdscr, "Messages per cycle", str(ui.messages))
         try:
             ui.messages = max(1, int(v))
         except (TypeError, ValueError):
             pass
-    elif r == 3:
-        ui.loop = not ui.loop
     elif r == 4:
+        ui.loop = not ui.loop
+    elif r == 5:
         v = _prompt(stdscr, "PCAP path (blank = off)", ui.pcap or "tgt-out.pcap")
         ui.pcap = v if v and v != "(off)" else None
-    elif r == 5:
-        ui.ep.client_ip = _prompt(stdscr, "Client IP", ui.ep.client_ip) or ui.ep.client_ip
     elif r == 6:
+        ui.ep.client_ip = _prompt(stdscr, "Client IP", ui.ep.client_ip) or ui.ep.client_ip
+    elif r == 7:
         ui.ep.server_ip = _prompt(stdscr, "Server IP", ui.ep.server_ip) or ui.ep.server_ip
 
 
@@ -461,7 +490,8 @@ def _act_service(stdscr, ui: UI):
     r = ui.row
     if r == 3:                                   # save config
         args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
-                                      ui.messages, env=ui.env)
+                                      ui.messages, env=ui.env,
+                                      incident=ui.incident, replay=ui.replay)
         ok, msg = service.write_config(ui.send_iface or "tgt0", args)
         ui.add_log(("saved: " if ok else "error: ") + msg)
     elif r in (4, 5, 6):
@@ -586,7 +616,7 @@ def _loop(stdscr):
         elif c == ord(' '):
             if PANELS[ui.focus] == "Protocols":
                 _activate(stdscr, ui)
-            elif PANELS[ui.focus] == "Settings" and ui.row == 3:
+            elif PANELS[ui.focus] == "Settings" and ui.row == 4:
                 ui.loop = not ui.loop
         elif c == ord('s'):
             ui.start_stop()
