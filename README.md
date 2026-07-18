@@ -53,7 +53,45 @@ cd Traffic-Generation-Toolkit
 ```bash
 sudo python3 -m tgt
 ```
-<img width="2501" height="1611" alt="image" src="https://github.com/user-attachments/assets/3a4c005b-6b74-40ed-b111-4c44b8e0af17" />
+```
+ TGT · Traffic Generation Toolkit                                                                                          ● GENERATING
+  env: native · root · ip:yes · service:not-installed                                                               ⚠ malware: stuxnet
+
+  ╭─ TGT ENGINE ──────────╮        ╭─ SEND ────────────────╮        ╭─ MONITOR ─────────────╮        ╭─ SENSOR ──────────────╮
+  │☣ +stuxnet             │        │ens19                  │        │(no peer)              │        │Zeek/Suricata          │
+  │☣s7-con▇▇▇▇▇▇▇▇▇▇▇▇▇▇  │        │▶ out                  │        │capture pt             │        │ingest                 │
+  │ modbus▇▇▇▇▇▇▇▇▇▇▇     │        │                       │        │                       │        │                       │
+  │ s7comm▇▇▇▇▇▇▇▇▇▇▇     │        │2770                   │        │◀ SPAN                 │        │◀ in                   │
+  │☣eterna▇▇▇▇▇▇▇▇▇       │        │packets                │        │                       │        │                       │
+  │                       │─•──•──▶│                       │─•──•──▶│                       │─•──•──▶│                       │
+  │                       │  emit  │                       │ mirror │                       │ ingest │                       │
+  │                       │        │                       │        │                       │        │                       │
+  │                       │        │                       │        │                       │        │                       │
+  │  20.0 pps             │        │                       │        │                       │        │                       │
+  ╰───────────────────────╯        ╰───────────────────────╯        ╰───────────────────────╯        ╰───────────────────────╯
+
+   Map   Protocols   Settings   Service                     │ ─ Live log
+                                                            │ 02:46:16 malware sprinkle ON: wannacry
+  Preset               (custom protocols)                   │ 02:46:17 start: profiles=modbus,s7comm +malware[wannacry] iface=ens19 rat
+  Replay pcap          (off — Enter to set)                 │ 02:46:17 raw socket bound to ens19
+  Sprinkle malware     ON                                   │ 02:46:17 built 82 frames/cycle for [modbus, s7comm + malware:wannacry]
+    variant            ⚠ stuxnet                            │ 02:46:23 stop requested
+    random pick        no                                   │ 02:46:23 done: 128 pkts, 9455 bytes, 0 errors
+    ratio              auto (natural)                       │ 02:46:28 start: profiles=modbus,s7comm +malware[wannacry] iface=ens19 rat
+  Rate (pps)           20  (0 = max)                        │ 02:46:28 raw socket bound to ens19
+  Msgs / cycle         5                                    │ 02:46:28 built 82 frames/cycle for [modbus, s7comm + malware:wannacry]
+  Loop                 yes                                  │ 02:46:36 stop requested
+  PCAP output          (off)                                │ 02:46:36 done: 172 pkts, 12722 bytes, 0 errors
+  Client IP            10.10.10.10                          │ 02:46:40 start: profiles=modbus,s7comm +malware[stuxnet] iface=ens19 rate
+  Server IP            10.10.10.20                          │ 02:46:40 raw socket bound to ens19
+                                                            │ 02:46:40 built 66 frames/cycle for [modbus, s7comm + malware:stuxnet]
+                                                            │ 02:46:46 stop requested
+                                                            │ 02:46:46 done: 110 pkts, 7734 bytes, 0 errors
+                                                            │ 02:47:29 start: profiles=modbus,s7comm +malware[stuxnet] iface=ens19 rate
+                                                            │ 02:47:29 raw socket bound to ens19
+                                                            │ 02:47:29 built 66 frames/cycle for [modbus, s7comm + malware:stuxnet]
+Tab panel · ↑↓ move · ←→/Enter change · Space toggle · s start/stop · c clear · q quit
+```
 
 In the UI: **Map** → `Create veth pair`, then **Protocols** (`Space` to pick), then
 press **`s`**. Point your sensor at `tgt0-mon`.
