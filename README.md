@@ -53,11 +53,7 @@ cd Traffic-Generation-Toolkit
 ```bash
 sudo python3 -m tgt
 ```
-
-```
 <img width="2501" height="1611" alt="image" src="https://github.com/user-attachments/assets/3a4c005b-6b74-40ed-b111-4c44b8e0af17" />
-
-```
 
 In the UI: **Map** → `Create veth pair`, then **Protocols** (`Space` to pick), then
 press **`s`**. Point your sensor at `tgt0-mon`.
