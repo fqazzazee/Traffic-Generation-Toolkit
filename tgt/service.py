@@ -117,10 +117,12 @@ def _find_tgtctl() -> Optional[str]:
 
 
 def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
-                   messages: int) -> str:
+                   messages: int, env: Optional[str] = None) -> str:
     """Serialize a selection into a `tgt run` argument string for the service."""
     parts: List[str] = []
-    if scenario:
+    if env:
+        parts += ["--env", env]
+    elif scenario:
         parts += ["--scenario", scenario]
     elif profiles:
         parts += ["--profile", ",".join(profiles)]

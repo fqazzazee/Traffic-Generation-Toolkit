@@ -16,7 +16,7 @@ import curses
 import time
 from typing import List, Optional
 
-from . import net, protocols, scenarios, service
+from . import enterprise, net, protocols, scenarios, service
 from .config import RunConfig
 from .engine import Engine
 from .packet import Endpoints
@@ -43,6 +43,7 @@ class UI:
         self.sensor_label = "Claroty CTD"
         self.selected: List[str] = ["modbus", "s7comm"]
         self.scenario: Optional[str] = None
+        self.env: Optional[str] = None      # modeled environment (overrides protos)
         self.rate = 20.0
         self.messages = 5
         self.loop = True
@@ -89,8 +90,13 @@ class UI:
 
     def set_scenario(self, key: Optional[str]):
         self.scenario = key
+        self.env = None
         if key:
             self.selected = list(scenarios.get(key).profiles)
+
+    def set_env(self, key: Optional[str]):
+        self.env = key
+        self.scenario = None
 
     def toggle_proto(self, key: str):
         if key in self.selected:
@@ -98,10 +104,11 @@ class UI:
         else:
             self.selected.append(key)
         self.scenario = None            # manual edit => custom
+        self.env = None
 
     def build_config(self) -> RunConfig:
         return RunConfig(
-            profiles=list(self.selected) or ["modbus"],
+            profiles=list(self.selected) or ["modbus"], env=self.env,
             iface=self.send_iface, pcap_path=self.pcap,
             rate=self.rate, messages=self.messages, loop=self.loop,
             endpoints=self.ep)
@@ -111,7 +118,7 @@ class UI:
             self.engine.stop()
             self.add_log("stop requested")
             return
-        if not self.selected:
+        if not self.env and not self.selected:
             self.add_log("no protocols selected")
             return
         if not self.send_iface and not self.pcap:
@@ -188,19 +195,32 @@ def _draw_diagram(win, ui: UI, top: int, w: int):
 
     inner = box_w - 2
 
-    # ENGINE box: active protocols with live bars
-    active = ui.selected[:4]
+    # ENGINE box: active protocols with live bars. In env mode the active list
+    # is the busiest protocols seen from the modeled conversations.
+    if ui.env:
+        if s and s.per_profile:
+            active = [k for k, _ in sorted(s.per_profile.items(),
+                      key=lambda kv: -kv[1])][:4]
+        else:
+            active = []
+        _put(win, by + 1, xs[0] + 1, f"env:{ui.env}"[:inner],
+             _cattr(C_GREEN, curses.A_BOLD))
+        base_row = by + 2
+    else:
+        active = ui.selected[:4]
+        base_row = by + 1
     maxc = 1
     if s and s.per_profile:
         maxc = max([s.per_profile.get(k, 0) for k in active] + [1])
     for j, k in enumerate(active):
+        if base_row + j >= by + bh - 2:
+            break
         cnt = s.per_profile.get(k, 0) if s else 0
         blen = int((cnt / maxc) * max(3, inner - 8)) if maxc else 0
-        bar = BAR * blen
-        _put(win, by + 1 + j, xs[0] + 1,
-             f"{k[:6]:6}", _cattr(C_GREEN))
-        _put(win, by + 1 + j, xs[0] + 8, bar[:inner - 8], _cattr(C_GREEN))
-    if not active:
+        _put(win, base_row + j, xs[0] + 1, f"{k[:6]:6}", _cattr(C_GREEN))
+        _put(win, base_row + j, xs[0] + 8, (BAR * blen)[:inner - 8],
+             _cattr(C_GREEN))
+    if not active and not ui.env:
         _put(win, by + 2, xs[0] + 1, "no protocols", _cattr(C_DIM))
     _put(win, by + bh - 2, xs[0] + 1,
          (f"{pps:6.1f} pps" if running else "idle"),
@@ -279,8 +299,14 @@ def _panel_rows(ui: UI) -> List[tuple]:
             rows.append((f"{mark} {prof.key}", val))
         return rows
     if p == "Settings":
+        if ui.env:
+            preset = f"env: {ui.env}"
+        elif ui.scenario:
+            preset = f"scenario: {ui.scenario}"
+        else:
+            preset = "(custom protocols)"
         return [
-            ("Scenario", ui.scenario or "(custom)"),
+            ("Preset", preset),
             ("Rate (pps)", f"{ui.rate:g}  (0 = max)"),
             ("Msgs / cycle", str(ui.messages)),
             ("Loop", "yes" if ui.loop else "no"),
@@ -291,7 +317,7 @@ def _panel_rows(ui: UI) -> List[tuple]:
     if p == "Service":
         st = ui.svc
         run_args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
-                                          ui.messages)
+                                          ui.messages, env=ui.env)
         return [
             ("Status", f"{st.status} ({st.mode})"),
             ("Config file", service.CONF_PATH),
@@ -394,13 +420,20 @@ def _act_map(stdscr, ui: UI):
 
 def _act_settings(stdscr, ui: UI):
     r = ui.row
-    if r == 0:                                   # scenario cycle
-        opts = [None] + [s.key for s in scenarios.all_scenarios()]
+    if r == 0:                                   # preset cycle: custom → scenarios → envs
+        scen = [("s", s.key) for s in scenarios.all_scenarios()]
+        envs = [("e", e.key) for e in enterprise.all_environments()]
+        opts = [("", None)] + scen + envs
+        cur = ("e", ui.env) if ui.env else ("s", ui.scenario) if ui.scenario else ("", None)
         try:
-            i = opts.index(ui.scenario)
+            i = opts.index(cur)
         except ValueError:
             i = 0
-        ui.set_scenario(opts[(i + 1) % len(opts)])
+        kind, key = opts[(i + 1) % len(opts)]
+        if kind == "e":
+            ui.set_env(key)
+        else:
+            ui.set_scenario(key)
     elif r == 1:
         v = _prompt(stdscr, "Rate pps (0 = max)", f"{ui.rate:g}")
         try:
@@ -428,7 +461,7 @@ def _act_service(stdscr, ui: UI):
     r = ui.row
     if r == 3:                                   # save config
         args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
-                                      ui.messages)
+                                      ui.messages, env=ui.env)
         ok, msg = service.write_config(ui.send_iface or "tgt0", args)
         ui.add_log(("saved: " if ok else "error: ") + msg)
     elif r in (4, 5, 6):

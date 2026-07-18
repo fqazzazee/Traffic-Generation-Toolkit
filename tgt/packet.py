@@ -10,7 +10,7 @@ DPI engines such as Claroty CTD key on stay easy to read and tweak.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
 # EtherTypes / IP protocol numbers
@@ -146,16 +146,26 @@ def arp(op: int, src_mac: str, src_ip: str, dst_mac: str, dst_ip: str) -> bytes:
 # ---------------------------------------------------------------------------
 @dataclass
 class Endpoints:
-    """The two hosts a flow runs between (client drives, server responds)."""
+    """The two hosts a flow runs between (client drives, server responds).
+
+    ``ttl_client``/``ttl_server`` and ``meta`` let a flow carry an OS/device
+    fingerprint (Windows TTL 128 vs Linux 64, HTTP User-Agent, SMB dialect,
+    vendor strings) so an analyser can classify assets and flag legacy ones.
+    """
     client_mac: str = "02:00:00:00:00:01"
     client_ip: str = "10.10.10.10"
     server_mac: str = "02:00:00:00:00:02"
     server_ip: str = "10.10.10.20"
     vlan: int | None = None
+    ttl_client: int = 64
+    ttl_server: int = 64
+    meta: dict = field(default_factory=dict)
 
 
 def ip_frame(ep: Endpoints, from_client: bool, proto: int, l4: bytes,
-             ttl: int = 64, ident: int = 0) -> bytes:
+             ttl: int | None = None, ident: int = 0) -> bytes:
+    if ttl is None:
+        ttl = ep.ttl_client if from_client else ep.ttl_server
     if from_client:
         s_mac, d_mac, s_ip, d_ip = (ep.client_mac, ep.server_mac,
                                     ep.client_ip, ep.server_ip)
