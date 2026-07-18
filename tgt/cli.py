@@ -18,7 +18,7 @@ from .engine import Engine
 from .packet import Endpoints
 from . import enterprise
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +154,8 @@ def cmd_run(args) -> int:
     )
     cfg = RunConfig(
         profiles=profs, env=env, incident=incident, sprinkle=sprinkle,
+        sprinkle_ratio=max(0.0, getattr(args, "sprinkle_ratio", 0.0)),
+        sprinkle_random=getattr(args, "sprinkle_random", False),
         replay_path=replay,
         replay_realtime=getattr(args, "replay_realtime", False),
         iface=args.iface, pcap_path=args.pcap,
@@ -239,6 +241,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--sprinkle", action="append", metavar="INCIDENT",
                    help="mix malware traffic into the base (normal) traffic; "
                         "comma-separated, repeatable  (e.g. --sprinkle wannacry)")
+    r.add_argument("--sprinkle-ratio", type=float, default=0.0, metavar="FRAC",
+                   help="target malware fraction 0.0-0.9 regardless of base size "
+                        "(e.g. 0.05 = 5%%); 0 = one natural minority cycle")
+    r.add_argument("--sprinkle-random", action="store_true",
+                   help="pick a random incident each cycle with jittered "
+                        "placement (from --sprinkle list, or all if none given)")
     r.add_argument("--replay", metavar="FILE",
                    help="replay frames from a .pcap file instead of generating")
     r.add_argument("--replay-realtime", action="store_true",

@@ -178,6 +178,27 @@ def test_sprinkle_mixes_malware_into_base() -> None:
         verify_ip_l4(f, "sprinkle")
 
 
+def test_sprinkle_ratio_hits_target_on_tiny_base() -> None:
+    atk = {"eternalblue", "port-scan", "dga-dns"}
+    for r in (0.1, 0.25):
+        cfg = RunConfig(profiles=["http", "dns"], sprinkle=["wannacry"],
+                        messages=3, sprinkle_ratio=r)
+        batch = build_batch(cfg)
+        got = sum(1 for k, _ in batch if k in atk) / len(batch)
+        check(abs(got - r) < 0.08, f"ratio {r}: got {got:.2f} (base grew to hit it)")
+
+
+def test_sprinkle_random_picks_varied_incidents() -> None:
+    seen = set()
+    atk = {"eternalblue", "telnet-brute", "s7-control", "iec104-command",
+           "tristation", "log4shell", "c2-beacon", "dga-dns", "port-scan"}
+    for _ in range(20):
+        batch = build_batch(RunConfig(env="it-org", sprinkle_random=True,
+                                      messages=1))
+        seen |= {k for k, _ in batch} & atk
+    check(len(seen) >= 3, f"random sprinkle not varied enough: {seen}")
+
+
 def test_replay_roundtrip() -> None:
     from tgt import pcapread
     ep = Endpoints()
