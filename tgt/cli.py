@@ -18,7 +18,7 @@ from .engine import Engine
 from .packet import Endpoints
 from . import enterprise
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +130,16 @@ def cmd_run(args) -> int:
         if not os.path.exists(replay):
             print(f"replay file not found: {replay}", file=sys.stderr)
             return 2
+    sprinkle: list[str] = []
+    for chunk in (getattr(args, "sprinkle", None) or []):
+        sprinkle += [x.strip() for x in chunk.split(",") if x.strip()]
+    for k in sprinkle:
+        if k not in incidents.INCIDENTS:
+            print(f"unknown malware variant: {k}. Try 'tgt list'.",
+                  file=sys.stderr)
+            return 2
     if env or incident or replay:
-        profs = ["modbus"]   # unused
+        profs = ["modbus"]   # unused (base comes from env/incident/replay)
     else:
         try:
             profs = _resolve_profiles(args)
@@ -145,7 +153,8 @@ def cmd_run(args) -> int:
         vlan=args.vlan,
     )
     cfg = RunConfig(
-        profiles=profs, env=env, incident=incident, replay_path=replay,
+        profiles=profs, env=env, incident=incident, sprinkle=sprinkle,
+        replay_path=replay,
         replay_realtime=getattr(args, "replay_realtime", False),
         iface=args.iface, pcap_path=args.pcap,
         rate=args.rate, count=args.count, duration=args.duration,
@@ -227,6 +236,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--incident",
                    help="famous incident scenario, e.g. wannacry | stuxnet | "
                         "industroyer | triton (see 'tgt list')")
+    r.add_argument("--sprinkle", action="append", metavar="INCIDENT",
+                   help="mix malware traffic into the base (normal) traffic; "
+                        "comma-separated, repeatable  (e.g. --sprinkle wannacry)")
     r.add_argument("--replay", metavar="FILE",
                    help="replay frames from a .pcap file instead of generating")
     r.add_argument("--replay-realtime", action="store_true",

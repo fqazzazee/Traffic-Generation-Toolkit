@@ -47,7 +47,22 @@ class Stats:
 
 
 def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
-    """Build one interleaved cycle of frames tagged with their profile key."""
+    """Build one interleaved cycle of frames tagged with their profile key.
+
+    The base is a scenario/environment/incident/protocol mix; any ``sprinkle``
+    incidents are then spread thinly through it so the malware rides on top of
+    otherwise-normal traffic.
+    """
+    base = _build_base(cfg)
+    if cfg.sprinkle:
+        from . import incidents
+        extras = [incidents.get(k).build(cfg.sprinkle_messages)
+                  for k in cfg.sprinkle if k in incidents.INCIDENTS]
+        base = _sprinkle(base, extras)
+    return base
+
+
+def _build_base(cfg: RunConfig) -> List[tuple[str, bytes]]:
     if cfg.incident:
         from . import incidents
         return incidents.get(cfg.incident).build(cfg.messages)
@@ -68,6 +83,26 @@ def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
                 batch.append(p[i])
         i += 1
     return batch
+
+
+def _sprinkle(base: List[tuple[str, bytes]],
+              extras: List[List[tuple[str, bytes]]]) -> List[tuple[str, bytes]]:
+    """Spread `extras` frames evenly through `base` so they stay a minority."""
+    flat = [item for e in extras for item in e]
+    if not flat:
+        return base
+    if not base:
+        return flat
+    interval = max(1, len(base) // (len(flat) + 1))
+    merged: List[tuple[str, bytes]] = []
+    ei = 0
+    for i, item in enumerate(base):
+        merged.append(item)
+        if (i + 1) % interval == 0 and ei < len(flat):
+            merged.append(flat[ei])
+            ei += 1
+    merged.extend(flat[ei:])
+    return merged
 
 
 class Engine:
@@ -136,6 +171,8 @@ class Engine:
                 batch = build_batch(cfg)
                 what = (f"incident {cfg.incident}" if cfg.incident else
                         f"env {cfg.env}" if cfg.env else ", ".join(cfg.profiles))
+                if cfg.sprinkle:
+                    what += f" + malware:{','.join(cfg.sprinkle)}"
                 self.log(f"built {len(batch)} frames/cycle for [{what}]")
 
             while not self._stop.is_set():

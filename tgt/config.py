@@ -12,6 +12,8 @@ class RunConfig:
     profiles: List[str] = field(default_factory=lambda: ["modbus"])
     env: Optional[str] = None            # modeled environment; overrides profiles
     incident: Optional[str] = None       # famous-incident scenario; overrides profiles
+    sprinkle: List[str] = field(default_factory=list)  # incidents mixed into the base
+    sprinkle_messages: int = 2           # exchanges per sprinkled incident (keeps it a minority)
     replay_path: Optional[str] = None    # replay this pcap instead of generating
     replay_realtime: bool = False        # honor original pcap inter-packet timing
     iface: Optional[str] = None          # send target; None => pcap-only
@@ -35,5 +37,7 @@ class RunConfig:
             what = f"env={self.env}"
         else:
             what = f"profiles={','.join(self.profiles)}"
+        if self.sprinkle:
+            what += f" +malware[{','.join(self.sprinkle)}]"
         return (f"{what} iface={target} "
                 f"rate={self.rate}pps {stop} loop={self.loop}")
