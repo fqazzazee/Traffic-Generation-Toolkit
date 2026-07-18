@@ -55,16 +55,8 @@ sudo python3 -m tgt
 ```
 
 ```
- TGT · Traffic Generation Toolkit                 ● GENERATING   ⚠ malware: wannacry
+<img width="2501" height="1611" alt="image" src="https://github.com/user-attachments/assets/3a4c005b-6b74-40ed-b111-4c44b8e0af17" />
 
-  ╭ TGT ENGINE ──╮      ╭ SEND ──────╮      ╭ MONITOR ───╮      ╭ SENSOR ──────╮
-  │ env:it-org   │─emit▶│ tgt0       │mirror│ tgt0-mon   │ingest│ Zeek/Suricata│
-  │ ☣ +wannacry  │ •••▶ │ ▶ out 12340│ •••▶ │ capture pt │ •••▶ │ ◀ ingest     │
-  │  smb  ▇▇▇▇▇▇  │      │ packets    │      │ ◀ SPAN     │      ╰──────────────╯
-  │  ldap ▇▇▇▇▇   │      ╰────────────╯      ╰────────────╯
-  │ ☣eternalbl ▇  │      50.0 pps
-  │ +6 more…     │
-  ╰──────────────╯      [ Map ]  Protocols  Settings  Service   │  ─ Live log
 ```
 
 In the UI: **Map** → `Create veth pair`, then **Protocols** (`Space` to pick), then
