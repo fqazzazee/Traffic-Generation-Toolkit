@@ -104,7 +104,7 @@ write_default_config() {
 # Edit, then: sudo ./scripts/tgtctl.sh restart
 
 # Virtual interface to generate on. A veth pair <IFACE> <-> <IFACE>-mon is
-# created automatically; point your sensor (Claroty CTD / tcpdump) at the -mon end.
+# created automatically; point your sensor (Zeek/Suricata/tcpdump, or Claroty CTD) at -mon.
 TGT_IFACE=tgt0
 
 # Arguments passed to `tgt run`. The service keeps looping until stopped.

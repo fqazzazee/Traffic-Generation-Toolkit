@@ -18,7 +18,7 @@ from .engine import Engine
 from .packet import Endpoints
 from . import enterprise
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ def cmd_env(args) -> int:
         print(f"  {i['name']:14} state={i['state']:8} mac={i['mac']:18} "
               f"mtu={i['mtu']}")
     if e.kind in ("wsl", "podman", "container"):
-        print(f"\nnote: on {e.kind}, run TGT and your capture tool (CTD/tcpdump) "
+        print(f"\nnote: on {e.kind}, run TGT and your sensor (Zeek/Suricata/tcpdump) "
               "inside the same\n      network namespace so both see the veth pair.")
     return 0
 
@@ -83,7 +83,7 @@ def cmd_iface(args) -> int:
             peer = args.peer or f"{args.name}-mon"
             print(f"\nveth ready. Generate on '{args.name}', capture on '{peer}':")
             print(f"  tgt run --iface {args.name} --profile modbus")
-            print(f"  # point Claroty CTD / tcpdump at: {peer}")
+            print(f"  # point your sensor (Zeek/Suricata/tcpdump, or Claroty CTD) at: {peer}")
         return 0 if res.ok else 1
     if args.iface_cmd == "delete":
         res = net.delete_interface(args.name, use_sudo=not args.no_sudo)
@@ -206,7 +206,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tgt",
         description="Traffic Generation Toolkit — craft OT/ICS + IT test "
                     "traffic onto a virtual interface for SPAN-ingestion "
-                    "testing (e.g. Claroty CTD).")
+                    "testing with Zeek, Suricata, Security Onion, Malcolm, "
+                    "Claroty CTD, Nozomi, etc.")
     p.add_argument("--version", action="version", version=f"tgt {VERSION}")
     sub = p.add_subparsers(dest="command")
 

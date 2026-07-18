@@ -5,7 +5,7 @@ Ethernet frame (layer 2) that can be handed straight to an ``AF_PACKET`` raw
 socket or written into a pcap file.
 
 The helpers are deliberately small and explicit so the byte-level patterns that
-DPI engines such as Claroty CTD key on stay easy to read and tweak.
+DPI engines (Zeek, Suricata, Claroty CTD, …) key on stay easy to read and tweak.
 """
 from __future__ import annotations
 
