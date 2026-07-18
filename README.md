@@ -339,16 +339,65 @@ off**; `select-all=true` mirrors the whole bridge — to mirror only TGT, use
 `select-src-port`/`select-dst-port` with the TGT tap's Port UUID; ERSPAN needs OVS
 ≥ 2.10 with kernel ERSPAN support; and TGT can pre-tag OT traffic with `--vlan <id>`.
 
-**Simpler local option (no OVS) — a hub bridge.** For same-host SPAN without OVS, put
-both VMs on an isolated Linux bridge (`vmbrspan`, no IP, no ports) and turn it into a
-hub so every frame reaches the analyser:
+#### Simpler local option (no OVS) — a persistent hub bridge
+
+For same-host SPAN without OVS, put both VMs on an isolated Linux bridge and turn it
+into a hub (no MAC learning ⇒ every frame floods to all ports, so the analyser sees
+everything). The `/etc/network/interfaces` file can only create the *bridge* — the
+hub flag has to be set on its *ports*, and on Proxmox the VM ports are `tap`
+interfaces created dynamically at VM start, so they aren't present when the interfaces
+file is applied at boot. You therefore need the bridge stanza **plus** a small
+companion that flips the flag after the VMs are up.
+
+**1. Create the isolated bridge** in `/etc/network/interfaces` (or GUI: *node → System
+→ Network → Create → Linux Bridge*), then `ifreload -a`:
+
+```
+auto vmbrspan
+iface vmbrspan inet manual
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+```
+
+`bridge-ports none` keeps it isolated (no uplink); `inet manual` gives it no IP — a
+pure L2 SPAN segment. Attach both VMs' NICs to `vmbrspan` (*VM → Hardware → Network
+Device*, firewall unchecked).
+
+**2. Turn it into a hub for the dynamic tap ports** with a Proxmox hookscript that runs
+after each VM starts. Create `/var/lib/vz/snippets/spanhub.sh`:
 
 ```bash
-# after both VMs are up, on the Proxmox host:
-for p in $(ip -o link show master vmbrspan | awk -F': ' '{print $2}' | sed 's/@.*//'); do
+#!/bin/bash
+# After a VM starts, make its SPAN bridge a hub (no learning => floods all).
+vmid="$1"; phase="$2"
+[ "$phase" = "post-start" ] || exit 0
+for p in $(ls /sys/class/net/vmbrspan/brif 2>/dev/null); do
     bridge link set dev "$p" learning off flood on mcast_flood on
 done
 ```
+
+Make it executable and attach it to **both** VMs (whichever boots last re-flips every
+port); it re-applies on every start, so it survives reboots:
+
+```bash
+chmod +x /var/lib/vz/snippets/spanhub.sh
+qm set <TGT_VMID>      --hookscript local:snippets/spanhub.sh
+qm set <ANALYSER_VMID> --hookscript local:snippets/spanhub.sh
+```
+
+Prefer not to use a hookscript? Just run the loop by hand once after starting the VMs.
+Verify with `bridge -d link show | grep -A1 vmbrspan` — each port should read
+`learning off flood on`.
+
+> If TGT runs **on the Proxmox host** rather than in a VM, its veth end is a static,
+> host-side port you *can* configure straight in the interfaces file — no hook needed
+> for that port (the analyser VM's tap still uses the hookscript):
+> ```
+>     post-up ip link add tgt0 type veth peer name tgt0-br || true
+>     post-up ip link set tgt0-br master vmbrspan up && ip link set tgt0 up
+>     post-up bridge link set dev tgt0-br learning off flood on mcast_flood on
+> ```
 
 **Then generate** (all methods): point TGT at its bridge NIC — set `TGT_IFACE=eth0`
 in `/etc/tgt/tgt.conf` and `sudo ./scripts/tgtctl.sh restart`, run
