@@ -23,7 +23,12 @@ Built for exercising **Claroty CTD SPAN ingestion** — and any other sensor
   protocols, control the service, and watch packets animate along the veth path in
   real time. Plus a full CLI for scripting and CI.
 - **Real protocol patterns.** Byte-accurate Modbus/TCP, DNP3, EtherNet/IP + CIP,
-  S7comm, IEC 60870-5-104, BACnet/IP, OPC UA, plus ARP, ICMP, DNS, HTTP, NTP.
+  S7comm, IEC 60870-5-104, BACnet/IP, OPC UA, plus DNS, DHCP, NetBIOS, HTTP, HTTPS,
+  SMB, Kerberos, LDAP, ARP, ICMP, NTP.
+- **Modeled organizations.** Generate a whole realistic network — 10+ servers, a
+  dozen users, a DC/DNS/file server, Rockwell + Siemens OT cells, HMIs and **legacy
+  Windows 2000/XP/7** — with OS/device fingerprints so an analyser can do asset
+  discovery and flag vulnerable hosts.
 - **Two output modes.** Send live on an interface (root / `CAP_NET_RAW`), or write a
   `.pcap` (needs nothing) for offline replay with `tcpreplay`.
 - **One-command setup + service.** `tgtctl.sh` installs system deps and
@@ -175,14 +180,22 @@ protocol · `s` start/stop · `c` clear log · `q` quit.
 | `modbus` | Modbus/TCP | OT | 502 / tcp |
 | `dnp3` | DNP3 | OT | 20000 / tcp |
 | `enip` | EtherNet/IP + CIP | OT | 44818 / tcp |
+| `enip-id` | EtherNet/IP List Identity (Rockwell vendor/model) | OT | 44818 / tcp |
 | `s7comm` | S7comm (Siemens) | OT | 102 / tcp |
+| `s7-id` | S7 SZL identity (Siemens order no.) | OT | 102 / tcp |
 | `iec104` | IEC 60870-5-104 | OT | 2404 / tcp |
 | `bacnet` | BACnet/IP | OT | 47808 / udp |
 | `opcua` | OPC UA | OT | 4840 / tcp |
 | `arp` | ARP | IT | — / l2 |
 | `icmp` | ICMP echo | IT | — / ip |
 | `dns` | DNS | IT | 53 / udp |
-| `http` | HTTP | IT | 80 / tcp |
+| `dhcp` | DHCP (option 55 + vendor-class fingerprint) | IT | 67 / udp |
+| `netbios` | NetBIOS-NS (host/OS announce) | IT | 137 / udp |
+| `http` | HTTP (per-host User-Agent) | IT | 80 / tcp |
+| `https` | HTTPS / TLS (ClientHello + SNI) | IT | 443 / tcp |
+| `smb` | SMB / CIFS (SMBv1 legacy or SMB2) | IT | 445 / tcp |
+| `kerberos` | Kerberos (AS-REQ/REP) | IT | 88 / tcp |
+| `ldap` | LDAP / Active Directory | IT | 389 / tcp |
 | `ntp` | NTP | IT | 123 / udp |
 
 TCP protocols emit a coherent session (SYN / SYN-ACK / ACK → PSH data → FIN) so
@@ -193,6 +206,39 @@ TCP and UDP checksums are computed correctly (verified by the self-test).
 
 `ot-baseline` · `ot-full` · `mixed-site` · `discovery` · `it-noise` — run `tgt list`
 for the exact protocol set and intent of each.
+
+---
+
+## Modeled environments — realistic organizations
+
+Beyond single-protocol traffic, TGT can generate a whole **modeled network**: named
+hosts with roles, IPs, vendor MAC OUIs, and **OS/device fingerprints**, having
+realistic conversations. This gives an analyser (Claroty CTD, Zeek, …) something to
+do **asset discovery** and **vulnerability spotting** on — legacy hosts advertise
+SMBv1 and old User-Agents so they're flagged as at-risk.
+
+```bash
+tgt run --env it-org           -i tgt0 --rate 100     # enterprise IT
+tgt run --env ot-plant         -i tgt0 --rate 100     # industrial OT
+tgt run --env enterprise-mixed -i tgt0 --rate 100     # both, converged
+```
+
+| env | models | fingerprints / vuln signals |
+|---|---|---|
+| `it-org` | 11 servers (DC×2, DNS, file, SQL, web, mail, proxy, backup) + 12 users, with DHCP, DNS, Kerberos, LDAP, SMB, HTTP/HTTPS, NetBIOS, NTP | Windows Server 2019 / Win10 / Linux; **legacy Win2000 file server, Win7 + WinXP users** (SMBv1 → MS17-010) |
+| `ot-plant` | Rockwell cell (ControlLogix/CompactLogix over EtherNet/IP) + Siemens cell (S7-300/1500 over S7comm), HMIs, historian, engineering WS | Rockwell/Allen-Bradley + Siemens vendor & model identity; **legacy WinXP/2000 HMIs** |
+| `enterprise-mixed` | the full converged site: `it-org` + `ot-plant` together (34 hosts) | everything above — the realistic IT/OT mix an industrial site presents |
+
+**How the fingerprints work:** each host carries an OS profile that shapes its
+traffic — TTL (128 Windows / 64 Linux / 30 Siemens), HTTP `User-Agent` (e.g.
+`MSIE 6.0; Windows NT 5.1` for XP), SMB dialect (SMBv1 `NT LM 0.12` for legacy vs
+SMB2), DHCP option-55 + vendor class, NetBIOS name, and vendor MAC OUI (Rockwell
+`00:1d:9c`, Siemens `00:0e:8c`). OT PLCs answer identity queries with real product
+strings (`1756-L71 LOGIX5571`, `6ES7 315-2EH14-0AB0`). `tgt list` prints each
+environment's asset count and the hosts flagged at-risk.
+
+Environments are selectable in the TUI (**Settings → Preset**) and the service
+config, exactly like scenarios.
 
 ---
 
@@ -210,6 +256,7 @@ tgt iface list                    list interfaces
 tgt run [options]
   -p, --profile KEY[,KEY]   protocol(s); repeatable  (e.g. -p modbus,s7comm)
   -s, --scenario NAME       load a named scenario
+  -e, --env NAME            modeled environment: it-org | ot-plant | enterprise-mixed
   -i, --iface NAME          send on this interface (needs root)
       --pcap PATH           write/also-write frames to a pcap file
       --rate PPS            packets per second (0 = as fast as possible)
@@ -434,9 +481,11 @@ tgt/
   packet.py      raw Ethernet/IP/TCP/UDP/ARP builders + checksums
   protocols.py   per-protocol payload + flow builders, profile registry
   scenarios.py   curated multi-protocol mixes
+  enterprise.py  modeled IT/OT organizations + host OS fingerprints
   pcap.py        libpcap file writer
   sender.py      AF_PACKET raw send + rate limiter
   net.py         environment detection + veth/dummy management
+  service.py     read/write service config + start/stop/restart
   engine.py      build → send/write loop with live stats (threaded)
   config.py      run configuration
   cli.py         argparse command-line interface

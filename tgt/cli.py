@@ -16,8 +16,9 @@ from . import net, protocols, scenarios
 from .config import RunConfig
 from .engine import Engine
 from .packet import Endpoints
+from . import enterprise
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +32,13 @@ def cmd_list(args) -> int:
     for s in scenarios.all_scenarios():
         print(f"  {s.key:14} {s.name:26} [{', '.join(s.profiles)}]")
         print(f"    {s.desc}")
+    print("\nEnvironments (modeled organizations — use with --env):")
+    for e in enterprise.all_environments():
+        print(f"  {e.key:18} {e.name:22} [{e.category}]")
+        print(f"    {e.summary()}")
+        if e.legacy_hosts():
+            leg = ", ".join(f"{h.name} ({h.fp.label})" for h in e.legacy_hosts())
+            print(f"    at-risk: {leg}")
     return 0
 
 
@@ -100,11 +108,18 @@ def _resolve_profiles(args) -> list[str]:
 
 
 def cmd_run(args) -> int:
-    try:
-        profs = _resolve_profiles(args)
-    except KeyError as e:
-        print(f"unknown protocol: {e}. Try 'tgt list'.", file=sys.stderr)
+    env = getattr(args, "env", None)
+    if env and env not in enterprise.ENVIRONMENTS:
+        print(f"unknown environment: {env}. Try 'tgt list'.", file=sys.stderr)
         return 2
+    if env:
+        profs = ["modbus"]   # unused when env is set
+    else:
+        try:
+            profs = _resolve_profiles(args)
+        except KeyError as e:
+            print(f"unknown protocol: {e}. Try 'tgt list'.", file=sys.stderr)
+            return 2
 
     ep = Endpoints(
         client_mac=args.client_mac, client_ip=args.client_ip,
@@ -112,7 +127,7 @@ def cmd_run(args) -> int:
         vlan=args.vlan,
     )
     cfg = RunConfig(
-        profiles=profs, iface=args.iface, pcap_path=args.pcap,
+        profiles=profs, env=env, iface=args.iface, pcap_path=args.pcap,
         rate=args.rate, count=args.count, duration=args.duration,
         messages=args.messages, loop=not args.once, endpoints=ep,
     )
@@ -186,6 +201,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--profile", "-p", action="append",
                    help="protocol key(s), comma-separated; repeatable")
     r.add_argument("--scenario", "-s", help="named scenario (see 'tgt list')")
+    r.add_argument("--env", "-e",
+                   help="modeled environment: it-org | ot-plant | "
+                        "enterprise-mixed (see 'tgt list')")
     r.add_argument("--iface", "-i", help="interface to send on (needs root)")
     r.add_argument("--pcap", help="also/only write frames to this pcap file")
     r.add_argument("--rate", type=float, default=20.0,

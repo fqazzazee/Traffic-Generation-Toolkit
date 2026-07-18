@@ -297,18 +297,177 @@ def dns_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def http_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """HTTP (80): GET request + 200 OK (HMI web UI style)."""
+    """HTTP (80): GET request + 200 OK.
+
+    The User-Agent comes from ``ep.meta['ua']`` when set, so a client's browser
+    and OS (e.g. MSIE 6.0 on Windows XP) is fingerprintable on the wire.
+    """
+    ua = ep.meta.get("ua", "TGT-Traffic-Gen")
+    host = ep.meta.get("host", ep.server_ip)
+    server_banner = ep.meta.get("server", "Apache")
     exchanges = []
     for i in range(count):
-        req = (f"GET /status?poll={i} HTTP/1.1\r\n"
-               f"Host: {ep.server_ip}\r\n"
-               "User-Agent: TGT-Traffic-Gen\r\n"
+        path = ep.meta.get("path", f"/status?poll={i}")
+        req = (f"GET {path} HTTP/1.1\r\n"
+               f"Host: {host}\r\n"
+               f"User-Agent: {ua}\r\n"
                "Accept: */*\r\n\r\n").encode()
         body = f'{{"tag":"AI-{i}","value":{i * 3}}}'.encode()
-        resp = (f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        resp = (f"HTTP/1.1 200 OK\r\nServer: {server_banner}\r\n"
+                f"Content-Type: application/json\r\n"
                 f"Content-Length: {len(body)}\r\n\r\n").encode() + body
         exchanges.append((req, resp))
     return _tcp_flow(ep, _sport(), 80, exchanges)
+
+
+# ---------------------------------------------------------------------------
+# Enterprise IT protocols (identity / fingerprint bearing)
+# ---------------------------------------------------------------------------
+def smb_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """SMB (445): negotiate + tree connect.
+
+    Legacy hosts advertise only SMBv1 ("NT LM 0.12"), which flags them as
+    exposed to MS17-010 / EternalBlue; modern hosts negotiate SMB2. Driven by
+    ``ep.meta['smb']`` = "smb1" | "smb2" (default smb2).
+    """
+    def netbios(payload: bytes) -> bytes:
+        return struct.pack("!I", len(payload))[1:].rjust(4, b"\x00")[:4] + payload
+
+    dialect = ep.meta.get("smb", "smb2")
+    exchanges = []
+    for i in range(count):
+        if dialect == "smb1":
+            # SMB1 NEGOTIATE listing legacy dialects incl. "NT LM 0.12"
+            dialects = b"\x02NT LM 0.12\x00\x02LANMAN2.1\x00"
+            smb = (b"\xffSMB" + struct.pack("<B", 0x72) +          # NEGOTIATE
+                   struct.pack("<I", 0) + b"\x18\x53\xc8" +
+                   struct.pack("<HHHHIHHHHH", 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                               (i + 1) & 0xFFFF) +
+                   struct.pack("<BH", 0, len(dialects)) + dialects)
+            req = netbios(smb)
+            resp_smb = (b"\xffSMB" + struct.pack("<B", 0x72) +
+                        struct.pack("<I", 0) + b"\x98\x53\xc8" + bytes(20) +
+                        b"\x11\x05\x00\x03\x0a\x00\x01\x00")
+            resp = netbios(resp_smb)
+        else:
+            # SMB2 NEGOTIATE (dialect 0x0311 / 3.1.1)
+            smb2 = (b"\xfeSMB" + struct.pack("<HH", 64, 1) + bytes(2) +
+                    struct.pack("<HH", 0, 0) + struct.pack("<I", 0) +
+                    struct.pack("<I", i + 1) + bytes(44) +
+                    struct.pack("<HHHH", 36, 2, 0, 0) +
+                    struct.pack("<HH", 0x0202, 0x0311))
+            req = netbios(smb2)
+            resp = netbios(smb2[:64] + struct.pack("<HHH", 65, 0, 0x0311))
+        exchanges.append((req, resp))
+    return _tcp_flow(ep, _sport(), 445, exchanges)
+
+
+def kerberos_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """Kerberos (88): AS-REQ / AS-REP style exchange to a Domain Controller."""
+    realm = ep.meta.get("realm", "CORP.LOCAL").encode()
+    exchanges = []
+    for i in range(count):
+        # minimal ASN.1-ish AS-REQ carrying the realm (classifiers key on
+        # port 88 + the KRB_AS_REQ application tag 0x6a and the realm string)
+        req = b"\x6a\x2e\x30\x2c" + b"\xa1\x03\x02\x01\x05" + \
+            b"\xa2\x03\x02\x01\x0a" + b"\x1b" + bytes([len(realm)]) + realm
+        rep = b"\x6b\x2e\x30\x2c" + b"\xa0\x03\x02\x01\x05" + \
+            b"\xa1\x03\x02\x01\x0b" + b"\x1b" + bytes([len(realm)]) + realm
+        exchanges.append((struct.pack("!I", len(req)) + req,
+                          struct.pack("!I", len(rep)) + rep))
+    return _tcp_flow(ep, _sport(), 88, exchanges)
+
+
+def ldap_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """LDAP (389): bindRequest + searchRequest to Active Directory."""
+    dn = ep.meta.get("dn", "CN=svc,DC=corp,DC=local").encode()
+    exchanges = []
+    for i in range(count):
+        # LDAP bindRequest (appl 0) with a simple DN — enough to classify AD/LDAP
+        inner = b"\x02\x01\x03" + b"\x04" + bytes([len(dn)]) + dn + \
+            b"\x80\x00"
+        bind = b"\x30" + bytes([len(inner) + 5]) + b"\x02\x01\x01" + \
+            b"\x60" + bytes([len(inner)]) + inner
+        srch = b"\x30\x0c\x02\x01\x02\x63\x07\x04\x00\x0a\x01\x00\x0a\x01\x00"
+        exchanges.append((bind, srch))
+    return _tcp_flow(ep, _sport(), 389, exchanges)
+
+
+def https_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """HTTPS (443): TLS ClientHello + ServerHello (SNI + cipher list).
+
+    The SNI host and offered ciphers make the session fingerprintable
+    (JA3-style) so an analyser sees encrypted web traffic and its endpoints.
+    """
+    sni = ep.meta.get("sni", ep.meta.get("host", "server.corp.local")).encode()
+    exchanges = []
+    for i in range(count):
+        # SNI extension
+        server_name = struct.pack("!BH", 0, len(sni)) + sni
+        sni_list = struct.pack("!H", len(server_name)) + server_name
+        sni_ext = struct.pack("!HH", 0x0000, len(sni_list)) + sni_list
+        exts = sni_ext
+        ciphers = struct.pack("!HHHH", 0x1301, 0x1302, 0xc02f, 0xc030)
+        body = (struct.pack("!H", 0x0303) + bytes(32) + b"\x00" +
+                struct.pack("!H", len(ciphers)) + ciphers +
+                b"\x01\x00" + struct.pack("!H", len(exts)) + exts)
+        hello = struct.pack("!B", 0x01) + struct.pack("!I", len(body))[1:] + body
+        rec = struct.pack("!BHH", 0x16, 0x0301, len(hello)) + hello  # handshake
+        # ServerHello record (minimal)
+        sh_body = struct.pack("!H", 0x0303) + bytes(32) + b"\x00" + \
+            struct.pack("!H", 0x1301) + b"\x00\x00\x00"
+        sh = struct.pack("!B", 0x02) + struct.pack("!I", len(sh_body))[1:] + sh_body
+        srec = struct.pack("!BHH", 0x16, 0x0303, len(sh)) + sh
+        exchanges.append((rec, srec))
+    return _tcp_flow(ep, _sport(), 443, exchanges)
+
+
+def dhcp_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """DHCP (67/68): Discover + Offer with a fingerprint (option 55 + vendor 60).
+
+    Option 55 (parameter request list) and option 60 (vendor class, e.g.
+    "MSFT 5.0") are exactly what device-fingerprinting engines use to identify
+    the OS — set via ``ep.meta['dhcp_vendor']``.
+    """
+    vendor = ep.meta.get("dhcp_vendor", "MSFT 5.0").encode()
+    chaddr = P.mac_to_bytes(ep.client_mac) + bytes(10)
+    frames = []
+    for i in range(count):
+        base = struct.pack("!BBBBIHH", 1, 1, 6, 0, 0x3903F326, 0, 0x8000) + \
+            bytes(4) * 4 + chaddr + bytes(64) + bytes(128) + \
+            struct.pack("!I", 0x63825363)          # magic cookie
+        # options: 53 (DHCPDISCOVER), 55 (param request list), 60 (vendor class)
+        opts = b"\x35\x01\x01" + \
+            b"\x37\x08\x01\x03\x06\x0f\x1f\x21\x2b\x2c" + \
+            b"\x3c" + bytes([len(vendor)]) + vendor + b"\xff"
+        disc = base + opts
+        frames.append(P.udp_frame(ep, True, 68, 67, disc, ident=i))
+        offer_opts = b"\x35\x01\x02\xff"           # DHCPOFFER
+        offer = base + offer_opts
+        frames.append(P.udp_frame(ep, False, 67, 68, offer, ident=i))
+    return frames
+
+
+def netbios_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """NetBIOS (137/UDP): name registration/announcement carrying the host name.
+
+    NetBIOS name-service broadcasts advertise the workstation name and, with
+    the browser service, its OS — a classic passive fingerprint source.
+    """
+    name = ep.meta.get("nbname", "WORKSTATION").upper()[:15].ljust(15)
+    def encode_nb(n: str) -> bytes:
+        enc = b""
+        for ch in (n + "\x00")[:16]:
+            b = ord(ch)
+            enc += bytes([(b >> 4) + 0x41, (b & 0x0F) + 0x41])
+        return b"\x20" + enc + b"\x00"
+    frames = []
+    for i in range(count):
+        # name registration request (broadcast)
+        pkt = struct.pack("!HHHHHH", (i + 1) & 0xFFFF, 0x2910, 1, 0, 0, 1) + \
+            encode_nb(name) + struct.pack("!HH", 0x0020, 0x0001)
+        frames.append(P.udp_frame(ep, True, 137, 137, pkt, ident=i))
+    return frames
 
 
 def ntp_flow(ep: Endpoints, count: int) -> List[bytes]:
@@ -320,6 +479,45 @@ def ntp_flow(ep: Endpoints, count: int) -> List[bytes]:
         resp = struct.pack("!B", 0x1C) + bytes(47)  # mode=4 (server)
         frames.append(P.udp_frame(ep, False, 123, _sport(), resp, ident=i))
     return frames
+
+
+# ---------------------------------------------------------------------------
+# OT asset-identity / fingerprint flows (vendor + model strings)
+# ---------------------------------------------------------------------------
+def enip_identity_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """EtherNet/IP (44818): List Identity carrying a Rockwell/Allen-Bradley
+    product name — what CTD reads to inventory the PLC vendor and model."""
+    product = ep.meta.get("product", "1756-L71/B LOGIX5571").encode()
+    vendor_id = ep.meta.get("vendor_id", 0x0001)   # 0x0001 = Rockwell Automation
+    exchanges = []
+    for i in range(count):
+        req = struct.pack("<HHIIQI", 0x0063, 0, 0, 0, 0, 0)   # ListIdentity
+        # CPF: 1 item, Identity object with vendor/device/product-name string
+        idbody = struct.pack("<HHHHIHBB", 1, 0x000C, 0, 0x0001, 0, vendor_id,
+                             0x0E, 0x00) + struct.pack("<HHI", 0x000C, 0x0001,
+                             0x00010203) + bytes([len(product)]) + product
+        resp = struct.pack("<HHIIQI", 0x0063, len(idbody), 0, 0, 0, 0) + idbody
+        exchanges.append((req, resp))
+    return _tcp_flow(ep, _sport(), 44818, exchanges)
+
+
+def s7_identity_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """S7comm (102): SZL read returning a Siemens module/order number
+    (e.g. 6ES7 ...), used to fingerprint Siemens S7 PLC family and firmware."""
+    order = ep.meta.get("order", "6ES7 315-2EH14-0AB0 ").encode()
+    def tpkt(payload: bytes) -> bytes:
+        return struct.pack("!BBH", 0x03, 0x00, 4 + len(payload)) + payload
+    cotp_dt = struct.pack("!BBB", 2, 0xF0, 0x80)
+    exchanges = []
+    for i in range(count):
+        # userdata SZL request (0x0011/0x001C module identification)
+        req_s7 = struct.pack("!BBHHHH", 0x32, 0x07, 0, (i + 1) & 0xFFFF, 8, 8) + \
+            b"\x00\x01\x12\x04\x11\x44\x01\x00"
+        resp_s7 = struct.pack("!BBHHHH", 0x32, 0x07, 0, (i + 1) & 0xFFFF, 12,
+                              len(order) + 8) + \
+            b"\x00\x01\x12\x08\x12\x84\x01\x00" + order
+        exchanges.append((tpkt(cotp_dt + req_s7), tpkt(cotp_dt + resp_s7)))
+    return _tcp_flow(ep, _sport(), 102, exchanges)
 
 
 # ===========================================================================
@@ -359,15 +557,32 @@ _reg("bacnet", "BACnet/IP", "OT", "47808", "udp", bacnet_flow,
      "BVLC/NPDU ReadProperty on analog-input objects")
 _reg("opcua", "OPC UA", "OT", "4840", "tcp", opcua_flow,
      "Hello/Acknowledge secure-channel handshake")
+# OT asset identity / fingerprint
+_reg("enip-id", "EtherNet/IP List Identity", "OT", "44818", "tcp",
+     enip_identity_flow, "Rockwell/Allen-Bradley vendor + product identity")
+_reg("s7-id", "S7 SZL Identity", "OT", "102", "tcp", s7_identity_flow,
+     "Siemens module/order number (6ES7…) identification")
 # IT / infra
 _reg("arp", "ARP", "IT", "-", "l2", arp_flow,
      "who-has/is-at + gratuitous announcements")
 _reg("icmp", "ICMP echo", "IT", "-", "ip", icmp_flow,
      "Ping request/reply sweep")
 _reg("dns", "DNS", "IT", "53", "udp", dns_flow,
-     "A-record query/response for OT hostnames")
+     "A-record query/response")
 _reg("http", "HTTP", "IT", "80", "tcp", http_flow,
-     "HMI web UI GET / 200 OK JSON polling")
+     "Web browsing GET / 200 OK with per-host User-Agent")
+_reg("https", "HTTPS / TLS", "IT", "443", "tcp", https_flow,
+     "TLS ClientHello/ServerHello with SNI + cipher list")
+_reg("smb", "SMB / CIFS", "IT", "445", "tcp", smb_flow,
+     "SMB negotiate (SMBv1 legacy or SMB2) + file-share traffic")
+_reg("kerberos", "Kerberos", "IT", "88", "tcp", kerberos_flow,
+     "AS-REQ/AS-REP to the Domain Controller")
+_reg("ldap", "LDAP / AD", "IT", "389", "tcp", ldap_flow,
+     "bind + search against Active Directory")
+_reg("dhcp", "DHCP", "IT", "67", "udp", dhcp_flow,
+     "Discover/Offer with option 55 + vendor-class fingerprint")
+_reg("netbios", "NetBIOS-NS", "IT", "137", "udp", netbios_flow,
+     "Name registration/announcement carrying host name + OS")
 _reg("ntp", "NTP", "IT", "123", "udp", ntp_flow,
      "Time sync client/server exchange")
 

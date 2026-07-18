@@ -48,6 +48,9 @@ class Stats:
 
 def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
     """Build one interleaved cycle of frames tagged with their profile key."""
+    if cfg.env:
+        from . import enterprise
+        return enterprise.get(cfg.env).build(cfg.messages)
     per_profile: List[List[tuple[str, bytes]]] = []
     for key in cfg.profiles:
         prof = protocols.get(key)
@@ -116,8 +119,8 @@ class Engine:
 
             limiter = RateLimiter(cfg.rate)
             batch = build_batch(cfg)
-            self.log(f"built {len(batch)} frames/cycle for "
-                     f"[{', '.join(cfg.profiles)}]")
+            what = f"env {cfg.env}" if cfg.env else ", ".join(cfg.profiles)
+            self.log(f"built {len(batch)} frames/cycle for [{what}]")
 
             while not self._stop.is_set():
                 for key, frame in batch:

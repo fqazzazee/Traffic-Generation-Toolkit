@@ -103,6 +103,47 @@ def test_scenarios_reference_real_profiles() -> None:
                   f"scenario {s.key} references unknown profile {key}")
 
 
+def test_environments_build_and_checksum() -> None:
+    from tgt import enterprise
+    for env in enterprise.all_environments():
+        batch = env.build(2)
+        check(len(batch) > 0, f"env {env.key} produced no frames")
+        for _, f in batch:
+            verify_ip_l4(f, f"env:{env.key}")
+        check(len(env.hosts) >= 10, f"env {env.key} has too few hosts")
+
+
+def test_it_org_has_servers_and_users() -> None:
+    from tgt import enterprise
+    it = enterprise.get("it-org")
+    servers = [h for h in it.hosts if h.role in
+               ("dc", "dns", "file", "db", "web", "mail", "proxy")]
+    users = [h for h in it.hosts if h.role == "ws"]
+    check(len(servers) >= 10, f"it-org has only {len(servers)} servers (need 10+)")
+    check(len(users) >= 12, f"it-org has only {len(users)} users (need 12+)")
+    roles = {h.role for h in it.hosts}
+    for need in ("dc", "dns", "file"):
+        check(need in roles, f"it-org missing role {need}")
+
+
+def test_legacy_fingerprints_on_the_wire() -> None:
+    from tgt import enterprise
+    env = enterprise.get("enterprise-mixed")
+    blob = b"".join(f for _, f in env.build(2))
+    check(b"NT LM 0.12" in blob, "no SMBv1 dialect (legacy Windows) present")
+    check(b"MSIE 6.0" in blob or b"Windows NT 5.1" in blob,
+          "no Windows XP User-Agent present")
+    check(b"6ES7" in blob, "no Siemens order number present")
+    check(b"LOGIX" in blob, "no Rockwell product string present")
+    check(len(env.legacy_hosts()) >= 5, "too few legacy/at-risk hosts modeled")
+
+
+def test_new_protocols_registered() -> None:
+    for key in ("smb", "https", "kerberos", "ldap", "dhcp", "netbios",
+                "enip-id", "s7-id"):
+        check(key in protocols.PROFILES, f"protocol {key} not registered")
+
+
 def test_pcap_roundtrip() -> None:
     ep = Endpoints()
     frames = protocols.enip_flow(ep, 3)
