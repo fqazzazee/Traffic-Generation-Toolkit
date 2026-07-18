@@ -31,7 +31,8 @@ Built for exercising **Claroty CTD SPAN ingestion** — and any other sensor
   discovery and flag vulnerable hosts.
 - **Famous incident scenarios.** Detection-test traffic for WannaCry, Stuxnet,
   Industroyer, TRITON, SUNBURST, Log4Shell and more — themed hostnames and the
-  network signatures each attack is known by, to validate that your sensor fires.
+  network signatures each attack is known by. **Sprinkle** any of them as a thin
+  minority into normal baseline traffic to test detection in a realistic haystack.
 - **PCAP replay.** Feed any captured `.pcap` (e.g. a real threat sample) back onto
   the wire, at a fixed rate or with its original timing.
 - **Two output modes.** Send live on an interface (root / `CAP_NET_RAW`), or write a
@@ -279,6 +280,25 @@ tgt run --incident industroyer  -i tgt0     # IEC-104 breaker command storm
 > malware. Run them only on your own isolated test SPAN, for authorized detection
 > engineering. This is the same idea as an IDS ruleset test pcap.
 
+### Sprinkle malware on top of normal traffic
+
+The most realistic detection test is an attack **buried in otherwise-normal traffic**.
+`--sprinkle` mixes an incident's traffic, as a thin minority, into any base (a
+scenario, an environment, or a protocol set) — so the malware rides on top of a
+believable baseline instead of standing alone:
+
+```bash
+tgt run --env it-org        --sprinkle wannacry     -i tgt0   # IT org + EternalBlue
+tgt run --env ot-plant      --sprinkle industroyer  -i tgt0   # OT plant + grid attack
+tgt run --scenario mixed-site --sprinkle sunburst,mirai -i tgt0   # two variants
+```
+
+The sprinkled frames are spread evenly through the base (typically a few percent of
+total), so the analyser must pick the needle out of the haystack. In the TUI it's
+**Settings → Sprinkle malware** (toggle) and **variant** (pick the incident); a red
+`⚠ malware: <name>` banner shows while it's armed. Same detection-test-only caveat as
+above applies.
+
 ### Replay a pcap
 
 Bring your own capture — a real threat sample, a lab recording, anything — and put it
@@ -312,6 +332,7 @@ tgt run [options]
   -s, --scenario NAME       load a named scenario
   -e, --env NAME            modeled environment: it-org | ot-plant | enterprise-mixed
       --incident NAME       famous incident: wannacry | stuxnet | industroyer | …
+      --sprinkle NAME[,NAME]  mix incident(s) into the base traffic; repeatable
       --replay FILE         replay frames from a .pcap instead of generating
       --replay-realtime     honor the pcap's original inter-packet timing
   -i, --iface NAME          send on this interface (needs root)

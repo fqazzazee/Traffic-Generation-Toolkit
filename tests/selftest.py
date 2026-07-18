@@ -163,6 +163,21 @@ def test_incident_signatures_present() -> None:
     check(b"P_PROGRAM" in blob("stuxnet"), "stuxnet: no S7 program download")
 
 
+def test_sprinkle_mixes_malware_into_base() -> None:
+    # a normal IT organization base with wannacry sprinkled on top
+    cfg = RunConfig(env="it-org", sprinkle=["wannacry"], messages=2,
+                    sprinkle_messages=2)
+    batch = build_batch(cfg)
+    labels = {k for k, _ in batch}
+    check("smb" in labels or "dns" in labels, "sprinkle: base traffic missing")
+    check("eternalblue" in labels, "sprinkle: malware traffic missing")
+    mal = sum(1 for k, _ in batch if k in
+              ("eternalblue", "port-scan", "dga-dns"))
+    check(mal < len(batch) / 2, "sprinkle: malware not a minority of a real base")
+    for _, f in batch:
+        verify_ip_l4(f, "sprinkle")
+
+
 def test_replay_roundtrip() -> None:
     from tgt import pcapread
     ep = Endpoints()

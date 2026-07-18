@@ -46,6 +46,8 @@ class UI:
         self.env: Optional[str] = None      # modeled environment (overrides protos)
         self.incident: Optional[str] = None  # attack scenario (overrides protos)
         self.replay: Optional[str] = None    # pcap to replay (overrides all)
+        self.sprinkle_on = False             # mix malware into the base traffic
+        self.sprinkle_variant = incidents.all_incidents()[0].key
         self.rate = 20.0
         self.messages = 5
         self.loop = True
@@ -115,9 +117,11 @@ class UI:
         self._clear_modes()             # manual edit => custom protocols
 
     def build_config(self) -> RunConfig:
+        sprinkle = ([self.sprinkle_variant]
+                    if self.sprinkle_on and self.sprinkle_variant else [])
         return RunConfig(
             profiles=list(self.selected) or ["modbus"], env=self.env,
-            incident=self.incident, replay_path=self.replay,
+            incident=self.incident, sprinkle=sprinkle, replay_path=self.replay,
             iface=self.send_iface, pcap_path=self.pcap,
             rate=self.rate, messages=self.messages, loop=self.loop,
             endpoints=self.ep)
@@ -328,6 +332,9 @@ def _panel_rows(ui: UI) -> List[tuple]:
         return [
             ("Preset", preset),
             ("Replay pcap", ui.replay or "(off — Enter to set)"),
+            ("Sprinkle malware", "ON" if ui.sprinkle_on else "off"),
+            ("  variant", f"⚠ {ui.sprinkle_variant}" if ui.sprinkle_on
+             else "(enable above)"),
             ("Rate (pps)", f"{ui.rate:g}  (0 = max)"),
             ("Msgs / cycle", str(ui.messages)),
             ("Loop", "yes" if ui.loop else "no"),
@@ -339,7 +346,8 @@ def _panel_rows(ui: UI) -> List[tuple]:
         st = ui.svc
         run_args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
                                           ui.messages, env=ui.env,
-                                          incident=ui.incident, replay=ui.replay)
+                                          incident=ui.incident, replay=ui.replay,
+                                          sprinkle=[ui.sprinkle_variant] if ui.sprinkle_on else None)
         return [
             ("Status", f"{st.status} ({st.mode})"),
             ("Config file", service.CONF_PATH),
@@ -463,26 +471,37 @@ def _act_settings(stdscr, ui: UI):
             ui.add_log(f"replay set: {v}")
         else:
             ui.replay = None
-    elif r == 2:
+    elif r == 2:                                  # sprinkle malware toggle
+        ui.sprinkle_on = not ui.sprinkle_on
+        ui.add_log(f"malware sprinkle {'ON: ' + ui.sprinkle_variant if ui.sprinkle_on else 'off'}")
+    elif r == 3:                                  # malware variant cycle
+        keys = [x.key for x in incidents.all_incidents()]
+        try:
+            i = keys.index(ui.sprinkle_variant)
+        except ValueError:
+            i = 0
+        ui.sprinkle_variant = keys[(i + 1) % len(keys)]
+        ui.sprinkle_on = True
+    elif r == 4:
         v = _prompt(stdscr, "Rate pps (0 = max)", f"{ui.rate:g}")
         try:
             ui.rate = max(0.0, float(v))
         except (TypeError, ValueError):
             pass
-    elif r == 3:
+    elif r == 5:
         v = _prompt(stdscr, "Messages per cycle", str(ui.messages))
         try:
             ui.messages = max(1, int(v))
         except (TypeError, ValueError):
             pass
-    elif r == 4:
+    elif r == 6:
         ui.loop = not ui.loop
-    elif r == 5:
+    elif r == 7:
         v = _prompt(stdscr, "PCAP path (blank = off)", ui.pcap or "tgt-out.pcap")
         ui.pcap = v if v and v != "(off)" else None
-    elif r == 6:
+    elif r == 8:
         ui.ep.client_ip = _prompt(stdscr, "Client IP", ui.ep.client_ip) or ui.ep.client_ip
-    elif r == 7:
+    elif r == 9:
         ui.ep.server_ip = _prompt(stdscr, "Server IP", ui.ep.server_ip) or ui.ep.server_ip
 
 
@@ -491,7 +510,8 @@ def _act_service(stdscr, ui: UI):
     if r == 3:                                   # save config
         args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
                                       ui.messages, env=ui.env,
-                                      incident=ui.incident, replay=ui.replay)
+                                      incident=ui.incident, replay=ui.replay,
+                                      sprinkle=[ui.sprinkle_variant] if ui.sprinkle_on else None)
         ok, msg = service.write_config(ui.send_iface or "tgt0", args)
         ui.add_log(("saved: " if ok else "error: ") + msg)
     elif r in (4, 5, 6):
@@ -539,6 +559,10 @@ def _draw(stdscr, ui: UI):
     priv = "root" if env.is_root else "no-root"
     envline = f"env: {env.kind} · {priv} · ip:{'yes' if env.has_ip else 'no'} · service:{ui.svc.status}"
     _put(stdscr, 1, 2, envline, _cattr(C_DIM))
+    if ui.sprinkle_on:
+        mal = f"⚠ malware: {ui.sprinkle_variant} "
+        _put(stdscr, 1, w - len(mal) - 2, mal,
+             _cattr(C_RED, curses.A_BOLD | curses.A_REVERSE))
 
     # diagram
     panel_top = _draw_diagram(stdscr, ui, 2, w)
@@ -616,8 +640,8 @@ def _loop(stdscr):
         elif c == ord(' '):
             if PANELS[ui.focus] == "Protocols":
                 _activate(stdscr, ui)
-            elif PANELS[ui.focus] == "Settings" and ui.row == 4:
-                ui.loop = not ui.loop
+            elif PANELS[ui.focus] == "Settings" and ui.row in (2, 3, 6):
+                _act_settings(stdscr, ui)
         elif c == ord('s'):
             ui.start_stop()
         elif c == ord('c'):

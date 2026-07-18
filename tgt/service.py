@@ -119,7 +119,8 @@ def _find_tgtctl() -> Optional[str]:
 def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                    messages: int, env: Optional[str] = None,
                    incident: Optional[str] = None,
-                   replay: Optional[str] = None) -> str:
+                   replay: Optional[str] = None,
+                   sprinkle: Optional[List[str]] = None) -> str:
     """Serialize a selection into a `tgt run` argument string for the service."""
     parts: List[str] = []
     if replay:
@@ -132,6 +133,8 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
         parts += ["--scenario", scenario]
     elif profiles:
         parts += ["--profile", ",".join(profiles)]
+    if sprinkle and not replay:
+        parts += ["--sprinkle", ",".join(sprinkle)]
     parts += ["--rate", f"{rate:g}"]
     if messages and messages != 5:
         parts += ["--messages", str(messages)]
