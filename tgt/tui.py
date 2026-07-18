@@ -40,7 +40,7 @@ class UI:
         # prefer an existing tgt* interface if present
         pref = next((n for n in ifaces if n.startswith("tgt")), None)
         self.send_iface: Optional[str] = pref
-        self.sensor_label = "Claroty CTD"
+        self.sensor_label = "Zeek/Suricata"
         self.selected: List[str] = ["modbus", "s7comm"]
         self.scenario: Optional[str] = None
         self.env: Optional[str] = None      # modeled environment (overrides protos)
@@ -195,12 +195,14 @@ def _draw_diagram(win, ui: UI, top: int, w: int):
     pps = s.pps if s else 0.0
     pkts = s.packets if s else 0
 
+    H, _ = win.getmaxyx()
     margin = 2
     usable = w - 2 * margin
     cell = max(16, usable // 4)
     box_w = max(11, cell - 8)
     xs = [margin + i * cell for i in range(4)]
-    bh = 7
+    # grow the boxes on taller terminals so the engine box lists more protocols
+    bh = max(7, min(H - top - 14, 12))
     by = top + 1
     mid = by + bh // 2
 
@@ -215,42 +217,56 @@ def _draw_diagram(win, ui: UI, top: int, w: int):
         _box(win, by, xs[i], bh, box_w, title, color)
 
     inner = box_w - 2
+    mal_labels = set(incidents.ATTACKS)
 
-    # ENGINE box: active protocols with live bars. In env/incident/replay modes
-    # the active list is the busiest labels seen from the generated traffic.
-    mode = None
+    # ENGINE box: header (base mode + ☣ malware badge) then the most-generated
+    # protocols, biggest first, with an overflow count if they don't all fit.
+    headers = []
     if ui.replay:
-        mode = f"replay:{ui.replay.split('/')[-1]}"
+        headers.append(("⟳ " + ui.replay.split("/")[-1], C_YELLOW))
     elif ui.incident:
-        mode = f"⚠ {ui.incident}"
+        headers.append(("☣ " + ui.incident, C_RED))
     elif ui.env:
-        mode = f"env:{ui.env}"
-    if mode:
-        if s and s.per_profile:
-            active = [k for k, _ in sorted(s.per_profile.items(),
-                      key=lambda kv: -kv[1])][:3]
-        else:
-            active = []
-        _put(win, by + 1, xs[0] + 1, mode[:inner],
-             _cattr(C_RED if ui.incident else C_GREEN, curses.A_BOLD))
-        base_row = by + 2
-    else:
-        active = ui.selected[:4]
-        base_row = by + 1
-    maxc = 1
+        headers.append(("env:" + ui.env, C_GREEN))
+    if ui.sprinkle_on and not ui.incident:
+        v = "random" if ui.sprinkle_random else ui.sprinkle_variant
+        headers.append(("☣ +" + v, C_RED))
+    for hj, (text, col) in enumerate(headers):
+        _put(win, by + 1 + hj, xs[0] + 1, text[:inner], _cattr(col, curses.A_BOLD))
+
     if s and s.per_profile:
-        maxc = max([s.per_profile.get(k, 0) for k in active] + [1])
-    for j, k in enumerate(active):
-        if base_row + j >= by + bh - 2:
-            break
+        ordered = [k for k, _ in sorted(s.per_profile.items(),
+                   key=lambda kv: -kv[1])]
+        maxc = max(s.per_profile.values())
+    else:
+        ordered = list(ui.selected)
+        maxc = 1
+
+    content_top = by + 1 + len(headers)
+    status_row = by + bh - 2
+    max_rows = max(0, status_row - content_top)
+    shown = ordered[:max_rows]
+    overflow = len(ordered) - len(shown)
+    if overflow > 0 and max_rows > 0:                # reserve a row for "+N more"
+        shown = ordered[:max_rows - 1]
+        overflow = len(ordered) - len(shown)
+    for j, k in enumerate(shown):
         cnt = s.per_profile.get(k, 0) if s else 0
-        blen = int((cnt / maxc) * max(3, inner - 8)) if maxc else 0
-        _put(win, base_row + j, xs[0] + 1, f"{k[:6]:6}", _cattr(C_GREEN))
-        _put(win, base_row + j, xs[0] + 8, (BAR * blen)[:inner - 8],
-             _cattr(C_GREEN))
-    if not active and not ui.env:
-        _put(win, by + 2, xs[0] + 1, "no protocols", _cattr(C_DIM))
-    _put(win, by + bh - 2, xs[0] + 1,
+        is_mal = k in mal_labels
+        col = C_RED if is_mal else C_GREEN
+        icon = "☣" if is_mal else " "
+        blen = int((cnt / maxc) * max(2, inner - 9)) if maxc else 0
+        _put(win, content_top + j, xs[0] + 1, f"{icon}{k[:6]:<6}",
+             _cattr(col, curses.A_BOLD if is_mal else 0))
+        _put(win, content_top + j, xs[0] + 8, (BAR * blen)[:inner - 8],
+             _cattr(col))
+    if overflow > 0:
+        _put(win, content_top + len(shown), xs[0] + 1, f"+{overflow} more…",
+             _cattr(C_DIM))
+    elif not ordered and not headers:
+        _put(win, content_top, xs[0] + 1, "no protocols", _cattr(C_DIM))
+
+    _put(win, status_row, xs[0] + 1,
          (f"{pps:6.1f} pps" if running else "idle"),
          _cattr(C_GREEN, curses.A_BOLD if running else 0))
 

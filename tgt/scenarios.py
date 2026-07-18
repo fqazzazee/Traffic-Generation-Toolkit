@@ -18,7 +18,7 @@ SCENARIOS = {
         "ot-baseline", "OT Baseline",
         ["modbus", "s7comm", "enip", "dnp3"],
         "Steady industrial polling across the common ICS protocols — the "
-        "'normal day' CTD should learn as a baseline."),
+        "'normal day' a monitor should learn as a baseline."),
     "ot-full": Scenario(
         "ot-full", "OT Full Sweep",
         ["modbus", "dnp3", "enip", "s7comm", "iec104", "bacnet", "opcua"],

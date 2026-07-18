@@ -1,13 +1,13 @@
 """Virtual interface management + environment detection.
 
-TGT sends onto a virtual interface so a monitoring tool (Claroty CTD, Wireshark,
+TGT sends onto a virtual interface so a monitoring tool (Wireshark, Zeek,
 Zeek, ...) can capture it exactly as it would a physical SPAN/mirror port.
 
 The recommended layout is a **veth pair**::
 
     tgt0  <--->  tgt0-mon
      |             |
-   generate      capture here (point CTD / tcpdump at tgt0-mon)
+   generate      capture here (point Zeek/Suricata/tcpdump at tgt0-mon)
 
 Frames written to one end appear on the other, which faithfully mimics a span
 session without touching any real network.  A ``dummy`` interface is offered as

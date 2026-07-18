@@ -3,7 +3,7 @@
 Each *flow builder* takes :class:`~tgt.packet.Endpoints` and a message ``count``
 and returns a list of complete Ethernet frames (``bytes``).  OT/ICS protocols
 are crafted at the byte level so the well-known signatures that DPI engines such
-as Claroty CTD classify on are explicit and easy to audit.
+a DPI monitor (Zeek, Suricata, Claroty CTD, …) classifies on are explicit.
 
 TCP protocols emit a coherent session (SYN / SYN-ACK / ACK, PSH data both ways,
 FIN teardown) via :class:`TcpSession` so stream-reassembling sensors see a real
@@ -486,7 +486,7 @@ def ntp_flow(ep: Endpoints, count: int) -> List[bytes]:
 # ---------------------------------------------------------------------------
 def enip_identity_flow(ep: Endpoints, count: int) -> List[bytes]:
     """EtherNet/IP (44818): List Identity carrying a Rockwell/Allen-Bradley
-    product name — what CTD reads to inventory the PLC vendor and model."""
+    product name — what a monitor reads to inventory the PLC vendor and model."""
     product = ep.meta.get("product", "1756-L71/B LOGIX5571").encode()
     vendor_id = ep.meta.get("vendor_id", 0x0001)   # 0x0001 = Rockwell Automation
     exchanges = []

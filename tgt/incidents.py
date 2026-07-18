@@ -1,7 +1,7 @@
 """Famous IT/OT incident scenarios — detection-test threat traffic.
 
 Each incident reproduces the *network-visible signatures* a monitoring tool
-(Claroty CTD, Zeek, Suricata, an IDS) would use to detect the real attack —
+(Zeek, Suricata, Security Onion, Claroty CTD, …) would use to detect the real attack —
 themed hostnames, the ports/protocols abused, scan and C2-beacon patterns, and
 public IOC domains — so you can validate that your analyser fires on them.
 

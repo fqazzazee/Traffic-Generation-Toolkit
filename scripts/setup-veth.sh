@@ -24,5 +24,5 @@ ip link set "$PEER" up
 echo "created veth pair:  $IFACE  <-->  $PEER"
 echo
 echo "  generate:  sudo python3 -m tgt run -s ot-baseline -i $IFACE --rate 50"
-echo "  capture :  sudo tcpdump -i $PEER      (or point Claroty CTD at $PEER)"
+echo "  capture :  sudo tcpdump -i $PEER      (or Zeek/Suricata/Claroty CTD on $PEER)"
 echo "  cleanup :  sudo ip link del $IFACE"
