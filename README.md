@@ -399,3 +399,14 @@ tgt/  packet · protocols · scenarios · enterprise · incidents · pcap · pca
 scripts/  tgtctl.sh (install + service)   setup-veth.sh
 tests/    selftest.py        Containerfile · docker-entrypoint.sh · Makefile · pyproject.toml
 ```
+
+---
+
+## License & security
+
+- **License:** [MIT](LICENSE).
+- **Security policy & vulnerability reporting:** [SECURITY.md](SECURITY.md).
+
+> **Built with AI assistance.** Parts of this project were written with the help of an
+> AI coding assistant. Review the code and test it in your own environment before
+> relying on it — and use it only where you are authorized to (see [Authorized use](#authorized-use)).
