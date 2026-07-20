@@ -11,6 +11,8 @@ Dragos**. Runs on a workstation, in **WSL**, or in a **Podman / Docker** contain
 
 `zero dependencies` · `pure Python stdlib` · `TUI + CLI` · `runs as a service`
 
+[![Blog](https://img.shields.io/badge/📖%20Blog-Read%20the%20Write--up-FF6C37)](https://blog.safeqbit.com/traffic-generation-toolkit-tgt-make-network-traffic-on-one-machine/)
+
 </div>
 
 ---
