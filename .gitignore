@@ -15,6 +15,9 @@ tgt-*.pcap
 *.pid
 *.log
 
+# Local-only files (not tracked)
+local-only/
+
 # Editor / OS
 .vscode/
 .idea/

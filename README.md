@@ -375,6 +375,10 @@ on the analyser with `tcpdump -i <nic>` that the traffic arrives.
 > once after starting the VMs. Verify with `bridge -d link show | grep -A1 vmbrspan` —
 > each port should read `learning off flood on`.
 
+> Full GUI-first walkthroughs (official docs + community tips + CLI fallbacks) for
+> Proxmox, Nutanix AHV, and VMware vSphere are in
+> [`SPAN Configuration/`](SPAN%20Configuration/).
+
 ---
 
 ## Verify
