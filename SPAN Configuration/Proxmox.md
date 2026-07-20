@@ -9,15 +9,17 @@ networking primitives, with CLI only where the GUI genuinely has no equivalent.
 
 ## Official documentation
 
-- **Proxmox VE Administration Guide** (`pve.proxmox.com/pve-docs/`) — chapter
-  **"Network Configuration"** covers Linux bridges, bonds, VLANs, and the OVS bridge
-  types available in the GUI.
-- Same guide, chapter on **"Hookscripts"** (`pvesh`/qm hookscript documentation) covers
-  the hookscript mechanism used below.
-- Proxmox VE **Bugzilla** and the official **Proxmox Community Forum**
-  (`forum.proxmox.com`) are the right places to check current behavior/known issues —
-  search "OVS mirror" or "SPAN bridge" before building on the CLI steps below, since
-  bridge internals have shifted across PVE major versions.
+- [Proxmox VE wiki — Network Configuration](https://pve.proxmox.com/wiki/Network_Configuration)
+  — Linux bridges, bonds, VLANs, and where the OVS bridge types show up in the GUI.
+- [Proxmox VE wiki — Open vSwitch](https://pve.proxmox.com/wiki/Open_vSwitch) —
+  working `/etc/network/interfaces` examples for OVS bridges/bonds/VLANs; confirms
+  OVS and Linux bonding/bridging/VLANs must not be mixed on the same interface.
+- The **Proxmox VE Administration Guide** (`pve.proxmox.com/pve-docs/`) covers
+  hookscripts (`qm set --hookscript`) in its API/CLI reference.
+- The official **Proxmox Community Forum** (`forum.proxmox.com`) is the right place
+  to check current behavior/known issues — search "OVS mirror" or "port mirror"
+  before building on the CLI steps below, since bridge internals have shifted across
+  PVE major versions. See the Community tips section for specific threads.
 
 ## GUI steps — isolated bridge (works for a 2-VM PoC with no CLI at all)
 
@@ -27,8 +29,11 @@ networking primitives, with CLI only where the GUI genuinely has no equivalent.
    `vmbrspan`. Apply the pending change (`Apply Configuration` in the Network view, or
    `ifreload -a` if you prefer confirming from a shell).
 2. **Attach both VMs' NICs to `vmbrspan`:** VM → Hardware → Network Device → Edit →
-   Bridge = `vmbrspan`. Leave the firewall checkbox **unticked** on both — the Proxmox
-   firewall can drop the very traffic you're trying to mirror.
+   Bridge = `vmbrspan`. Leave the firewall checkbox **unticked** on both — if the
+   Proxmox firewall is enabled anywhere in the chain (VM, node, *or* datacenter
+   level) it inserts an intermediate `fwbr`/`fwln` bridge that silently breaks
+   mirrored traffic, confirmed in the forum thread cited under Community tips below.
+   Check Datacenter → Firewall too, not just the VM's NIC.
 3. **Nothing else on this bridge.** With exactly two ports on the segment, any frame
    TGT sends to a synthetic/simulated destination MAC is "unknown unicast" — standard
    bridge behavior floods unknown-unicast to every other port, which is only the
@@ -123,21 +128,31 @@ ERSPAN ingestion natively before committing to this as the design.
 ## Community tips
 
 Not Proxmox-official guidance — cross-check against current forum activity, but
-reflects recurring practitioner experience:
+reflects recurring, confirmed practitioner experience:
 
-- Proxmox Forum threads on isolated/"dummy" bridges repeatedly flag that leaving
-  **Bridge ports** genuinely empty (not just unchecked) is what keeps the segment from
-  leaking onto the LAN — a bridge with `bridge-ports none` still gets an `ifreload`
-  warning in older PVE versions that people mistake for an error; it's expected.
-- Multiple forum posts on IDS/sensor labs note the **firewall checkbox on the VM's
-  network device** is the single most common reason mirrored traffic silently vanishes
-  — the Proxmox firewall (if enabled cluster/datacenter-wide) applies per-tap even when
-  you think you've left it off at the VM level; check Datacenter → Firewall too, not
-  just the VM's NIC.
-- Threads discussing OVS on Proxmox consistently recommend re-applying mirror config
-  via a systemd unit (`After=pve-guests.service`) rather than relying on manual
-  `ovs-vsctl` after every reboot — nobody has found a way to make it survive
-  `ifreload -a` natively.
+- [Proxmox Forum — "Open vSwitch Port Mirror problem (SNORT/ZEEK/Security
+  Onion)"](https://forum.proxmox.com/threads/open-vswitch-port-mirror-problem-snort-zeek-security-onion.72949/):
+  a user's OVS mirror was created successfully but traffic still didn't arrive at the
+  analyser. The actual fix — confirmed in-thread — was **disabling the firewall on
+  the VM's network device and mirroring the tap interface directly**: Proxmox's
+  firewall inserts an intermediate `fwbr`/`fwln` bridge layer between the VM and the
+  real bridge whenever the firewall is enabled anywhere in the chain (VM, node, or
+  datacenter level), and that extra layer silently breaks the mirror. This is a
+  stronger, confirmed version of the firewall-checkbox tip below.
+- [Proxmox Forum — "how to setup OVS bridge SPAN port (port mirror)"](https://forum.proxmox.com/threads/how-to-setup-ovs-bridge-span-port-port-mirror.152055/):
+  confirms the VM owning the destination tap **must already be running** before you
+  execute the `ovs-vsctl` mirror command (the tap interface doesn't exist until then),
+  and that the mirror config does not survive a reboot.
+- [David, Medium — "Proxmox Port Mirroring: How to Send SPAN Traffic to a Suricata IDS
+  VM Using Open vSwitch"](https://medium.com/@davidmuth04/proxmox-port-mirroring-how-to-send-span-traffic-to-a-suricata-ids-vm-using-open-vswitch-dab7309f52e0)
+  and [William Roberts — "Configuring Suricata IDS in Proxmox"](https://wroberts.me/?p=242)
+  both walk through the same `ovs-vsctl` mirror pattern end-to-end for an IDS lab,
+  useful as a worked example alongside the command above.
+- [bytebl33d — "Active Directory Home Lab with Proxmox, Part 4"](https://bytebl33d.github.io/blog/proxmox-homelab-part4/)
+  independently confirms the mirror command must be re-run every time the monitored
+  container/VM restarts, and recommends a hookscript to reapply it automatically —
+  the same mechanism this doc uses for the Linux-bridge hub trick, just applied to an
+  OVS mirror instead.
 
 ## Verify
 
@@ -145,3 +160,13 @@ reflects recurring practitioner experience:
 tcpdump -i <nic> -n
 ```
 on the analyser VM before pointing its detection engine at the interface.
+
+## Sources
+
+- [Proxmox VE wiki — Network Configuration](https://pve.proxmox.com/wiki/Network_Configuration)
+- [Proxmox VE wiki — Open vSwitch](https://pve.proxmox.com/wiki/Open_vSwitch)
+- [Proxmox Forum — OVS Port Mirror problem (SNORT/ZEEK/Security Onion)](https://forum.proxmox.com/threads/open-vswitch-port-mirror-problem-snort-zeek-security-onion.72949/)
+- [Proxmox Forum — how to setup OVS bridge SPAN port (port mirror)](https://forum.proxmox.com/threads/how-to-setup-ovs-bridge-span-port-port-mirror.152055/)
+- [Medium (David) — Proxmox Port Mirroring for Suricata via OVS](https://medium.com/@davidmuth04/proxmox-port-mirroring-how-to-send-span-traffic-to-a-suricata-ids-vm-using-open-vswitch-dab7309f52e0)
+- [William Roberts — Configuring Suricata IDS in Proxmox](https://wroberts.me/?p=242)
+- [bytebl33d — Active Directory Home Lab with Proxmox, Part 4](https://bytebl33d.github.io/blog/proxmox-homelab-part4/)
