@@ -55,6 +55,7 @@ cd Traffic-Generation-Toolkit
 ```bash
 sudo python3 -m tgt
 ```
+https://blog.safeqbit.com/content/media/2026/07/Screencast-From-2026-07-17-22-53-49.mp4
 ```
  TGT · Traffic Generation Toolkit                                                                                          ● GENERATING
   env: native · root · ip:yes · service:not-installed                                                               ⚠ malware: stuxnet
