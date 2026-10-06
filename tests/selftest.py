@@ -360,6 +360,26 @@ def test_sprinkle_maps_incident_hosts_onto_env_by_role() -> None:
             if incidents._is_external(h):
                 check(h.name not in m, f"{key}: external {h.name} was remapped")
 
+    # vendor-aware: embedded devices only land on the same vendor's devices,
+    # an exact role beats its family, and a family fills in when it's missing
+    site, plant = enterprise.get("industrial-site"), enterprise.get("ot-plant")
+    for e in enterprise.all_environments():
+        for ic in incidents.all_incidents():
+            for name, tgt in ic.map_onto(e).items():
+                v = incidents._device_vendor(ic.host(name))
+                check(v is None or incidents._device_vendor(tgt) == v,
+                      f"{ic.key}->{e.key}: {name} mapped across vendors "
+                      f"onto {tgt.name}")
+    check(incidents.get("industroyer").map_onto(site)["RTU-104"].role == "rtu",
+          "industroyer RTU not mapped onto the site's RTU")
+    check(incidents.get("triton").map_onto(site)["SIS-TRICONEX"].os ==
+          "schneider", "triton SIS not mapped onto a Schneider controller")
+    check("SIS-TRICONEX" not in incidents.get("triton").map_onto(plant),
+          "triton SIS mapped although ot-plant has no Schneider device")
+    rtu = incidents.get("industroyer").map_onto(plant).get("RTU-104")
+    check(rtu is not None and rtu.role == "plc" and rtu.os == "siemens",
+          "industroyer RTU did not fall back to a Siemens field device")
+
     # whole sprinkle path still hits its target ratio with the env base
     cfg = RunConfig(env="it-org", sprinkle=["wannacry"], messages=2,
                     sprinkle_ratio=0.2)

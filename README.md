@@ -239,6 +239,13 @@ tgt run --env ot-plant --sprinkle-random --sprinkle-ratio 0.05  -i tgt0   # rand
 - **`--sprinkle-ratio 0.0–0.9`** — fixed malware fraction regardless of base size.
 - **`--sprinkle-random`** — random variant + jittered placement each cycle.
 
+On an `--env` base, the incident's hosts are re-addressed onto the environment's real
+assets, so the attack comes from and hits hosts that are in the inventory, on their VLANs.
+Each host maps onto one with the same role (or, failing that, a related role: PLC / RTU /
+relay / drive / meter, or SCADA / HMI / historian). An embedded device must also match by
+vendor (MAC OUI): Industroyer's IEC-104 RTU lands on a Siemens RTU or PLC, never a Rockwell
+one. Hosts with no match, and external C2 or internet attackers, keep their own addresses.
+
 In the TUI: **Settings → Sprinkle malware** (toggle · variant · random · ratio); a red
 `⚠ malware: <name>` banner shows while armed.
 

@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
 from . import packet as P
-from .enterprise import FINGERPRINTS, Host, OUI_ROCKWELL, OUI_SIEMENS, OUI_WIN
+from .enterprise import (FINGERPRINTS, OUI_DELL, OUI_SCHNEIDER, OUI_SIEMENS,
+                         OUI_VENDORS, OUI_WIN, Host)
 from .packet import Endpoints
 from .protocols import TcpSession, _sport, _tcp_flow
 
@@ -244,29 +245,31 @@ class Incident:
         return out
 
     def map_onto(self, env) -> Dict[str, Host]:
-        """Map each internal incident host to an environment host of the same
-        role (same OS preferred, then any unused, then shared), so sprinkled
-        malware rides on real inventory assets. External adversary
-        infrastructure — a public IP or a name containing ``C2`` — is left out
-        and keeps its own identity."""
-        by_role: Dict[str, List[Host]] = {}
-        for h in env.hosts:
-            by_role.setdefault(h.role, []).append(h)
-        for pool in by_role.values():
-            pool.sort(key=lambda h: h.name)
+        """Map each internal incident host onto an environment host, so
+        sprinkled malware rides on real inventory assets.
+
+        A candidate must share the role, or failing that the role family
+        (see ``_ROLE_FAMILIES``); an embedded device must also come from the
+        same vendor (by MAC OUI), so a Siemens S7 attack never lands on a
+        Rockwell PLC. Among candidates: exact role first, then a host not yet
+        used, then the same OS. Hosts with no candidate — and external
+        adversary infrastructure (see ``_is_external``) — keep their own
+        identity."""
         used: set = set()
         mapping: Dict[str, Host] = {}
         for ih in self.hosts:
             if _is_external(ih):
                 continue
-            cands = by_role.get(ih.role, [])
-            pick = (next((h for h in cands
-                          if h.os == ih.os and h.name not in used), None)
-                    or next((h for h in cands if h.name not in used), None)
-                    or (cands[0] if cands else None))
-            if pick is not None:
-                used.add(pick.name)
-                mapping[ih.name] = pick
+            vendor = _device_vendor(ih)
+            cands = [h for h in env.hosts if _role_tier(ih.role, h.role)
+                     and (vendor is None or _device_vendor(h) == vendor)]
+            if not cands:
+                continue
+            pick = min(cands, key=lambda h: (-_role_tier(ih.role, h.role),
+                                             h.name in used, h.os != ih.os,
+                                             h.name))
+            used.add(pick.name)
+            mapping[ih.name] = pick
         return mapping
 
     def build_on(self, messages: int, env,
@@ -318,6 +321,28 @@ def _is_external(host: Host) -> bool:
     except ValueError:
         return False
     return not any(ip in net for net in _RFC1918)
+
+
+# Roles that may stand in for one another when an environment lacks the exact
+# one: field devices (Purdue L1-2) and supervisory consoles (L2-3).
+_ROLE_FAMILIES = ({"plc", "rtu", "relay", "drive", "meter"},
+                  {"scada", "hmi", "hist"})
+
+
+def _role_tier(want: str, have: str) -> int:
+    """2 = same role, 1 = same role family, 0 = not a substitute."""
+    if want == have:
+        return 2
+    return 1 if any(want in f and have in f for f in _ROLE_FAMILIES) else 0
+
+
+def _device_vendor(host: Host):
+    """Embedded-device vendor from the MAC OUI; ``None`` for generic PC/VM
+    NICs (VMware, Dell), whose OUI says nothing about the software."""
+    oui = host.mac[:8].lower()
+    if oui in (OUI_WIN, OUI_DELL):
+        return None
+    return OUI_VENDORS.get(oui)
 
 
 def _h(name, ip, role, os_, oui=OUI_WIN, product=""):
@@ -398,7 +423,7 @@ _reg(Incident("stuxnet", "Stuxnet", "OT", "2010",
     "Sabotage of Siemens S7 PLCs at Natanz: SMBv1 propagation and S7comm "
     "PLC STOP + malicious program download from a compromised engineering WS.",
     [_h("STEP7-ENGWS", "172.16.2.50", "eng", "win7"),
-     _h("WINCC-SCADA", "172.16.2.51", "web", "winxp"),
+     _h("WINCC-SCADA", "172.16.2.51", "scada", "winxp"),
      _h("PLC-S7-417", "172.16.2.21", "plc", "siemens", OUI_SIEMENS,
         "6ES7 417-4XT05-0AB0")],
     [("STEP7-ENGWS", "WINCC-SCADA", "eternalblue", {}),
@@ -410,7 +435,7 @@ _reg(Incident("industroyer", "Industroyer / CrashOverride", "OT", "2016",
     "command storm to trip substation breakers.",
     [_h("INDUSTROYER-C2", "172.16.0.200", "web", "linux"),
      _h("SUBSTATION-HMI", "172.16.0.30", "hmi", "win7"),
-     _h("RTU-104", "172.16.1.30", "plc", "siemens", OUI_SIEMENS)],
+     _h("RTU-104", "172.16.1.30", "rtu", "siemens", OUI_SIEMENS)],
     [("SUBSTATION-HMI", "RTU-104", "iec104-command", {}),
      ("INDUSTROYER-C2", "SUBSTATION-HMI", "c2-beacon", {
         "domain": "195.16.88.6", "uri": "/xmlrpc"})]))
@@ -419,7 +444,7 @@ _reg(Incident("triton", "TRITON / TRISIS", "OT", "2017",
     "Attack on a Schneider Triconex Safety Instrumented System via the "
     "TriStation protocol (UDP 1502) from a compromised engineering station.",
     [_h("TRITON-ENGWS", "172.16.0.60", "eng", "win7"),
-     _h("SIS-TRICONEX", "172.16.3.10", "plc", "rockwell", OUI_ROCKWELL,
+     _h("SIS-TRICONEX", "172.16.3.10", "plc", "schneider", OUI_SCHNEIDER,
         "Triconex 3008")],
     [("TRITON-ENGWS", "SIS-TRICONEX", "tristation", {}),
      ("TRITON-ENGWS", "SIS-TRICONEX", "port-scan",
