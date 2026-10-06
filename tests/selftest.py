@@ -17,6 +17,7 @@ from tgt.packet import Endpoints
 from tgt.pcap import PcapWriter
 
 _failures: list[str] = []
+_skipped: list[str] = []
 
 
 def check(cond: bool, msg: str) -> None:
@@ -278,6 +279,52 @@ def test_inventory_export() -> None:
               "tgt inventory CLI did not write JSON")
 
 
+# tshark protocol layer each builder must produce (frame.protocols names)
+_DISSECTS_AS = {
+    "modbus": "mbtcp", "dnp3": "dnp3", "enip": "cip", "s7comm": "s7comm",
+    "iec104": "iec60870_asdu", "bacnet": "bacapp", "opcua": "opcua",
+    "enip-id": "enip", "s7-id": "s7comm", "arp": "arp", "icmp": "icmp",
+    "dns": "dns", "http": "http", "https": "tls", "smb": "smb2",
+    "kerberos": "kerberos", "ldap": "ldap", "dhcp": "dhcp", "netbios": "nbns",
+    "ntp": "ntp",
+}
+
+
+def test_tshark_dissects_every_builder() -> None:
+    """Optional: with tshark on PATH, every builder (plus the SMB1 dialect and
+    a full industrial-site cycle) must decode as its protocol with no
+    malformed-packet or other expert warnings."""
+    import shutil
+    import subprocess
+    from tgt import enterprise
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_dissects_every_builder")
+        return
+    check(set(_DISSECTS_AS) == set(protocols.PROFILES),
+          "_DISSECTS_AS out of sync with the protocol registry")
+    groups = {k: protocols.get(k).build(Endpoints(), 3) for k in _DISSECTS_AS}
+    groups["smb1"] = protocols.smb_flow(Endpoints(meta={"smb": "smb1"}), 3)
+    site = [f for _, f in enterprise.get("industrial-site").build(2)]
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/all.pcap"
+        with PcapWriter(path) as w:
+            for frames in list(groups.values()) + [site]:
+                for f in frames:
+                    w.write(f)
+        layers = subprocess.run(
+            ["tshark", "-r", path, "-T", "fields", "-e", "frame.protocols"],
+            capture_output=True, text=True).stdout.splitlines()
+        expert = subprocess.run(["tshark", "-r", path, "-q", "-z", "expert,warn"],
+                                capture_output=True, text=True).stdout
+    seen = {x for line in layers for x in line.split(":")}
+    for key, layer in list(_DISSECTS_AS.items()) + [("smb1", "smb")]:
+        check(layer in seen, f"tshark: {key} never dissected as {layer}")
+    if "Errors (" in expert or "Warns (" in expert:
+        detail = [ln.strip() for ln in expert.splitlines()
+                  if "Malformed" in ln or "Warning" in ln or "incorrect" in ln]
+        _failures.append("tshark expert warnings: " + "; ".join(detail[:5]))
+
+
 def test_it_org_has_servers_and_users() -> None:
     from tgt import enterprise
     it = enterprise.get("it-org")
@@ -413,7 +460,8 @@ def main() -> int:
             t()
         except Exception as e:  # noqa: BLE001
             _failures.append(f"{t.__name__} raised {e!r}")
-        status = "ok" if len(_failures) == before else "FAIL"
+        status = ("FAIL" if len(_failures) != before else
+                  "skip" if t.__name__ in _skipped else "ok")
         print(f"  {t.__name__:42} {status}")
     print("-" * 50)
     if _failures:

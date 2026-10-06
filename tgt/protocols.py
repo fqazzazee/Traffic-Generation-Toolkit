@@ -12,6 +12,7 @@ conversation rather than orphaned segments.
 from __future__ import annotations
 
 import struct
+import zlib
 from typing import Callable, List
 
 from . import packet as P
@@ -99,6 +100,75 @@ def _sport() -> int:
     return _next_sport
 
 
+# ---------------------------------------------------------------------------
+# Shared encoders
+# ---------------------------------------------------------------------------
+def _der(tag: int, content: bytes) -> bytes:
+    """One ASN.1 DER TLV (Kerberos, LDAP), long-form length when needed."""
+    n = len(content)
+    if n < 0x80:
+        return bytes([tag, n]) + content
+    ln = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([tag, 0x80 | len(ln)]) + ln + content
+
+
+def _der_int(v: int, tag: int = 0x02) -> bytes:
+    return _der(tag, v.to_bytes((v.bit_length() + 8) // 8 or 1, "big",
+                                signed=True))
+
+
+def _der_seq(*items: bytes) -> bytes:
+    return _der(0x30, b"".join(items))
+
+
+def _ctx(n: int, content: bytes) -> bytes:
+    """Explicit context tag [n] (constructed)."""
+    return _der(0xA0 | n, content)
+
+
+def _tpkt(payload: bytes) -> bytes:
+    """ISO-on-TCP (RFC 1006) TPKT header, used by S7comm."""
+    return struct.pack("!BBH", 0x03, 0x00, 4 + len(payload)) + payload
+
+
+_COTP_DT = b"\x02\xf0\x80"          # COTP DT, TPDU-NR 0, last data unit
+
+
+def _s7(rosctr: int, ref: int, param: bytes, data: bytes = b"") -> bytes:
+    """S7comm PDU in COTP DT: Job(1)/Userdata(7) 10-byte header, Ack_Data(3)
+    adds the 2-byte error class/code."""
+    hdr = struct.pack("!BBHHHH", 0x32, rosctr, 0, ref & 0xFFFF, len(param),
+                      len(data))
+    if rosctr in (2, 3):
+        hdr += b"\x00\x00"
+    return _tpkt(_COTP_DT + hdr + param + data)
+
+
+def _s7_connect() -> List[tuple[bytes, bytes]]:
+    """COTP connect (TSAP rack 0 / slot 2) + S7 Setup Communication — how
+    every S7 session opens before any read or SZL request."""
+    params = b"\xc0\x01\x0a\xc1\x02\x01\x00\xc2\x02\x01\x02"
+    cr = _tpkt(struct.pack("!BBHHB", 6 + len(params), 0xE0, 0x0000, 0x0001,
+                           0x00) + params)
+    cc = _tpkt(struct.pack("!BBHHB", 6 + len(params), 0xD0, 0x0001, 0x0044,
+                           0x00) + params)
+    # Setup Communication: max AmQ calling/called 1, PDU length 480 -> 240
+    setup = _s7(1, 0, struct.pack("!BBHHH", 0xF0, 0x00, 1, 1, 480))
+    setup_ack = _s7(3, 0, struct.pack("!BBHHH", 0xF0, 0x00, 1, 1, 240))
+    return [(cr, cc), (setup, setup_ack)]
+
+
+def _enip(cmd: int, session: int, data: bytes, context: int = 0) -> bytes:
+    """EtherNet/IP encapsulation header (24 bytes, little-endian)."""
+    return struct.pack("<HHIIQI", cmd, len(data), session, 0, context, 0) + data
+
+
+def _cpf(*items: tuple[int, bytes]) -> bytes:
+    """EtherNet/IP Common Packet Format: item count + (type, length, data)."""
+    return struct.pack("<H", len(items)) + b"".join(
+        struct.pack("<HH", t, len(d)) + d for t, d in items)
+
+
 # ===========================================================================
 # OT / ICS protocols
 # ===========================================================================
@@ -119,100 +189,109 @@ def modbus_flow(ep: Endpoints, count: int) -> List[bytes]:
     return _tcp_flow(ep, _sport(), 502, exchanges)
 
 
+def _dnp3_crc(data: bytes) -> bytes:
+    """DNP3 link-layer CRC-16 (poly 0x3D65, reflected), little-endian."""
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA6BC if crc & 1 else crc >> 1
+    return struct.pack("<H", ~crc & 0xFFFF)
+
+
 def dnp3_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """DNP3 (20000): data-link header (0x0564) + application read request."""
-    def dl_frame(src: int, dst: int, ctrl: int, app: bytes) -> bytes:
-        length = 5 + len(app)          # len counts everything after the len byte
-        hdr = struct.pack("<BBBBHH", 0x05, 0x64, length & 0xFF, ctrl,
-                          dst & 0xFFFF, src & 0xFFFF)
-        # CRC bytes are normally appended per block; sensors classify on the
-        # 0x0564 start pattern + control/addressing, which we reproduce here.
-        return hdr + app
+    """DNP3 (20000): link frames (0x0564 + per-block CRCs) carrying a master's
+    class-0 READ and the outstation's analog-input RESPONSE (g30v2)."""
+    def link(ctrl: int, dst: int, src: int, user: bytes) -> bytes:
+        hdr = struct.pack("<BBBBHH", 0x05, 0x64, 5 + len(user), ctrl, dst, src)
+        out = hdr + _dnp3_crc(hdr)
+        for k in range(0, len(user), 16):          # CRC after every 16 bytes
+            out += user[k:k + 16] + _dnp3_crc(user[k:k + 16])
+        return out
 
     exchanges = []
     for i in range(count):
-        # Application layer: transport hdr + app ctrl + function READ (0x01)
-        req_app = struct.pack("<BBB", 0xC0 | (i & 0x3F), 0xC0 | (i & 0x0F), 0x01)
-        resp_app = struct.pack("<BBBBB", 0xC0 | (i & 0x3F), 0xC0 | (i & 0x0F),
-                               0x81, 0x00, 0x00)  # RESPONSE + IIN
-        req = dl_frame(src=10, dst=1, ctrl=0xC4, app=req_app)
-        resp = dl_frame(src=1, dst=10, ctrl=0x44, app=resp_app)
-        exchanges.append((req, resp))
+        tp = 0xC0 | (i & 0x3F)                     # transport: FIN | FIR | seq
+        ac = 0xC0 | (i & 0x0F)                     # application: FIR | FIN | seq
+        read = bytes([tp, ac, 0x01]) + b"\x3c\x01\x06"   # READ g60v1, all
+        points = b"".join(struct.pack("<Bh", 0x01, 100 * i + p)
+                          for p in range(4))      # flags ONLINE + int16
+        resp = bytes([tp, ac, 0x81, 0x00, 0x00]) + \
+            b"\x1e\x02\x00\x00\x03" + points       # g30v2, start-stop 0..3
+        exchanges.append((link(0xC4, 1, 10, read), link(0x44, 10, 1, resp)))
     return _tcp_flow(ep, _sport(), 20000, exchanges)
 
 
 def enip_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """EtherNet/IP (44818): register session + CIP list-identity style exchange."""
-    def enip(cmd: int, session: int, data: bytes) -> bytes:
-        return struct.pack("<HHIIQI", cmd, len(data), session, 0, 0, 0) + data
+    """EtherNet/IP (44818): RegisterSession, unconnected CIP Get_Attribute_Single
+    polls (Identity status) in SendRRData, then UnRegisterSession."""
+    session = 0x12340000 | (zlib.crc32(P.ip_to_bytes(ep.client_ip)) & 0xFFFF)
+    exchanges = [(_enip(0x0065, 0, struct.pack("<HH", 1, 0)),
+                  _enip(0x0065, session, struct.pack("<HH", 1, 0)))]
 
-    exchanges = []
-    session = 0x00000000
-    # RegisterSession (0x0065): protocol version 1, options 0
-    reg = enip(0x0065, 0, struct.pack("<HH", 1, 0))
-    reg_resp = enip(0x0065, 0x12345678, struct.pack("<HH", 1, 0))
-    exchanges.append((reg, reg_resp))
-    session = 0x12345678
-    for i in range(max(0, count - 1)):
-        # SendRRData (0x006F) wrapping a small CIP service request
-        cip = struct.pack("<BBBB", 0x0E, 0x02, 0x20, 0x01)  # Get_Attribute_Single
-        data = struct.pack("<IHH", 0, 0, len(cip)) + cip
-        req = enip(0x006F, session, data)
-        resp = enip(0x006F, session, data + b"\x00\x00")
-        exchanges.append((req, resp))
+    def rr(cip: bytes, ctx: int) -> bytes:      # SendRRData: handle, timeout
+        return _enip(0x006F, session, struct.pack("<IH", 0, 10) +
+                     _cpf((0x0000, b""), (0x00B2, cip)), context=ctx)
+
+    for i in range(count):
+        # Get_Attribute_Single, path class 0x01 / instance 1 / attribute 5
+        req = bytes([0x0E, 0x03, 0x20, 0x01, 0x24, 0x01, 0x30, 0x05])
+        rsp = bytes([0x8E, 0x00, 0x00, 0x00]) + struct.pack("<H", 0x0060)
+        exchanges.append((rr(req, i + 1), rr(rsp, i + 1)))
+    exchanges.append((_enip(0x0066, session, b""), b""))   # UnRegisterSession
     return _tcp_flow(ep, _sport(), 44818, exchanges)
 
 
 def s7comm_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """S7comm (102): TPKT + COTP + S7 header, ROSCTR job/ack pattern."""
-    def tpkt(cotp_plus: bytes) -> bytes:
-        length = 4 + len(cotp_plus)
-        return struct.pack("!BBH", 0x03, 0x00, length) + cotp_plus
-
-    # COTP connection request (once) then S7 data PDUs
-    frames_ex = []
-    # COTP CR (class 0)
-    cotp_cr = struct.pack("!BB HHB", 17, 0xE0, 0, 0, 0x00) + \
-        b"\xc0\x01\x0a\xc1\x02\x01\x00\xc2\x02\x01\x02"
-    cotp_cc = struct.pack("!BB HHB", 17, 0xD0, 0, 0, 0x00) + \
-        b"\xc0\x01\x0a\xc1\x02\x01\x00\xc2\x02\x01\x02"
-    frames_ex.append((tpkt(cotp_cr), tpkt(cotp_cc)))
-
-    cotp_dt = struct.pack("!BBB", 2, 0xF0, 0x80)  # COTP DT, EOT
-    for i in range(max(0, count - 1)):
-        # S7 header: proto 0x32, ROSCTR job(1)/ack_data(3), PDUref, par/data len
-        s7_job = struct.pack("!BBHHHH", 0x32, 0x01, 0, (i + 1) & 0xFFFF, 8, 0) + \
-            b"\x00\x04\x01\x12\x0a\x10\x02"  # read-var style param
-        s7_ack = struct.pack("!BBHHHHBB", 0x32, 0x03, 0, (i + 1) & 0xFFFF,
-                             2, 5, 0, 0) + b"\x00\x04\x01"
-        req = tpkt(cotp_dt + s7_job)
-        resp = tpkt(cotp_dt + s7_ack)
-        frames_ex.append((req, resp))
-    return _tcp_flow(ep, _sport(), 102, frames_ex)
+    """S7comm (102): COTP connect, Setup Communication, then Read Var jobs on
+    DB1 answered by Ack_Data with the bytes read."""
+    exchanges = _s7_connect()
+    for i in range(count):
+        ref = i + 1
+        addr = (i * 10) << 3                       # byte offset, in bits
+        item = b"\x12\x0a\x10\x02" + struct.pack("!HHB", 10, 1, 0x84) + \
+            addr.to_bytes(3, "big")                # S7ANY: 10 BYTE of DB1
+        job = _s7(1, ref, b"\x04\x01" + item)
+        values = bytes((i + v) & 0xFF for v in range(10))
+        ack = _s7(3, ref, b"\x04\x01",
+                  b"\xff\x04" + struct.pack("!H", len(values) * 8) + values)
+        exchanges.append((job, ack))
+    return _tcp_flow(ep, _sport(), 102, exchanges)
 
 
 def iec104_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """IEC 60870-5-104 (2404): APCI (0x68) U/I frames, TESTFR + measured values."""
-    def apci_u(control: int) -> bytes:
-        # U-format: STARTDT/STOPDT/TESTFR act/con
-        return struct.pack("<BBBBB", 0x68, 4, control, 0, 0)
+    """IEC 60870-5-104 (2404): STARTDT, a station interrogation answered with
+    measured floats (M_ME_NC_1), then spontaneous values acked by S-frames."""
+    def u(ctrl: int) -> bytes:                     # U-format: 4 control octets
+        return bytes([0x68, 4, ctrl, 0, 0, 0])
 
-    def apci_i(tx: int, rx: int, asdu: bytes) -> bytes:
-        length = 4 + len(asdu)
-        ctrl = struct.pack("<HH", (tx << 1) & 0xFFFF, (rx << 1) & 0xFFFF)
-        return struct.pack("<BB", 0x68, length) + ctrl + asdu
+    def s(nr: int) -> bytes:                       # S-format acknowledgement
+        return struct.pack("<BBHH", 0x68, 4, 0x0001, nr << 1)
 
-    exchanges = []
-    # STARTDT act / con
-    exchanges.append((apci_u(0x07), apci_u(0x0B)))
-    tx = rx = 0
-    for i in range(max(0, count - 1)):
-        # ASDU: type 13 (M_ME_NC_1 float), 1 obj, COT=3 (spont), CA=1, IOA=1
-        asdu = struct.pack("<BBBH", 13, 0x01, 0x03, 1) + \
-            struct.pack("<BH", 1, 0) + struct.pack("<fB", 1.5 + i, 0x00)
-        exchanges.append((apci_i(tx, rx, asdu), apci_u(0x43)))  # TESTFR con ack
-        tx += 1
-        rx += 1
+    def i_fr(ns: int, nr: int, asdu: bytes) -> bytes:
+        return struct.pack("<BBHH", 0x68, 4 + len(asdu), ns << 1, nr << 1) + asdu
+
+    def asdu(type_id: int, cot: int, ioa: int, element: bytes) -> bytes:
+        # 1 object, COT + originator 0, common address 1, 3-byte IOA
+        return struct.pack("<BBBBH", type_id, 1, cot, 0, 1) + \
+            ioa.to_bytes(3, "little") + element
+
+    def value(i: int) -> bytes:                    # short float + QDS
+        return struct.pack("<fB", 49.95 + 0.01 * i, 0x00)
+
+    gi = b"\x14"                                   # QOI 20: station
+    exchanges = [(u(0x07), u(0x0B))]               # STARTDT act / con
+    exchanges.append((
+        i_fr(0, 0, asdu(100, 6, 0, gi)),           # C_IC_NA_1 activation
+        i_fr(0, 1, asdu(100, 7, 0, gi)) +          # ... confirmation
+        i_fr(1, 1, asdu(13, 20, 1001, value(0))) +   # interrogated value
+        i_fr(2, 1, asdu(100, 10, 0, gi))))         # ... termination
+    ns = 3
+    for i in range(1, max(1, count)):
+        exchanges.append((s(ns), i_fr(ns, 1, asdu(13, 3, 1001 + i % 4,
+                                                  value(i)))))
+        ns += 1
+    exchanges.append((s(ns), b""))
     return _tcp_flow(ep, _sport(), 2404, exchanges)
 
 
@@ -231,17 +310,57 @@ def bacnet_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def opcua_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """OPC UA (4840): Hello / Acknowledge handshake pattern."""
-    endpoint_url = b"opc.tcp://plc.local:4840"
-    hel_body = struct.pack("<IIIIII", 0, 65536, 65536, 65536, 0,
-                           len(endpoint_url)) + endpoint_url
-    hel = b"HEL" + b"F" + struct.pack("<I", 8 + len(hel_body)) + hel_body
-    ack_body = struct.pack("<IIIIII", 0, 65536, 65536, 65536, 0, 0)
-    ack = b"ACK" + b"F" + struct.pack("<I", 8 + len(ack_body)) + ack_body
-    exchanges = [(hel, ack)]
-    for _ in range(max(0, count - 1)):
-        msg = b"MSG" + b"F" + struct.pack("<I", 12) + b"\x00\x00\x00\x00"
-        exchanges.append((msg, msg))
+    """OPC UA binary (4840): Hello/Acknowledge, OpenSecureChannel (policy None),
+    Read requests for a process value, then CloseSecureChannel."""
+    url = f"opc.tcp://{ep.meta.get('host', ep.server_ip)}:4840".encode()
+    policy = b"http://opcfoundation.org/UA/SecurityPolicy#None"
+    null = struct.pack("<i", -1)                   # null String / ByteString
+    ts = 134041248000000000                        # DateTime: 2025-10-06
+    chan, token = 0x2000 + (zlib.crc32(url) & 0xFFF), 1
+
+    def s(b: bytes) -> bytes:
+        return struct.pack("<i", len(b)) + b
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        return kind + b"F" + struct.pack("<I", 8 + len(body)) + body
+
+    def nid(n: int, ns: int = 0) -> bytes:         # four-byte NodeId
+        return struct.pack("<BBH", 0x01, ns, n)
+
+    def req_hdr(handle: int) -> bytes:   # token, time, handle, diag, audit, timeout, ext
+        return b"\x00\x00" + struct.pack("<qII", ts, handle, 0) + null + \
+            struct.pack("<I", 10000) + b"\x00\x00\x00"
+
+    def rsp_hdr(handle: int) -> bytes:   # time, handle, result, diag, strings, ext
+        return struct.pack("<qII", ts, handle, 0) + b"\x00" + null + \
+            b"\x00\x00\x00"
+
+    def asym(seq: int, body: bytes) -> bytes:
+        return chunk(b"OPN", struct.pack("<I", chan if seq > 1 else 0) +
+                     s(policy) + null + null + struct.pack("<II", 1, 1) + body)
+
+    def sym(kind: bytes, seq: int, req_id: int, body: bytes) -> bytes:
+        return chunk(kind, struct.pack("<IIII", chan, token, seq, req_id) + body)
+
+    hel = chunk(b"HEL", struct.pack("<IIIII", 0, 65535, 65535, 0, 0) + s(url))
+    ack = chunk(b"ACK", struct.pack("<IIIII", 0, 65535, 65535, 2097152, 0))
+    opn = asym(1, nid(446) + req_hdr(1) + struct.pack("<III", 0, 0, 1) +
+               s(b"") + struct.pack("<I", 3600000))
+    opn_rsp = asym(2, nid(449) + rsp_hdr(1) + struct.pack("<I", 0) +
+                   struct.pack("<IIqI", chan, token, ts, 3600000) + s(b""))
+    exchanges = [(hel, ack), (opn, opn_rsp)]
+    for i in range(count):
+        seq, h = i + 2, i + 2
+        node = nid(1001 + i % 8, ns=2) + struct.pack("<I", 13) + null + \
+            struct.pack("<H", 0) + null            # Value attr, no range/encoding
+        read = sym(b"MSG", seq, h, nid(631) + req_hdr(h) +
+                   struct.pack("<dIi", 0.0, 2, 1) + node)
+        dv = b"\x01\x0b" + struct.pack("<d", 72.5 + i)   # DataValue: Double
+        rsp = sym(b"MSG", seq, h, nid(634) + rsp_hdr(h) +
+                  struct.pack("<i", 1) + dv + struct.pack("<i", 0))
+        exchanges.append((read, rsp))
+    n = count + 2
+    exchanges.append((sym(b"CLO", n, n, nid(452) + req_hdr(n)), b""))
     return _tcp_flow(ep, _sport(), 4840, exchanges)
 
 
@@ -265,13 +384,16 @@ def arp_flow(ep: Endpoints, count: int) -> List[bytes]:
     return frames
 
 
+_PING_DATA = b"abcdefghijklmnopqrstuvwabcdefghi"   # Windows ping.exe
+
+
 def icmp_flow(ep: Endpoints, count: int) -> List[bytes]:
     """ICMP echo request/reply (ping sweep style)."""
     frames = []
     for i in range(count):
-        req = P.icmp_echo(0x1234, i, b"tgt-icmp-probe--" + bytes(16))
+        req = P.icmp_echo(0x1234, i, _PING_DATA)
         frames.append(P.ip_frame(ep, True, P.IPPROTO_ICMP, req, ident=i))
-        rep = struct.pack("!BBHHH", 0, 0, 0, 0x1234, i) + b"tgt-icmp-probe--" + bytes(16)
+        rep = struct.pack("!BBHHH", 0, 0, 0, 0x1234, i) + _PING_DATA
         chk = P.checksum16(rep)
         rep = rep[:2] + struct.pack("!H", chk) + rep[4:]
         frames.append(P.ip_frame(ep, False, P.IPPROTO_ICMP, rep, ident=i))
@@ -324,72 +446,136 @@ def http_flow(ep: Endpoints, count: int) -> List[bytes]:
 # Enterprise IT protocols (identity / fingerprint bearing)
 # ---------------------------------------------------------------------------
 def smb_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """SMB (445): negotiate + tree connect.
+    """SMB (445): NEGOTIATE, then ECHO keep-alives.
 
     Legacy hosts advertise only SMBv1 ("NT LM 0.12"), which flags them as
-    exposed to MS17-010 / EternalBlue; modern hosts negotiate SMB2. Driven by
-    ``ep.meta['smb']`` = "smb1" | "smb2" (default smb2).
+    exposed to MS17-010 / EternalBlue; modern hosts negotiate SMB 3.0.2. Driven
+    by ``ep.meta['smb']`` = "smb1" | "smb2" (default smb2).
     """
-    def netbios(payload: bytes) -> bytes:
-        return struct.pack("!I", len(payload))[1:].rjust(4, b"\x00")[:4] + payload
+    def nbss(payload: bytes) -> bytes:           # session message + 24-bit len
+        return struct.pack("!I", len(payload)) + payload
 
+    systime = 134041248000000000                   # FILETIME 2025-10-06
     dialect = ep.meta.get("smb", "smb2")
     exchanges = []
-    for i in range(count):
-        if dialect == "smb1":
-            # SMB1 NEGOTIATE listing legacy dialects incl. "NT LM 0.12"
-            dialects = b"\x02NT LM 0.12\x00\x02LANMAN2.1\x00"
-            smb = (b"\xffSMB" + struct.pack("<B", 0x72) +          # NEGOTIATE
-                   struct.pack("<I", 0) + b"\x18\x53\xc8" +
-                   struct.pack("<HHHHIHHHHH", 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                               (i + 1) & 0xFFFF) +
-                   struct.pack("<BH", 0, len(dialects)) + dialects)
-            req = netbios(smb)
-            resp_smb = (b"\xffSMB" + struct.pack("<B", 0x72) +
-                        struct.pack("<I", 0) + b"\x98\x53\xc8" + bytes(20) +
-                        b"\x11\x05\x00\x03\x0a\x00\x01\x00")
-            resp = netbios(resp_smb)
-        else:
-            # SMB2 NEGOTIATE (dialect 0x0311 / 3.1.1)
-            smb2 = (b"\xfeSMB" + struct.pack("<HH", 64, 1) + bytes(2) +
-                    struct.pack("<HH", 0, 0) + struct.pack("<I", 0) +
-                    struct.pack("<I", i + 1) + bytes(44) +
-                    struct.pack("<HHHH", 36, 2, 0, 0) +
-                    struct.pack("<HH", 0x0202, 0x0311))
-            req = netbios(smb2)
-            resp = netbios(smb2[:64] + struct.pack("<HHH", 65, 0, 0x0311))
-        exchanges.append((req, resp))
+    if dialect == "smb1":
+        def hdr(cmd: int, flags: int, mid: int) -> bytes:
+            # cmd, status, flags, flags2 (unicode|NT status|long names) ...
+            return b"\xffSMB" + struct.pack("<BIBH", cmd, 0, flags, 0xC853) + \
+                struct.pack("<H8sHHHHH", 0, bytes(8), 0, 0, 0xFEFF, 0, mid)
+
+        dialects = b"\x02NT LM 0.12\x00\x02LANMAN2.1\x00"
+        domain = ep.meta.get("realm", "CORP.LOCAL").split(".")[0]
+        names = (domain + "\x00" + ep.meta.get("host", "SERVER").upper() +
+                 "\x00").encode("utf-16-le")
+        neg = hdr(0x72, 0x18, 1) + struct.pack("<BH", 0, len(dialects)) + \
+            dialects
+        # WordCount 17: dialect 0, user-level + challenge auth, no ext. sec.
+        neg_rsp = hdr(0x72, 0x98, 1) + struct.pack(
+            "<BHBHHIIIIQhB", 17, 0, 0x03, 50, 1, 16644, 65536, 0,
+            0x0000E3FD, systime, 0, 8) + \
+            struct.pack("<H", 8 + len(names)) + b"\x11\x22\x33\x44\x55\x66\x77\x88" + names
+        exchanges.append((nbss(neg), nbss(neg_rsp)))
+        for i in range(max(0, count - 1)):
+            data = b"tgt-echo"
+            echo = hdr(0x2B, 0x18, i + 2) + struct.pack("<BHH", 1, 1, len(data)) + data
+            echo_rsp = hdr(0x2B, 0x98, i + 2) + struct.pack("<BHH", 1, 1, len(data)) + data
+            exchanges.append((nbss(echo), nbss(echo_rsp)))
+    else:
+        def hdr(cmd: int, mid: int, resp: bool) -> bytes:
+            return b"\xfeSMB" + struct.pack(
+                "<HHIHHIIQIIQ", 64, 0, 0, cmd, 1, 1 if resp else 0, 0, mid,
+                0xFEFF, 0, 0) + bytes(16)
+
+        dialects = (0x0202, 0x0210, 0x0300, 0x0302)
+        guid = bytes(10) + P.mac_to_bytes(ep.client_mac)
+        neg = hdr(0, 0, False) + struct.pack(
+            "<HHHHI16sQ", 36, len(dialects), 0x01, 0, 0x7F, guid, 0) + \
+            struct.pack(f"<{len(dialects)}H", *dialects)
+        sguid = bytes(10) + P.mac_to_bytes(ep.server_mac)
+        neg_rsp = hdr(0, 0, True) + struct.pack(
+            "<HHHH16sIIIIQQHHI", 65, 0x01, 0x0302, 0, sguid, 0x2F,
+            8388608, 8388608, 8388608, systime, 0, 0x80, 0, 0)
+        exchanges.append((nbss(neg), nbss(neg_rsp)))
+        for i in range(max(0, count - 1)):
+            echo = struct.pack("<HH", 4, 0)
+            exchanges.append((nbss(hdr(0x0D, i + 1, False) + echo),
+                              nbss(hdr(0x0D, i + 1, True) + echo)))
     return _tcp_flow(ep, _sport(), 445, exchanges)
 
 
+def _krb_principal(name_type: int, *parts: str) -> bytes:
+    return _der_seq(_ctx(0, _der_int(name_type)),
+                    _ctx(1, _der_seq(*(_der(0x1B, p.encode()) for p in parts))))
+
+
 def kerberos_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """Kerberos (88): AS-REQ / AS-REP style exchange to a Domain Controller."""
-    realm = ep.meta.get("realm", "CORP.LOCAL").encode()
+    """Kerberos (88/TCP): AS-REQ and the DC's KRB-ERROR PREAUTH_REQUIRED.
+
+    A Windows client's first AS-REQ carries no pre-authentication and the DC
+    answers KDC_ERR_PREAUTH_REQUIRED (25) — the opening move of every domain
+    logon. Classifiers key on port 88, the realm and the client principal.
+    """
+    realm = ep.meta.get("realm", "CORP.LOCAL")
+    host = ep.meta.get("nbname")
+    cname = f"{host}$" if host else "user"         # computer account logon
     exchanges = []
     for i in range(count):
-        # minimal ASN.1-ish AS-REQ carrying the realm (classifiers key on
-        # port 88 + the KRB_AS_REQ application tag 0x6a and the realm string)
-        req = b"\x6a\x2e\x30\x2c" + b"\xa1\x03\x02\x01\x05" + \
-            b"\xa2\x03\x02\x01\x0a" + b"\x1b" + bytes([len(realm)]) + realm
-        rep = b"\x6b\x2e\x30\x2c" + b"\xa0\x03\x02\x01\x05" + \
-            b"\xa1\x03\x02\x01\x0b" + b"\x1b" + bytes([len(realm)]) + realm
+        body = _der_seq(
+            _ctx(0, _der(0x03, b"\x00\x40\x81\x00\x10")),   # kdc-options
+            _ctx(1, _krb_principal(1, cname)),              # NT-PRINCIPAL
+            _ctx(2, _der(0x1B, realm.encode())),
+            _ctx(3, _krb_principal(2, "krbtgt", realm)),    # NT-SRV-INST
+            _ctx(5, _der(0x18, b"20370913024805Z")),        # till
+            _ctx(7, _der_int(0x1A2B3C00 + i)),              # nonce
+            _ctx(8, _der_seq(_der_int(18), _der_int(17), _der_int(23))))
+        req = _der(0x6A, _der_seq(_ctx(1, _der_int(5)), _ctx(2, _der_int(10)),
+                                  _ctx(4, body)))
+        err = _der(0x7E, _der_seq(
+            _ctx(0, _der_int(5)), _ctx(1, _der_int(30)),
+            _ctx(4, _der(0x18, b"20261006120000Z")), _ctx(5, _der_int(i * 1000)),
+            _ctx(6, _der_int(25)),                          # PREAUTH_REQUIRED
+            _ctx(9, _der(0x1B, realm.encode())),
+            _ctx(10, _krb_principal(2, "krbtgt", realm))))
         exchanges.append((struct.pack("!I", len(req)) + req,
-                          struct.pack("!I", len(rep)) + rep))
+                          struct.pack("!I", len(err)) + err))
     return _tcp_flow(ep, _sport(), 88, exchanges)
 
 
 def ldap_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """LDAP (389): bindRequest + searchRequest to Active Directory."""
+    """LDAP (389): simple bind, rootDSE searches, unbind.
+
+    The rootDSE query (defaultNamingContext, dnsHostName) is how domain members
+    locate AD; the bind DN carries the client's identity.
+    """
     dn = ep.meta.get("dn", "CN=svc,DC=corp,DC=local").encode()
-    exchanges = []
+    at = dn.upper().find(b"DC=")
+    naming = dn[at:] if at >= 0 else b""
+    fqdn = ep.meta.get("sni", ep.meta.get("host", "dc01.corp.local")).encode()
+
+    def msg(mid: int, op: bytes) -> bytes:
+        return _der_seq(_der_int(mid), op)
+
+    def result(tag: int) -> bytes:                 # success, no DN, no message
+        return _der(tag, _der(0x0A, b"\x00") + _der(0x04, b"") + _der(0x04, b""))
+
+    def attr(name: bytes, val: bytes) -> bytes:    # PartialAttribute
+        return _der_seq(_der(0x04, name), _der(0x31, _der(0x04, val)))
+
+    bind = msg(1, _der(0x60, _der_int(3) + _der(0x04, dn) + _der(0x80, b"")))
+    exchanges = [(bind, msg(1, result(0x61)))]
     for i in range(count):
-        # LDAP bindRequest (appl 0) with a simple DN — enough to classify AD/LDAP
-        inner = b"\x02\x01\x03" + b"\x04" + bytes([len(dn)]) + dn + \
-            b"\x80\x00"
-        bind = b"\x30" + bytes([len(inner) + 5]) + b"\x02\x01\x01" + \
-            b"\x60" + bytes([len(inner)]) + inner
-        srch = b"\x30\x0c\x02\x01\x02\x63\x07\x04\x00\x0a\x01\x00\x0a\x01\x00"
-        exchanges.append((bind, srch))
+        mid = i + 2
+        search = msg(mid, _der(0x63,
+            _der(0x04, b"") + _der(0x0A, b"\x00") + _der(0x0A, b"\x00") +
+            _der_int(0) + _der_int(0) + _der(0x01, b"\x00") +
+            _der(0x87, b"objectClass") +           # filter: (objectClass=*)
+            _der_seq(_der(0x04, b"defaultNamingContext"),
+                     _der(0x04, b"dnsHostName"))))
+        entry = msg(mid, _der(0x64, _der(0x04, b"") + _der_seq(
+            attr(b"defaultNamingContext", naming), attr(b"dnsHostName", fqdn))))
+        exchanges.append((search, entry + msg(mid, result(0x65))))
+    exchanges.append((msg(count + 2, _der(0x42, b"")), b""))   # unbind
     return _tcp_flow(ep, _sport(), 389, exchanges)
 
 
@@ -465,7 +651,9 @@ def netbios_flow(ep: Endpoints, count: int) -> List[bytes]:
     for i in range(count):
         # name registration request (broadcast)
         pkt = struct.pack("!HHHHHH", (i + 1) & 0xFFFF, 0x2910, 1, 0, 0, 1) + \
-            encode_nb(name) + struct.pack("!HH", 0x0020, 0x0001)
+            encode_nb(name) + struct.pack("!HH", 0x0020, 0x0001) + \
+            struct.pack("!HHHIHH4s", 0xC00C, 0x0020, 0x0001, 300000, 6,
+                        0x0000, P.ip_to_bytes(ep.client_ip))   # B-node, unique
         frames.append(P.udp_frame(ep, True, 137, 137, pkt, ident=i))
     return frames
 
@@ -487,36 +675,45 @@ def ntp_flow(ep: Endpoints, count: int) -> List[bytes]:
 def enip_identity_flow(ep: Endpoints, count: int) -> List[bytes]:
     """EtherNet/IP (44818): List Identity carrying a Rockwell/Allen-Bradley
     product name — what a monitor reads to inventory the PLC vendor and model."""
-    product = ep.meta.get("product", "1756-L71/B LOGIX5571").encode()
+    product = ep.meta.get("product", "1756-L71/B LOGIX5571").encode()[:32]
     vendor_id = ep.meta.get("vendor_id", 0x0001)   # 0x0001 = Rockwell Automation
+    dev_type = ep.meta.get("device_type", 0x000E)  # 0x0E PLC, 0x02 AC drive
+    serial = zlib.crc32(P.mac_to_bytes(ep.server_mac))
+    sock = struct.pack(">hHI8s", 2, 44818,
+                       int.from_bytes(P.ip_to_bytes(ep.server_ip), "big"),
+                       bytes(8))
+    # version, socket, vendor, device type, product code, revision 20.11,
+    # status, serial, product name (SHORT_STRING), state 3 = operational
+    ident = struct.pack("<H", 1) + sock + struct.pack(
+        "<HHHBBHI", vendor_id, dev_type, 55, 20, 11, 0x0060, serial) + \
+        bytes([len(product)]) + product + b"\x03"
     exchanges = []
     for i in range(count):
-        req = struct.pack("<HHIIQI", 0x0063, 0, 0, 0, 0, 0)   # ListIdentity
-        # CPF: 1 item, Identity object with vendor/device/product-name string
-        idbody = struct.pack("<HHHHIHBB", 1, 0x000C, 0, 0x0001, 0, vendor_id,
-                             0x0E, 0x00) + struct.pack("<HHI", 0x000C, 0x0001,
-                             0x00010203) + bytes([len(product)]) + product
-        resp = struct.pack("<HHIIQI", 0x0063, len(idbody), 0, 0, 0, 0) + idbody
-        exchanges.append((req, resp))
+        exchanges.append((_enip(0x0063, 0, b"", context=i + 1),
+                          _enip(0x0063, 0, _cpf((0x000C, ident)),
+                                context=i + 1)))
     return _tcp_flow(ep, _sport(), 44818, exchanges)
 
 
 def s7_identity_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """S7comm (102): SZL read returning a Siemens module/order number
-    (e.g. 6ES7 ...), used to fingerprint Siemens S7 PLC family and firmware."""
-    order = ep.meta.get("order", "6ES7 315-2EH14-0AB0 ").encode()
-    def tpkt(payload: bytes) -> bytes:
-        return struct.pack("!BBH", 0x03, 0x00, 4 + len(payload)) + payload
-    cotp_dt = struct.pack("!BBB", 2, 0xF0, 0x80)
-    exchanges = []
+    """S7comm (102): SZL 0x0011 read returning the Siemens order number
+    (e.g. 6ES7 ...) and firmware version — how monitors fingerprint S7 PLCs."""
+    order = ep.meta.get("order", "6ES7 315-2EH14-0AB0").encode().ljust(20)[:20]
+    # SZL 0x0011 records (28 bytes): index, MlfB, BGTyp, Ausbg, Ausbe
+    recs = struct.pack("!H20sHHH", 0x0001, order, 0, 0x0001, 0x0001) + \
+        struct.pack("!H20sHHH", 0x0006, order, 0, 0x0001, 0x0001) + \
+        struct.pack("!H20sHHH", 0x0007, b" " * 20, 0, 0x5603, 0x0200)  # V3.2
+    szl = struct.pack("!HHHH", 0x0011, 0x0000, 28, 3) + recs
+    exchanges = _s7_connect()
     for i in range(count):
-        # userdata SZL request (0x0011/0x001C module identification)
-        req_s7 = struct.pack("!BBHHHH", 0x32, 0x07, 0, (i + 1) & 0xFFFF, 8, 8) + \
-            b"\x00\x01\x12\x04\x11\x44\x01\x00"
-        resp_s7 = struct.pack("!BBHHHH", 0x32, 0x07, 0, (i + 1) & 0xFFFF, 12,
-                              len(order) + 8) + \
-            b"\x00\x01\x12\x08\x12\x84\x01\x00" + order
-        exchanges.append((tpkt(cotp_dt + req_s7), tpkt(cotp_dt + resp_s7)))
+        ref = i + 1
+        # userdata: CPU functions (0x4) request, subfunction read SZL
+        req = _s7(7, ref, b"\x00\x01\x12\x04\x11\x44\x01\x00",
+                  b"\xff\x09\x00\x04\x00\x11\x00\x00")    # SZL 0x0011 idx 0
+        rsp = _s7(7, ref, b"\x00\x01\x12\x08\x12\x84\x01" + bytes([ref & 0xFF]) +
+                  b"\x00\x00\x00\x00",
+                  b"\xff\x09" + struct.pack("!H", len(szl)) + szl)
+        exchanges.append((req, rsp))
     return _tcp_flow(ep, _sport(), 102, exchanges)
 
 
@@ -546,17 +743,17 @@ def _reg(key, name, category, port, transport, build, desc):
 _reg("modbus", "Modbus/TCP", "OT", "502", "tcp", modbus_flow,
      "Read Holding Registers + Write Single Register polling")
 _reg("dnp3", "DNP3", "OT", "20000", "tcp", dnp3_flow,
-     "0x0564 data-link frames with application READ requests")
+     "CRC-valid link frames: class-0 READ + analog-input RESPONSE")
 _reg("enip", "EtherNet/IP + CIP", "OT", "44818", "tcp", enip_flow,
-     "RegisterSession + CIP Get_Attribute exchanges")
+     "RegisterSession + SendRRData CIP Get_Attribute_Single polls")
 _reg("s7comm", "S7comm (Siemens)", "OT", "102", "tcp", s7comm_flow,
-     "TPKT/COTP connect + S7 job/ack read-var PDUs")
+     "COTP connect, Setup Communication, Read Var job/ack_data")
 _reg("iec104", "IEC 60870-5-104", "OT", "2404", "tcp", iec104_flow,
-     "APCI STARTDT + I-format ASDU measured values")
+     "STARTDT, interrogation + M_ME_NC_1 floats, S-frame acks")
 _reg("bacnet", "BACnet/IP", "OT", "47808", "udp", bacnet_flow,
      "BVLC/NPDU ReadProperty on analog-input objects")
 _reg("opcua", "OPC UA", "OT", "4840", "tcp", opcua_flow,
-     "Hello/Acknowledge secure-channel handshake")
+     "Hello/Ack, OpenSecureChannel, ReadRequest/Response, Close")
 # OT asset identity / fingerprint
 _reg("enip-id", "EtherNet/IP List Identity", "OT", "44818", "tcp",
      enip_identity_flow, "Rockwell/Allen-Bradley vendor + product identity")
@@ -574,11 +771,11 @@ _reg("http", "HTTP", "IT", "80", "tcp", http_flow,
 _reg("https", "HTTPS / TLS", "IT", "443", "tcp", https_flow,
      "TLS ClientHello/ServerHello with SNI + cipher list")
 _reg("smb", "SMB / CIFS", "IT", "445", "tcp", smb_flow,
-     "SMB negotiate (SMBv1 legacy or SMB2) + file-share traffic")
+     "Negotiate (SMBv1 legacy or SMB 3.0.2) + echo keep-alives")
 _reg("kerberos", "Kerberos", "IT", "88", "tcp", kerberos_flow,
-     "AS-REQ/AS-REP to the Domain Controller")
+     "AS-REQ + PREAUTH_REQUIRED from the Domain Controller")
 _reg("ldap", "LDAP / AD", "IT", "389", "tcp", ldap_flow,
-     "bind + search against Active Directory")
+     "bind + rootDSE search against Active Directory")
 _reg("dhcp", "DHCP", "IT", "67", "udp", dhcp_flow,
      "Discover/Offer with option 55 + vendor-class fingerprint")
 _reg("netbios", "NetBIOS-NS", "IT", "137", "udp", netbios_flow,

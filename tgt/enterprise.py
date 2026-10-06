@@ -319,6 +319,7 @@ class Environment:
             "realm": "CORP.LOCAL",
             "dn": f"CN={client.name},DC=corp,DC=local",
             "product": server.product or "1756-L71/B LOGIX5571",
+            "device_type": 0x02 if server.role == "drive" else 0x0E,  # CIP
             "order": server.product or "6ES7 315-2EH14-0AB0",
             "server": "Microsoft-IIS/10.0" if server.os.startswith("win") else "Apache",
         }
