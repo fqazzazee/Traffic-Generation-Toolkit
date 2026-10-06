@@ -212,7 +212,7 @@ def _ot_hosts() -> List[Host]:
     # Supervisory / IT-in-OT (172.16.0.0/24)
     h += [
         Host("HISTORIAN", "172.16.0.10", _mac(OUI_WIN, 0x300), "hist", "win2019"),
-        Host("SCADA01", "172.16.0.11", _mac(OUI_WIN, 0x301), "web", "win10"),
+        Host("SCADA01", "172.16.0.11", _mac(OUI_WIN, 0x301), "scada", "win10"),
         Host("ENGWS01", "172.16.0.20", _mac(OUI_WIN, 0x302), "eng", "win7"),
         Host("HMI-XP", "172.16.0.30", _mac(OUI_WIN, 0x303), "hmi", "winxp"),
         Host("HMI-2000", "172.16.0.31", _mac(OUI_WIN, 0x304), "hmi", "win2000"),

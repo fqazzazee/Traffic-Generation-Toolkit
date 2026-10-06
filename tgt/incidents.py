@@ -22,7 +22,7 @@ from . import packet as P
 from .enterprise import (FINGERPRINTS, OUI_DELL, OUI_SCHNEIDER, OUI_SIEMENS,
                          OUI_VENDORS, OUI_WIN, Host)
 from .packet import Endpoints
-from .protocols import TcpSession, _sport, _tcp_flow
+from .protocols import _s7, _s7_connect, _sport, _tcp_flow
 
 AttackBuilder = Callable[[Endpoints, int], List[bytes]]
 
@@ -52,18 +52,27 @@ def smb_eternalblue(ep: Endpoints, count: int) -> List[bytes]:
     """SMBv1 (445) negotiate + Trans2 with the ETERNALBLUE/DOUBLEPULSAR
     signature (SMBv1 'NT LM 0.12', Trans2 SESSION_SETUP subcmd 0x000e,
     multiplex id 0x0052) that IDS rules flag for MS17-010."""
-    def nb(p): return b"\x00" + struct.pack("!I", len(p))[1:] + p
+    def nbss(p): return struct.pack("!I", len(p)) + p
+
+    def hdr(cmd, mid):                               # 32-byte SMB1 header
+        return b"\xffSMB" + struct.pack("<BIBH", cmd, 0, 0x18, 0xC853) + \
+            struct.pack("<H8sHHHHH", 0, bytes(8), 0, 0, 0xFFFE, 0, mid)
+
+    dialects = b"\x02NT LM 0.12\x00\x02LANMAN2.1\x00"
     exchanges = []
     for i in range(count):
-        neg = (b"\xffSMB\x72\x00\x00\x00\x00\x18\x53\xc8" + bytes(20) +
-               struct.pack("<BH", 0, 12) + b"\x02NT LM 0.12\x00")
-        # Trans2 request, SESSION_SETUP (0x000e), Multiplex ID 82 (0x0052)
-        trans2 = (b"\xffSMB\x32\x00\x00\x00\x00\x18\x07\xc0" + bytes(12) +
-                  struct.pack("<HH", 0, 0x0052) +          # TID, MID=82
-                  b"\x0f\x0c\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
-                  struct.pack("<H", 0x000e))               # subcommand
-        exchanges.append((nb(neg), nb(neg[:33])))
-        exchanges.append((nb(trans2), nb(trans2[:40])))
+        neg = hdr(0x72, i + 1) + struct.pack("<BH", 0, len(dialects)) + dialects
+        neg_rsp = hdr(0x72, i + 1) + struct.pack("<BHH", 1, 0, 0)  # WCT 1
+        exchanges.append((nbss(neg), nbss(neg_rsp)))
+        # SMB_COM_TRANSACTION2 (0x32), SESSION_SETUP setup word 0x000e,
+        # Multiplex ID 0x0052 — the DOUBLEPULSAR/ETERNALBLUE MS17-010 tell.
+        params = struct.pack("<HHHHBBHIHHHHHBBH",
+                             0, 0, 1024, 1024, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             1, 0, 0x000E)
+        trans2 = hdr(0x32, 0x0052) + struct.pack("<B", 15) + params + \
+            struct.pack("<H", 0)
+        trans2_rsp = hdr(0x32, 0x0052) + struct.pack("<BH", 0, 0)
+        exchanges.append((nbss(trans2), nbss(trans2_rsp)))
     return _tcp_flow(ep, _sport(), 445, exchanges)
 
 
@@ -136,40 +145,42 @@ def log4shell(ep: Endpoints, count: int) -> List[bytes]:
 def s7_control(ep: Endpoints, count: int) -> List[bytes]:
     """S7comm (102) PLC control — STOP CPU + program download (Stuxnet-style
     manipulation of a Siemens PLC, not just read/monitor)."""
-    def tpkt(p): return struct.pack("!BBH", 0x03, 0x00, 4 + len(p)) + p
-    cotp = struct.pack("!BBB", 2, 0xF0, 0x80)
-    exchanges = []
+    exchanges = _s7_connect()                        # COTP + Setup Comm first
     for i in range(count):
-        # S7 job, PLC STOP (function 0x29) then program download (0x1a)
-        stop = struct.pack("!BBHHHH", 0x32, 0x01, 0, (i + 1) & 0xFFFF, 16, 0) + \
-            b"\x29\x00\x00\x00\x00\x00\x00\x09P_PROGRAM"
-        ack = struct.pack("!BBHHHHBB", 0x32, 0x03, 0, (i + 1) & 0xFFFF, 2, 0,
-                          0, 0)
-        exchanges.append((tpkt(cotp + stop), tpkt(cotp + ack)))
+        ref = i + 1
+        # S7 job, PLC STOP (function 0x29): "P_PROGRAM" is the documented
+        # service name Stuxnet used to halt the CPU before a block download.
+        stop_param = b"\x29\x00\x00\x00\x00\x00\x00\x09P_PROGRAM"
+        job = _s7(1, ref, stop_param)
+        ack = _s7(3, ref, b"\x29\x00\x00\x00\x00\x00\x00\x00")
+        exchanges.append((job, ack))
     return _tcp_flow(ep, _sport(), 102, exchanges)
 
 
 def iec104_command(ep: Endpoints, count: int) -> List[bytes]:
     """IEC 60870-5-104 (2404) control commands — breaker single/double
     commands (type 45/46, activation) as in Industroyer/CrashOverride."""
-    def apci_i(tx, rx, asdu):
-        return struct.pack("<BB", 0x68, 4 + len(asdu)) + \
-            struct.pack("<HH", (tx << 1) & 0xFFFF, (rx << 1) & 0xFFFF) + asdu
-    exchanges = []
-    tx = rx = 0
+    def u(ctrl):                                     # U-format control frame
+        return bytes([0x68, 4, ctrl, 0, 0, 0])
+
+    def i_fr(ns, nr, asdu):                          # I-format data frame
+        return struct.pack("<BBHH", 0x68, 4 + len(asdu), ns << 1, nr << 1) + asdu
+
+    def asdu(type_id, cot, ioa, element):
+        # type, VSQ(1 object), COT + originator(0), common address 1, 3-byte IOA
+        return struct.pack("<BBBBH", type_id, 1, cot, 0, 1) + \
+            ioa.to_bytes(3, "little") + element
+
+    exchanges = [(u(0x07), u(0x0B))]                 # STARTDT act / con
+    ns = 0
     for i in range(count):
         ioa = 0x1001 + i
-        # C_SC_NA_1 (45) single command, COT=6 (activation), SCS=1 (close/trip)
-        asdu = struct.pack("<BBBH", 45, 0x01, 0x06, 1) + \
-            struct.pack("<BH", ioa & 0xFF, (ioa >> 8) & 0xFFFF) + \
-            struct.pack("<B", 0x01)
-        # C_DC_NA_1 (46) double command as ack-back
-        ack = struct.pack("<BBBH", 46, 0x01, 0x07, 1) + \
-            struct.pack("<BH", ioa & 0xFF, (ioa >> 8) & 0xFFFF) + \
-            struct.pack("<B", 0x02)
-        exchanges.append((apci_i(tx, rx, asdu), apci_i(rx, tx, ack)))
-        tx += 1
-        rx += 1
+        # C_SC_NA_1 (45) single command, COT=6 activation, SCS=1 (close/trip)
+        cmd = i_fr(ns, 0, asdu(45, 6, ioa, b"\x01"))
+        # ... COT=7 activation confirmation back
+        con = i_fr(0, ns + 1, asdu(45, 7, ioa, b"\x01"))
+        exchanges.append((cmd, con))
+        ns += 1
     return _tcp_flow(ep, _sport(), 2404, exchanges)
 
 
@@ -227,14 +238,19 @@ def rdp_brute(ep: Endpoints, count: int) -> List[bytes]:
     """RDP (3389) password spraying: X.224 Connection Requests carrying the
     'Cookie: mstshash=<user>' routing token one after another."""
     users = ep.meta.get("users", ["administrator", "admin", "backup", "svc"])
-    exchanges = []
+    # Each attempt is its own TCP connection with a single X.224 CR (RDP allows
+    # only one Connection Request per connection), so spraying = many sessions.
+    frames = []
     for i in range(count):
         cookie = f"Cookie: mstshash={users[i % len(users)]}\r\n".encode()
         x224 = struct.pack("!BBHHB", len(cookie) + 6, 0xE0, 0, 0, 0) + cookie
         cr = struct.pack("!BBH", 0x03, 0x00, 4 + len(x224)) + x224    # TPKT
-        cc = struct.pack("!BBHBBHHB", 0x03, 0x00, 11, 7, 0xD0, 0, 0, 0)
-        exchanges.append((cr, cc))
-    return _tcp_flow(ep, _sport(), 3389, exchanges)
+        # CC carries the RDP Negotiation Response the cookie's CR asks for
+        neg = struct.pack("<BBHI", 0x02, 0, 8, 0)      # TYPE_RDP_NEG_RSP
+        x224_cc = struct.pack("!BBHHB", 6 + len(neg), 0xD0, 0, 0, 0) + neg
+        cc = struct.pack("!BBH", 0x03, 0x00, 4 + len(x224_cc)) + x224_cc
+        frames += _tcp_flow(ep, _sport(), 3389, [(cr, cc)])
+    return frames
 
 
 def smb_lateral(ep: Endpoints, count: int) -> List[bytes]:
@@ -243,18 +259,23 @@ def smb_lateral(ep: Endpoints, count: int) -> List[bytes]:
     def nbss(payload: bytes) -> bytes:
         return struct.pack("!I", len(payload)) + payload
 
+    def hdr(cmd, mid, resp):                     # 64-byte SMB2 header
+        return b"\xfeSMB" + struct.pack(
+            "<HHIHHIIQIIQ", 64, 0, 0, cmd, 1, 1 if resp else 0, 0, mid,
+            0xFEFF, 0, 0) + bytes(16)
+
     host = ep.meta.get("host", "FILESRV01")
     shares = [f"\\\\{host}\\IPC$", f"\\\\{host}\\ADMIN$", f"\\\\{host}\\C$"]
     exchanges = []
     for i in range(count):
         path = shares[i % len(shares)].encode("utf-16-le")
-        hdr = b"\xfeSMB" + struct.pack("<HHIHHIIQ", 64, 0, 0, 3, 1, 0, 0,
-                                       i + 1) + bytes(28)   # SMB2 TREE_CONNECT
-        body = struct.pack("<HHH", 9, 0, 72) + struct.pack("<H", len(path)) + \
-            path
-        req = nbss(hdr + body)
-        resp = nbss(hdr[:16] + struct.pack("<I", 1) + hdr[20:] +
-                    struct.pack("<HBBI", 16, 1, 0, 0x001F01FF))
+        # SMB2 TREE_CONNECT: StructSize 9, Flags, PathOffset 72, PathLength
+        req = nbss(hdr(3, i + 1, False) +
+                   struct.pack("<HHHH", 9, 0, 64 + 8, len(path)) + path)
+        # response: StructSize 16, ShareType DISK, access mask
+        # response: StructSize 16, ShareType DISK, flags, caps, access mask
+        resp = nbss(hdr(3, i + 1, True) +
+                    struct.pack("<HBBIII", 16, 1, 0, 0, 0, 0x001F01FF))
         exchanges.append((req, resp))
     return _tcp_flow(ep, _sport(), 445, exchanges)
 

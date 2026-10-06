@@ -325,6 +325,30 @@ def test_tshark_dissects_every_builder() -> None:
         _failures.append("tshark expert warnings: " + "; ".join(detail[:5]))
 
 
+def test_tshark_incidents_not_malformed() -> None:
+    """Optional: with tshark on PATH, no incident's synthetic signature traffic
+    dissects as a malformed packet (guards the attack-builder framing)."""
+    import shutil
+    import subprocess
+    from tgt import incidents
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_incidents_not_malformed")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        bad = []
+        for key in incidents.INCIDENTS:
+            path = f"{d}/{key}.pcap"
+            with PcapWriter(path) as w:
+                for _, f in incidents.get(key).build(3):
+                    w.write(f)
+            expert = subprocess.run(
+                ["tshark", "-r", path, "-q", "-z", "expert,warn"],
+                capture_output=True, text=True).stdout
+            if "Malformed" in expert or "ERR" in expert:
+                bad.append(key)
+        check(not bad, f"incidents dissect as malformed: {', '.join(bad)}")
+
+
 def test_sprinkle_maps_incident_hosts_onto_env_by_role() -> None:
     from tgt import enterprise, incidents
 
