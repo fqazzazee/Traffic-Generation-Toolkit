@@ -100,7 +100,7 @@ the veth path as it generates, and four tabbed panels do everything:
 |---|---|
 | **Map** | pick the send interface, see its `-mon` peer, name the sensor, create/delete the veth |
 | **Protocols** | toggle any protocol; live per-protocol counters |
-| **Settings** | preset (scenario/env/incident), rate, **malware sprinkle** (toggle/variant/random/ratio), pcap replay, endpoints |
+| **Settings** | preset (scenario/env/incident), **SPAN view** (access/core, for an env), rate, **malware sprinkle** (toggle/variant/random/ratio), pcap replay, endpoints |
 | **Service** | service status; save config + start/stop/restart the background service |
 
 The **TGT ENGINE** box lists the most-generated protocols (biggest first, with a

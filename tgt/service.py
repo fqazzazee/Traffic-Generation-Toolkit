@@ -122,7 +122,8 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                    replay: Optional[str] = None,
                    sprinkle: Optional[List[str]] = None,
                    sprinkle_random: bool = False,
-                   sprinkle_ratio: float = 0.0) -> str:
+                   sprinkle_ratio: float = 0.0,
+                   span: str = "access") -> str:
     """Serialize a selection into a `tgt run` argument string for the service."""
     parts: List[str] = []
     if replay:
@@ -131,6 +132,8 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
         parts += ["--incident", incident]
     elif env:
         parts += ["--env", env]
+        if span and span != "access":
+            parts += ["--span", span]
     elif scenario:
         parts += ["--scenario", scenario]
     elif profiles:
