@@ -93,21 +93,29 @@ python3 -m tgt run -s ot-full --pcap ot.pcap --count 500
 
 ## The TUI
 
-`python3 -m tgt` (or `tgt`) opens a **live SPAN flow diagram** — packets animate along
-the veth path as it generates, and four tabbed panels do everything:
+`python3 -m tgt` (or `tgt`) opens a **live SPAN flow diagram**. Packets animate along
+the veth path as it generates, and each box carries live data:
+
+- **TGT ENGINE:** the preset, any sprinkled malware, the traffic mix (share of frames per
+  protocol, biggest first; malware rows always stay on screen), pps and elapsed time.
+- **SEND:** interface and link state (or the pcap file), packets, bytes, Mb/s, errors.
+- **MONITOR:** the `-mon` peer and its state, the SPAN view, VLAN tagging, frames per cycle.
+- **SENSOR:** your sensor's name and the interface it should listen on.
+
+Four tabbed panels below drive it. Each shows only the rows that apply to the current
+preset, explains the selected row underneath, and the key bar lists what the keys do there:
 
 | Panel | What you do |
 |---|---|
-| **Map** | pick the send interface, see its `-mon` peer, name the sensor, create/delete the veth |
-| **Protocols** | toggle any protocol; live per-protocol counters |
-| **Settings** | preset (scenario/env/incident), **SPAN view** (access/core, for an env), rate, **malware sprinkle** (toggle/variant/random/ratio), pcap replay, endpoints |
-| **Service** | service status; save config + start/stop/restart the background service |
+| **Run** | preset (pick from a filterable list: scenarios, environments, incidents, pcap replay), **SPAN view** (access/core, for an env), **malware sprinkle** (toggle/variant/random/ratio), rate, messages, loop, pcap output, endpoints |
+| **Traffic** | toggle protocols for a custom mix; live per-protocol counters |
+| **Interfaces** | pick the send interface, see its `-mon` peer, name the sensor, create/delete the veth (delete asks you to type the name) |
+| **Service** | service status and the exact `tgt run` it would execute; save config + start/stop/restart |
 
-The **TGT ENGINE** box lists the most-generated protocols (biggest first, with a
-`+N more…` overflow) and shows a red **☣** badge whenever malware traffic is flowing.
+Below 80 columns the diagram collapses to a one-line flow strip.
 
-**Keys:** `Tab` panel · `↑/↓` move · `Enter`/`←/→` change · `Space` toggle · `s`
-start/stop · `c` clear log · `q` quit.
+**Keys:** `Tab` panel · `↑/↓` move · `←/→` change · `Enter` pick/edit/run · `Space`
+toggle · `s` start/stop · `c` clear log · `?` help · `q` quit.
 
 ---
 
@@ -246,8 +254,8 @@ relay / drive / meter, or SCADA / HMI / historian). An embedded device must also
 vendor (MAC OUI): Industroyer's IEC-104 RTU lands on a Siemens RTU or PLC, never a Rockwell
 one. Hosts with no match, and external C2 or internet attackers, keep their own addresses.
 
-In the TUI: **Settings → Sprinkle malware** (toggle · variant · random · ratio); a red
-`⚠ malware: <name>` banner shows while armed.
+In the TUI: **Run → Malware sprinkle** (toggle · variant · random · ratio); a red
+`☣ malware: <name>` banner shows while armed.
 
 ### Replay a pcap
 
@@ -260,7 +268,7 @@ tgt run --replay threat.pcap -i tgt0 --loop               # loop forever
 ```
 
 Reads classic libpcap (both byte orders, µs/ns; Ethernet, raw-IP, Linux SLL). For
-pcapng: `editcap -F pcap in.pcapng out.pcap` first. TUI: **Settings → Replay pcap**.
+pcapng: `editcap -F pcap in.pcapng out.pcap` first. TUI: **Run → Preset → replay a pcap file…**.
 
 ---
 

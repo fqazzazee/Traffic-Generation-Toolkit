@@ -391,6 +391,47 @@ def test_sprinkle_maps_incident_hosts_onto_env_by_role() -> None:
         verify_ip_l4(f, "env-sprinkle")
 
 
+def test_tui_panel_model() -> None:
+    """The TUI's data-driven rows, without a terminal: every visible row has
+    help, ←/→ never prompts or raises, and config/service args follow the
+    selected mode."""
+    from tgt import tui
+    ui = tui.UI()
+    ui.engine = None
+    for preset in (("c", None), ("s", "ot-baseline"), ("e", "industrial-site"),
+                   ("i", "stuxnet")):
+        tui._apply_preset(None, ui, preset)
+        for sprinkle in (False, True):
+            ui.sprinkle_on = sprinkle
+            for focus in range(len(tui.PANELS)):
+                ui.focus = focus
+                for f in tui._fields(ui):
+                    check(bool(f.help(ui)),
+                          f"tui: {tui.PANELS[focus]}/{f.label} has no help")
+                    f.value(ui)
+                    if f.act and f.label not in (
+                            "Create veth pair", "Delete send iface",
+                            "Save config", "Start service", "Stop service",
+                            "Restart service", "Sensor label", "PCAP output",
+                            "Client IP", "Server IP"):
+                        for step in (1, -1):
+                            f.act(None, ui, step)   # stdscr=None: no prompts
+                            tui._apply_preset(None, ui, preset)
+                            ui.sprinkle_on = sprinkle
+    ui.focus = 0
+    tui._apply_preset(None, ui, ("e", "industrial-site"))
+    labels = [f.label for f in tui._fields(ui)]
+    check("SPAN view" in labels and "Client IP" not in labels,
+          "tui: env preset shows the wrong Run rows")
+    ui.span = "core"
+    check(ui.build_config().span == "core" and "--span core" in ui.run_args(),
+          "tui: SPAN view not carried into config / service args")
+    tui._apply_preset(None, ui, ("c", None))
+    labels = [f.label for f in tui._fields(ui)]
+    check("SPAN view" not in labels and "Client IP" in labels,
+          "tui: custom preset shows the wrong Run rows")
+
+
 def test_it_org_has_servers_and_users() -> None:
     from tgt import enterprise
     it = enterprise.get("it-org")

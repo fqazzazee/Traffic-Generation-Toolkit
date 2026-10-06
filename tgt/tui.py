@@ -4,17 +4,22 @@ The centrepiece is the flow diagram:
 
     TGT ENGINE ─▶ tgt0 (send) ┈▶ tgt0-mon (monitor) ─▶ SENSOR
 
-Packets animate along the veth path in real time while it generates. Four tabbed
-panels below the diagram let you map interfaces, toggle protocols, edit run
-settings, and control the persistent background service — all from one screen.
+Each box carries live data — the traffic mix (malware always visible), packets,
+bytes and errors on the send side, the SPAN view and VLAN tagging at the
+monitor — and packets animate along the path while it generates. Four tabbed
+panels below drive it: Run (preset, SPAN view, malware, rate, output), Traffic
+(protocol mix), Interfaces (veth pair + sensor) and Service.
 
 Pure curses, no dependencies. Works over SSH and inside WSL/Podman terminals.
 """
 from __future__ import annotations
 
 import curses
+import ipaddress
+import os
+import textwrap
 import time
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from . import enterprise, incidents, net, protocols, scenarios, service
 from .config import RunConfig
@@ -29,21 +34,28 @@ DOT = "•"
 ARROW = "▶"
 BAR = "▇"
 
-PANELS = ["Map", "Protocols", "Settings", "Service"]
+PANELS = ["Run", "Traffic", "Interfaces", "Service"]
+
+RATE_STEPS = [1, 5, 10, 20, 50, 100, 200, 500, 1000, 0]        # 0 = max
+RATIO_STEPS = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]
+
+Value = Union[str, Tuple[str, int]]
 
 
 # ── state ───────────────────────────────────────────────────────────────────
 class UI:
     def __init__(self):
-        ifaces = [i["name"] for i in net.list_interfaces()
-                  if i["name"] not in ("lo",)]
-        # prefer an existing tgt* interface if present
-        pref = next((n for n in ifaces if n.startswith("tgt")), None)
+        self.sys = net.detect_env()          # cached: it reads /proc and PATH
+        self.ifaces: Dict[str, dict] = {}
+        self._if_poll = 0.0
+        self.refresh(force=True)
+        pref = next((n for n in self.ifaces
+                     if n.startswith("tgt") and not n.endswith("-mon")), None)
         self.send_iface: Optional[str] = pref
         self.sensor_label = "Zeek/Suricata"
         self.selected: List[str] = ["modbus", "s7comm"]
         self.scenario: Optional[str] = None
-        self.env: Optional[str] = None      # modeled environment (overrides protos)
+        self.env: Optional[str] = None       # modeled environment (overrides protos)
         self.span = "access"                 # env capture point: access | core
         self.incident: Optional[str] = None  # attack scenario (overrides protos)
         self.replay: Optional[str] = None    # pcap to replay (overrides all)
@@ -60,10 +72,10 @@ class UI:
         self.engine: Optional[Engine] = None
         self.log: List[str] = []
         self.focus = 0                 # index into PANELS
-        self.row = 0                   # selected row within panel
+        self.row = 0                   # selected (visible) row within panel
         self.frame = 0                 # animation tick
-        self.svc = service.service_state()
-        self._svc_poll = 0.0
+        self.help_open = False
+        self._warned_restart = False
         self._load_service_config()
 
     # -- helpers -----------------------------------------------------------
@@ -77,23 +89,44 @@ class UI:
     def stats(self):
         return self.engine.stats if self.engine else None
 
+    def refresh(self, force: bool = False):
+        """Poll the service and interfaces every 2 s, not every frame."""
+        now = time.time()
+        if force or now - self._if_poll > 2.0:
+            self.svc = service.service_state()
+            self.ifaces = {i["name"]: i for i in net.list_interfaces()
+                           if i["name"] != "lo"}
+            self._if_poll = now
+
+    def iface_state(self, name: Optional[str]) -> Tuple[str, int]:
+        if not name:
+            return "", C_DIM
+        info = self.ifaces.get(name)
+        if info is None:
+            return "✕ missing", C_RED
+        st = info.get("state") or "unknown"
+        if st == "up":
+            return "● up", C_GREEN
+        if st == "unknown":                  # dummy/tun report "unknown"
+            return "● unknown", C_YELLOW
+        return f"○ {st}", C_YELLOW
+
     @property
-    def mon_iface(self) -> str:
+    def mon_iface(self) -> Optional[str]:
         if not self.send_iface:
-            return ""
+            return None
         cand = f"{self.send_iface}-mon"
-        return cand if net.interface_exists(cand) else "(no peer)"
+        return cand if cand in self.ifaces else None
 
     def _load_service_config(self):
         cfg = service.read_config()
         if cfg.get("TGT_IFACE") and not self.send_iface:
             self.send_iface = cfg["TGT_IFACE"]
 
-    def refresh_service(self):
-        now = time.time()
-        if now - self._svc_poll > 2.0:
-            self.svc = service.service_state()
-            self._svc_poll = now
+    # -- mode --------------------------------------------------------------
+    def mode(self) -> str:
+        return ("replay" if self.replay else "incident" if self.incident else
+                "env" if self.env else "scenario" if self.scenario else "custom")
 
     def _clear_modes(self):
         self.scenario = self.env = self.incident = self.replay = None
@@ -112,6 +145,10 @@ class UI:
         self._clear_modes()
         self.incident = key
 
+    def set_replay(self, path: str):
+        self._clear_modes()
+        self.replay = path
+
     def toggle_proto(self, key: str):
         if key in self.selected:
             self.selected.remove(key)
@@ -119,15 +156,17 @@ class UI:
             self.selected.append(key)
         self._clear_modes()             # manual edit => custom protocols
 
-    def build_config(self) -> RunConfig:
+    def sprinkle_list(self) -> List[str]:
         # random picks from all incidents (variant ignored); else the chosen one
         if self.sprinkle_on and not self.sprinkle_random:
-            sprinkle = [self.sprinkle_variant]
-        else:
-            sprinkle = []
+            return [self.sprinkle_variant]
+        return []
+
+    def build_config(self) -> RunConfig:
         return RunConfig(
             profiles=list(self.selected) or ["modbus"], env=self.env,
-            span=self.span, incident=self.incident, sprinkle=sprinkle,
+            span=self.span, incident=self.incident,
+            sprinkle=self.sprinkle_list(),
             sprinkle_random=self.sprinkle_on and self.sprinkle_random,
             sprinkle_ratio=self.sprinkle_ratio if self.sprinkle_on else 0.0,
             replay_path=self.replay,
@@ -135,21 +174,70 @@ class UI:
             rate=self.rate, messages=self.messages, loop=self.loop,
             endpoints=self.ep)
 
+    def run_args(self) -> str:
+        """The same selection as a `tgt run` argument string (for the service)."""
+        return service.build_run_args(
+            self.scenario, self.selected, self.rate, self.messages,
+            env=self.env, incident=self.incident, replay=self.replay,
+            sprinkle=self.sprinkle_list() or None,
+            sprinkle_random=self.sprinkle_on and self.sprinkle_random,
+            sprinkle_ratio=self.sprinkle_ratio if self.sprinkle_on else 0.0,
+            span=self.span)
+
     def start_stop(self):
         if self.running():
             self.engine.stop()
             self.add_log("stop requested")
             return
-        if not (self.env or self.incident or self.replay or self.selected):
-            self.add_log("no protocols selected")
+        if self.mode() == "custom" and not self.selected:
+            self.add_log("no protocols selected — pick some on the Traffic tab")
             return
         if not self.send_iface and not self.pcap:
-            self.add_log("map a send interface or set a pcap path first")
+            self.add_log("set a send interface (Interfaces) or a PCAP output "
+                         "(Run) first")
             return
         cfg = self.build_config()
         self.add_log(f"start: {cfg.summary()}")
+        self._warned_restart = False
         self.engine = Engine(cfg, on_log=self.add_log)
         self.engine.start()
+
+    def changed(self):
+        """A setting changed; say once per run that it applies on restart."""
+        if self.running() and not self._warned_restart:
+            self.add_log("changes apply on the next start (s to stop, s again)")
+            self._warned_restart = True
+
+
+# ── formatting ──────────────────────────────────────────────────────────────
+def _fit(text: str, n: int, left: bool = False) -> str:
+    """Truncate to n columns with an ellipsis (on the left for paths)."""
+    if n <= 0:
+        return ""
+    if len(text) <= n:
+        return text
+    if n == 1:
+        return "…"
+    return "…" + text[-(n - 1):] if left else text[:n - 1] + "…"
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _clock(sec: float) -> str:
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _onoff(flag: bool, on: str = "on", off: str = "off") -> Tuple[str, int]:
+    return (on, C_GREEN) if flag else (off, C_DIM)
 
 
 # ── safe drawing helpers ────────────────────────────────────────────────────
@@ -190,259 +278,748 @@ def _box(win, y, x, h, w, title, color, focused=False):
 
 
 # ── the flow diagram ────────────────────────────────────────────────────────
-def _draw_diagram(win, ui: UI, top: int, w: int):
+def _mix(ui: UI, slots: int) -> Tuple[List[Tuple[str, int]], int, int]:
+    """(key, count) rows for the engine box, biggest first, plus the number
+    hidden and the total. Malware rows are always kept on screen — a thin
+    minority is exactly what you are testing for."""
+    s = ui.stats()
+    counts = dict(s.per_profile) if s and s.per_profile else {}
+    total = sum(counts.values())
+    if not counts:
+        return [], 0, 0
+    mal = set(incidents.ATTACKS)
+    by_count = sorted(counts, key=lambda k: -counts[k])
+    if len(by_count) > slots:
+        slots = max(0, slots - 1)                 # room for "+N more"
+    keep = ([k for k in by_count if k in mal] +
+            [k for k in by_count if k not in mal])[:slots]
+    shown = [k for k in by_count if k in keep]
+    return [(k, counts[k]) for k in shown], len(by_count) - len(shown), total
+
+
+def _engine_idle_lines(ui: UI) -> List[Tuple[str, int]]:
+    """What the engine box says before anything has been generated."""
+    m = ui.mode()
+    if m == "env":
+        e = enterprise.get(ui.env)
+        return [(f"{len(e.hosts)} hosts", C_DIM),
+                (f"{len(e.segments)} VLANs", C_DIM),
+                (f"{len(e.conversations)} flows", C_DIM)]
+    if m == "incident":
+        inc = incidents.get(ui.incident)
+        return [(f"{inc.name}", C_DIM), (f"{inc.category} · {inc.year}", C_DIM)]
+    if m == "replay":
+        return [(_fit(os.path.basename(ui.replay), 30), C_DIM)]
+    return [(k, C_DIM) for k in ui.selected] or [("no protocols", C_DIM)]
+
+
+def _diagram_height(ui: UI, H: int, top: int) -> int:
+    """Box height: just enough for the engine's content (header, traffic mix
+    or idle summary, status) and the counters, capped by the terminal."""
+    s = ui.stats()
+    n = len(s.per_profile) if s and s.per_profile else \
+        len(_engine_idle_lines(ui))
+    headers = 1 + (ui.sprinkle_on and ui.mode() != "replay")
+    want = max(6, headers + n + 1) + 2
+    return max(7, min(want, 16, H - top - 15))
+
+
+def _draw_diagram(win, ui: UI, top: int, w: int) -> int:
+    H, _ = win.getmaxyx()
+    margin, gap = (2, 6) if w >= 100 else (1, 4)
+    box_w = (w - 2 * margin - 3 * gap) // 4
+    if box_w < 16:
+        return _draw_strip(win, ui, top, w)
     s = ui.stats()
     running = ui.running()
     pps = s.pps if s else 0.0
-    pkts = s.packets if s else 0
-
-    H, _ = win.getmaxyx()
-    margin = 2
-    usable = w - 2 * margin
-    cell = max(16, usable // 4)
-    box_w = max(11, cell - 8)
-    xs = [margin + i * cell for i in range(4)]
-    # grow the boxes on taller terminals so the engine box lists more protocols
-    bh = max(7, min(H - top - 14, 12))
+    xs = [margin + i * (box_w + gap) for i in range(4)]
+    bh = _diagram_height(ui, H, top)
     by = top + 1
     mid = by + bh // 2
+    inner = box_w - 2
+    rows = bh - 2
 
-    # node colours + titles
-    nodes = [
-        (C_GREEN, "TGT ENGINE"),
-        (C_CYAN, "SEND"),
-        (C_YELLOW, "MONITOR"),
-        (C_MAGENTA, "SENSOR"),
-    ]
-    for i, (color, title) in enumerate(nodes):
+    for i, (color, title) in enumerate([(C_GREEN, "TGT ENGINE"),
+                                        (C_CYAN, "SEND"),
+                                        (C_YELLOW, "MONITOR"),
+                                        (C_MAGENTA, "SENSOR")]):
         _box(win, by, xs[i], bh, box_w, title, color)
 
-    inner = box_w - 2
-    mal_labels = set(incidents.ATTACKS)
+    def line(col, r, text, attr=0):
+        if 0 <= r < rows:
+            _put(win, by + 1 + r, xs[col] + 1, _fit(text, inner), attr)
 
-    # ENGINE box: header (base mode + ☣ malware badge) then the most-generated
-    # protocols, biggest first, with an overflow count if they don't all fit.
-    headers = []
-    if ui.replay:
-        headers.append(("⟳ " + ui.replay.split("/")[-1], C_YELLOW))
-    elif ui.incident:
-        headers.append(("☣ " + ui.incident, C_RED))
-    elif ui.env:
-        headers.append(("env:" + ui.env, C_GREEN))
-    if ui.sprinkle_on and not ui.incident:
+    # ENGINE: mode header, malware badge, traffic mix (or idle summary), status
+    m = ui.mode()
+    head = {"env": (f"env {ui.env}", C_GREEN),
+            "incident": (f"☣ {ui.incident}", C_RED),
+            "replay": ("⟳ replay", C_YELLOW),
+            "scenario": (f"scenario {ui.scenario}", C_CYAN),
+            "custom": (f"{len(ui.selected)} protocols", C_CYAN)}[m]
+    headers = [head]
+    if ui.sprinkle_on and m != "replay":
         v = "random" if ui.sprinkle_random else ui.sprinkle_variant
-        headers.append(("☣ +" + v, C_RED))
-    for hj, (text, col) in enumerate(headers):
-        _put(win, by + 1 + hj, xs[0] + 1, text[:inner], _cattr(col, curses.A_BOLD))
-
-    if s and s.per_profile:
-        ordered = [k for k, _ in sorted(s.per_profile.items(),
-                   key=lambda kv: -kv[1])]
-        maxc = max(s.per_profile.values())
+        headers.append((f"☣ +{v}", C_RED))
+    for r, (text, col) in enumerate(headers):
+        line(0, r, text, _cattr(col, curses.A_BOLD))
+    body_top = len(headers)
+    slots = max(0, rows - body_top - 1)           # last row = status
+    mix, hidden, total = _mix(ui, slots)
+    mal = set(incidents.ATTACKS)
+    if mix:
+        name_w = max(4, inner - 7)
+        for r, (k, cnt) in enumerate(mix):
+            bad = k in mal
+            pct = f"{100 * cnt / total:5.1f}%" if total else ""
+            text = f"{'☣' if bad else ' '}{_fit(k, name_w):<{name_w}}{pct:>6}"
+            line(0, body_top + r, text,
+                 _cattr(C_RED if bad else C_GREEN,
+                        curses.A_BOLD if bad else 0))
+        if hidden:
+            line(0, body_top + len(mix), f" +{hidden} more…", _cattr(C_DIM))
     else:
-        ordered = list(ui.selected)
-        maxc = 1
-
-    content_top = by + 1 + len(headers)
-    status_row = by + bh - 2
-    max_rows = max(0, status_row - content_top)
-    shown = ordered[:max_rows]
-    overflow = len(ordered) - len(shown)
-    if overflow > 0 and max_rows > 0:                # reserve a row for "+N more"
-        shown = ordered[:max_rows - 1]
-        overflow = len(ordered) - len(shown)
-    for j, k in enumerate(shown):
-        cnt = s.per_profile.get(k, 0) if s else 0
-        is_mal = k in mal_labels
-        col = C_RED if is_mal else C_GREEN
-        icon = "☣" if is_mal else " "
-        blen = int((cnt / maxc) * max(2, inner - 9)) if maxc else 0
-        _put(win, content_top + j, xs[0] + 1, f"{icon}{k[:6]:<6}",
-             _cattr(col, curses.A_BOLD if is_mal else 0))
-        _put(win, content_top + j, xs[0] + 8, (BAR * blen)[:inner - 8],
-             _cattr(col))
-    if overflow > 0:
-        _put(win, content_top + len(shown), xs[0] + 1, f"+{overflow} more…",
+        for r, (text, col) in enumerate(_engine_idle_lines(ui)[:slots]):
+            line(0, body_top + r, f" {text}", _cattr(col))
+    if running:
+        status = f"{pps:6.1f} pps  {_clock(s.elapsed)}"
+        line(0, rows - 1, status, _cattr(C_GREEN, curses.A_BOLD))
+    else:
+        line(0, rows - 1, "idle — press s" if s is None else "stopped",
              _cattr(C_DIM))
-    elif not ordered and not headers:
-        _put(win, content_top, xs[0] + 1, "no protocols", _cattr(C_DIM))
 
-    _put(win, status_row, xs[0] + 1,
-         (f"{pps:6.1f} pps" if running else "idle"),
-         _cattr(C_GREEN, curses.A_BOLD if running else 0))
+    # SEND: interface + state, pcap file, counters
+    st_text, st_col = ui.iface_state(ui.send_iface)
+    if ui.send_iface:
+        line(1, 0, ui.send_iface, _cattr(C_CYAN, curses.A_BOLD))
+        line(1, 1, st_text, _cattr(st_col))
+    else:
+        line(1, 0, "no interface", _cattr(C_DIM))
+        line(1, 1, "pcap only" if ui.pcap else "unmapped",
+             _cattr(C_YELLOW if not ui.pcap else C_DIM))
+    r = 2
+    if ui.pcap:
+        line(1, r, "→ " + _fit(os.path.basename(ui.pcap), inner - 2),
+             _cattr(C_DIM))
+        r += 1
+    pkts = s.packets if s else 0
+    line(1, r, f"{pkts:,} pkts", _cattr(C_CYAN))
+    line(1, r + 1, f"{_human(s.bytes if s else 0)} {s.mbps if s else 0:.2f}Mb/s",
+         _cattr(C_DIM))
+    errs = s.errors if s else 0
+    line(1, r + 2, f"errors {errs}", _cattr(C_RED if errs else C_DIM,
+                                            curses.A_BOLD if errs else 0))
 
-    # SEND box
-    send_name = ui.send_iface or "(unmapped)"
-    _put(win, by + 1, xs[1] + 1, send_name[:inner], _cattr(C_CYAN, curses.A_BOLD))
-    _put(win, by + 2, xs[1] + 1, f"{ARROW} out", _cattr(C_CYAN))
-    _put(win, by + 4, xs[1] + 1, f"{pkts}"[:inner], _cattr(C_CYAN))
-    _put(win, by + 5, xs[1] + 1, "packets", _cattr(C_DIM))
+    # MONITOR: peer + state, SPAN view, tagging
+    mon = ui.mon_iface
+    if mon:
+        mt, mc = ui.iface_state(mon)
+        line(2, 0, mon, _cattr(C_YELLOW, curses.A_BOLD))
+        line(2, 1, mt, _cattr(mc))
+    else:
+        line(2, 0, "no peer", _cattr(C_DIM))
+        line(2, 1, "create a veth" if ui.send_iface else "-", _cattr(C_DIM))
+    if m == "env":
+        e = enterprise.get(ui.env)
+        line(2, 2, f"SPAN {ui.span}", _cattr(C_YELLOW))
+        line(2, 3, f"{len(e.segments)} VLANs tagged", _cattr(C_DIM))
+        if ui.span == "core":
+            line(2, 4, "+ routed hops", _cattr(C_DIM))
+    else:
+        line(2, 2, "SPAN mirror", _cattr(C_YELLOW))
+        line(2, 3, "untagged", _cattr(C_DIM))
+    if s and s.cycle_frames:
+        line(2, rows - 1, f"{s.cycle_frames:,} /cycle", _cattr(C_DIM))
 
-    # MONITOR box
-    _put(win, by + 1, xs[2] + 1, (ui.mon_iface or "-")[:inner],
-         _cattr(C_YELLOW, curses.A_BOLD))
-    _put(win, by + 2, xs[2] + 1, "capture pt", _cattr(C_YELLOW))
-    _put(win, by + 4, xs[2] + 1, "◀ SPAN", _cattr(C_DIM))
+    # SENSOR: label + where it should listen
+    line(3, 0, ui.sensor_label, _cattr(C_MAGENTA, curses.A_BOLD))
+    line(3, 1, "listens on", _cattr(C_DIM))
+    line(3, 2, mon or ("the pcap" if ui.pcap else "-"), _cattr(C_MAGENTA))
 
-    # SENSOR box
-    _put(win, by + 1, xs[3] + 1, ui.sensor_label[:inner],
-         _cattr(C_MAGENTA, curses.A_BOLD))
-    _put(win, by + 2, xs[3] + 1, "ingest", _cattr(C_MAGENTA))
-    _put(win, by + 4, xs[3] + 1, "◀ in", _cattr(C_DIM))
-
-    # animated flow in the gaps
-    labels = ["emit", "mirror", "ingest"]
-    for i in range(3):
-        gap_start = xs[i] + box_w
-        gap_end = xs[i + 1]
-        glen = gap_end - gap_start
-        if glen < 2:
-            continue
-        # base line
-        _put(win, mid, gap_start, BOX["h"] * (glen - 1), _cattr(C_DIM))
-        _put(win, mid, gap_end - 1, ARROW,
-             _cattr(C_GREEN if running else C_DIM,
-                    curses.A_BOLD if running else 0))
-        # moving dots
-        if running and pps > 0:
-            ndots = max(1, min(glen - 1, 1 + int(pps / 15)))
-            step = max(1, glen // max(1, ndots))
-            for kdot in range(ndots):
-                pos = (ui.frame + kdot * step) % (glen - 1)
-                _put(win, mid, gap_start + pos, DOT,
-                     _cattr(C_GREEN, curses.A_BOLD))
-        # gap label
-        _put(win, mid + 1, gap_start + max(0, (glen - len(labels[i])) // 2),
-             labels[i], _cattr(C_DIM))
-
+    # animated flow in the gaps: emit (solid), mirror (dotted), ingest (solid)
+    for i, (label, dotted) in enumerate([("emit", False), ("mirror", True),
+                                         ("ingest", False)]):
+        g0 = xs[i] + box_w
+        glen = xs[i + 1] - g0
+        live = running and (i == 0 or mon is not None)
+        _put(win, mid, g0, ("┈" if dotted else BOX["h"]) * (glen - 1),
+             _cattr(C_DIM))
+        _put(win, mid, g0 + glen - 1, ARROW,
+             _cattr(C_GREEN if live else C_DIM, curses.A_BOLD if live else 0))
+        if live and pps > 0:
+            ndots = max(1, min(glen - 2, 1 + int(pps / 15)))
+            step = max(1, (glen - 1) // ndots)
+            for k in range(ndots):
+                pos = (ui.frame + k * step) % (glen - 1)
+                _put(win, mid, g0 + pos, DOT, _cattr(C_GREEN, curses.A_BOLD))
+        if len(label) <= glen:                       # skip if it won't fit
+            _put(win, mid + 1, g0 + (glen - len(label)) // 2, label,
+                 _cattr(C_DIM))
     return by + bh + 1
 
 
-# ── panels ──────────────────────────────────────────────────────────────────
-def _iface_list(ui: UI) -> List[str]:
-    return [i["name"] for i in net.list_interfaces() if i["name"] != "lo"]
+def _draw_strip(win, ui: UI, top: int, w: int) -> int:
+    """Narrow terminals: the same flow as one line plus a counters line."""
+    s = ui.stats()
+    running = ui.running()
+    mon = ui.mon_iface or "no peer"
+    send = ui.send_iface or ("pcap" if ui.pcap else "unmapped")
+    parts = [("ENGINE", C_GREEN), (" ━▶ ", C_DIM), (send, C_CYAN),
+             (" ┈▶ ", C_DIM), (mon, C_YELLOW), (" ━▶ ", C_DIM),
+             (ui.sensor_label, C_MAGENTA)]
+    x = 2
+    for text, col in parts:
+        _put(win, top + 1, x, text, _cattr(col, curses.A_BOLD))
+        x += len(text)
+    if s:
+        info = (f"{s.packets:,} pkts · {s.pps:.1f} pps · {_human(s.bytes)} · "
+                f"errors {s.errors}")
+    else:
+        info = "idle — press s to start"
+    _put(win, top + 2, 2, _fit(info, w - 4),
+         _cattr(C_GREEN if running else C_DIM))
+    return top + 4
 
 
-def _panel_rows(ui: UI) -> List[tuple]:
-    """Return rows for the active panel as (label, value) tuples."""
-    p = PANELS[ui.focus]
-    if p == "Map":
-        return [
-            ("Send interface", ui.send_iface or "(none — pcap only)"),
-            ("Monitor (peer)", ui.mon_iface or "-"),
-            ("Sensor label", ui.sensor_label),
-            ("Create veth pair", "press Enter"),
-            ("Delete send iface", "press Enter"),
-        ]
-    if p == "Protocols":
-        rows = []
-        s = ui.stats()
-        for prof in protocols.all_profiles():
-            mark = "◉" if prof.key in ui.selected else "○"
+# ── panel model ─────────────────────────────────────────────────────────────
+class Field:
+    """One row of a panel: a label, a live value, what the keys do, help."""
+
+    def __init__(self, label: str, value: Callable[[UI], Value],
+                 act: Optional[Callable] = None, help: Union[str, Callable] = "",
+                 show: Optional[Callable[[UI], bool]] = None,
+                 toggle: bool = False, keys: str = "",
+                 space: Optional[Callable] = None):
+        self.label = label
+        self.value = value
+        self.act = act                  # act(stdscr, ui, step): step -1/+1/0
+        self._help = help
+        self.show = show or (lambda ui: True)
+        self.toggle = toggle            # Space activates it
+        self.space = space              # or does this instead
+        self.keys = keys or ("Space toggle" if toggle else
+                             "Enter run" if act else "")
+
+    def help(self, ui: UI) -> str:
+        return self._help(ui) if callable(self._help) else self._help
+
+
+def _cycle(seq: list, cur, step: int):
+    try:
+        i = seq.index(cur)
+    except ValueError:
+        i = -1 if step >= 0 else 0
+    return seq[(i + (step or 1)) % len(seq)]
+
+
+# -- Run panel ---------------------------------------------------------------
+def _preset_value(ui: UI) -> Value:
+    m = ui.mode()
+    if m == "replay":
+        return f"⟳ replay {os.path.basename(ui.replay)}", C_YELLOW
+    if m == "incident":
+        return f"☣ incident: {ui.incident}", C_RED
+    if m == "env":
+        return f"env: {ui.env}", C_GREEN
+    if m == "scenario":
+        return f"scenario: {ui.scenario}", C_CYAN
+    return f"custom mix ({len(ui.selected)} protocols)", 0
+
+
+def _preset_items(ui: UI) -> list:
+    items = [("Custom", ("c", None), "custom protocol mix",
+              f"Your own selection on the Traffic tab "
+              f"({len(ui.selected)} selected).")]
+    items += [("Scenarios", ("s", s.key), f"{s.key:16} {s.name}",
+               f"{s.desc}  [{', '.join(s.profiles)}]")
+              for s in scenarios.all_scenarios()]
+    items += [("Environments", ("e", e.key), f"{e.key:16} {e.name}",
+               f"{e.desc}  ({e.summary()})")
+              for e in enterprise.all_environments()]
+    items += [("Incidents", ("i", x.key), f"{x.key:16} {x.name} ({x.year})",
+               f"{x.desc}  Signals: {'; '.join(x.indicators())}")
+              for x in incidents.all_incidents()]
+    items += [("Replay", ("r", None), "replay a pcap file…",
+               "Send the frames of an existing capture instead of "
+               "generating traffic.")]
+    return items
+
+
+def _current_preset(ui: UI):
+    m = ui.mode()
+    return {"env": ("e", ui.env), "incident": ("i", ui.incident),
+            "scenario": ("s", ui.scenario), "replay": ("r", None),
+            "custom": ("c", None)}[m]
+
+
+def _apply_preset(stdscr, ui: UI, choice):
+    kind, key = choice
+    if kind == "r":
+        path = _prompt(stdscr, "Replay pcap path", ui.replay or "")
+        if path and os.path.exists(path):
+            ui.set_replay(path)
+            ui.add_log(f"replay: {path}")
+        elif path:
+            ui.add_log(f"replay file not found: {path}")
+        return
+    {"i": ui.set_incident, "e": ui.set_env, "s": ui.set_scenario}.get(
+        kind, lambda k: ui._clear_modes())(key)
+
+
+def _act_preset(stdscr, ui: UI, step: int):
+    if step == 0:
+        choice = _pick(stdscr, "Preset — base traffic", _preset_items(ui),
+                       _current_preset(ui))
+        if choice is not None:
+            _apply_preset(stdscr, ui, choice)
+        return
+    opts = [it[1] for it in _preset_items(ui) if it[1][0] != "r"]
+    _apply_preset(stdscr, ui, _cycle(opts, _current_preset(ui), step))
+
+
+def _act_span(stdscr, ui: UI, step: int):
+    ui.span = "core" if ui.span == "access" else "access"
+
+
+def _act_sprinkle(stdscr, ui: UI, step: int):
+    ui.sprinkle_on = not ui.sprinkle_on
+    ui.add_log(f"malware sprinkle "
+               f"{'ON: ' + ui.sprinkle_variant if ui.sprinkle_on else 'off'}")
+
+
+def _variant_items() -> list:
+    return [(x.category, x.key, f"{x.key:14} {x.name} ({x.year})",
+             f"{x.desc}  Signals: {'; '.join(x.indicators())}")
+            for x in incidents.all_incidents()]
+
+
+def _act_variant(stdscr, ui: UI, step: int):
+    if step == 0:
+        v = _pick(stdscr, "Malware to sprinkle", _variant_items(),
+                  ui.sprinkle_variant)
+        if v is None:
+            return
+    else:
+        v = _cycle([x.key for x in incidents.all_incidents()],
+                   ui.sprinkle_variant, step)
+    ui.sprinkle_variant = v
+    ui.sprinkle_random = False
+
+
+def _act_random(stdscr, ui: UI, step: int):
+    ui.sprinkle_random = not ui.sprinkle_random
+
+
+def _act_ratio(stdscr, ui: UI, step: int):
+    if step:
+        steps = RATIO_STEPS
+        cur = min(steps, key=lambda r: abs(r - ui.sprinkle_ratio))
+        i = max(0, min(len(steps) - 1, steps.index(cur) + step))
+        ui.sprinkle_ratio = steps[i]
+        return
+    v = _prompt(stdscr, "Malware fraction 0–0.9 (0 = natural minority)",
+                f"{ui.sprinkle_ratio:g}")
+    try:
+        ui.sprinkle_ratio = min(0.9, max(0.0, float(v)))
+    except (TypeError, ValueError):
+        ui.add_log(f"not a number: {v}")
+
+
+def _act_rate(stdscr, ui: UI, step: int):
+    if step:
+        steps = RATE_STEPS
+        cur = 0 if ui.rate == 0 else min(steps[:-1],
+                                         key=lambda r: abs(r - ui.rate))
+        i = max(0, min(len(steps) - 1, steps.index(cur) + step))
+        ui.rate = float(steps[i])
+        return
+    v = _prompt(stdscr, "Packets per second (0 = as fast as possible)",
+                f"{ui.rate:g}")
+    try:
+        ui.rate = max(0.0, float(v))
+    except (TypeError, ValueError):
+        ui.add_log(f"not a number: {v}")
+
+
+def _act_msgs(stdscr, ui: UI, step: int):
+    if step:
+        ui.messages = max(1, ui.messages + step)
+        return
+    v = _prompt(stdscr, "Protocol exchanges per flow per cycle",
+                str(ui.messages))
+    try:
+        ui.messages = max(1, int(v))
+    except (TypeError, ValueError):
+        ui.add_log(f"not a whole number: {v}")
+
+
+def _act_loop(stdscr, ui: UI, step: int):
+    ui.loop = not ui.loop
+
+
+def _act_pcap(stdscr, ui: UI, step: int):
+    v = _prompt(stdscr, "Write frames to this pcap (blank = off)",
+                ui.pcap or "tgt-out.pcap")
+    ui.pcap = v if v and v != "(off)" else None
+
+
+def _act_pcap_off(stdscr, ui: UI, step: int):
+    """Space: switch the pcap output off, or ask for a path when it is off."""
+    if ui.pcap:
+        ui.pcap = None
+    else:
+        _act_pcap(stdscr, ui, 0)
+
+
+def _ip_prompt(stdscr, ui: UI, label: str, cur: str) -> str:
+    v = _prompt(stdscr, label, cur) or cur
+    try:
+        ipaddress.ip_address(v)
+        return v
+    except ValueError:
+        ui.add_log(f"not an IPv4 address: {v}")
+        return cur
+
+
+def _act_client(stdscr, ui: UI, step: int):
+    ui.ep.client_ip = _ip_prompt(stdscr, ui, "Client IP", ui.ep.client_ip)
+
+
+def _act_server(stdscr, ui: UI, step: int):
+    ui.ep.server_ip = _ip_prompt(stdscr, ui, "Server IP", ui.ep.server_ip)
+
+
+def _manual(ui: UI) -> bool:
+    return ui.mode() in ("custom", "scenario")
+
+
+def _sprinkle_detail(ui: UI) -> bool:
+    return ui.sprinkle_on and ui.mode() != "replay"
+
+
+RUN_FIELDS = [
+    Field("Preset", _preset_value, _act_preset,
+          "Base traffic: a protocol mix, a scenario, a modeled environment "
+          "(hosts, VLANs, fingerprints), an incident, or a pcap replay.",
+          keys="Enter pick · ←→ cycle"),
+    Field("SPAN view",
+          lambda ui: (f"‹ {ui.span} ›", C_CYAN), _act_span,
+          "Where the sensor taps the environment: access = each frame once, on "
+          "its sender's VLAN; core = also the router's copy on the receiver's "
+          "VLAN (gateway MAC, TTL-1).",
+          show=lambda ui: ui.mode() == "env", toggle=True,
+          keys="←→/Space switch"),
+    Field("Malware sprinkle",
+          lambda ui: _onoff(ui.sprinkle_on, "☣ ON", "off"), _act_sprinkle,
+          "Mix an attack into the base traffic as a thin minority. On an "
+          "environment, its hosts are re-addressed onto real assets of the same "
+          "role and vendor.",
+          show=lambda ui: ui.mode() != "replay", toggle=True),
+    Field("  variant",
+          lambda ui: (incidents.get(ui.sprinkle_variant).name, C_RED),
+          _act_variant, "Which incident to sprinkle.",
+          show=lambda ui: _sprinkle_detail(ui) and not ui.sprinkle_random,
+          keys="Enter pick · ←→ cycle"),
+    Field("  random pick", lambda ui: _onoff(ui.sprinkle_random), _act_random,
+          "Pick a random incident each cycle and jitter where it lands.",
+          show=_sprinkle_detail, toggle=True),
+    Field("  ratio",
+          lambda ui: (f"{ui.sprinkle_ratio:.0%}" if ui.sprinkle_ratio > 0
+                      else "natural minority"),
+          _act_ratio,
+          "Target malware fraction of all frames. 0 = one natural cycle per "
+          "variant (a few percent).",
+          show=_sprinkle_detail, keys="←→ step · Enter type"),
+    Field("Rate",
+          lambda ui: f"{ui.rate:g} pps" if ui.rate else ("max", C_YELLOW),
+          _act_rate, "Packets per second (0 = as fast as the system allows).",
+          keys="←→ step · Enter type"),
+    Field("Messages / flow", lambda ui: str(ui.messages), _act_msgs,
+          "Protocol exchanges in each flow per cycle. Larger = longer sessions "
+          "and a bigger cycle.", keys="←→ ±1 · Enter type"),
+    Field("Loop", lambda ui: _onoff(ui.loop, "repeat", "one cycle"), _act_loop,
+          "Rebuild and resend continuously, or send one cycle and stop.",
+          toggle=True),
+    Field("PCAP output",
+          lambda ui: (ui.pcap, C_CYAN) if ui.pcap else ("off", C_DIM),
+          _act_pcap,
+          "Also (or only) write every frame to a pcap file — no root needed. "
+          "Space switches it off.",
+          keys="Enter path · Space on/off", space=_act_pcap_off),
+    Field("Client IP", lambda ui: ui.ep.client_ip, _act_client,
+          "Client address for a custom mix or scenario (environments and "
+          "incidents bring their own hosts).", show=_manual, keys="Enter edit"),
+    Field("Server IP", lambda ui: ui.ep.server_ip, _act_server,
+          "Server address for a custom mix or scenario.", show=_manual,
+          keys="Enter edit"),
+]
+
+
+# -- Traffic panel -----------------------------------------------------------
+def _traffic_fields(ui: UI) -> List[Field]:
+    s = ui.stats()
+    fields = []
+    for prof in protocols.all_profiles():
+        def value(ui, prof=prof):
             cnt = s.per_profile.get(prof.key, 0) if s else 0
-            val = f"{prof.port:>6}/{prof.transport:3} {cnt if cnt else ''}"
-            rows.append((f"{mark} {prof.key}", val))
-        return rows
-    if p == "Settings":
-        if ui.replay:
-            preset = f"replay: {ui.replay.split('/')[-1]}"
-        elif ui.incident:
-            preset = f"incident: {ui.incident}"
-        elif ui.env:
-            preset = f"env: {ui.env}"
-        elif ui.scenario:
-            preset = f"scenario: {ui.scenario}"
-        else:
-            preset = "(custom protocols)"
-        variant = ("random" if ui.sprinkle_random else f"⚠ {ui.sprinkle_variant}") \
-            if ui.sprinkle_on else "(enable above)"
-        ratio = (f"{ui.sprinkle_ratio:.0%}" if ui.sprinkle_ratio > 0
-                 else "auto (natural)")
-        span = (f"{ui.span}  (core = routed hops too)" if ui.env
-                else "(env preset only)")
-        return [
-            ("Preset", preset),
-            ("SPAN view", span),
-            ("Replay pcap", ui.replay or "(off — Enter to set)"),
-            ("Sprinkle malware", "ON" if ui.sprinkle_on else "off"),
-            ("  variant", variant),
-            ("  random pick", "yes" if ui.sprinkle_random else "no"),
-            ("  ratio", ratio),
-            ("Rate (pps)", f"{ui.rate:g}  (0 = max)"),
-            ("Msgs / cycle", str(ui.messages)),
-            ("Loop", "yes" if ui.loop else "no"),
-            ("PCAP output", ui.pcap or "(off)"),
-            ("Client IP", ui.ep.client_ip),
-            ("Server IP", ui.ep.server_ip),
-        ]
-    if p == "Service":
-        st = ui.svc
-        run_args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
-                                          ui.messages, env=ui.env,
-                                          incident=ui.incident, replay=ui.replay,
-                                          sprinkle=[ui.sprinkle_variant] if (ui.sprinkle_on and not ui.sprinkle_random) else None,
-                                          sprinkle_random=ui.sprinkle_on and ui.sprinkle_random,
-                                          sprinkle_ratio=ui.sprinkle_ratio if ui.sprinkle_on else 0.0,
-                                          span=ui.span)
-        return [
-            ("Status", f"{st.status} ({st.mode})"),
-            ("Config file", service.CONF_PATH),
-            ("Would run", run_args),
-            ("Save config", "press Enter"),
-            ("Start service", "press Enter"),
-            ("Stop service", "press Enter"),
-            ("Restart service", "press Enter"),
-        ]
-    return []
+            port = f"{prof.port}/{prof.transport}" if prof.port != "-" \
+                else prof.transport
+            text = f"{prof.category}  {port:<10} {cnt:>7,}" if cnt else \
+                f"{prof.category}  {port}"
+            return text, (C_GREEN if prof.key in ui.selected else C_DIM)
+
+        def act(stdscr, ui, step, prof=prof):
+            ui.toggle_proto(prof.key)
+
+        def help_(ui, prof=prof):
+            note = ("" if ui.mode() == "custom" else
+                    "  (Toggling switches the preset to a custom mix.)")
+            return f"{prof.name} — {prof.desc}.{note}"
+
+        mark = "◉" if prof.key in ui.selected else "○"
+        fields.append(Field(f"{mark} {prof.key}", value, act, help_,
+                            toggle=True, keys="Space/Enter toggle"))
+    return fields
+
+
+# -- Interfaces panel --------------------------------------------------------
+def _act_send(stdscr, ui: UI, step: int):
+    opts = [None] + [n for n in ui.ifaces if not n.endswith("-mon")]
+    ui.send_iface = _cycle(opts, ui.send_iface, step)
+
+
+def _act_sensor(stdscr, ui: UI, step: int):
+    ui.sensor_label = _prompt(stdscr, "Sensor label",
+                              ui.sensor_label) or ui.sensor_label
+
+
+def _act_create(stdscr, ui: UI, step: int):
+    name = _prompt(stdscr, "New veth pair name (peer gets -mon)",
+                   ui.send_iface or "tgt0")
+    if not name:
+        return
+    ui.add_log(f"creating veth {name} <-> {name}-mon …")
+    res = net.create_veth(name)
+    for ln in res.log:
+        ui.add_log(ln)
+    ui.refresh(force=True)
+    if res.ok:
+        ui.send_iface = name
+
+
+def _act_delete(stdscr, ui: UI, step: int):
+    name = ui.send_iface
+    if not name:
+        ui.add_log("no send interface selected")
+        return
+    typed = _prompt(stdscr, f"Type '{name}' to delete it (and its peer)", "")
+    if typed != name:
+        ui.add_log("delete cancelled")
+        return
+    res = net.delete_interface(name)
+    for ln in res.log:
+        ui.add_log(ln)
+    ui.refresh(force=True)
+    if res.ok:
+        ui.send_iface = None
+
+
+def _iface_value(ui: UI) -> Value:
+    if not ui.send_iface:
+        return "none — pcap only", C_DIM
+    st, col = ui.iface_state(ui.send_iface)
+    return f"{ui.send_iface}  {st}", col
+
+
+IFACE_FIELDS = [
+    Field("Send interface", _iface_value, _act_send,
+          "Where TGT transmits (needs root/CAP_NET_RAW). With none, use a PCAP "
+          "output on the Run tab.", keys="←→/Enter cycle"),
+    Field("Monitor (peer)",
+          lambda ui: ((f"{ui.mon_iface}  {ui.iface_state(ui.mon_iface)[0]}",
+                       ui.iface_state(ui.mon_iface)[1]) if ui.mon_iface
+                      else ("none", C_DIM)),
+          None, "The veth peer your sensor listens on: every frame sent on the "
+          "send interface appears here."),
+    Field("Sensor label", lambda ui: ui.sensor_label, _act_sensor,
+          "Name shown in the SENSOR box (e.g. Claroty CTD, Zeek, Suricata).",
+          keys="Enter edit"),
+    Field("Create veth pair", lambda ui: ("press Enter", C_DIM), _act_create,
+          "Create <name> and <name>-mon (needs iproute2 and sudo)."),
+    Field("Delete send iface", lambda ui: ("press Enter", C_DIM), _act_delete,
+          "Delete the send interface and its peer. Asks you to type the name.",
+          show=lambda ui: bool(ui.send_iface)),
+]
+
+
+# -- Service panel -----------------------------------------------------------
+def _act_save(stdscr, ui: UI, step: int):
+    ok, msg = service.write_config(ui.send_iface or "tgt0", ui.run_args())
+    ui.add_log(("saved: " if ok else "error: ") + msg)
+
+
+def _svc(action: str):
+    def act(stdscr, ui: UI, step: int):
+        ui.add_log(f"service {action} …")
+        ok, msg = service.service_action(action)
+        ui.add_log(("service " if ok else "service FAILED: ") + msg)
+        ui.refresh(force=True)
+    return act
+
+
+def _svc_value(ui: UI) -> Value:
+    st = ui.svc
+    col = {"active": C_GREEN, "failed": C_RED}.get(st.status, C_DIM)
+    return f"{st.status} ({st.mode})", col
+
+
+SERVICE_FIELDS = [
+    Field("Status", _svc_value, None,
+          "The background service runs `tgt run` from the saved config, and "
+          "survives logout/reboot."),
+    Field("Would run", lambda ui: ui.run_args(), None,
+          lambda ui: f"tgt run -i {ui.send_iface or 'tgt0'} {ui.run_args()}"),
+    Field("Config file", lambda ui: (service.CONF_PATH, C_DIM), None,
+          lambda ui: service.CONF_PATH),
+    Field("Save config", lambda ui: ("press Enter", C_DIM), _act_save,
+          "Write the current Run/Traffic selection as the service's config."),
+    Field("Start service", lambda ui: ("press Enter", C_DIM), _svc("start"),
+          "Start the background service."),
+    Field("Stop service", lambda ui: ("press Enter", C_DIM), _svc("stop"),
+          "Stop the background service."),
+    Field("Restart service", lambda ui: ("press Enter", C_DIM),
+          _svc("restart"), "Restart it to pick up a newly saved config."),
+]
+
+
+def _fields(ui: UI) -> List[Field]:
+    """Visible rows of the focused panel."""
+    p = PANELS[ui.focus]
+    fields = {"Run": RUN_FIELDS, "Interfaces": IFACE_FIELDS,
+              "Service": SERVICE_FIELDS}.get(p) or _traffic_fields(ui)
+    return [f for f in fields if f.show(ui)]
+
+
+def _context(ui: UI) -> Optional[Tuple[str, int]]:
+    """One line under the tabs describing what the preset will generate."""
+    if PANELS[ui.focus] == "Traffic":
+        return (f"{len(ui.selected)} of {len(protocols.PROFILES)} selected"
+                + ("" if ui.mode() == "custom" else
+                   f" — preset is {ui.mode()}"), C_DIM)
+    if PANELS[ui.focus] != "Run":
+        return None
+    m = ui.mode()
+    if m == "env":
+        e = enterprise.get(ui.env)
+        return (f"{len(e.hosts)} hosts · {len(e.segments)} VLANs · "
+                f"{len(e.conversations)} flows · {len(e.legacy_hosts())} at-risk",
+                C_GREEN)
+    if m == "incident":
+        inc = incidents.get(ui.incident)
+        return f"{inc.name} ({inc.year}) · {len(inc.hosts)} hosts", C_RED
+    if m == "scenario":
+        return ", ".join(scenarios.get(ui.scenario).profiles), C_CYAN
+    if m == "replay":
+        return ui.replay, C_YELLOW
+    return (", ".join(ui.selected) or "nothing selected — see Traffic"), C_DIM
+
+
+def _tab_label(ui: UI, name: str, short: bool = False) -> str:
+    if short:
+        return {"Interfaces": "Ifaces"}.get(name, name)
+    if name == "Traffic":
+        return f"Traffic {len(ui.selected)}"
+    return name
 
 
 def _draw_panel(win, ui: UI, y0, x0, h, w):
-    # tab strip
+    short = sum(len(_tab_label(ui, n)) + 3 for n in PANELS) > w
     tx = x0
     for i, name in enumerate(PANELS):
         active = i == ui.focus
-        attr = _cattr(C_CYAN, curses.A_REVERSE if active else curses.A_BOLD)
-        label = f" {name} "
-        _put(win, y0, tx, label, attr if active else _cattr(C_DIM))
+        label = f" {_tab_label(ui, name, short)} "
+        _put(win, y0, tx, _fit(label, x0 + w - tx),
+             _cattr(C_CYAN, curses.A_REVERSE) if active else _cattr(C_DIM))
         tx += len(label) + 1
-    # rows
-    rows = _panel_rows(ui)
-    ui.row = max(0, min(ui.row, len(rows) - 1))
-    top = y0 + 2
-    avail = h - 3
+
+    fields = _fields(ui)
+    ui.row = max(0, min(ui.row, len(fields) - 1))
+    top = y0 + 1
+    ctx = _context(ui)
+    if ctx:
+        _put(win, top, x0, _fit(ctx[0], w), _cattr(ctx[1]))
+    top += 1
+
+    help_text = fields[ui.row].help(ui) if fields else ""
+    # rows first; help gets what's left (1-4 lines, ellipsis if cut short)
+    wrapped = textwrap.wrap(help_text, max(10, w - 2))
+    room = max(1, min(4, h - 3 - len(fields) - 1))
+    help_lines = wrapped[:room]
+    if len(wrapped) > room:
+        help_lines[-1] = _fit(help_lines[-1] + " …", w - 2)
+    avail = max(1, h - 3 - len(help_lines))
+    shown_rows = min(len(fields), avail)
     start = max(0, ui.row - avail + 1)
-    for idx in range(start, min(len(rows), start + avail)):
-        label, value = rows[idx]
+    label_w = 18
+    for idx in range(start, min(len(fields), start + avail)):
+        f = fields[idx]
         yy = top + (idx - start)
         sel = idx == ui.row
-        # colour protocol markers
-        base = _cattr(C_GREEN if (PANELS[ui.focus] == "Protocols"
-                     and label.startswith("◉")) else C_DIM)
-        lattr = _cattr(C_CYAN, curses.A_REVERSE) if sel else curses.A_BOLD
-        _put(win, yy, x0, f"{label:20}", lattr if sel else base)
-        _put(win, yy, x0 + 21, str(value)[:w - 22],
-             _cattr(C_CYAN, curses.A_REVERSE) if sel else 0)
+        val = f.value(ui)
+        text, col = (val if isinstance(val, tuple) else (val, 0))
+        shown = _fit(text, w - label_w - 3, left=f.label == "PCAP output")
+        if sel:
+            _put(win, yy, x0, f"▸ {f.label:<{label_w}} {shown}".ljust(w),
+                 _cattr(C_CYAN, curses.A_REVERSE))
+        else:
+            _put(win, yy, x0, f"  {f.label:<{label_w}}", curses.A_BOLD)
+            _put(win, yy, x0 + label_w + 3, shown, _cattr(col) if col else 0)
+    if len(fields) > avail:
+        more = len(fields) - start - avail
+        if more > 0:
+            _put(win, top + avail - 1, x0 + w - 8, f"↓ {more} more",
+                 _cattr(C_DIM))
+    for j, ln in enumerate(help_lines):
+        _put(win, top + shown_rows + 1 + j, x0 + 1, ln, _cattr(C_DIM))
+
+
+def _log_color(msg: str) -> int:
+    low = msg.lower()
+    if any(w in low for w in ("error", "cannot", "failed", "not found",
+                              "not a ")):
+        return C_RED
+    if "malware" in low or "☣" in msg:
+        return C_YELLOW
+    if low.startswith(("start", "done", "saved", "built", "replaying",
+                       "writing")):
+        return C_GREEN
+    return 0
 
 
 def _draw_log(win, ui: UI, y0, x0, h, w):
-    _put(win, y0, x0, "─ Live log ", _cattr(C_BLUE, curses.A_BOLD))
-    visible = ui.log[-(h - 1):]
-    for j, line in enumerate(visible):
-        ts, _, rest = line.partition(" ")
+    _put(win, y0, x0, "─ Log ", _cattr(C_BLUE, curses.A_BOLD))
+    lines: List[Tuple[str, str, int]] = []
+    for entry in ui.log[-(h * 2):]:
+        ts, _, msg = entry.partition(" ")
+        wrapped = textwrap.wrap(msg, max(10, w - len(ts) - 2)) or [""]
+        col = _log_color(msg)
+        for k, part in enumerate(wrapped):
+            lines.append((ts if k == 0 else "", part, col))
+    for j, (ts, part, col) in enumerate(lines[-(h - 1):]):
         _put(win, y0 + 1 + j, x0, ts, _cattr(C_DIM))
-        _put(win, y0 + 1 + j, x0 + len(ts) + 1, rest[:w - len(ts) - 2])
+        _put(win, y0 + 1 + j, x0 + 9, part, _cattr(col) if col else 0)
 
 
-# ── input prompts ───────────────────────────────────────────────────────────
+# ── modal inputs ────────────────────────────────────────────────────────────
 def _prompt(stdscr, label: str, default: str = "") -> Optional[str]:
     curses.echo()
     curses.curs_set(1)
     h, w = stdscr.getmaxyx()
-    width = max(30, w - 4)
-    win = curses.newwin(3, width, h // 2 - 1, 2)
+    width = max(30, min(w - 4, 100))
+    win = curses.newwin(3, width, h // 2 - 1, (w - width) // 2)
     win.box()
     hint = f" {label}  [Enter = {default}] " if default else f" {label} "
-    _put(win, 0, 2, hint[:width - 4], _cattr(C_CYAN, curses.A_BOLD))
+    _put(win, 0, 2, _fit(hint, width - 4), _cattr(C_CYAN, curses.A_BOLD))
     _put(win, 1, 2, "> ")
     win.refresh()
     try:
@@ -455,196 +1032,203 @@ def _prompt(stdscr, label: str, default: str = "") -> Optional[str]:
     return val or (default or None)
 
 
-# ── panel actions ───────────────────────────────────────────────────────────
-def _act_map(stdscr, ui: UI):
-    r = ui.row
-    if r == 0:                                   # cycle send iface
-        opts = [None] + _iface_list(ui)
-        try:
-            i = opts.index(ui.send_iface)
-        except ValueError:
-            i = 0
-        ui.send_iface = opts[(i + 1) % len(opts)]
-    elif r == 2:                                 # sensor label
-        ui.sensor_label = _prompt(stdscr, "Sensor label",
-                                  ui.sensor_label) or ui.sensor_label
-    elif r == 3:                                 # create veth
-        name = _prompt(stdscr, "veth interface name", ui.send_iface or "tgt0")
-        if name:
-            ui.add_log(f"creating veth {name} <-> {name}-mon …")
-            res = net.create_veth(name)
-            for ln in res.log:
-                ui.add_log(ln)
-            if res.ok:
-                ui.send_iface = name
-    elif r == 4:                                 # delete
-        if ui.send_iface:
-            res = net.delete_interface(ui.send_iface)
-            for ln in res.log:
-                ui.add_log(ln)
+def _best_match(items: list, query: str) -> int:
+    """Index (among the filtered items) of the best hit for ``query``: a label
+    starting with it, then a label containing it, then only the description.
+    Display order stays grouped; this only decides where the cursor lands."""
+    q = query.lower()
+    shown = [it for it in items if q in f"{it[0]} {it[2]} {it[3]}".lower()]
+    if not q or not shown:
+        return 0
+
+    def rank(it):
+        label = it[2].lower().strip()
+        return 0 if label.startswith(q) else 1 if q in label else 2
+    return min(range(len(shown)), key=lambda i: (rank(shown[i]), i))
 
 
-def _act_settings(stdscr, ui: UI):
-    r = ui.row
-    if r == 0:                        # preset: custom → scenarios → envs → incidents
-        scen = [("s", s.key) for s in scenarios.all_scenarios()]
-        envs = [("e", e.key) for e in enterprise.all_environments()]
-        incs = [("i", x.key) for x in incidents.all_incidents()]
-        opts = [("", None)] + scen + envs + incs
-        cur = (("i", ui.incident) if ui.incident else ("e", ui.env) if ui.env
-               else ("s", ui.scenario) if ui.scenario else ("", None))
-        try:
-            i = opts.index(cur)
-        except ValueError:
-            i = 0
-        kind, key = opts[(i + 1) % len(opts)]
-        {"i": ui.set_incident, "e": ui.set_env}.get(kind, ui.set_scenario)(key)
-    elif r == 1:                                  # SPAN view (env only)
-        if ui.env:
-            ui.span = "core" if ui.span == "access" else "access"
-            ui.add_log(f"SPAN view: {ui.span}")
+def _pick(stdscr, title: str, items: list, current=None):
+    """Modal list: items are (group, value, label, description). Type to
+    filter, ↑↓ to move, Enter to choose, Esc to cancel. Returns the value, or
+    None on cancel."""
+    H, W = stdscr.getmaxyx()
+    width = min(W - 4, 96)
+    height = min(H - 2, 30)
+    win = curses.newwin(height, width, (H - height) // 2, (W - width) // 2)
+    win.keypad(True)
+    query = ""
+    sel = next((i for i, it in enumerate(items) if it[1] == current), 0)
+    while True:
+        shown = [it for it in items if query.lower() in
+                 f"{it[0]} {it[2]} {it[3]}".lower()]
+        sel = max(0, min(sel, len(shown) - 1))
+        # display lines: group headers + items
+        disp: List[Tuple[Optional[int], str]] = []
+        last = None
+        for i, it in enumerate(shown):
+            if it[0] != last:
+                disp.append((None, it[0]))
+                last = it[0]
+            disp.append((i, it[2]))
+        desc_lines = (textwrap.wrap(shown[sel][3], width - 4)[:3]
+                      if shown else ["no match"])
+        list_h = height - 5 - len(desc_lines)
+        cur_line = next((j for j, (i, _) in enumerate(disp) if i == sel), 0)
+        first = max(0, min(cur_line - list_h // 2, len(disp) - list_h))
+        win.erase()
+        win.attron(_cattr(C_CYAN))
+        win.box()
+        win.attroff(_cattr(C_CYAN))
+        _put(win, 0, 2, f" {title} ", _cattr(C_CYAN, curses.A_BOLD))
+        _put(win, 1, 2, f"filter: {query}▏", _cattr(C_YELLOW))
+        for j, (i, text) in enumerate(disp[first:first + list_h]):
+            y = 2 + j
+            if i is None:
+                _put(win, y, 2, text.upper(), _cattr(C_DIM, curses.A_BOLD))
+            elif i == sel:
+                _put(win, y, 3, _fit(f"▸ {text}", width - 6).ljust(width - 6),
+                     _cattr(C_CYAN, curses.A_REVERSE))
+            else:
+                _put(win, y, 3, _fit(f"  {text}", width - 6))
+        _put(win, height - 2 - len(desc_lines), 2, "─" * (width - 4),
+             _cattr(C_DIM))
+        for j, ln in enumerate(desc_lines):
+            _put(win, height - 1 - len(desc_lines) + j, 2, ln, _cattr(C_DIM))
+        _put(win, height - 1, 2, " type to filter · ↑↓ move · Enter choose · "
+             "Esc cancel ", _cattr(C_CYAN))
+        win.refresh()
+        c = win.getch()
+        if c in (27,):
+            return None
+        if c in (curses.KEY_ENTER, 10, 13):
+            return shown[sel][1] if shown else None
+        if c in (curses.KEY_UP,):
+            sel = (sel - 1) % max(1, len(shown))
+        elif c in (curses.KEY_DOWN, 9):
+            sel = (sel + 1) % max(1, len(shown))
+        elif c in (curses.KEY_BACKSPACE, 127, 8):
+            query = query[:-1]
+            sel = _best_match(items, query)
+        elif 32 <= c < 127:
+            query += chr(c)
+            sel = _best_match(items, query)
+
+
+def _draw_help(stdscr):
+    H, W = stdscr.getmaxyx()
+    lines = [
+        ("Keys", None),
+        ("Tab / Shift-Tab", "next / previous panel"),
+        ("↑ ↓  (j k)", "move between rows"),
+        ("← →", "change the value (cycle, step, switch)"),
+        ("Enter", "pick from a list, type a value, or run the action"),
+        ("Space", "toggle on/off rows and protocols"),
+        ("s", "start / stop generating"),
+        ("c", "clear the log"),
+        ("?", "this help"),
+        ("q", "quit (stops the engine)"),
+        ("", ""),
+        ("Panels", None),
+        ("Run", "preset, SPAN view, malware sprinkle, rate, pcap output"),
+        ("Traffic", "the protocol mix for a custom preset"),
+        ("Interfaces", "send interface, its -mon peer, the sensor"),
+        ("Service", "save the selection and run it in the background"),
+        ("", ""),
+        ("Tip", "send on <name>, point the sensor at <name>-mon"),
+    ]
+    width = min(W - 4, 84)
+    height = min(H - 2, len(lines) + 4)
+    win = curses.newwin(height, width, (H - height) // 2, (W - width) // 2)
+    win.attron(_cattr(C_CYAN))
+    win.box()
+    win.attroff(_cattr(C_CYAN))
+    _put(win, 0, 2, " TGT help ", _cattr(C_CYAN, curses.A_BOLD))
+    for j, (k, v) in enumerate(lines[:height - 3]):
+        if v is None:
+            _put(win, 1 + j, 2, k.upper(), _cattr(C_YELLOW, curses.A_BOLD))
         else:
-            ui.add_log("SPAN view applies to an --env preset")
-    elif r == 2:                                  # replay pcap
-        v = _prompt(stdscr, "Replay pcap path (blank = off)", ui.replay or "")
-        if v:
-            ui._clear_modes()
-            ui.replay = v
-            ui.add_log(f"replay set: {v}")
-        else:
-            ui.replay = None
-    elif r == 3:                                  # sprinkle malware toggle
-        ui.sprinkle_on = not ui.sprinkle_on
-        ui.add_log(f"malware sprinkle {'ON: ' + ui.sprinkle_variant if ui.sprinkle_on else 'off'}")
-    elif r == 4:                                  # malware variant cycle
-        keys = [x.key for x in incidents.all_incidents()]
-        try:
-            i = keys.index(ui.sprinkle_variant)
-        except ValueError:
-            i = 0
-        ui.sprinkle_variant = keys[(i + 1) % len(keys)]
-        ui.sprinkle_on = True
-        ui.sprinkle_random = False
-    elif r == 5:                                  # random pick toggle
-        ui.sprinkle_random = not ui.sprinkle_random
-        if ui.sprinkle_random:
-            ui.sprinkle_on = True
-    elif r == 6:                                  # ratio
-        v = _prompt(stdscr, "Malware ratio 0-0.9 (0 = auto)",
-                    f"{ui.sprinkle_ratio:g}")
-        try:
-            ui.sprinkle_ratio = min(0.9, max(0.0, float(v)))
-            if ui.sprinkle_ratio > 0:
-                ui.sprinkle_on = True
-        except (TypeError, ValueError):
-            pass
-    elif r == 7:
-        v = _prompt(stdscr, "Rate pps (0 = max)", f"{ui.rate:g}")
-        try:
-            ui.rate = max(0.0, float(v))
-        except (TypeError, ValueError):
-            pass
-    elif r == 8:
-        v = _prompt(stdscr, "Messages per cycle", str(ui.messages))
-        try:
-            ui.messages = max(1, int(v))
-        except (TypeError, ValueError):
-            pass
-    elif r == 9:
-        ui.loop = not ui.loop
-    elif r == 10:
-        v = _prompt(stdscr, "PCAP path (blank = off)", ui.pcap or "tgt-out.pcap")
-        ui.pcap = v if v and v != "(off)" else None
-    elif r == 11:
-        ui.ep.client_ip = _prompt(stdscr, "Client IP", ui.ep.client_ip) or ui.ep.client_ip
-    elif r == 12:
-        ui.ep.server_ip = _prompt(stdscr, "Server IP", ui.ep.server_ip) or ui.ep.server_ip
+            _put(win, 1 + j, 3, f"{k:<16}", curses.A_BOLD)
+            _put(win, 1 + j, 20, _fit(v, width - 23))
+    _put(win, height - 1, 2, " any key closes ", _cattr(C_CYAN))
+    win.refresh()
 
 
-def _act_service(stdscr, ui: UI):
-    r = ui.row
-    if r == 3:                                   # save config
-        args = service.build_run_args(ui.scenario, ui.selected, ui.rate,
-                                      ui.messages, env=ui.env,
-                                      incident=ui.incident, replay=ui.replay,
-                                      sprinkle=[ui.sprinkle_variant] if (ui.sprinkle_on and not ui.sprinkle_random) else None,
-                                      sprinkle_random=ui.sprinkle_on and ui.sprinkle_random,
-                                      sprinkle_ratio=ui.sprinkle_ratio if ui.sprinkle_on else 0.0,
-                                      span=ui.span)
-        ok, msg = service.write_config(ui.send_iface or "tgt0", args)
-        ui.add_log(("saved: " if ok else "error: ") + msg)
-    elif r in (4, 5, 6):
-        action = {4: "start", 5: "stop", 6: "restart"}[r]
-        ui.add_log(f"service {action} …")
-        ok, msg = service.service_action(action)
-        ui.add_log(("service " if ok else "service FAILED: ") + msg)
-        ui.svc = service.service_state()
-
-
-def _activate(stdscr, ui: UI):
-    p = PANELS[ui.focus]
-    if p == "Map":
-        _act_map(stdscr, ui)
-    elif p == "Protocols":
-        prof = protocols.all_profiles()[ui.row]
-        ui.toggle_proto(prof.key)
-    elif p == "Settings":
-        _act_settings(stdscr, ui)
-    elif p == "Service":
-        _act_service(stdscr, ui)
+# ── actions ─────────────────────────────────────────────────────────────────
+def _activate(stdscr, ui: UI, step: int):
+    fields = _fields(ui)
+    if not fields:
+        return
+    f = fields[ui.row]
+    if f.act is None:
+        return
+    f.act(stdscr, ui, step)
+    if PANELS[ui.focus] in ("Run", "Traffic"):
+        ui.changed()
+    # keep the cursor on the same field if rows appeared/disappeared
+    after = _fields(ui)
+    labels = [g.label for g in after]
+    key = f.label if PANELS[ui.focus] != "Traffic" else f.label[2:]
+    for i, lab in enumerate(labels):
+        if (lab if PANELS[ui.focus] != "Traffic" else lab[2:]) == key:
+            ui.row = i
+            break
 
 
 # ── main render + loop ───────────────────────────────────────────────────────
-def _status_word(ui: UI):
-    if ui.running():
-        return "● GENERATING", C_GREEN
-    return "○ idle", C_DIM
-
-
 def _draw(stdscr, ui: UI):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
-    if w < 62 or h < 20:
-        _put(stdscr, 0, 0, "Terminal too small — need at least 62x20.")
+    if w < 60 or h < 20:
+        _put(stdscr, 0, 0, "Terminal too small — need at least 60x20.")
         stdscr.refresh()
         return
 
-    env = net.detect_env()
-    title = " TGT · Traffic Generation Toolkit "
-    _put(stdscr, 0, 0, title.ljust(w), _cattr(C_CYAN, curses.A_REVERSE))
-    word, wcolor = _status_word(ui)
-    _put(stdscr, 0, w - len(word) - 2, word, _cattr(wcolor, curses.A_BOLD | curses.A_REVERSE))
+    # title bar: name · state · elapsed
+    _put(stdscr, 0, 0, " TGT · Traffic Generation Toolkit".ljust(w),
+         _cattr(C_CYAN, curses.A_REVERSE))
+    s = ui.stats()
+    if ui.running():
+        word, col = f"● GENERATING {_clock(s.elapsed)}", C_GREEN
+    elif s and s.packets:
+        word, col = f"■ stopped · {s.packets:,} sent", C_YELLOW
+    else:
+        word, col = "○ idle", C_DIM
+    _put(stdscr, 0, w - len(word) - 2, word,
+         _cattr(col, curses.A_BOLD | curses.A_REVERSE))
 
-    priv = "root" if env.is_root else "no-root"
-    envline = f"env: {env.kind} · {priv} · ip:{'yes' if env.has_ip else 'no'} · service:{ui.svc.status}"
-    _put(stdscr, 1, 2, envline, _cattr(C_DIM))
-    if ui.sprinkle_on:
+    # system line + malware badge
+    e = ui.sys
+    sysline = (f"{e.kind} · {'root' if e.is_root else 'no root (live send needs sudo)'}"
+               f" · iproute2 {'✓' if e.has_ip else '✗'} · service {ui.svc.status}")
+    _put(stdscr, 1, 2, sysline, _cattr(C_DIM))
+    if ui.sprinkle_on and ui.mode() != "replay":
         variant = "random" if ui.sprinkle_random else ui.sprinkle_variant
         pct = f" @{ui.sprinkle_ratio:.0%}" if ui.sprinkle_ratio > 0 else ""
-        mal = f"⚠ malware: {variant}{pct} "
+        mal = f" ☣ malware: {variant}{pct} "
         _put(stdscr, 1, w - len(mal) - 2, mal,
              _cattr(C_RED, curses.A_BOLD | curses.A_REVERSE))
 
-    # diagram
     panel_top = _draw_diagram(stdscr, ui, 2, w)
 
-    # split lower area: panel (left) + log (right)
     lower_h = h - panel_top - 1
-    if lower_h < 4:
-        stdscr.refresh()
-        return
-    split = max(34, w * 45 // 100)
-    _draw_panel(stdscr, ui, panel_top, 2, lower_h, split - 3)
-    # vertical divider
-    for yy in range(panel_top, h - 1):
-        _put(stdscr, yy, split - 1, BOX["v"], _cattr(C_DIM))
-    _draw_log(stdscr, ui, panel_top, split + 1, lower_h, w - split - 2)
+    if lower_h >= 4:
+        split = max(40, w * 52 // 100)
+        _draw_panel(stdscr, ui, panel_top, 2, lower_h, split - 4)
+        for yy in range(panel_top, h - 1):
+            _put(stdscr, yy, split - 1, BOX["v"], _cattr(C_DIM))
+        _draw_log(stdscr, ui, panel_top, split + 1, lower_h, w - split - 2)
 
-    # key bar
-    keys = ("Tab panel · ↑↓ move · ←→/Enter change · Space toggle · "
-            "s start/stop · c clear · q quit")
-    _put(stdscr, h - 1, 0, keys.ljust(w)[:w - 1], _cattr(C_CYAN, curses.A_REVERSE))
+    # key bar: what the keys do on this row
+    fields = _fields(ui)
+    hint = fields[ui.row].keys if fields and ui.row < len(fields) else ""
+    keys = " · ".join(x for x in (
+        "Tab panel", "↑↓ move", hint,
+        f"s {'stop' if ui.running() else 'start'}", "? help", "q quit") if x)
+    _put(stdscr, h - 1, 0, (" " + keys).ljust(w)[:w - 1],
+         _cattr(C_CYAN, curses.A_REVERSE))
     stdscr.refresh()
+    if ui.help_open:
+        _draw_help(stdscr)
 
 
 def _init_colors():
@@ -665,17 +1249,59 @@ def _init_colors():
     curses.init_pair(C_DIM, curses.COLOR_WHITE, bg)
 
 
+def _handle_key(stdscr, ui: UI, c: int) -> bool:
+    """Apply one keypress. Returns False when the UI should exit."""
+    if ui.help_open:
+        ui.help_open = False
+        return True
+    fields = _fields(ui)
+    if c == 9:                                         # Tab
+        ui.focus = (ui.focus + 1) % len(PANELS)
+        ui.row = 0
+    elif c == curses.KEY_BTAB:                         # Shift-Tab
+        ui.focus = (ui.focus - 1) % len(PANELS)
+        ui.row = 0
+    elif c in (curses.KEY_UP, ord('k')):
+        ui.row = (ui.row - 1) % max(1, len(fields))
+    elif c in (curses.KEY_DOWN, ord('j')):
+        ui.row = (ui.row + 1) % max(1, len(fields))
+    elif c == curses.KEY_LEFT:
+        _activate(stdscr, ui, -1)
+    elif c == curses.KEY_RIGHT:
+        _activate(stdscr, ui, +1)
+    elif c in (curses.KEY_ENTER, 10, 13):
+        _activate(stdscr, ui, 0)
+    elif c == ord(' ') and fields:
+        f = fields[ui.row]
+        if f.space:
+            f.space(stdscr, ui, 0)
+            if PANELS[ui.focus] in ("Run", "Traffic"):
+                ui.changed()
+        elif f.toggle:
+            _activate(stdscr, ui, 0)
+    elif c == ord('?'):
+        ui.help_open = True
+    elif c == ord('s'):
+        ui.start_stop()
+    elif c == ord('c'):
+        ui.log.clear()
+    elif c == ord('q'):
+        return False
+    return True
+
+
 def _loop(stdscr):
     curses.curs_set(0)
     _init_colors()
     stdscr.nodelay(True)
     stdscr.timeout(90)                 # ~11 fps animation
     ui = UI()
-    ui.add_log("welcome — map an interface, pick protocols, press s to generate")
+    ui.add_log("welcome — pick a preset on Run, set an interface or pcap, "
+               "press s (? for help)")
 
     while True:
         ui.frame += 1
-        ui.refresh_service()
+        ui.refresh()
         try:
             _draw(stdscr, ui)
         except curses.error:
@@ -683,35 +1309,13 @@ def _loop(stdscr):
         c = stdscr.getch()
         if c == -1:
             continue
-        rows = _panel_rows(ui)
-        if c in (9,):                                  # Tab
-            ui.focus = (ui.focus + 1) % len(PANELS)
-            ui.row = 0
-        elif c in (curses.KEY_BTAB,):                  # Shift-Tab
-            ui.focus = (ui.focus - 1) % len(PANELS)
-            ui.row = 0
-        elif c in (curses.KEY_UP, ord('k')):
-            ui.row = (ui.row - 1) % max(1, len(rows))
-        elif c in (curses.KEY_DOWN, ord('j')):
-            ui.row = (ui.row + 1) % max(1, len(rows))
-        elif c in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_ENTER, 10, 13):
-            _activate(stdscr, ui)
-            stdscr.nodelay(True)
-            stdscr.timeout(90)
-        elif c == ord(' '):
-            if PANELS[ui.focus] == "Protocols":
-                _activate(stdscr, ui)
-            elif PANELS[ui.focus] == "Settings" and ui.row in (1, 3, 4, 5, 9):
-                _act_settings(stdscr, ui)
-        elif c == ord('s'):
-            ui.start_stop()
-        elif c == ord('c'):
-            ui.log.clear()
-        elif c in (ord('q'), 27):
+        if not _handle_key(stdscr, ui, c):
             if ui.running():
                 ui.engine.stop()
                 ui.engine.join(timeout=2)
             break
+        stdscr.nodelay(True)
+        stdscr.timeout(90)
 
 
 def run() -> int:

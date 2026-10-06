@@ -27,6 +27,7 @@ class Stats:
     last_error: str = ""
     running: bool = False
     finished: bool = False
+    cycle_frames: int = 0          # frames in one built (or replayed) cycle
     per_profile: dict = field(default_factory=dict)
 
     @property
@@ -220,6 +221,7 @@ class Engine:
                 elif cfg.sprinkle:
                     what += f" + malware:{','.join(cfg.sprinkle)}"
                 self.log(f"built {len(batch)} frames/cycle for [{what}]")
+            self.stats.cycle_frames = len(batch)
 
             while not self._stop.is_set():
                 for idx, (key, frame) in enumerate(batch):
