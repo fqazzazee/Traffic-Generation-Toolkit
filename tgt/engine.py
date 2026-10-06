@@ -63,8 +63,16 @@ def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
         if not pool:
             return base
 
+        env = None
+        if cfg.env:
+            from . import enterprise
+            env = enterprise.get(cfg.env)
+
         def cycle(i):
-            return incidents.get(pool[i % len(pool)]).build(cfg.sprinkle_messages)
+            inc = incidents.get(pool[i % len(pool)])
+            if env is not None:     # ride on the environment's real inventory
+                return inc.build_on(cfg.sprinkle_messages, env, span=cfg.span)
+            return inc.build(cfg.sprinkle_messages)
 
         r = min(max(cfg.sprinkle_ratio, 0.0), 0.9)
         if r > 0 and base:

@@ -13,6 +13,7 @@ Bring your own real capture instead? Use ``tgt run --replay file.pcap``.
 """
 from __future__ import annotations
 
+import ipaddress
 import struct
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
@@ -242,8 +243,81 @@ class Incident:
             i += 1
         return out
 
+    def map_onto(self, env) -> Dict[str, Host]:
+        """Map each internal incident host to an environment host of the same
+        role (same OS preferred, then any unused, then shared), so sprinkled
+        malware rides on real inventory assets. External adversary
+        infrastructure — a public IP or a name containing ``C2`` — is left out
+        and keeps its own identity."""
+        by_role: Dict[str, List[Host]] = {}
+        for h in env.hosts:
+            by_role.setdefault(h.role, []).append(h)
+        for pool in by_role.values():
+            pool.sort(key=lambda h: h.name)
+        used: set = set()
+        mapping: Dict[str, Host] = {}
+        for ih in self.hosts:
+            if _is_external(ih):
+                continue
+            cands = by_role.get(ih.role, [])
+            pick = (next((h for h in cands
+                          if h.os == ih.os and h.name not in used), None)
+                    or next((h for h in cands if h.name not in used), None)
+                    or (cands[0] if cands else None))
+            if pick is not None:
+                used.add(pick.name)
+                mapping[ih.name] = pick
+        return mapping
+
+    def build_on(self, messages: int, env,
+                 span: str = "access") -> List[Tuple[str, bytes]]:
+        """Build this incident re-addressed onto ``env``'s real hosts and placed
+        on the same VLANs/trunk as the environment's own traffic (see
+        :meth:`map_onto`). Flows whose hosts stay external keep their
+        addressing and ride through the internal peer's gateway."""
+        mapping = self.map_onto(env)
+
+        def resolve(name: str) -> Host:
+            return mapping.get(name) or self.host(name)
+
+        streams: List[List[Tuple[str, bytes]]] = []
+        for aname, vname, atk, meta in self.flows:
+            a, v = resolve(aname), resolve(vname)
+            ep = self._endpoints(a, v, meta)
+            frames = ATTACKS[atk][0](ep, max(1, messages))
+            placed: List[Tuple[str, bytes]] = []
+            for f in frames:
+                for g in env.place(f, a, v, span, env.segment_or_none):
+                    placed.append((atk, g))
+            streams.append(placed)
+        out: List[Tuple[str, bytes]] = []
+        i = 0
+        while any(i < len(s) for s in streams):
+            for s in streams:
+                if i < len(s):
+                    out.append(s[i])
+            i += 1
+        return out
+
     def indicators(self) -> List[str]:
         return sorted({ATTACKS[f[2]][1] for f in self.flows})
+
+
+_RFC1918 = [ipaddress.ip_network(n) for n in
+            ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+
+
+def _is_external(host: Host) -> bool:
+    """An adversary host outside the modeled inventory: a non-RFC1918 address
+    (the incidents use TEST-NET ranges as public-IP stand-ins), or a C2 node by
+    name. Such hosts are never remapped onto an environment asset."""
+    if "C2" in host.name:
+        return True
+    try:
+        ip = ipaddress.ip_address(host.ip)
+    except ValueError:
+        return False
+    return not any(ip in net for net in _RFC1918)
 
 
 def _h(name, ip, role, os_, oui=OUI_WIN, product=""):

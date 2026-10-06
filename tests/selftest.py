@@ -325,6 +325,52 @@ def test_tshark_dissects_every_builder() -> None:
         _failures.append("tshark expert warnings: " + "; ".join(detail[:5]))
 
 
+def test_sprinkle_maps_incident_hosts_onto_env_by_role() -> None:
+    from tgt import enterprise, incidents
+
+    env = enterprise.get("it-org")
+    env_ips = {h.ip for h in env.hosts}
+
+    inc = incidents.get("wannacry")
+    mapping = inc.map_onto(env)
+    # patient zero (Win7 ws) must land on a real legacy Win7 workstation
+    p0 = mapping["WANNACRY-PATIENT0"]
+    check(p0 in env.hosts and p0.os == "win7" and p0.role == "ws",
+          f"wannacry patient-zero not mapped to a Win7 workstation: {p0.name}")
+    check(len({h.name for h in mapping.values()}) == len(mapping),
+          "wannacry mapping reused one env host for several incident hosts")
+
+    # every sprinkled frame's IPs are real inventory hosts or kept-external ones
+    ext_ips = {h.ip for h in inc.hosts if incidents._is_external(h)}
+    for _, f in inc.build_on(2, env):
+        ips = P.frame_ips(f)
+        if ips:
+            for ip in ips:
+                check(ip in env_ips or ip in ext_ips,
+                      f"wannacry sprinkle has phantom host {ip}")
+        check(_vlan(f) in {s.vlan for s in env.segments},
+              "wannacry sprinkle frame not tagged on an env VLAN")
+
+    # external C2 / public attackers are never remapped
+    for key in ("sunburst", "log4shell", "mirai"):
+        ic = incidents.get(key)
+        m = ic.map_onto(env if key != "mirai"
+                        else enterprise.get("enterprise-mixed"))
+        for h in ic.hosts:
+            if incidents._is_external(h):
+                check(h.name not in m, f"{key}: external {h.name} was remapped")
+
+    # whole sprinkle path still hits its target ratio with the env base
+    cfg = RunConfig(env="it-org", sprinkle=["wannacry"], messages=2,
+                    sprinkle_ratio=0.2)
+    batch = build_batch(cfg)
+    atk = {"eternalblue", "port-scan", "dga-dns"}
+    got = sum(1 for k, _ in batch if k in atk) / len(batch)
+    check(abs(got - 0.2) < 0.08, f"env sprinkle ratio off: {got:.2f}")
+    for _, f in batch:
+        verify_ip_l4(f, "env-sprinkle")
+
+
 def test_it_org_has_servers_and_users() -> None:
     from tgt import enterprise
     it = enterprise.get("it-org")

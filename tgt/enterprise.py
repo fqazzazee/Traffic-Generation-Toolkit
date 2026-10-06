@@ -331,23 +331,46 @@ class Environment:
 
     def _place(self, frame: bytes, client: Host, server: Host,
                span: str) -> List[bytes]:
+        return self.place(frame, client, server, span, self.segment_of)
+
+    def place(self, frame: bytes, client: Host, server: Host, span: str,
+              seg_of) -> List[bytes]:
         """A host-built frame as it appears on the trunk (one or two copies).
 
-        Same segment: switched, tagged with the segment VLAN. Cross segment:
-        the sender addresses its gateway on its own VLAN; in the ``core`` view
-        the router's egress copy follows on the receiver's VLAN with TTL-1.
+        ``seg_of(host)`` gives the host's :class:`Segment`, or ``None`` when the
+        host is foreign to this environment (e.g. an external C2/attacker a
+        sprinkle injected). Same internal segment: switched, tagged with the
+        segment VLAN. Cross internal segments: the sender addresses its gateway
+        on its own VLAN and, in the ``core`` view, the router's egress copy
+        follows on the receiver's VLAN with TTL-1. When exactly one side is
+        foreign the frame is tagged with the internal host's VLAN and reaches
+        it via that segment's gateway MAC; when both are foreign it is left
+        untouched.
         """
         from_client = frame[6:12] == mac_to_bytes(client.mac)
         src, dst = (client, server) if from_client else (server, client)
-        sseg, dseg = self.segment_of(src), self.segment_of(dst)
+        sseg, dseg = seg_of(src), seg_of(dst)
+        if sseg is None and dseg is None:
+            return [frame]
         if sseg is dseg:
             return [rewrite_l2(frame, bytes_to_mac(frame[6:12]),
                                bytes_to_mac(frame[0:6]), sseg.vlan)]
+        if sseg is None or dseg is None:            # one side foreign
+            iseg = sseg or dseg
+            if sseg is None:                        # foreign -> internal dst
+                return [rewrite_l2(frame, iseg.gateway_mac,
+                                   bytes_to_mac(frame[0:6]), iseg.vlan)]
+            return [rewrite_l2(frame, bytes_to_mac(frame[6:12]),
+                               iseg.gateway_mac, iseg.vlan)]
         out = [rewrite_l2(frame, src.mac, sseg.gateway_mac, sseg.vlan)]
         if span == "core":
             out.append(rewrite_l2(frame, dseg.gateway_mac, dst.mac, dseg.vlan,
                                   ttl=frame[14 + 8] - 1))
         return out
+
+    def segment_or_none(self, host: Host):
+        """Like :meth:`segment_of`, but ``None`` for a host not in this env."""
+        return self._seg.get(host.name)
 
     def build(self, messages: int,
               span: str = "access") -> List[Tuple[str, bytes]]:
