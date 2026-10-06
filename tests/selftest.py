@@ -243,6 +243,41 @@ def test_l2_protocols_cannot_cross_segments() -> None:
     _failures.append("ARP between segments was accepted")
 
 
+def test_inventory_export() -> None:
+    import contextlib
+    import csv
+    import io
+    import json
+    import os
+    from tgt import cli, enterprise, inventory
+    for env in enterprise.all_environments():
+        buf = io.StringIO()
+        inventory.write_csv(env, buf)
+        rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
+        check(len(rows) == len(env.hosts), f"inventory {env.key}: row count")
+        check(all(r["segment"] and r["vlan"] and r["zone"] for r in rows),
+              f"inventory {env.key}: host without segment/VLAN/zone")
+        doc = json.loads(json.dumps(inventory.to_json(env)))
+        check(len(doc["flows"]) == len(env.conversations),
+              f"inventory {env.key}: flow count")
+        check(not any(s.startswith("arp") for h in doc["hosts"]
+                      for s in h["serves"]), f"inventory {env.key}: ARP as service")
+    site = {h["name"]: h for h in inventory.hosts(enterprise.get("industrial-site"))}
+    check("enip 44818/tcp" in site["PLC-PK1"]["serves"], "PLC-PK1 not serving ENIP")
+    check(site["PLC-PK1"]["mac_vendor"] == "Rockwell Automation",
+          "PLC-PK1 MAC vendor wrong")
+    check("modbus" in site["WS-CONTRACTOR"]["uses"],
+          "contractor laptop's Modbus use missing")
+    check(site["OT-DC01"]["legacy"], "Server 2012 R2 DC not flagged legacy")
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "inv.json")
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = cli.main(["inventory", "-e", "ot-plant", "-f", "json",
+                           "-o", out])
+        check(rc == 0 and json.load(open(out))["env"] == "ot-plant",
+              "tgt inventory CLI did not write JSON")
+
+
 def test_it_org_has_servers_and_users() -> None:
     from tgt import enterprise
     it = enterprise.get("it-org")

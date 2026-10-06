@@ -5,6 +5,7 @@
     tgt env                  show detected environment (WSL/Podman/native)
     tgt iface ...            create / delete / list virtual interfaces
     tgt run ...              generate traffic (send and/or write pcap)
+    tgt inventory -e ENV     export an environment's ground-truth asset list
 """
 from __future__ import annotations
 
@@ -203,6 +204,24 @@ def cmd_run(args) -> int:
     return 0 if s.errors == 0 else 1
 
 
+def cmd_inventory(args) -> int:
+    from . import inventory
+    if args.env not in enterprise.ENVIRONMENTS:
+        print(f"unknown environment: {args.env}. Try 'tgt list'.",
+              file=sys.stderr)
+        return 2
+    env = enterprise.get(args.env)
+    write = inventory.write_json if args.format == "json" else inventory.write_csv
+    if args.output:
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            write(env, f)
+        print(f"wrote {len(env.hosts)} hosts ({args.format}) to {args.output}",
+              file=sys.stderr)
+    else:
+        write(env, sys.stdout)
+    return 0
+
+
 def cmd_tui(args) -> int:
     from . import tui
     return tui.run()
@@ -222,6 +241,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("list", help="list protocols and scenarios")
     sub.add_parser("env", help="show detected environment and interfaces")
     sub.add_parser("tui", help="launch the text UI (default)")
+
+    pv = sub.add_parser("inventory",
+                        help="export an environment's ground-truth assets")
+    pv.add_argument("--env", "-e", required=True,
+                    help="environment to export (see 'tgt list')")
+    pv.add_argument("--format", "-f", choices=["csv", "json"], default="csv",
+                    help="csv = one row per host; json adds segments + flows")
+    pv.add_argument("--output", "-o", metavar="FILE",
+                    help="write here instead of stdout")
 
     pi = sub.add_parser("iface", help="manage virtual interfaces")
     isub = pi.add_subparsers(dest="iface_cmd", required=True)
@@ -291,6 +319,7 @@ def main(argv=None) -> int:
         return cmd_tui(args)
     return {
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,
+        "inventory": cmd_inventory,
     }[args.command](args)
 
 

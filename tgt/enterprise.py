@@ -36,6 +36,13 @@ OUI_JCI = "00:10:8d"        # Johnson Controls (Metasys BMS)
 OUI_TRIDIUM = "00:01:f0"    # Tridium (Niagara JACE)
 OUI_SEL = "00:30:a7"        # Schweitzer Engineering Laboratories
 
+OUI_VENDORS: Dict[str, str] = {
+    OUI_WIN: "VMware", OUI_ROCKWELL: "Rockwell Automation",
+    OUI_SIEMENS: "Siemens", OUI_DELL: "Dell", OUI_SCHNEIDER: "Schneider Electric",
+    OUI_JCI: "Johnson Controls", OUI_TRIDIUM: "Tridium",
+    OUI_SEL: "Schweitzer Engineering Laboratories",
+}
+
 
 @dataclass
 class OSFingerprint:
@@ -69,19 +76,19 @@ FINGERPRINTS: Dict[str, OSFingerprint] = {
     "win2012": OSFingerprint("win2012", "Windows Server 2012 R2", 128,
         "Mozilla/5.0 (Windows NT 6.3; Win64; x64) Trident/7.0", "smb2",
         legacy=True, risk="EOL Oct 2023; no security updates"),
-    "rockwell": OSFingerprint("rockwell", "Rockwell PLC (ControlLogix)", 64,
+    "rockwell": OSFingerprint("rockwell", "Rockwell Automation firmware", 64,
         smb="none", dhcp_vendor="", legacy=False,
         risk="OT asset — patch cadence slow; expose CIP/ENIP"),
-    "siemens": OSFingerprint("siemens", "Siemens S7 PLC", 30,
+    "siemens": OSFingerprint("siemens", "Siemens SIMATIC firmware", 30,
         smb="none", dhcp_vendor="", legacy=False,
-        risk="OT asset — S7comm unauthenticated on legacy families"),
-    "schneider": OSFingerprint("schneider", "Schneider Modicon PLC", 64,
+        risk="OT asset — S7comm (legacy families) / IEC-104 unauthenticated"),
+    "schneider": OSFingerprint("schneider", "Schneider Electric firmware", 64,
         smb="none", dhcp_vendor="",
         risk="OT asset — Modbus/TCP has no authentication"),
-    "bacnet": OSFingerprint("bacnet", "BACnet building controller", 64,
+    "bacnet": OSFingerprint("bacnet", "BACnet controller firmware", 64,
         smb="none", dhcp_vendor="",
         risk="BMS asset — BACnet/IP unauthenticated; common pivot into OT"),
-    "sel": OSFingerprint("sel", "SEL protection relay / RTAC", 64,
+    "sel": OSFingerprint("sel", "SEL device firmware", 64,
         smb="none", dhcp_vendor="",
         risk="Electrical asset — DNP3 without Secure Authentication"),
 }

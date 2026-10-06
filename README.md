@@ -181,6 +181,21 @@ tgt run --env it-org --span access -i tgt0   # default: each frame once, on the 
 tgt run --env it-org --span core   -i tgt0   # + routed copy on the receiver's VLAN (gw MAC, TTL-1)
 ```
 
+### Ground-truth inventory
+
+`tgt inventory` exports what a sensor *should* discover from an environment, so you can diff it
+against your analyser's asset list (Claroty CTD, Nozomi, Zeek `known_hosts`, …):
+
+```bash
+tgt inventory -e industrial-site                    > site.csv    # one row per host
+tgt inventory -e industrial-site -f json -o site.json             # + segments and expected flows
+```
+
+Each host row has: name, IP, MAC, MAC vendor, device vendor and product, role, OS/firmware,
+segment, VLAN, subnet, zone, gateway, legacy flag, risk note, services served
+(`modbus 502/tcp`, …) and protocols used. The JSON `flows` list is the expected
+communication baseline, including the planted contractor → meter violation in `industrial-site`.
+
 ---
 
 ## Attack incidents
@@ -264,6 +279,8 @@ tgt run [options]
       --pcap PATH        write frames to a pcap        --rate PPS   (0 = max)
       --count N | --duration SECS | --once        --messages N   (default 5)
       --client-ip/-mac · --server-ip/-mac · --vlan ID
+
+tgt inventory -e ENV     ground-truth asset list    [-f csv|json] [-o FILE]
 ```
 
 ---
@@ -397,7 +414,7 @@ functional exploits — for authorized detection engineering only.
 ## Project layout
 
 ```
-tgt/  packet · protocols · scenarios · enterprise · incidents · pcap · pcapread
+tgt/  packet · protocols · scenarios · enterprise · inventory · incidents · pcap · pcapread
       sender · net · service · engine · config · cli · tui
 scripts/  tgtctl.sh (install + service)   setup-veth.sh
 tests/    selftest.py        Containerfile · docker-entrypoint.sh · Makefile · pyproject.toml
