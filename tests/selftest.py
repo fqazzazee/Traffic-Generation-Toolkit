@@ -391,6 +391,62 @@ def test_sprinkle_maps_incident_hosts_onto_env_by_role() -> None:
         verify_ip_l4(f, "env-sprinkle")
 
 
+def test_preset_protocols_match_generated_traffic() -> None:
+    """Each preset's advertised protocol list is exactly what it generates,
+    and selecting a preset in the TUI puts those protocols on the Traffic
+    tab."""
+    from tgt import enterprise, incidents, tui
+
+    amap = incidents.ATTACK_PROTOCOLS
+    check(set(amap) == set(incidents.ATTACKS),
+          "ATTACK_PROTOCOLS must cover every attack exactly")
+    for atk, proto in amap.items():
+        check(proto is None or proto in protocols.PROFILES,
+              f"attack {atk} maps to unknown protocol {proto}")
+
+    for env in enterprise.all_environments():
+        made = {k for k, _ in env.build(1)}
+        check(set(env.protocols()) == made,
+              f"env {env.key}: protocols() {sorted(env.protocols())} != "
+              f"generated {sorted(made)}")
+    for inc in incidents.all_incidents():
+        made = {k for k, _ in inc.build(1)}
+        check(set(inc.protocols()) == {amap[k] for k in made} - {None},
+              f"incident {inc.key}: protocols() disagree with its traffic")
+        check(set(inc.attack_only()) == {k for k in made if amap[k] is None},
+              f"incident {inc.key}: attack_only() disagrees with its traffic")
+    for sc in scenarios.all_scenarios():
+        made = {k for k, _ in build_batch(RunConfig(profiles=sc.profiles,
+                                                    messages=1))}
+        check(made == set(sc.profiles),
+              f"scenario {sc.key}: generates {sorted(made)}")
+
+    ui = tui.UI()
+    ui.engine = None
+    for _group, choice, _label, _desc in tui._preset_items(ui):
+        kind, key = choice
+        if kind not in ("s", "e", "i"):
+            continue
+        tui._apply_preset(None, ui, choice)
+        want = {"s": lambda k: list(scenarios.get(k).profiles),
+                "e": lambda k: enterprise.get(k).protocols(),
+                "i": lambda k: incidents.get(k).protocols()}[kind](key)
+        check(ui.selected == want == ui.preset_protocols(),
+              f"tui: preset {key} selected {ui.selected}, want {want}")
+    # picking custom after a preset starts from that preset's protocols, and
+    # toggling one on the Traffic tab switches to a custom mix without it
+    tui._apply_preset(None, ui, ("e", "ot-plant"))
+    plant = enterprise.get("ot-plant").protocols()
+    tui._apply_preset(None, ui, ("c", None))
+    check(ui.mode() == "custom" and ui.selected == plant,
+          "tui: custom after env lost the env's protocols")
+    tui._apply_preset(None, ui, ("e", "ot-plant"))
+    ui.toggle_proto("modbus")
+    check(ui.mode() == "custom" and "modbus" not in ui.selected
+          and len(ui.selected) == len(plant) - 1,
+          "tui: toggling a protocol under a preset did not start a custom mix")
+
+
 def test_net_interface_kinds() -> None:
     """veth detection from sysfs: a veth's iflink is its peer's ifindex and
     the peer points back; a VLAN's iflink is its parent, which does not."""
@@ -537,6 +593,17 @@ def test_incident_signatures_present() -> None:
     check(b"jndi:ldap" in blob("log4shell"), "log4shell: no JNDI string")
     check(b"TRISTATION" in blob("triton"), "triton: no TriStation payload")
     check(b"P_PROGRAM" in blob("stuxnet"), "stuxnet: no S7 program download")
+    check(b"NT LM 0.12" in blob("notpetya"), "notpetya: no SMBv1 signature")
+    check(b"mstshash=" in blob("colonial"), "colonial: no RDP mstshash cookie")
+    check(b"cdn.darkside-c2.example" in blob("colonial"),
+          "colonial: no TLS C2 SNI")
+    check(b"emotet-c2" in blob("emotet"),   # DNS labels are length-prefixed
+          "emotet: no DNS-tunnel C2 domain")
+    check(b"\xde\xad" in blob("pipedream"),
+          "pipedream: no Modbus Write Multiple Registers payload")
+    utf16_admin = "ADMIN$".encode("utf-16-le")
+    check(utf16_admin in blob("ekans") or utf16_admin in blob("colonial"),
+          "no SMB admin-share (ADMIN$) lateral-movement signature")
 
 
 def test_sprinkle_mixes_malware_into_base() -> None:

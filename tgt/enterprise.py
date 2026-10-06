@@ -400,6 +400,11 @@ class Environment:
             i += 1
         return out
 
+    def protocols(self) -> List[str]:
+        """Protocols this environment's conversations use, in registry order."""
+        used = {proto for _, _, proto in self.conversations}
+        return [k for k in protocols.PROFILES if k in used]
+
     def legacy_hosts(self) -> List[Host]:
         return [h for h in self.hosts if h.fp.legacy]
 

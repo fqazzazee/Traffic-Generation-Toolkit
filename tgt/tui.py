@@ -141,19 +141,42 @@ class UI:
     def _clear_modes(self):
         self.scenario = self.env = self.incident = self.replay = None
 
+    def preset_protocols(self) -> Optional[List[str]]:
+        """Registry protocols the current preset generates (None for a custom
+        mix or a pcap replay, whose protocols are the selection / the file)."""
+        if self.scenario:
+            return list(scenarios.get(self.scenario).profiles)
+        if self.env:
+            return enterprise.get(self.env).protocols()
+        if self.incident:
+            return incidents.get(self.incident).protocols()
+        return None
+
+    def preset_extras(self) -> List[str]:
+        """Attack-only traffic an incident preset adds (no registry protocol)."""
+        return incidents.get(self.incident).attack_only() if self.incident else []
+
+    def _adopt_preset_protocols(self):
+        """Show the preset's protocols on the Traffic tab — and start a custom
+        mix from them if you toggle one."""
+        protos = self.preset_protocols()
+        if protos is not None:
+            self.selected = protos
+
     def set_scenario(self, key: Optional[str]):
         self._clear_modes()
         self.scenario = key
-        if key:
-            self.selected = list(scenarios.get(key).profiles)
+        self._adopt_preset_protocols()
 
     def set_env(self, key: Optional[str]):
         self._clear_modes()
         self.env = key
+        self._adopt_preset_protocols()
 
     def set_incident(self, key: Optional[str]):
         self._clear_modes()
         self.incident = key
+        self._adopt_preset_protocols()
 
     def set_replay(self, path: str):
         self._clear_modes()
@@ -314,10 +337,11 @@ def _engine_idle_lines(ui: UI) -> List[Tuple[str, int]]:
         e = enterprise.get(ui.env)
         return [(f"{len(e.hosts)} hosts", C_DIM),
                 (f"{len(e.segments)} VLANs", C_DIM),
-                (f"{len(e.conversations)} flows", C_DIM)]
+                (f"{len(e.conversations)} flows", C_DIM),
+                (f"{len(e.protocols())} protocols", C_DIM)]
     if m == "incident":
-        inc = incidents.get(ui.incident)
-        return [(f"{inc.name}", C_DIM), (f"{inc.category} · {inc.year}", C_DIM)]
+        return ([(k, C_DIM) for k in ui.preset_protocols()] +
+                [(f"☣ {a}", C_RED) for a in ui.preset_extras()])
     if m == "replay":
         return [(_fit(os.path.basename(ui.replay), 30), C_DIM)]
     return [(k, C_DIM) for k in ui.selected] or [("no protocols", C_DIM)]
@@ -574,18 +598,31 @@ def _preset_value(ui: UI) -> Value:
     return f"custom mix ({len(ui.selected)} protocols)", 0
 
 
+def _proto_summary(protos: List[str], extras: List[str] = ()) -> str:
+    """'modbus, s7comm + port-scan' — registry protocols, then attack-only."""
+    text = ", ".join(protos)
+    if extras:
+        text += (" + " if text else "") + ", ".join(extras)
+    return text or "none"
+
+
 def _preset_items(ui: UI) -> list:
     items = [("Custom", ("c", None), "custom protocol mix",
               f"Your own selection on the Traffic tab "
               f"({len(ui.selected)} selected).")]
+    # descriptions: a "Protocols:" paragraph first, then the prose
     items += [("Scenarios", ("s", s.key), f"{s.key:16} {s.name}",
-               f"{s.desc}  [{', '.join(s.profiles)}]")
+               f"Protocols: {_proto_summary(s.profiles)}\n{s.desc}")
               for s in scenarios.all_scenarios()]
     items += [("Environments", ("e", e.key), f"{e.key:16} {e.name}",
-               f"{e.desc}  ({e.summary()})")
+               f"Protocols ({len(e.protocols())}): "
+               f"{_proto_summary(e.protocols())}\n{len(e.hosts)} hosts · "
+               f"{len(e.segments)} VLANs · {len(e.conversations)} flows. "
+               f"{e.desc}")
               for e in enterprise.all_environments()]
     items += [("Incidents", ("i", x.key), f"{x.key:16} {x.name} ({x.year})",
-               f"{x.desc}  Signals: {'; '.join(x.indicators())}")
+               f"Protocols: {_proto_summary(x.protocols(), x.attack_only())}"
+               f"\n{x.desc}  Signals: {'; '.join(x.indicators())}")
               for x in incidents.all_incidents()]
     items += [("Replay", ("r", None), "replay a pcap file…",
                "Send the frames of an existing capture instead of "
@@ -637,7 +674,8 @@ def _act_sprinkle(stdscr, ui: UI, step: int):
 
 def _variant_items() -> list:
     return [(x.category, x.key, f"{x.key:14} {x.name} ({x.year})",
-             f"{x.desc}  Signals: {'; '.join(x.indicators())}")
+             f"Protocols: {_proto_summary(x.protocols(), x.attack_only())}"
+             f"\n{x.desc}  Signals: {'; '.join(x.indicators())}")
             for x in incidents.all_incidents()]
 
 
@@ -973,20 +1011,35 @@ def _fields(ui: UI) -> List[Field]:
 def _context(ui: UI) -> Optional[Tuple[str, int]]:
     """One line under the tabs describing what the preset will generate."""
     if PANELS[ui.focus] == "Traffic":
-        return (f"{len(ui.selected)} of {len(protocols.PROFILES)} selected"
-                + ("" if ui.mode() == "custom" else
-                   f" — preset is {ui.mode()}"), C_DIM)
+        m = ui.mode()
+        if m == "custom":
+            return (f"{len(ui.selected)} of {len(protocols.PROFILES)} "
+                    f"selected", C_DIM)
+        if m == "replay":
+            return "replay: protocols come from the pcap", C_YELLOW
+        key = {"env": ui.env, "incident": ui.incident,
+               "scenario": ui.scenario}[m]
+        extras = ui.preset_extras()
+        if not ui.selected:
+            text = (f"{m} {key} uses none of these — only "
+                    f"{', '.join(extras)}" if extras else
+                    f"{m} {key} uses none of these")
+        else:
+            text = f"{m} {key} uses these {len(ui.selected)}" + (
+                " + " + ", ".join(extras) if extras else "")
+        return text, C_RED if m == "incident" else C_GREEN
     if PANELS[ui.focus] != "Run":
         return None
     m = ui.mode()
     if m == "env":
         e = enterprise.get(ui.env)
         return (f"{len(e.hosts)} hosts · {len(e.segments)} VLANs · "
-                f"{len(e.conversations)} flows · {len(e.legacy_hosts())} at-risk",
-                C_GREEN)
+                f"{len(e.conversations)} flows · {len(e.protocols())} protocols"
+                f" · {len(e.legacy_hosts())} at-risk", C_GREEN)
     if m == "incident":
         inc = incidents.get(ui.incident)
-        return f"{inc.name} ({inc.year}) · {len(inc.hosts)} hosts", C_RED
+        return (f"{inc.name} ({inc.year}) · "
+                f"{_proto_summary(inc.protocols(), inc.attack_only())}", C_RED)
     if m == "scenario":
         return ", ".join(scenarios.get(ui.scenario).profiles), C_CYAN
     if m == "replay":
@@ -1140,7 +1193,8 @@ def _pick(stdscr, title: str, items: list, current=None):
                 disp.append((None, it[0]))
                 last = it[0]
             disp.append((i, it[2]))
-        desc_lines = (textwrap.wrap(shown[sel][3], width - 4)[:3]
+        desc_lines = ([ln for para in shown[sel][3].split("\n")
+                       for ln in textwrap.wrap(para, width - 4)][:5]
                       if shown else ["no match"])
         list_h = height - 5 - len(desc_lines)
         cur_line = next((j for j, (i, _) in enumerate(disp) if i == sel), 0)

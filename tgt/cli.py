@@ -37,6 +37,7 @@ def cmd_list(args) -> int:
     for e in enterprise.all_environments():
         print(f"  {e.key:18} {e.name:22} [{e.category}]")
         print(f"    {e.summary()}")
+        print(f"    protocols: {', '.join(e.protocols())}")
         segs = ", ".join(f"{s.name} v{s.vlan} {s.subnet}" for s in e.segments)
         print(f"    segments: {segs}")
         if e.legacy_hosts():
@@ -48,6 +49,8 @@ def cmd_list(args) -> int:
     for inc in incidents.all_incidents():
         print(f"  {inc.key:14} {inc.name:26} [{inc.category} · {inc.year}]")
         print(f"    {inc.desc}")
+        protos, extra = ", ".join(inc.protocols()), ", ".join(inc.attack_only())
+        print(f"    protocols: {protos}{' + ' if protos and extra else ''}{extra}")
         print(f"    signals: {'; '.join(inc.indicators())}")
     return 0
 

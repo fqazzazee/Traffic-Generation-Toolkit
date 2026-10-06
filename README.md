@@ -127,6 +127,10 @@ preset, explains the selected row underneath, and the key bar lists what the key
 | **Interfaces** | pick the send interface and see how it reaches the sensor (veth pair or real interface that needs a SPAN), name the sensor, create/delete a veth pair (delete asks you to type the name and is never offered for a real interface) |
 | **Service** | service status and the exact `tgt run` it would execute; save config + start/stop/restart |
 
+Choosing a preset puts its protocols on the **Traffic** tab (an incident's attack-only
+traffic, such as a port scan, is listed next to them), and toggling one there starts a
+custom mix from them. `tgt list` shows each environment's and incident's protocols too.
+
 Below 80 columns the diagram collapses to a one-line flow strip.
 
 **Keys:** `Tab` panel · `↑/↓` move · `←/→` change · `Enter` pick/edit/run · `Space`
@@ -243,6 +247,22 @@ tgt run --incident industroyer  -i tgt0     # IEC-104 breaker command storm
 | `stuxnet` | 2010 | Siemens S7comm PLC control + SMBv1 spread |
 | `industroyer` | 2016 | IEC 60870-5-104 breaker commands |
 | `triton` | 2017 | TriStation (UDP 1502) to a Triconex SIS |
+| `notpetya` | 2017 | SMBv1 EternalBlue worm + 445 sweep (destructive) |
+| `ryuk` | 2019 | HTTP C2 + 445/3389 scan + SMB lateral movement |
+| `blackenergy` | 2015 | Ukraine-grid HTTP C2 + substation port recon |
+| `emotet` | 2018 | HTTP C2 beacon + DNS tunneling / exfil |
+| `colonial` | 2021 | DarkSide: TLS C2, RDP spray, SMB admin-share lateral |
+| `havex` | 2014 | Dragonfly: HTTP C2 + OPC/ICS control-port scan |
+| `ekans` | 2020 | ICS ransomware: SMB lateral + unauthorized Modbus writes |
+| `pipedream` | 2022 | INCONTROLLER: ICS port scan + Modbus Write-Registers |
+| `vpnfilter` | 2018 | Router botnet: HTTP C2 + Modbus manipulation |
+
+Run `tgt list` for every incident with the exact protocols and signals each emits.
+New attack signatures available to incidents: DNS tunneling, TLS/SNI C2 beaconing,
+RDP (`mstshash`) password spray, SMB admin-share (`ADMIN$`/`IPC$`) lateral movement,
+and unauthorized Modbus Write Multiple Registers — alongside the earlier SMBv1
+EternalBlue, HTTP C2, DGA DNS, Telnet brute, Log4Shell JNDI, S7 control, IEC-104
+commands and TriStation.
 
 > **Detection-test traffic only** — synthetic packets carrying the recognizable
 > *indicators*, **not** working exploits, shellcode, or malware. For authorized
