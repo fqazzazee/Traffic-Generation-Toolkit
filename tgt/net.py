@@ -65,22 +65,49 @@ def detect_env() -> Env:
                is_root=is_root, has_ip=has_ip)
 
 
-def list_interfaces() -> List[dict]:
-    """Enumerate interfaces from /sys/class/net (no external tools needed)."""
-    base = "/sys/class/net"
+def list_interfaces(base: str = "/sys/class/net") -> List[dict]:
+    """Enumerate interfaces from /sys/class/net (no external tools needed).
+
+    Each entry also carries ``kind`` — ``"veth"`` or ``"nic"`` (anything else:
+    physical NIC, VM vNIC, bridge, VLAN, dummy, tun …) — and, for a veth, the
+    ``peer`` name (``None`` when the peer lives in another network namespace).
+    A veth's ``iflink`` is its peer's ``ifindex`` and the peer points back; a
+    VLAN/macvlan also has ``iflink != ifindex`` but its parent does not.
+    """
     out = []
     if not os.path.isdir(base):
         return out
     for name in sorted(os.listdir(base)):
-        info = {"name": name, "mac": "", "state": "", "mtu": ""}
+        info = {"name": name, "mac": "", "state": "", "mtu": "",
+                "ifindex": "", "iflink": "", "devtype": "",
+                "kind": "nic", "peer": None}
         for attr, key in (("address", "mac"), ("operstate", "state"),
-                          ("mtu", "mtu")):
+                          ("mtu", "mtu"), ("ifindex", "ifindex"),
+                          ("iflink", "iflink")):
             try:
                 with open(os.path.join(base, name, attr)) as fh:
                     info[key] = fh.read().strip()
             except OSError:
                 pass
+        try:
+            with open(os.path.join(base, name, "uevent")) as fh:
+                for ln in fh:
+                    if ln.startswith("DEVTYPE="):
+                        info["devtype"] = ln.split("=", 1)[1].strip()
+        except OSError:
+            pass
+        info["virtual"] = not os.path.exists(os.path.join(base, name, "device"))
         out.append(info)
+    by_index = {i["ifindex"]: i for i in out if i["ifindex"]}
+    for i in out:
+        if not i["ifindex"] or not i["iflink"] or i["iflink"] == i["ifindex"]:
+            continue
+        other = by_index.get(i["iflink"])
+        if other is not None:                    # local peer — or a parent
+            if other["iflink"] == i["ifindex"]:
+                i["kind"], i["peer"] = "veth", other["name"]
+        elif i["virtual"] and not i["devtype"]:  # peer in another namespace
+            i["kind"] = "veth"
     return out
 
 

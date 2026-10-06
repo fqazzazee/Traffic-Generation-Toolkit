@@ -21,7 +21,7 @@ Dragos**. Runs on a workstation, in **WSL**, or in a **Podman / Docker** contain
 
 - [What it does](#what-it-does) · [Quick start](#quick-start) · [The TUI](#the-tui)
 - Traffic: [Protocols & scenarios](#protocols--scenarios) · [Modeled orgs](#modeled-organizations) · [Attack incidents](#attack-incidents) · [Replay pcaps](#replay-a-pcap)
-- Running: [CLI](#cli-reference) · [Service](#run-as-a-service) · [WSL / Podman / Proxmox](#deployment)
+- Running: [CLI](#cli-reference) · [Service](#run-as-a-service) · [WSL / Podman / Proxmox](#deployment) · [Sensor in another VM](#sensor-on-another-machine-or-vm)
 - [Verify](#verify) · [Authorized use](#authorized-use) · [Layout](#project-layout)
 
 ---
@@ -33,6 +33,11 @@ on a single host — **no real network needed** — using a **veth pair**: two b
 virtual NICs where frames sent on one end appear on the other.
 
 > Generate on **`tgt0`** → point your sensor at **`tgt0-mon`**.
+
+A veth only reaches a sensor that shares this host's kernel (the host itself, a
+container, a network namespace). For a sensor in **another VM or on another machine**,
+send on a real interface and let a switch or hypervisor mirror it; see
+[Sensor on another machine or VM](#sensor-on-another-machine-or-vm).
 
 <img width="1024" height="559" alt="SPAN simulation diagram" src="https://github.com/user-attachments/assets/c666137f-5360-434d-b6c4-438a1f49ac10" />
 
@@ -64,8 +69,8 @@ https://github.com/user-attachments/assets/36108f6f-9ab7-4748-a387-1102560a0a3b
 
 
 
-In the UI: **Map** → `Create veth pair`, then **Protocols** (`Space` to pick), then
-press **`s`**. Point your sensor at `tgt0-mon`.
+In the UI: **Interfaces** → `Create veth pair`, then **Run** → Preset (or **Traffic**,
+`Space` to pick protocols), then press **`s`**. Point your sensor at `tgt0-mon`.
 
 **Headless** — three commands:
 
@@ -93,14 +98,24 @@ python3 -m tgt run -s ot-full --pcap ot.pcap --count 500
 
 ## The TUI
 
-`python3 -m tgt` (or `tgt`) opens a **live SPAN flow diagram**. Packets animate along
-the veth path as it generates, and each box carries live data:
+`python3 -m tgt` (or `tgt`) opens a **live SPAN flow diagram**, drawn for how frames
+actually reach your sensor. TGT reads the send interface's type from the kernel:
+
+```
+veth pair        TGT ENGINE ──▶ SEND tgt0 ──veth──▶ MONITOR tgt0-mon ──▶ SENSOR
+real interface   TGT ENGINE ──▶ SEND eth0 ┈┈SPAN┈┈▶ SENSOR     (a switch / vSwitch mirrors it)
+pcap only        TGT ENGINE ──▶ PCAP file ┈import┈▶ SENSOR     (offline, not animated)
+```
+
+Packets animate along the path as it generates, and each box carries live data:
 
 - **TGT ENGINE:** the preset, any sprinkled malware, the traffic mix (share of frames per
   protocol, biggest first; malware rows always stay on screen), pps and elapsed time.
-- **SEND:** interface and link state (or the pcap file), packets, bytes, Mb/s, errors.
-- **MONITOR:** the `-mon` peer and its state, the SPAN view, VLAN tagging, frames per cycle.
-- **SENSOR:** your sensor's name and the interface it should listen on.
+- **SEND / PCAP:** interface, link state and type (or the pcap file), packets, bytes,
+  Mb/s, errors, frames per cycle.
+- **MONITOR** (veth only): the peer and its state, the SPAN view and VLAN tagging.
+- **SENSOR:** your sensor's name and how it gets the traffic: the veth peer it listens on,
+  the interface it gets a SPAN of, or the pcap it imports.
 
 Four tabbed panels below drive it. Each shows only the rows that apply to the current
 preset, explains the selected row underneath, and the key bar lists what the keys do there:
@@ -109,7 +124,7 @@ preset, explains the selected row underneath, and the key bar lists what the key
 |---|---|
 | **Run** | preset (pick from a filterable list: scenarios, environments, incidents, pcap replay), **SPAN view** (access/core, for an env), **malware sprinkle** (toggle/variant/random/ratio), rate, messages, loop, pcap output, endpoints |
 | **Traffic** | toggle protocols for a custom mix; live per-protocol counters |
-| **Interfaces** | pick the send interface, see its `-mon` peer, name the sensor, create/delete the veth (delete asks you to type the name) |
+| **Interfaces** | pick the send interface and see how it reaches the sensor (veth pair or real interface that needs a SPAN), name the sensor, create/delete a veth pair (delete asks you to type the name and is never offered for a real interface) |
 | **Service** | service status and the exact `tgt run` it would execute; save config + start/stop/restart |
 
 Below 80 columns the diagram collapses to a one-line flow strip.
@@ -347,6 +362,24 @@ podman run --rm -it --network container:sensor --cap-add=NET_ADMIN --cap-add=NET
     tgt run -s ot-baseline -i tgt0-mon --rate 50
 ```
 
+### Sensor on another machine or VM
+
+A veth pair lives inside one kernel, so a sensor in a separate VM or on another machine
+can't open `tgt0-mon`. Send on a **real interface** instead (`-i eth0`, or pick it in the
+TUI's Interfaces tab) and let something in between copy the traffic to the sensor:
+
+| Setup | How the sensor gets the traffic |
+|---|---|
+| TGT and the sensor are VMs on one hypervisor | The hypervisor mirrors TGT's vNIC to the sensor's monitor vNIC: a Proxmox hub bridge (next section), or VMware / Nutanix / Xen port mirroring ([`SPAN Configuration/`](SPAN%20Configuration/README.md)). |
+| TGT on a KVM/Proxmox host, sensor in a VM | Put the veth peer on the sensor's bridge and make it a hub: `ip link set tgt0-mon master vmbrspan` and `ip link set vmbrspan type bridge ageing_time 0`. Without hub mode the bridge learns that every TGT MAC sits behind `tgt0-mon` and stops flooding frames to the sensor. |
+| Physical lab switch | Send from a host on a port or VLAN the switch mirrors (a SPAN **source**) to the sensor's monitor port. |
+| No mirroring available | Write a pcap (`--pcap`) and import it into the sensor, if it supports offline analysis. |
+
+Don't transmit out of the sensor's own capture NIC. The sensor may ignore its own
+outgoing frames, and a switch port configured to accept ingress on a SPAN destination
+would forward TGT's synthetic OT commands and attack traffic into the real network.
+Mirror traffic only on isolated segments you're authorized to test.
+
 ### Proxmox — feed a Traffic Analyser VM (hub bridge)
 
 Typical lab: **TGT in one VM, the analyser** (Zeek, Suricata, Security Onion, Malcolm,
@@ -397,7 +430,7 @@ unchecked**). The analyser's NIC must be **promiscuous** (`ip link set eth0 up p
 on`); most sensors set this themselves.
 
 **4. Generate and verify** — point TGT at its bridge NIC (`TGT_IFACE=eth0` in
-`/etc/tgt/tgt.conf`, or `-i eth0` on the CLI, or the TUI's **Map** panel), then confirm
+`/etc/tgt/tgt.conf`, or `-i eth0` on the CLI, or the TUI's **Interfaces** panel), then confirm
 on the analyser with `tcpdump -i <nic>` that the traffic arrives.
 
 > Not using a hookscript? Just run the `for p in … bridge link set …` loop by hand

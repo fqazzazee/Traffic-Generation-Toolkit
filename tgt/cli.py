@@ -52,6 +52,16 @@ def cmd_list(args) -> int:
     return 0
 
 
+def _iface_line(i: dict) -> str:
+    """One interface, marking veth pairs: a sensor on this host captures on
+    the peer; a real interface needs a switch/vSwitch SPAN to reach one."""
+    link = (f"  veth <-> {i['peer']}" if i.get("peer") else
+            "  veth (peer in another namespace)" if i.get("kind") == "veth"
+            else "")
+    return (f"{i['name']:14} state={i['state']:8} mac={i['mac']:18} "
+            f"mtu={i['mtu']}{link}")
+
+
 def cmd_env(args) -> int:
     e = net.detect_env()
     print(f"environment : {e.kind}  ({e.detail})")
@@ -59,8 +69,7 @@ def cmd_env(args) -> int:
     print(f"iproute2 'ip': {'found' if e.has_ip else 'MISSING'}")
     print("\ninterfaces:")
     for i in net.list_interfaces():
-        print(f"  {i['name']:14} state={i['state']:8} mac={i['mac']:18} "
-              f"mtu={i['mtu']}")
+        print(f"  {_iface_line(i)}")
     if e.kind in ("wsl", "podman", "container"):
         print(f"\nnote: on {e.kind}, run TGT and your sensor (Zeek/Suricata/tcpdump) "
               "inside the same\n      network namespace so both see the veth pair.")
@@ -70,8 +79,7 @@ def cmd_env(args) -> int:
 def cmd_iface(args) -> int:
     if args.iface_cmd == "list":
         for i in net.list_interfaces():
-            print(f"{i['name']:14} state={i['state']:8} mac={i['mac']:18} "
-                  f"mtu={i['mtu']}")
+            print(_iface_line(i))
         return 0
     if args.iface_cmd == "create":
         if args.type == "veth":

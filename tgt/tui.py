@@ -1,8 +1,10 @@
 """TGT text UI — a live SPAN traffic-flow diagram you can navigate and drive.
 
-The centrepiece is the flow diagram:
+The centrepiece is the flow diagram, drawn for how frames reach the sensor:
 
-    TGT ENGINE ─▶ tgt0 (send) ┈▶ tgt0-mon (monitor) ─▶ SENSOR
+    veth pair        TGT ENGINE ─▶ tgt0 (send) ─▶ tgt0-mon (monitor) ─▶ SENSOR
+    real interface   TGT ENGINE ─▶ eth0 (send) ┈▶ SENSOR   (via a SPAN)
+    pcap only        TGT ENGINE ─▶ PCAP ┈▶ SENSOR          (imported)
 
 Each box carries live data — the traffic mix (malware always visible), packets,
 bytes and errors on the send side, the SPAN view and VLAN tagging at the
@@ -111,12 +113,20 @@ class UI:
             return "● unknown", C_YELLOW
         return f"○ {st}", C_YELLOW
 
+    def link_kind(self) -> str:
+        """How frames reach the sensor: ``veth`` (a pair on this host),
+        ``nic`` (a real interface — a switch/vSwitch SPAN must mirror it),
+        ``pcap`` (file only) or ``none`` (nothing mapped yet)."""
+        if self.send_iface:
+            info = self.ifaces.get(self.send_iface)
+            return "veth" if info and info.get("kind") == "veth" else "nic"
+        return "pcap" if self.pcap else "none"
+
     @property
     def mon_iface(self) -> Optional[str]:
-        if not self.send_iface:
-            return None
-        cand = f"{self.send_iface}-mon"
-        return cand if cand in self.ifaces else None
+        """The veth peer the sensor captures on (None if not a local veth)."""
+        info = self.ifaces.get(self.send_iface or "")
+        return info.get("peer") if info and info.get("kind") == "veth" else None
 
     def _load_service_config(self):
         cfg = service.read_config()
@@ -313,135 +323,175 @@ def _engine_idle_lines(ui: UI) -> List[Tuple[str, int]]:
     return [(k, C_DIM) for k in ui.selected] or [("no protocols", C_DIM)]
 
 
-def _diagram_height(ui: UI, H: int, top: int) -> int:
+Line = Tuple[str, int]                     # (text, curses attribute)
+Node = Tuple[int, str, str, List[Line]]    # (colour, title, short name, lines)
+Link = Tuple[str, bool, bool]              # (label, dotted, animated)
+
+
+def _diagram_height(ui: UI, H: int, top: int, others: int) -> int:
     """Box height: just enough for the engine's content (header, traffic mix
-    or idle summary, status) and the counters, capped by the terminal."""
+    or idle summary, status) and the tallest other box, capped by the
+    terminal."""
     s = ui.stats()
     n = len(s.per_profile) if s and s.per_profile else \
         len(_engine_idle_lines(ui))
     headers = 1 + (ui.sprinkle_on and ui.mode() != "replay")
-    want = max(6, headers + n + 1) + 2
+    want = max(6, headers + n + 1, others) + 2
     return max(7, min(want, 16, H - top - 15))
 
 
-def _draw_diagram(win, ui: UI, top: int, w: int) -> int:
-    H, _ = win.getmaxyx()
-    margin, gap = (2, 6) if w >= 100 else (1, 4)
-    box_w = (w - 2 * margin - 3 * gap) // 4
-    if box_w < 16:
-        return _draw_strip(win, ui, top, w)
+def _engine_lines(ui: UI, rows: int, inner: int) -> List[Line]:
+    """Mode header, malware badge, traffic mix (or idle summary); the status
+    line is always the last row."""
     s = ui.stats()
-    running = ui.running()
-    pps = s.pps if s else 0.0
-    xs = [margin + i * (box_w + gap) for i in range(4)]
-    bh = _diagram_height(ui, H, top)
-    by = top + 1
-    mid = by + bh // 2
-    inner = box_w - 2
-    rows = bh - 2
-
-    for i, (color, title) in enumerate([(C_GREEN, "TGT ENGINE"),
-                                        (C_CYAN, "SEND"),
-                                        (C_YELLOW, "MONITOR"),
-                                        (C_MAGENTA, "SENSOR")]):
-        _box(win, by, xs[i], bh, box_w, title, color)
-
-    def line(col, r, text, attr=0):
-        if 0 <= r < rows:
-            _put(win, by + 1 + r, xs[col] + 1, _fit(text, inner), attr)
-
-    # ENGINE: mode header, malware badge, traffic mix (or idle summary), status
     m = ui.mode()
     head = {"env": (f"env {ui.env}", C_GREEN),
             "incident": (f"☣ {ui.incident}", C_RED),
             "replay": ("⟳ replay", C_YELLOW),
             "scenario": (f"scenario {ui.scenario}", C_CYAN),
             "custom": (f"{len(ui.selected)} protocols", C_CYAN)}[m]
-    headers = [head]
+    out: List[Line] = [(head[0], _cattr(head[1], curses.A_BOLD))]
     if ui.sprinkle_on and m != "replay":
         v = "random" if ui.sprinkle_random else ui.sprinkle_variant
-        headers.append((f"☣ +{v}", C_RED))
-    for r, (text, col) in enumerate(headers):
-        line(0, r, text, _cattr(col, curses.A_BOLD))
-    body_top = len(headers)
-    slots = max(0, rows - body_top - 1)           # last row = status
+        out.append((f"☣ +{v}", _cattr(C_RED, curses.A_BOLD)))
+    slots = max(0, rows - len(out) - 1)
     mix, hidden, total = _mix(ui, slots)
     mal = set(incidents.ATTACKS)
     if mix:
         name_w = max(4, inner - 7)
-        for r, (k, cnt) in enumerate(mix):
+        for k, cnt in mix:
             bad = k in mal
             pct = f"{100 * cnt / total:5.1f}%" if total else ""
-            text = f"{'☣' if bad else ' '}{_fit(k, name_w):<{name_w}}{pct:>6}"
-            line(0, body_top + r, text,
-                 _cattr(C_RED if bad else C_GREEN,
-                        curses.A_BOLD if bad else 0))
+            out.append((f"{'☣' if bad else ' '}{_fit(k, name_w):<{name_w}}"
+                        f"{pct:>6}", _cattr(C_RED if bad else C_GREEN,
+                                            curses.A_BOLD if bad else 0)))
         if hidden:
-            line(0, body_top + len(mix), f" +{hidden} more…", _cattr(C_DIM))
+            out.append((f" +{hidden} more…", _cattr(C_DIM)))
     else:
-        for r, (text, col) in enumerate(_engine_idle_lines(ui)[:slots]):
-            line(0, body_top + r, f" {text}", _cattr(col))
-    if running:
-        status = f"{pps:6.1f} pps  {_clock(s.elapsed)}"
-        line(0, rows - 1, status, _cattr(C_GREEN, curses.A_BOLD))
+        out += [(f" {t}", _cattr(c)) for t, c in _engine_idle_lines(ui)[:slots]]
+    out = out[:max(0, rows - 1)]
+    out += [("", 0)] * (rows - 1 - len(out))
+    if ui.running():
+        out.append((f"{s.pps:6.1f} pps  {_clock(s.elapsed)}",
+                    _cattr(C_GREEN, curses.A_BOLD)))
     else:
-        line(0, rows - 1, "idle — press s" if s is None else "stopped",
-             _cattr(C_DIM))
+        out.append(("idle — press s" if s is None else "stopped",
+                    _cattr(C_DIM)))
+    return out
 
-    # SEND: interface + state, pcap file, counters
-    st_text, st_col = ui.iface_state(ui.send_iface)
-    if ui.send_iface:
-        line(1, 0, ui.send_iface, _cattr(C_CYAN, curses.A_BOLD))
-        line(1, 1, st_text, _cattr(st_col))
-    else:
-        line(1, 0, "no interface", _cattr(C_DIM))
-        line(1, 1, "pcap only" if ui.pcap else "unmapped",
-             _cattr(C_YELLOW if not ui.pcap else C_DIM))
-    r = 2
-    if ui.pcap:
-        line(1, r, "→ " + _fit(os.path.basename(ui.pcap), inner - 2),
-             _cattr(C_DIM))
-        r += 1
-    pkts = s.packets if s else 0
-    line(1, r, f"{pkts:,} pkts", _cattr(C_CYAN))
-    line(1, r + 1, f"{_human(s.bytes if s else 0)} {s.mbps if s else 0:.2f}Mb/s",
-         _cattr(C_DIM))
+
+def _counter_lines(ui: UI) -> List[Line]:
+    s = ui.stats()
     errs = s.errors if s else 0
-    line(1, r + 2, f"errors {errs}", _cattr(C_RED if errs else C_DIM,
-                                            curses.A_BOLD if errs else 0))
-
-    # MONITOR: peer + state, SPAN view, tagging
-    mon = ui.mon_iface
-    if mon:
-        mt, mc = ui.iface_state(mon)
-        line(2, 0, mon, _cattr(C_YELLOW, curses.A_BOLD))
-        line(2, 1, mt, _cattr(mc))
-    else:
-        line(2, 0, "no peer", _cattr(C_DIM))
-        line(2, 1, "create a veth" if ui.send_iface else "-", _cattr(C_DIM))
-    if m == "env":
-        e = enterprise.get(ui.env)
-        line(2, 2, f"SPAN {ui.span}", _cattr(C_YELLOW))
-        line(2, 3, f"{len(e.segments)} VLANs tagged", _cattr(C_DIM))
-        if ui.span == "core":
-            line(2, 4, "+ routed hops", _cattr(C_DIM))
-    else:
-        line(2, 2, "SPAN mirror", _cattr(C_YELLOW))
-        line(2, 3, "untagged", _cattr(C_DIM))
+    out = [(f"{s.packets if s else 0:,} pkts", _cattr(C_CYAN)),
+           (f"{_human(s.bytes if s else 0)} {s.mbps if s else 0:.2f}Mb/s",
+            _cattr(C_DIM)),
+           (f"errors {errs}", _cattr(C_RED if errs else C_DIM,
+                                     curses.A_BOLD if errs else 0))]
     if s and s.cycle_frames:
-        line(2, rows - 1, f"{s.cycle_frames:,} /cycle", _cattr(C_DIM))
+        out.append((f"{s.cycle_frames:,} /cycle", _cattr(C_DIM)))
+    return out
 
-    # SENSOR: label + where it should listen
-    line(3, 0, ui.sensor_label, _cattr(C_MAGENTA, curses.A_BOLD))
-    line(3, 1, "listens on", _cattr(C_DIM))
-    line(3, 2, mon or ("the pcap" if ui.pcap else "-"), _cattr(C_MAGENTA))
 
-    # animated flow in the gaps: emit (solid), mirror (dotted), ingest (solid)
-    for i, (label, dotted) in enumerate([("emit", False), ("mirror", True),
-                                         ("ingest", False)]):
+def _tagging_lines(ui: UI) -> List[Line]:
+    if ui.mode() == "env":
+        e = enterprise.get(ui.env)
+        out = [(f"SPAN {ui.span}", _cattr(C_YELLOW)),
+               (f"{len(e.segments)} VLANs tagged", _cattr(C_DIM))]
+        if ui.span == "core":
+            out.append(("+ routed hops", _cattr(C_DIM)))
+        return out
+    return [("untagged", _cattr(C_DIM))]
+
+
+def _diagram_nodes(ui: UI) -> Tuple[List[Node], List[Link]]:
+    """The boxes after the engine, and the links between all boxes, for how
+    frames reach the sensor (see :meth:`UI.link_kind`):
+
+    veth  ENGINE ─▶ SEND ─▶ MONITOR (peer) ─▶ SENSOR
+    nic   ENGINE ─▶ SEND ┈▶ SENSOR    (a switch / vSwitch SPAN mirrors it)
+    pcap  ENGINE ─▶ PCAP ┈▶ SENSOR    (imported offline — never animated)
+    """
+    kind = ui.link_kind()
+    running = ui.running()
+    send = ui.send_iface or ""
+    pcap = os.path.basename(ui.pcap) if ui.pcap else ""
+    label: Line = (ui.sensor_label, _cattr(C_MAGENTA, curses.A_BOLD))
+    if kind == "pcap":
+        box = [("pcap file", _cattr(C_CYAN, curses.A_BOLD)),
+               (pcap, _cattr(C_CYAN))] + _counter_lines(ui)
+        sensor = [label, ("imports", _cattr(C_DIM)),
+                  (pcap, _cattr(C_MAGENTA))] + _tagging_lines(ui)
+        return ([(C_CYAN, "PCAP", pcap, box),
+                 (C_MAGENTA, "SENSOR", ui.sensor_label, sensor)],
+                [("write", False, running), ("import", True, False)])
+    if kind == "none":
+        box = [("no interface", _cattr(C_DIM)),
+               ("set one or a pcap", _cattr(C_YELLOW))] + _counter_lines(ui)
+        return ([(C_CYAN, "SEND", "unmapped", box),
+                 (C_MAGENTA, "SENSOR", ui.sensor_label,
+                  [label, ("-", _cattr(C_DIM))])],
+                [("emit", False, False), ("", True, False)])
+    st, col = ui.iface_state(send)
+    box = [(send, _cattr(C_CYAN, curses.A_BOLD)),
+           (f"{st} · {'veth' if kind == 'veth' else 'interface'}",
+            _cattr(col))]
+    if pcap:
+        box.append(("+ " + pcap, _cattr(C_DIM)))
+    box += _counter_lines(ui)
+    if kind == "veth":
+        peer = ui.mon_iface
+        if peer:
+            pst, pcol = ui.iface_state(peer)
+            mon = [(peer, _cattr(C_YELLOW, curses.A_BOLD)), (pst, _cattr(pcol))]
+        else:
+            mon = [("peer elsewhere", _cattr(C_YELLOW, curses.A_BOLD)),
+                   ("other namespace", _cattr(C_DIM))]
+        mon += _tagging_lines(ui)
+        sensor = [label, ("listens on", _cattr(C_DIM)),
+                  (peer or "the veth peer", _cattr(C_MAGENTA))]
+        return ([(C_CYAN, "SEND", send, box),
+                 (C_YELLOW, "MONITOR", peer or "peer", mon),
+                 (C_MAGENTA, "SENSOR", ui.sensor_label, sensor)],
+                [("emit", False, running), ("veth", False, running),
+                 ("ingest", False, running and peer is not None)])
+    # a real interface: something outside this host must mirror it
+    up = ui.iface_state(send)[0].startswith("●")
+    sensor = [label, ("gets a SPAN of", _cattr(C_DIM)),
+              (send, _cattr(C_MAGENTA))] + _tagging_lines(ui)
+    return ([(C_CYAN, "SEND", send, box),
+             (C_MAGENTA, "SENSOR", ui.sensor_label, sensor)],
+            [("emit", False, running), ("SPAN", True, running and up)])
+
+
+def _draw_diagram(win, ui: UI, top: int, w: int) -> int:
+    H, _ = win.getmaxyx()
+    nodes, links = _diagram_nodes(ui)
+    n = len(nodes) + 1
+    margin, gap = (2, 6) if w >= 100 else (1, 4)
+    box_w = (w - 2 * margin - (n - 1) * gap) // n
+    if box_w < 16:
+        return _draw_strip(win, ui, top, w, nodes, links)
+    if box_w > 34:                       # fewer boxes: longer links instead
+        box_w = 34
+        gap = (w - 2 * margin - n * box_w) // (n - 1)
+    bh = _diagram_height(ui, H, top, max(len(nd[3]) for nd in nodes))
+    rows, inner = bh - 2, box_w - 2
+    boxes = [(C_GREEN, "TGT ENGINE", "ENGINE",
+              _engine_lines(ui, rows, inner))] + nodes
+    xs = [margin + i * (box_w + gap) for i in range(n)]
+    by = top + 1
+    mid = by + bh // 2
+    for i, (color, title, _short, lines) in enumerate(boxes):
+        _box(win, by, xs[i], bh, box_w, title, color)
+        for r, (text, attr) in enumerate(lines[:rows]):
+            _put(win, by + 1 + r, xs[i] + 1, _fit(text, inner), attr)
+
+    s = ui.stats()
+    pps = s.pps if s else 0.0
+    for i, (label, dotted, live) in enumerate(links):
         g0 = xs[i] + box_w
         glen = xs[i + 1] - g0
-        live = running and (i == 0 or mon is not None)
         _put(win, mid, g0, ("┈" if dotted else BOX["h"]) * (glen - 1),
              _cattr(C_DIM))
         _put(win, mid, g0 + glen - 1, ARROW,
@@ -452,22 +502,20 @@ def _draw_diagram(win, ui: UI, top: int, w: int) -> int:
             for k in range(ndots):
                 pos = (ui.frame + k * step) % (glen - 1)
                 _put(win, mid, g0 + pos, DOT, _cattr(C_GREEN, curses.A_BOLD))
-        if len(label) <= glen:                       # skip if it won't fit
+        if label and len(label) <= glen:          # skip if it won't fit
             _put(win, mid + 1, g0 + (glen - len(label)) // 2, label,
                  _cattr(C_DIM))
     return by + bh + 1
 
 
-def _draw_strip(win, ui: UI, top: int, w: int) -> int:
+def _draw_strip(win, ui: UI, top: int, w: int, nodes: List[Node],
+                links: List[Link]) -> int:
     """Narrow terminals: the same flow as one line plus a counters line."""
     s = ui.stats()
-    running = ui.running()
-    mon = ui.mon_iface or "no peer"
-    send = ui.send_iface or ("pcap" if ui.pcap else "unmapped")
-    parts = [("ENGINE", C_GREEN), (" ━▶ ", C_DIM), (send, C_CYAN),
-             (" ┈▶ ", C_DIM), (mon, C_YELLOW), (" ━▶ ", C_DIM),
-             (ui.sensor_label, C_MAGENTA)]
     x = 2
+    parts = [("ENGINE", C_GREEN)]
+    for (color, _title, short, _lines), (_l, dotted, _a) in zip(nodes, links):
+        parts += [(" ┈▶ " if dotted else " ━▶ ", C_DIM), (short, color)]
     for text, col in parts:
         _put(win, top + 1, x, text, _cattr(col, curses.A_BOLD))
         x += len(text)
@@ -477,7 +525,7 @@ def _draw_strip(win, ui: UI, top: int, w: int) -> int:
     else:
         info = "idle — press s to start"
     _put(win, top + 2, 2, _fit(info, w - 4),
-         _cattr(C_GREEN if running else C_DIM))
+         _cattr(C_GREEN if ui.running() else C_DIM))
     return top + 4
 
 
@@ -831,24 +879,46 @@ def _iface_value(ui: UI) -> Value:
     return f"{ui.send_iface}  {st}", col
 
 
+def _link_value(ui: UI) -> Value:
+    if ui.link_kind() == "veth":
+        return ((f"veth pair ↔ {ui.mon_iface}", C_GREEN) if ui.mon_iface
+                else ("veth, peer in another namespace", C_GREEN))
+    return "real interface — needs a SPAN", C_YELLOW
+
+
+def _link_help(ui: UI) -> str:
+    if ui.link_kind() == "veth":
+        return ("A virtual cable on this host: the sensor captures on the peer. "
+                "It must share this kernel — this host, a container, or a "
+                "network namespace.")
+    return ("Frames leave this interface for real. The sensor sees them only if "
+            "a switch or hypervisor port mirror copies this port or VLAN to "
+            "its monitor port (README: 'Sensor on another machine or VM').")
+
+
 IFACE_FIELDS = [
     Field("Send interface", _iface_value, _act_send,
-          "Where TGT transmits (needs root/CAP_NET_RAW). With none, use a PCAP "
-          "output on the Run tab.", keys="←→/Enter cycle"),
+          "Where TGT transmits (needs root/CAP_NET_RAW): a veth for a sensor on "
+          "this host, or a real interface a SPAN mirrors to the sensor. With "
+          "none, use a PCAP output on the Run tab.", keys="←→/Enter cycle"),
+    Field("Link to sensor", _link_value, None, _link_help,
+          show=lambda ui: bool(ui.send_iface)),
     Field("Monitor (peer)",
           lambda ui: ((f"{ui.mon_iface}  {ui.iface_state(ui.mon_iface)[0]}",
                        ui.iface_state(ui.mon_iface)[1]) if ui.mon_iface
                       else ("none", C_DIM)),
           None, "The veth peer your sensor listens on: every frame sent on the "
-          "send interface appears here."),
+          "send interface appears here.",
+          show=lambda ui: ui.link_kind() == "veth"),
     Field("Sensor label", lambda ui: ui.sensor_label, _act_sensor,
           "Name shown in the SENSOR box (e.g. Claroty CTD, Zeek, Suricata).",
           keys="Enter edit"),
     Field("Create veth pair", lambda ui: ("press Enter", C_DIM), _act_create,
           "Create <name> and <name>-mon (needs iproute2 and sudo)."),
-    Field("Delete send iface", lambda ui: ("press Enter", C_DIM), _act_delete,
-          "Delete the send interface and its peer. Asks you to type the name.",
-          show=lambda ui: bool(ui.send_iface)),
+    Field("Delete veth pair", lambda ui: ("press Enter", C_DIM), _act_delete,
+          "Delete the veth pair (both ends). Asks you to type the name. Real "
+          "interfaces are never offered for deletion.",
+          show=lambda ui: ui.link_kind() == "veth"),
 ]
 
 

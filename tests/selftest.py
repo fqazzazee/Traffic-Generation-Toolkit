@@ -391,6 +391,42 @@ def test_sprinkle_maps_incident_hosts_onto_env_by_role() -> None:
         verify_ip_l4(f, "env-sprinkle")
 
 
+def test_net_interface_kinds() -> None:
+    """veth detection from sysfs: a veth's iflink is its peer's ifindex and
+    the peer points back; a VLAN's iflink is its parent, which does not."""
+    import os
+    from tgt import net
+
+    def mk(base, name, ifindex, iflink, device=False, devtype=""):
+        d = os.path.join(base, name)
+        os.makedirs(d)
+        for attr, val in (("ifindex", ifindex), ("iflink", iflink),
+                          ("operstate", "up"), ("address", "02:00:00:00:00:01"),
+                          ("mtu", "1500"),
+                          ("uevent", f"INTERFACE={name}\n" +
+                           (f"DEVTYPE={devtype}\n" if devtype else ""))):
+            with open(os.path.join(d, attr), "w") as fh:
+                fh.write(val + "\n")
+        if device:
+            os.makedirs(os.path.join(d, "device"))
+
+    with tempfile.TemporaryDirectory() as base:
+        mk(base, "tgt0", "10", "11")
+        mk(base, "tgt0-mon", "11", "10")
+        mk(base, "eth0", "2", "2", device=True)
+        mk(base, "eth0.10", "12", "2", devtype="vlan")
+        mk(base, "vethc", "13", "99")                 # peer in another netns
+        mk(base, "br0", "14", "14", devtype="bridge")
+        got = {i["name"]: (i["kind"], i["peer"])
+               for i in net.list_interfaces(base)}
+    want = {"tgt0": ("veth", "tgt0-mon"), "tgt0-mon": ("veth", "tgt0"),
+            "eth0": ("nic", None), "eth0.10": ("nic", None),
+            "vethc": ("veth", None), "br0": ("nic", None)}
+    for name, kind in want.items():
+        check(got.get(name) == kind,
+              f"net: {name} classified {got.get(name)}, want {kind}")
+
+
 def test_tui_panel_model() -> None:
     """The TUI's data-driven rows, without a terminal: every visible row has
     help, ←/→ never prompts or raises, and config/service args follow the
@@ -410,7 +446,7 @@ def test_tui_panel_model() -> None:
                           f"tui: {tui.PANELS[focus]}/{f.label} has no help")
                     f.value(ui)
                     if f.act and f.label not in (
-                            "Create veth pair", "Delete send iface",
+                            "Create veth pair", "Delete veth pair",
                             "Save config", "Start service", "Stop service",
                             "Restart service", "Sensor label", "PCAP output",
                             "Client IP", "Server IP"):
@@ -430,6 +466,27 @@ def test_tui_panel_model() -> None:
     labels = [f.label for f in tui._fields(ui)]
     check("SPAN view" not in labels and "Client IP" in labels,
           "tui: custom preset shows the wrong Run rows")
+
+    # Interfaces: a veth shows its peer + delete; a real NIC hides both
+    ui.focus = tui.PANELS.index("Interfaces")
+    ui.ifaces = {
+        "eth0": {"name": "eth0", "state": "up", "kind": "nic", "peer": None},
+        "tgt0": {"name": "tgt0", "state": "up", "kind": "veth",
+                 "peer": "tgt0-mon"},
+        "tgt0-mon": {"name": "tgt0-mon", "state": "up", "kind": "veth",
+                     "peer": "tgt0"}}
+    ui.send_iface = "eth0"
+    labels = [f.label for f in tui._fields(ui)]
+    check(ui.link_kind() == "nic" and "Monitor (peer)" not in labels
+          and "Delete veth pair" not in labels,
+          "tui: real interface shows veth rows / delete")
+    ui.send_iface = "tgt0"
+    labels = [f.label for f in tui._fields(ui)]
+    check(ui.link_kind() == "veth" and ui.mon_iface == "tgt0-mon"
+          and "Monitor (peer)" in labels and "Delete veth pair" in labels,
+          "tui: veth hides its peer / delete rows")
+    ui.send_iface, ui.pcap = None, "x.pcap"
+    check(ui.link_kind() == "pcap", "tui: pcap-only not detected")
 
 
 def test_it_org_has_servers_and_users() -> None:
