@@ -30,6 +30,11 @@ from .packet import Endpoints, bytes_to_mac, mac_to_bytes, rewrite_l2
 OUI_WIN = "00:50:56"        # VMware-hosted Windows/Linux
 OUI_ROCKWELL = "00:1d:9c"   # Rockwell Automation / Allen-Bradley
 OUI_SIEMENS = "00:0e:8c"    # Siemens
+OUI_DELL = "00:06:5b"       # Dell — physical workstations
+OUI_SCHNEIDER = "00:80:f4"  # Telemecanique / Schneider Electric (Modicon)
+OUI_JCI = "00:10:8d"        # Johnson Controls (Metasys BMS)
+OUI_TRIDIUM = "00:01:f0"    # Tridium (Niagara JACE)
+OUI_SEL = "00:30:a7"        # Schweitzer Engineering Laboratories
 
 
 @dataclass
@@ -61,12 +66,24 @@ FINGERPRINTS: Dict[str, OSFingerprint] = {
     "win2000": OSFingerprint("win2000", "Windows 2000", 128,
         "Mozilla/4.0 (compatible; MSIE 5.0; Windows NT 5.0)", "smb1",
         legacy=True, risk="EOL 2010; SMBv1 → MS08-067 / MS17-010"),
+    "win2012": OSFingerprint("win2012", "Windows Server 2012 R2", 128,
+        "Mozilla/5.0 (Windows NT 6.3; Win64; x64) Trident/7.0", "smb2",
+        legacy=True, risk="EOL Oct 2023; no security updates"),
     "rockwell": OSFingerprint("rockwell", "Rockwell PLC (ControlLogix)", 64,
         smb="none", dhcp_vendor="", legacy=False,
         risk="OT asset — patch cadence slow; expose CIP/ENIP"),
     "siemens": OSFingerprint("siemens", "Siemens S7 PLC", 30,
         smb="none", dhcp_vendor="", legacy=False,
         risk="OT asset — S7comm unauthenticated on legacy families"),
+    "schneider": OSFingerprint("schneider", "Schneider Modicon PLC", 64,
+        smb="none", dhcp_vendor="",
+        risk="OT asset — Modbus/TCP has no authentication"),
+    "bacnet": OSFingerprint("bacnet", "BACnet building controller", 64,
+        smb="none", dhcp_vendor="",
+        risk="BMS asset — BACnet/IP unauthenticated; common pivot into OT"),
+    "sel": OSFingerprint("sel", "SEL protection relay / RTAC", 64,
+        smb="none", dhcp_vendor="",
+        risk="Electrical asset — DNP3 without Secure Authentication"),
 }
 
 
@@ -75,7 +92,7 @@ class Host:
     name: str
     ip: str
     mac: str
-    role: str          # dc, dns, file, web, mail, db, proxy, ws, plc, hmi, hist, eng
+    role: str          # dc, dns, file, web, mail, db, proxy, ws, plc, hmi, hist, eng, …
     os: str            # fingerprint key
     vendor: str = ""
     product: str = ""  # OT: model / order number
@@ -95,7 +112,7 @@ class Segment:
     name: str
     vlan: int
     subnet: str        # CIDR, e.g. "10.20.10.0/24"
-    zone: str          # IT | OT-SUPERVISORY (Purdue L3) | OT-CELL (L1-2)
+    zone: str          # IT | DMZ (L3.5) | OT-SUPERVISORY (L3) | OT-CELL (L1-2)
     gateway: str       # default-gateway IP
 
     @property
@@ -147,15 +164,10 @@ def _it_segments() -> List[Segment]:
     ]
 
 
-def _it_conversations(hosts: List[Host]) -> List[Conversation]:
-    by = {x.name: x for x in hosts}
-    dc = "DC01"
-    dns = "DNS01"
-    file = "FILE01"
-    web = "WEB01"
-    proxy = "PROXY01"
+def _office_conversations(users: List[str], dc: str, dns: str, file: str,
+                          proxy: str, app: str) -> List[Conversation]:
+    """The daily chatter of a domain-joined Windows user."""
     conv: List[Conversation] = []
-    users = [x.name for x in hosts if x.role == "ws"]
     for u in users:
         conv += [
             (u, dns, "dhcp"),          # address + fingerprint
@@ -165,9 +177,17 @@ def _it_conversations(hosts: List[Host]) -> List[Conversation]:
             (u, dc, "ldap"),
             (u, file, "smb"),          # SMBv1 vs SMB2 depends on the user OS
             (u, proxy, "http"),        # browsing
-            (u, "APP01", "https"),     # encrypted app
+            (u, app, "https"),         # encrypted app
             (u, dc, "ntp"),
         ]
+    return conv
+
+
+def _it_conversations(hosts: List[Host]) -> List[Conversation]:
+    by = {x.name: x for x in hosts}
+    users = [x.name for x in hosts if x.role == "ws"]
+    conv = _office_conversations(users, "DC01", "DNS01", "FILE01", "PROXY01",
+                                 "APP01")
     # server-to-server
     conv += [
         ("DC01", "DC02", "ldap"), ("DC02", "DC01", "kerberos"),
@@ -269,6 +289,11 @@ class Environment:
                 raise ValueError(f"{self.key}: host {h.name} ({h.ip}) is in "
                                  f"{len(hit)} segments, expected 1")
             self._seg[h.name] = hit[0]
+        for c, sv, proto in self.conversations:
+            if (protocols.get(proto).transport == "l2"
+                    and self._seg[c] is not self._seg[sv]):
+                raise ValueError(f"{self.key}: {proto} is L2-only but "
+                                 f"{c} -> {sv} crosses segments")
 
     def host(self, name: str) -> Host:
         return next(h for h in self.hosts if h.name == name)
@@ -370,6 +395,188 @@ def _mixed_conversations(hosts: List[Host]) -> List[Conversation]:
     return _it_conversations(hosts) + _ot_conversations(hosts)
 
 
+# ---------------------------------------------------------------------------
+# Industrial site: a large Purdue-model plant, corporate IT down to cells
+# ---------------------------------------------------------------------------
+def _site_segments() -> List[Segment]:
+    return [
+        Segment("CORP-SERVERS", 10, "10.10.10.0/24", "IT", "10.10.10.1"),
+        Segment("CORP-USERS", 20, "10.10.20.0/24", "IT", "10.10.20.1"),
+        Segment("IT-OT-DMZ", 50, "10.10.50.0/24", "DMZ", "10.10.50.1"),
+        Segment("OT-OPS", 100, "10.100.0.0/24", "OT-SUPERVISORY",
+                "10.100.0.1"),
+        Segment("AREA-PACKAGING", 110, "10.100.10.0/24", "OT-CELL",
+                "10.100.10.1"),
+        Segment("AREA-PROCESS", 120, "10.100.20.0/24", "OT-CELL",
+                "10.100.20.1"),
+        Segment("AREA-UTILITIES", 130, "10.100.30.0/24", "OT-CELL",
+                "10.100.30.1"),
+        Segment("BMS", 140, "10.100.40.0/24", "OT-CELL", "10.100.40.1"),
+        Segment("SUBSTATION", 150, "10.100.50.0/24", "OT-CELL",
+                "10.100.50.1"),
+    ]
+
+
+def _site_hosts() -> List[Host]:
+    h: List[Host] = []
+
+    def add(name, ip, oui, n, role, os_, vendor="", product=""):
+        h.append(Host(name, ip, _mac(oui, n), role, os_, vendor, product))
+
+    # L4 corporate servers (virtualised) + 30 office users
+    for i, (name, role, os_) in enumerate([
+            ("DC01", "dc", "win2019"), ("DC02", "dc", "win2019"),
+            ("DNS01", "dns", "win2019"), ("FILE01", "file", "win2019"),
+            ("ERP01", "db", "win2019"), ("MAIL01", "mail", "linux"),
+            ("WEB01", "web", "linux"), ("PROXY01", "proxy", "linux")],
+            start=10):
+        add(name, f"10.10.10.{i}", OUI_WIN, 0x1000 + i, role, os_)
+    user_os = ["win10"] * 26 + ["win7", "win7", "winxp", "win10"]
+    for i, os_ in enumerate(user_os, start=20):
+        add(f"WS{i:02d}", f"10.10.20.{i}", OUI_DELL, 0x2000 + i, "ws", os_)
+    # a contractor laptop that talks straight to the plant floor (see below)
+    add("WS-CONTRACTOR", "10.10.20.99", OUI_DELL, 0x2099, "ws", "win10")
+
+    # L3.5 IT/OT DMZ — the only sanctioned path between IT and OT
+    add("JUMP01", "10.10.50.10", OUI_WIN, 0x5010, "jump", "win2019")
+    add("HIST-DMZ", "10.10.50.11", OUI_WIN, 0x5011, "hist", "win2019")
+    add("WSUS01", "10.10.50.12", OUI_WIN, 0x5012, "patch", "win2019")
+    add("AV01", "10.10.50.13", OUI_WIN, 0x5013, "av", "win2019")
+
+    # L3 site operations
+    add("OT-DC01", "10.100.0.10", OUI_WIN, 0x6010, "dc", "win2012")
+    add("HIST01", "10.100.0.11", OUI_WIN, 0x6011, "hist", "win2019")
+    add("SCADA01", "10.100.0.12", OUI_WIN, 0x6012, "scada", "win2019")
+    add("SCADA02", "10.100.0.13", OUI_WIN, 0x6013, "scada", "win2019")
+    add("OPCUA01", "10.100.0.14", OUI_WIN, 0x6014, "opc", "win2019")
+    add("BMS-SUP", "10.100.0.15", OUI_WIN, 0x6015, "bms", "linux")
+    add("OT-NTP", "10.100.0.16", OUI_WIN, 0x6016, "ntp", "linux")
+    add("ENG01", "10.100.0.20", OUI_DELL, 0x6020, "eng", "win10")
+    add("ENG02", "10.100.0.21", OUI_DELL, 0x6021, "eng", "win7")
+
+    # Packaging area — Rockwell lines: HMIs, Logix PLCs, PowerFlex drives
+    add("HMI-PK1", "10.100.10.10", OUI_DELL, 0x7010, "hmi", "win10")
+    add("HMI-PK2", "10.100.10.11", OUI_DELL, 0x7011, "hmi", "win7")
+    for i, prod in enumerate(["1756-L83E ControlLogix 5580",
+                              "1756-L71/B LOGIX5571",
+                              "1769-L36ERM CompactLogix",
+                              "5069-L320ER CompactLogix 5380"], start=1):
+        add(f"PLC-PK{i}", f"10.100.10.{20 + i}", OUI_ROCKWELL, 0x7020 + i,
+            "plc", "rockwell", "Rockwell", prod)
+    for i in range(1, 7):
+        add(f"DRV-PK{i}", f"10.100.10.{40 + i}", OUI_ROCKWELL, 0x7040 + i,
+            "drive", "rockwell", "Rockwell", "PowerFlex 755")
+
+    # Process area — Siemens S7 cells
+    add("HMI-PR1", "10.100.20.10", OUI_DELL, 0x8010, "hmi", "win10")
+    add("HMI-PR2", "10.100.20.11", OUI_DELL, 0x8011, "hmi", "win7")
+    for i, prod in enumerate(["6ES7 516-3AN01-0AB0", "6ES7 317-2EK14-0AB0",
+                              "6ES7 315-2EH14-0AB0", "6ES7 151-8AB01-0AB0",
+                              "6ES7 315-2EH14-0AB0", "6ES7 516-3AN01-0AB0"],
+                             start=1):
+        add(f"PLC-PR{i}", f"10.100.20.{20 + i}", OUI_SIEMENS, 0x8020 + i,
+            "plc", "siemens", "Siemens", prod)
+
+    # Utilities — Schneider Modicon PLCs + Modbus power meters
+    add("HMI-UT1", "10.100.30.10", OUI_DELL, 0x9010, "hmi", "winxp")
+    for i, prod in enumerate(["BMX P34 2020 Modicon M340",
+                              "BME P58 2040 Modicon M580",
+                              "BMX P34 2020 Modicon M340"], start=1):
+        add(f"PLC-UT{i}", f"10.100.30.{20 + i}", OUI_SCHNEIDER, 0x9020 + i,
+            "plc", "schneider", "Schneider Electric", prod)
+    for i in range(1, 7):
+        add(f"METER-UT{i}", f"10.100.30.{40 + i}", OUI_SCHNEIDER,
+            0x9040 + i, "meter", "schneider", "Schneider Electric",
+            "PowerLogic PM5560")
+
+    # Building management — Niagara JACE polling Metasys BACnet controllers
+    add("BMS-JACE", "10.100.40.10", OUI_TRIDIUM, 0xA010, "bms", "linux",
+        "Tridium", "JACE-8000")
+    for i in range(1, 9):
+        add(f"BAC-AHU{i}", f"10.100.40.{20 + i}", OUI_JCI, 0xA020 + i,
+            "bms", "bacnet", "Johnson Controls", "Metasys FEC2611")
+
+    # Substation — SEL RTAC concentrating protection relays
+    add("RTAC01", "10.100.50.10", OUI_SEL, 0xB010, "rtu", "sel", "SEL",
+        "SEL-3530 RTAC")
+    for i, prod in enumerate(["SEL-751", "SEL-751", "SEL-487E", "SEL-351S"],
+                             start=1):
+        add(f"RELAY{i}", f"10.100.50.{20 + i}", OUI_SEL, 0xB020 + i,
+            "relay", "sel", "SEL", prod)
+    add("RTU-104", "10.100.50.30", OUI_SIEMENS, 0xB030, "rtu", "siemens",
+        "Siemens", "SICAM A8000 CP-8050")
+    return h
+
+
+def _site_conversations(hosts: List[Host]) -> List[Conversation]:
+    by = {x.name: x for x in hosts}
+
+    def named(prefix):
+        return [x.name for x in hosts if x.name.startswith(prefix)]
+
+    users = [x.name for x in hosts if x.role == "ws"]
+    conv = _office_conversations(users, "DC01", "DNS01", "FILE01", "PROXY01",
+                                 "ERP01")
+    conv += [
+        ("DC01", "DC02", "ldap"), ("DC02", "DC01", "kerberos"),
+        ("WEB01", "ERP01", "https"), ("MAIL01", "DC01", "ldap"),
+        # IT <-> DMZ: business users read the replica, admins hop in
+        ("WS20", "HIST-DMZ", "https"), ("WS21", "HIST-DMZ", "https"),
+        ("WS22", "JUMP01", "https"), ("JUMP01", "DC01", "kerberos"),
+        ("WSUS01", "PROXY01", "http"), ("AV01", "PROXY01", "https"),
+        # DMZ <-> L3: historian replication, remote access, patches, AV
+        ("HIST01", "HIST-DMZ", "https"), ("JUMP01", "ENG01", "https"),
+        ("JUMP01", "ENG02", "smb"),
+        ("SCADA01", "WSUS01", "http"), ("HIST01", "WSUS01", "http"),
+        ("ENG01", "AV01", "https"), ("ENG02", "AV01", "https"),
+    ]
+    # L3: OT domain, DNS and time
+    for x in ("HIST01", "SCADA01", "SCADA02", "OPCUA01", "ENG01", "ENG02",
+              "HMI-PK1", "HMI-PK2", "HMI-PR1", "HMI-PR2", "HMI-UT1"):
+        conv += [(x, "OT-DC01", "kerberos"), (x, "OT-DC01", "dns")]
+    for x in named("PLC-") + ["RTAC01", "BMS-JACE"]:
+        conv.append((x, "OT-NTP", "ntp"))
+    conv += [
+        ("SCADA01", "HIST01", "opcua"), ("SCADA02", "HIST01", "opcua"),
+        ("HIST01", "OPCUA01", "opcua"), ("BMS-SUP", "BMS-JACE", "https"),
+        ("ENG02", "HIST01", "smb"), ("HMI-UT1", "HIST01", "smb"),
+        ("HMI-UT1", "SCADA01", "http"),
+    ]
+    # Packaging: HMIs poll their line's PLCs, PLCs drive the PowerFlexes
+    for i, plc in enumerate(named("PLC-PK")):
+        conv.append((("HMI-PK1", "HMI-PK2")[i % 2], plc, "enip"))
+        conv.append(("HIST01", plc, "enip"))
+        conv.append(("ENG01", plc, "enip-id"))
+    for i, drv in enumerate(named("DRV-PK")):
+        conv.append((f"PLC-PK{i % 4 + 1}", drv, "enip"))
+        conv.append(("ENG01", drv, "enip-id"))
+    conv.append(("SCADA01", "PLC-PK1", "icmp"))
+    # Process: Siemens HMIs, historian and engineering
+    for i, plc in enumerate(named("PLC-PR")):
+        conv.append((("HMI-PR1", "HMI-PR2")[i % 2], plc, "s7comm"))
+        conv.append(("HIST01", plc, "s7comm"))
+        conv.append(("ENG02", plc, "s7-id"))
+    conv.append(("SCADA01", "PLC-PR1", "icmp"))
+    # Utilities: HMI + historian over Modbus/TCP
+    for plc in named("PLC-UT"):
+        conv += [("HMI-UT1", plc, "modbus"), ("HIST01", plc, "modbus")]
+    for m in named("METER-UT"):
+        conv.append(("HIST01", m, "modbus"))
+    # BMS: JACE polls the controllers, SCADA reads a few points
+    for ahu in named("BAC-AHU"):
+        conv.append(("BMS-JACE", ahu, "bacnet"))
+    conv += [("SCADA02", "BAC-AHU1", "bacnet"), ("BMS-JACE", "BAC-AHU1", "arp")]
+    # Substation: RTAC polls relays locally; SCADA polls RTAC + IEC-104 RTU
+    for r in named("RELAY"):
+        conv.append(("RTAC01", r, "dnp3"))
+    conv += [("SCADA02", "RTAC01", "dnp3"), ("SCADA02", "RTU-104", "iec104"),
+             ("HIST01", "RTAC01", "dnp3"), ("RTAC01", "RELAY1", "arp")]
+    # Policy violation an analyser should flag: an IT laptop polling a
+    # utilities meter directly (L4 -> L1), bypassing the DMZ.
+    conv.append(("WS-CONTRACTOR", "METER-UT1", "modbus"))
+    return [c for c in conv if c[0] in by and c[1] in by]
+
+
 ENVIRONMENTS: Dict[str, Environment] = {}
 
 
@@ -393,6 +600,12 @@ _reg_env("enterprise-mixed", "Mixed IT + OT Site", "mixed",
          "The full site: the IT organization and the OT plant together — the "
          "realistic converged network an analyser sees at an industrial site.",
          _mixed_hosts, _mixed_conversations, _mixed_segments)
+_reg_env("industrial-site", "Industrial Site", "mixed",
+         "A large Purdue-model plant: corporate IT, an IT/OT DMZ, L3 site "
+         "operations, Rockwell packaging, Siemens process, Schneider "
+         "utilities, a BACnet BMS and an SEL/DNP3 substation, across 9 "
+         "VLANs, plus one IT laptop talking straight to the plant floor.",
+         _site_hosts, _site_conversations, _site_segments)
 
 
 def get(key: str) -> Environment:

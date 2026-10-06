@@ -243,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--scenario", "-s", help="named scenario (see 'tgt list')")
     r.add_argument("--env", "-e",
                    help="modeled environment: it-org | ot-plant | "
-                        "enterprise-mixed (see 'tgt list')")
+                        "enterprise-mixed | industrial-site (see 'tgt list')")
     r.add_argument("--span", choices=enterprise.SPAN_VIEWS, default="access",
                    help="--env capture point: access = each frame once on its "
                         "sender's VLAN; core = also the routed copy on the "

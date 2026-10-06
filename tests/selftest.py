@@ -207,6 +207,42 @@ def test_span_core_adds_routed_hop() -> None:
           "core view duplicated switched (same-subnet) traffic")
 
 
+def test_industrial_site_is_a_full_purdue_plant() -> None:
+    from tgt import enterprise
+    site = enterprise.get("industrial-site")
+    check(len(site.hosts) >= 90, f"industrial-site has only {len(site.hosts)} hosts")
+    zones = {s.zone for s in site.segments}
+    check(zones == {"IT", "DMZ", "OT-SUPERVISORY", "OT-CELL"},
+          f"industrial-site zones incomplete: {zones}")
+    protos = {p for _, _, p in site.conversations}
+    for need in ("enip", "enip-id", "s7comm", "s7-id", "modbus", "dnp3",
+                 "iec104", "bacnet", "opcua"):
+        check(need in protos, f"industrial-site never speaks {need}")
+    vendors = {h.vendor for h in site.hosts if h.vendor}
+    check(len(vendors) >= 5, f"industrial-site has few OT vendors: {vendors}")
+    blob = b"".join(f for _, f in site.build(1))
+    check(b"PowerFlex 755" in blob, "industrial-site: no drive identity")
+    check(b"6ES7 516" in blob, "industrial-site: no S7-1500 order number")
+    # IT and OT meet only in the DMZ ... except the one planted violation
+    zone = {h.name: site.segment_of(h).zone for h in site.hosts}
+    bypass = [(c, sv) for c, sv, _ in site.conversations
+              if {zone[c], zone[sv]} & {"IT"} and
+              {zone[c], zone[sv]} & {"OT-SUPERVISORY", "OT-CELL"}]
+    check(bypass == [("WS-CONTRACTOR", "METER-UT1")],
+          f"unexpected IT<->OT flows bypassing the DMZ: {bypass}")
+
+
+def test_l2_protocols_cannot_cross_segments() -> None:
+    from tgt import enterprise
+    it = enterprise.get("it-org")
+    try:
+        enterprise.Environment("t", "t", "IT", "", it.hosts,
+                               [("WS20", "DC01", "arp")], it.segments)
+    except ValueError:
+        return
+    _failures.append("ARP between segments was accepted")
+
+
 def test_it_org_has_servers_and_users() -> None:
     from tgt import enterprise
     it = enterprise.get("it-org")

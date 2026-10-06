@@ -142,6 +142,7 @@ to discover and vulnerable systems to flag.
 tgt run --env it-org           -i tgt0 --rate 100     # enterprise IT
 tgt run --env ot-plant         -i tgt0 --rate 100     # industrial OT
 tgt run --env enterprise-mixed -i tgt0 --rate 100     # both, converged
+tgt run --env industrial-site  -i tgt0 --rate 500     # large Purdue-model plant
 ```
 
 | env | models | at-risk fingerprints |
@@ -149,6 +150,7 @@ tgt run --env enterprise-mixed -i tgt0 --rate 100     # both, converged
 | `it-org` | 11 servers (DC×2, DNS, file, SQL, web, mail, proxy, backup) + 12 users; DHCP/DNS/Kerberos/LDAP/SMB/HTTP(S)/NetBIOS/NTP | **legacy Win2000 file server, Win7 + WinXP users** — SMBv1 → MS17-010 |
 | `ot-plant` | Rockwell cell (EtherNet/IP) + Siemens cell (S7comm), HMIs, historian, engineering WS | vendor identity + **legacy WinXP/2000 HMIs** |
 | `enterprise-mixed` | `it-org` + `ot-plant` together (34 hosts) | the full converged IT/OT mix |
+| `industrial-site` | 97 hosts on 9 VLANs: corporate IT, IT/OT DMZ, L3 operations, Rockwell packaging (Logix + PowerFlex), Siemens process, Schneider Modicon utilities + PM5560 meters, Johnson Controls/Tridium BACnet BMS, SEL RTAC + relays over DNP3, IEC-104 RTU | legacy Win7/XP HMIs and users, a Server 2012 R2 OT domain controller, and **an IT laptop polling a meter directly (L4 → L1)** |
 
 Each host's OS profile shapes its traffic — TTL (128 Windows / 64 Linux / 30 Siemens),
 HTTP `User-Agent`, SMB dialect, DHCP/NetBIOS fields, MAC OUI (Rockwell `00:1d:9c`,
@@ -164,6 +166,11 @@ switch whose gateway MACs are HSRP virtual MACs (`00:00:0c:07:ac:<vlan>`):
 | `OT-SUPERVISORY` | 100 | 172.16.0.0/24 | OT-SUPERVISORY (Purdue L3) |
 | `OT-CELL-RW` | 110 | 172.16.1.0/24 | OT-CELL (L1–2, Rockwell) |
 | `OT-CELL-S7` | 120 | 172.16.2.0/24 | OT-CELL (L1–2, Siemens) |
+
+`industrial-site` has its own segments: `CORP-SERVERS` (10) and `CORP-USERS` (20) in IT,
+`IT-OT-DMZ` (50) as the DMZ, `OT-OPS` (100) at L3, and five L1–2 cells: `AREA-PACKAGING` (110),
+`AREA-PROCESS` (120), `AREA-UTILITIES` (130), `BMS` (140) and `SUBSTATION` (150). IT segments
+use `10.10.<n>.0/24` and OT segments use `10.100.<n>.0/24`. Run `tgt list` to see them all.
 
 Every env frame carries its segment's 802.1Q tag. Same-segment flows are switched
 peer to peer, and cross-segment flows are addressed to the sender's gateway MAC. `--span`
@@ -246,7 +253,7 @@ tgt iface delete|list    remove / list interfaces
 
 tgt run [options]
   -p, --profile K[,K]    protocol(s), repeatable        -s, --scenario NAME
-  -e, --env NAME         it-org | ot-plant | enterprise-mixed
+  -e, --env NAME         it-org | ot-plant | enterprise-mixed | industrial-site
       --span VIEW        access | core  (env capture point; core adds routed hops)
       --incident NAME    wannacry | stuxnet | industroyer | triton | …
       --sprinkle N[,N]   mix incident(s) into the base traffic
