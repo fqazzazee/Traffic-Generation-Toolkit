@@ -90,7 +90,7 @@ def _build_base(cfg: RunConfig) -> List[tuple[str, bytes]]:
         return incidents.get(cfg.incident).build(cfg.messages)
     if cfg.env:
         from . import enterprise
-        return enterprise.get(cfg.env).build(cfg.messages)
+        return enterprise.get(cfg.env).build(cfg.messages, span=cfg.span)
     per_profile: List[List[tuple[str, bytes]]] = []
     for key in cfg.profiles:
         prof = protocols.get(key)

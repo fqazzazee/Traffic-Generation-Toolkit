@@ -36,6 +36,8 @@ def cmd_list(args) -> int:
     for e in enterprise.all_environments():
         print(f"  {e.key:18} {e.name:22} [{e.category}]")
         print(f"    {e.summary()}")
+        segs = ", ".join(f"{s.name} v{s.vlan} {s.subnet}" for s in e.segments)
+        print(f"    segments: {segs}")
         if e.legacy_hosts():
             leg = ", ".join(f"{h.name} ({h.fp.label})" for h in e.legacy_hosts())
             print(f"    at-risk: {leg}")
@@ -122,6 +124,11 @@ def cmd_run(args) -> int:
     if env and env not in enterprise.ENVIRONMENTS:
         print(f"unknown environment: {env}. Try 'tgt list'.", file=sys.stderr)
         return 2
+    span = getattr(args, "span", "access")
+    if span != "access" and not env:
+        print("--span core needs --env (segments come from the modeled "
+              "environment).", file=sys.stderr)
+        return 2
     if incident and incident not in incidents.INCIDENTS:
         print(f"unknown incident: {incident}. Try 'tgt list'.", file=sys.stderr)
         return 2
@@ -153,7 +160,8 @@ def cmd_run(args) -> int:
         vlan=args.vlan,
     )
     cfg = RunConfig(
-        profiles=profs, env=env, incident=incident, sprinkle=sprinkle,
+        profiles=profs, env=env, span=span, incident=incident,
+        sprinkle=sprinkle,
         sprinkle_ratio=max(0.0, getattr(args, "sprinkle_ratio", 0.0)),
         sprinkle_random=getattr(args, "sprinkle_random", False),
         replay_path=replay,
@@ -236,6 +244,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--env", "-e",
                    help="modeled environment: it-org | ot-plant | "
                         "enterprise-mixed (see 'tgt list')")
+    r.add_argument("--span", choices=enterprise.SPAN_VIEWS, default="access",
+                   help="--env capture point: access = each frame once on its "
+                        "sender's VLAN; core = also the routed copy on the "
+                        "receiver's VLAN (gateway MAC, TTL-1)")
     r.add_argument("--incident",
                    help="famous incident scenario, e.g. wannacry | stuxnet | "
                         "industroyer | triton (see 'tgt list')")

@@ -182,3 +182,39 @@ def udp_frame(ep: Endpoints, from_client: bool, sport: int, dport: int,
     d_ip = ep.server_ip if from_client else ep.client_ip
     seg = udp(s_ip, d_ip, sport, dport, payload)
     return ip_frame(ep, from_client, IPPROTO_UDP, seg, ident=ident)
+
+
+def frame_ips(frame: bytes) -> tuple[str, str] | None:
+    """(src_ip, dst_ip) of an IPv4 frame (802.1Q-tagged or not), else None."""
+    off = 14
+    etype = struct.unpack("!H", frame[12:14])[0]
+    if etype == ETH_P_VLAN:
+        etype = struct.unpack("!H", frame[16:18])[0]
+        off = 18
+    if etype != ETH_P_IP or len(frame) < off + 20:
+        return None
+    return (".".join(map(str, frame[off + 12:off + 16])),
+            ".".join(map(str, frame[off + 16:off + 20])))
+
+
+def rewrite_l2(frame: bytes, src_mac: str, dst_mac: str, vlan: int | None,
+               ttl: int | None = None) -> bytes:
+    """Re-address a frame as it appears on another hop of a routed path.
+
+    New MACs, the other segment's 802.1Q tag and (for IPv4) a new TTL with the
+    header checksum recomputed. TCP/UDP checksums do not cover the TTL, so the
+    L4 segment is carried over untouched.
+    """
+    etype = struct.unpack("!H", frame[12:14])[0]
+    body = frame[14:]
+    if etype == ETH_P_VLAN:
+        etype = struct.unpack("!H", frame[16:18])[0]
+        body = frame[18:]
+    if etype == ETH_P_IP and ttl is not None and len(body) >= 20:
+        ihl = (body[0] & 0x0F) * 4
+        hdr = bytearray(body[:ihl])
+        hdr[8] = max(1, min(255, ttl))
+        hdr[10:12] = b"\x00\x00"
+        hdr[10:12] = struct.pack("!H", checksum16(bytes(hdr)))
+        body = bytes(hdr) + body[ihl:]
+    return ethernet(dst_mac, src_mac, etype, body, vlan=vlan)

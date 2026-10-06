@@ -154,6 +154,26 @@ Each host's OS profile shapes its traffic — TTL (128 Windows / 64 Linux / 30 S
 HTTP `User-Agent`, SMB dialect, DHCP/NetBIOS fields, MAC OUI (Rockwell `00:1d:9c`,
 Siemens `00:0e:8c`), and PLC identity strings (`1756-L71 LOGIX5571`, `6ES7 315-…`).
 
+Hosts sit in **segments**, each with its own VLAN, subnet, zone and gateway, routed by a core L3
+switch whose gateway MACs are HSRP virtual MACs (`00:00:0c:07:ac:<vlan>`):
+
+| segment | VLAN | subnet | zone |
+|---|---|---|---|
+| `IT-SERVERS` | 10 | 10.20.10.0/24 | IT |
+| `IT-USERS` | 20 | 10.20.20.0/24 | IT |
+| `OT-SUPERVISORY` | 100 | 172.16.0.0/24 | OT-SUPERVISORY (Purdue L3) |
+| `OT-CELL-RW` | 110 | 172.16.1.0/24 | OT-CELL (L1–2, Rockwell) |
+| `OT-CELL-S7` | 120 | 172.16.2.0/24 | OT-CELL (L1–2, Siemens) |
+
+Every env frame carries its segment's 802.1Q tag. Same-segment flows are switched
+peer to peer, and cross-segment flows are addressed to the sender's gateway MAC. `--span`
+picks where the sensor sits:
+
+```bash
+tgt run --env it-org --span access -i tgt0   # default: each frame once, on the sender's VLAN
+tgt run --env it-org --span core   -i tgt0   # + routed copy on the receiver's VLAN (gw MAC, TTL-1)
+```
+
 ---
 
 ## Attack incidents
@@ -227,6 +247,7 @@ tgt iface delete|list    remove / list interfaces
 tgt run [options]
   -p, --profile K[,K]    protocol(s), repeatable        -s, --scenario NAME
   -e, --env NAME         it-org | ot-plant | enterprise-mixed
+      --span VIEW        access | core  (env capture point; core adds routed hops)
       --incident NAME    wannacry | stuxnet | industroyer | triton | …
       --sprinkle N[,N]   mix incident(s) into the base traffic
       --sprinkle-ratio F   target malware fraction 0.0–0.9 (0 = natural)

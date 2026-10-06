@@ -27,15 +27,19 @@ def check(cond: bool, msg: str) -> None:
 def verify_ip_l4(frame: bytes, label: str) -> None:
     """IP and TCP/UDP checksums must re-sum to zero when correct."""
     eth_type = struct.unpack("!H", frame[12:14])[0]
+    off = 14
+    if eth_type == P.ETH_P_VLAN:
+        eth_type = struct.unpack("!H", frame[16:18])[0]
+        off = 18
     if eth_type != P.ETH_P_IP:
         return
-    ihl = (frame[14] & 0x0F) * 4
-    ip_hdr = frame[14:14 + ihl]
+    ihl = (frame[off] & 0x0F) * 4
+    ip_hdr = frame[off:off + ihl]
     check(P.checksum16(ip_hdr) == 0, f"{label}: IP checksum invalid")
-    proto = frame[14 + 9]
-    src = frame[14 + 12:14 + 16]
-    dst = frame[14 + 16:14 + 20]
-    seg = frame[14 + ihl:]
+    proto = frame[off + 9]
+    src = frame[off + 12:off + 16]
+    dst = frame[off + 16:off + 20]
+    seg = frame[off + ihl:]
     if proto in (P.IPPROTO_TCP, P.IPPROTO_UDP):
         pseudo = src + dst + struct.pack("!BBH", 0, proto, len(seg))
         check(P.checksum16(pseudo + seg) == 0,
@@ -111,6 +115,96 @@ def test_environments_build_and_checksum() -> None:
         for _, f in batch:
             verify_ip_l4(f, f"env:{env.key}")
         check(len(env.hosts) >= 10, f"env {env.key} has too few hosts")
+
+
+def _vlan(frame: bytes) -> int | None:
+    if struct.unpack("!H", frame[12:14])[0] != P.ETH_P_VLAN:
+        return None
+    return struct.unpack("!H", frame[14:16])[0] & 0x0FFF
+
+
+def test_every_host_has_a_segment() -> None:
+    from tgt import enterprise
+    for env in enterprise.all_environments():
+        check(len(env.segments) >= 2, f"env {env.key}: not segmented")
+        for h in env.hosts:
+            seg = env.segment_of(h)
+            check(seg.contains(h.ip), f"{env.key}: {h.name} outside {seg.name}")
+            check(h.ip != seg.gateway, f"{env.key}: {h.name} uses gateway IP")
+        for _, f in env.build(1):
+            check(_vlan(f) in {s.vlan for s in env.segments},
+                  f"env {env.key}: frame without a segment VLAN tag")
+
+
+def _one_flow(env_key: str, conv, span: str):
+    from tgt import enterprise
+    base = enterprise.get(env_key)
+    env = enterprise.Environment("t", "t", base.category, "", base.hosts,
+                                 [conv], base.segments)
+    return env, [f for _, f in env.build(1, span=span)]
+
+
+def test_cross_subnet_uses_gateway_and_tags() -> None:
+    env, frames = _one_flow("it-org", ("WS20", "DC01", "kerberos"), "access")
+    ws, dc = env.host("WS20"), env.host("DC01")
+    users, servers = env.segment_of(ws), env.segment_of(dc)
+    check(users is not servers, "WS20 and DC01 should be on different segments")
+    seen = set()
+    for f in frames:
+        src, dst = P.frame_ips(f)
+        if src == ws.ip:
+            seen.add("c2s")
+            check(_vlan(f) == users.vlan, "client frame not on users VLAN")
+            check(f[0:6] == P.mac_to_bytes(users.gateway_mac),
+                  "client frame not addressed to its gateway")
+            check(f[6:12] == P.mac_to_bytes(ws.mac), "client src MAC wrong")
+        else:
+            seen.add("s2c")
+            check(_vlan(f) == servers.vlan, "server frame not on servers VLAN")
+            check(f[0:6] == P.mac_to_bytes(servers.gateway_mac),
+                  "server frame not addressed to its gateway")
+    check(seen == {"c2s", "s2c"}, f"cross-subnet flow missing a direction: {seen}")
+
+
+def test_same_subnet_is_switched() -> None:
+    env, frames = _one_flow("ot-plant", ("HMI-RW", "PLC-RW1", "enip"), "access")
+    hmi, plc = env.host("HMI-RW"), env.host("PLC-RW1")
+    seg = env.segment_of(hmi)
+    for f in frames:
+        check(_vlan(f) == seg.vlan, "same-subnet frame on wrong VLAN")
+        macs = {f[0:6], f[6:12]}
+        check(macs == {P.mac_to_bytes(hmi.mac), P.mac_to_bytes(plc.mac)},
+              "same-subnet frame not addressed peer-to-peer")
+
+
+def test_span_core_adds_routed_hop() -> None:
+    conv = ("WS20", "DC01", "kerberos")
+    env, access = _one_flow("it-org", conv, "access")
+    _, core = _one_flow("it-org", conv, "core")
+    check(len(core) == 2 * len(access), "core view should double routed frames")
+    ws, dc = env.host("WS20"), env.host("DC01")
+    users, servers = env.segment_of(ws), env.segment_of(dc)
+    for ingress, egress in zip(core[0::2], core[1::2]):
+        verify_ip_l4(egress, "span-core")
+        check(P.frame_ips(ingress) == P.frame_ips(egress),
+              "routed hop changed the IP addresses")
+        check(egress[18 + 8] == ingress[18 + 8] - 1, "routed hop TTL not -1")
+        check(egress[18 + 20:] == ingress[18 + 20:], "routed hop changed L4")
+        if P.frame_ips(ingress)[0] == ws.ip:
+            check(_vlan(egress) == servers.vlan, "egress not on servers VLAN")
+            check(egress[6:12] == P.mac_to_bytes(servers.gateway_mac)
+                  and egress[0:6] == P.mac_to_bytes(dc.mac),
+                  "egress not gateway -> server")
+        else:
+            check(_vlan(egress) == users.vlan, "egress not on users VLAN")
+            check(egress[6:12] == P.mac_to_bytes(users.gateway_mac)
+                  and egress[0:6] == P.mac_to_bytes(ws.mac),
+                  "egress not gateway -> client")
+    # same-subnet traffic is not routed, so core adds nothing
+    _, a = _one_flow("ot-plant", ("HMI-RW", "PLC-RW1", "enip"), "access")
+    _, c = _one_flow("ot-plant", ("HMI-RW", "PLC-RW1", "enip"), "core")
+    check([f[:18] for f in a] == [f[:18] for f in c],   # ports/seqs are random
+          "core view duplicated switched (same-subnet) traffic")
 
 
 def test_it_org_has_servers_and_users() -> None:

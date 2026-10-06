@@ -8,16 +8,23 @@ the OT side — Rockwell EtherNet/IP and Siemens S7comm PLC polling with vendor
 identity. Legacy hosts (Windows 2000/XP/7) advertise SMBv1 and old User-Agents so
 an analyser (Zeek, Suricata, Claroty CTD, …) can inventory assets and flag the risky ones.
 
+Hosts sit in segments (:class:`Segment`) — one VLAN + subnet + security zone each, routed
+by a core L3 switch. Same-segment flows are switched (peer MACs); cross-segment
+flows go via the gateway MAC and carry each segment's 802.1Q tag. The default
+``access`` view shows every frame once, on its sender's VLAN; the ``core`` view
+adds the routed copy on the receiver's VLAN, as a SPAN on the core switch sees.
+
 Everything is synthetic and self-contained; it reuses the byte-accurate builders
 in :mod:`tgt.protocols`, driving them between arbitrary host pairs.
 """
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple
 
 from . import protocols
-from .packet import Endpoints
+from .packet import Endpoints, bytes_to_mac, mac_to_bytes, rewrite_l2
 
 # Vendor OUIs — an analyser also fingerprints assets by MAC prefix.
 OUI_WIN = "00:50:56"        # VMware-hosted Windows/Linux
@@ -78,6 +85,30 @@ class Host:
         return FINGERPRINTS[self.os]
 
 
+@dataclass(frozen=True)
+class Segment:
+    """One L2 broadcast domain: a VLAN carrying one IPv4 subnet.
+
+    ``gateway`` is the segment's SVI on the core L3 switch. Its MAC is the HSRP
+    virtual MAC for group = VLAN (0000.0c07.acXX), which is what hosts ARP for.
+    """
+    name: str
+    vlan: int
+    subnet: str        # CIDR, e.g. "10.20.10.0/24"
+    zone: str          # IT | OT-SUPERVISORY (Purdue L3) | OT-CELL (L1-2)
+    gateway: str       # default-gateway IP
+
+    @property
+    def gateway_mac(self) -> str:
+        return f"00:00:0c:07:ac:{self.vlan & 0xFF:02x}"
+
+    def contains(self, ip: str) -> bool:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(self.subnet)
+
+
+SPAN_VIEWS = ("access", "core")
+
+
 # A conversation: client drives `proto` toward server.
 Conversation = Tuple[str, str, str]   # (client_name, server_name, proto_key)
 
@@ -107,6 +138,13 @@ def _it_hosts() -> List[Host]:
         h.append(Host(f"WS{i:02d}", f"10.20.20.{i}", _mac(OUI_WIN, 0x200 + i),
                       "ws", os_))
     return h
+
+
+def _it_segments() -> List[Segment]:
+    return [
+        Segment("IT-SERVERS", 10, "10.20.10.0/24", "IT", "10.20.10.1"),
+        Segment("IT-USERS", 20, "10.20.20.0/24", "IT", "10.20.20.1"),
+    ]
 
 
 def _it_conversations(hosts: List[Host]) -> List[Conversation]:
@@ -171,6 +209,15 @@ def _ot_hosts() -> List[Host]:
     return h
 
 
+def _ot_segments() -> List[Segment]:
+    return [
+        Segment("OT-SUPERVISORY", 100, "172.16.0.0/24", "OT-SUPERVISORY",
+                "172.16.0.1"),
+        Segment("OT-CELL-RW", 110, "172.16.1.0/24", "OT-CELL", "172.16.1.1"),
+        Segment("OT-CELL-S7", 120, "172.16.2.0/24", "OT-CELL", "172.16.2.1"),
+    ]
+
+
 def _ot_conversations(hosts: List[Host]) -> List[Conversation]:
     by = {x.name: x for x in hosts}
     conv: List[Conversation] = [
@@ -205,11 +252,31 @@ class Environment:
     desc: str
     hosts: List[Host]
     conversations: List[Conversation]
+    segments: List[Segment]
+
+    def __post_init__(self) -> None:
+        vlans = [s.vlan for s in self.segments]
+        if len(set(vlans)) != len(vlans):
+            raise ValueError(f"{self.key}: duplicate VLAN in {vlans}")
+        for s in self.segments:
+            if not s.contains(s.gateway):
+                raise ValueError(f"{self.key}: gateway {s.gateway} outside "
+                                 f"{s.name} {s.subnet}")
+        self._seg: Dict[str, Segment] = {}
+        for h in self.hosts:
+            hit = [s for s in self.segments if s.contains(h.ip)]
+            if len(hit) != 1:
+                raise ValueError(f"{self.key}: host {h.name} ({h.ip}) is in "
+                                 f"{len(hit)} segments, expected 1")
+            self._seg[h.name] = hit[0]
 
     def host(self, name: str) -> Host:
         return next(h for h in self.hosts if h.name == name)
 
-    def _endpoints(self, client: Host, server: Host, vlan=None) -> Endpoints:
+    def segment_of(self, host: Host) -> Segment:
+        return self._seg[host.name]
+
+    def _endpoints(self, client: Host, server: Host) -> Endpoints:
         meta = {
             "ua": client.fp.ua,
             "smb": client.fp.smb if client.fp.smb != "none" else "smb2",
@@ -223,25 +290,57 @@ class Environment:
             "order": server.product or "6ES7 315-2EH14-0AB0",
             "server": "Microsoft-IIS/10.0" if server.os.startswith("win") else "Apache",
         }
+        # Built untagged, host to host; _place() puts each frame on its VLAN.
         return Endpoints(
             client_mac=client.mac, client_ip=client.ip,
-            server_mac=server.mac, server_ip=server.ip, vlan=vlan,
+            server_mac=server.mac, server_ip=server.ip,
             ttl_client=client.fp.ttl, ttl_server=server.fp.ttl, meta=meta)
 
-    def build(self, messages: int) -> List[Tuple[str, bytes]]:
-        """One cycle: interleave every modeled conversation once."""
-        streams: List[List[Tuple[str, bytes]]] = []
+    def _place(self, frame: bytes, client: Host, server: Host,
+               span: str) -> List[bytes]:
+        """A host-built frame as it appears on the trunk (one or two copies).
+
+        Same segment: switched, tagged with the segment VLAN. Cross segment:
+        the sender addresses its gateway on its own VLAN; in the ``core`` view
+        the router's egress copy follows on the receiver's VLAN with TTL-1.
+        """
+        from_client = frame[6:12] == mac_to_bytes(client.mac)
+        src, dst = (client, server) if from_client else (server, client)
+        sseg, dseg = self.segment_of(src), self.segment_of(dst)
+        if sseg is dseg:
+            return [rewrite_l2(frame, bytes_to_mac(frame[6:12]),
+                               bytes_to_mac(frame[0:6]), sseg.vlan)]
+        out = [rewrite_l2(frame, src.mac, sseg.gateway_mac, sseg.vlan)]
+        if span == "core":
+            out.append(rewrite_l2(frame, dseg.gateway_mac, dst.mac, dseg.vlan,
+                                  ttl=frame[14 + 8] - 1))
+        return out
+
+    def build(self, messages: int,
+              span: str = "access") -> List[Tuple[str, bytes]]:
+        """One cycle: interleave every modeled conversation once.
+
+        ``span`` is the capture point: ``access`` (each frame once, on its
+        sender's VLAN) or ``core`` (routed frames also on the receiver's VLAN).
+        """
+        if span not in SPAN_VIEWS:
+            raise ValueError(f"unknown span view {span!r}; use {SPAN_VIEWS}")
+        # each stream item is the group of copies one host frame produces;
+        # a group stays contiguous so ingress/egress hops sit side by side
+        streams: List[List[Tuple[str, List[bytes]]]] = []
         for cname, sname, proto in self.conversations:
             client, server = self.host(cname), self.host(sname)
             ep = self._endpoints(client, server)
             frames = protocols.get(proto).build(ep, max(1, messages))
-            streams.append([(proto, f) for f in frames])
+            streams.append([(proto, self._place(f, client, server, span))
+                            for f in frames])
         out: List[Tuple[str, bytes]] = []
         i = 0
         while any(i < len(s) for s in streams):
             for s in streams:
                 if i < len(s):
-                    out.append(s[i])
+                    proto, group = s[i]
+                    out.extend((proto, g) for g in group)
             i += 1
         return out
 
@@ -255,11 +354,16 @@ class Environment:
         roles = ", ".join(f"{v} {k}" for k, v in sorted(cats.items()))
         leg = len(self.legacy_hosts())
         return (f"{len(self.hosts)} hosts ({roles}); "
+                f"{len(self.segments)} segments; "
                 f"{len(self.conversations)} conversations; {leg} legacy/at-risk")
 
 
 def _mixed_hosts() -> List[Host]:
     return _it_hosts() + _ot_hosts()
+
+
+def _mixed_segments() -> List[Segment]:
+    return _it_segments() + _ot_segments()
 
 
 def _mixed_conversations(hosts: List[Host]) -> List[Conversation]:
@@ -269,26 +373,26 @@ def _mixed_conversations(hosts: List[Host]) -> List[Conversation]:
 ENVIRONMENTS: Dict[str, Environment] = {}
 
 
-def _reg_env(key, name, category, desc, hosts_fn, conv_fn):
+def _reg_env(key, name, category, desc, hosts_fn, conv_fn, seg_fn):
     hosts = hosts_fn()
     ENVIRONMENTS[key] = Environment(key, name, category, desc, hosts,
-                                    conv_fn(hosts))
+                                    conv_fn(hosts), seg_fn())
 
 
 _reg_env("it-org", "IT Organization", "IT",
          "Enterprise IT: DC/DNS/file/web/mail servers + 12 users with DHCP, "
          "Kerberos, LDAP, SMB, HTTP/HTTPS and OS-fingerprint chatter "
          "(incl. a legacy Windows 2000 file server, Win7 and WinXP users).",
-         _it_hosts, _it_conversations)
+         _it_hosts, _it_conversations, _it_segments)
 _reg_env("ot-plant", "OT Plant", "OT",
          "Rockwell + Siemens cells: ControlLogix/CompactLogix over EtherNet/IP, "
          "S7-300/1500 over S7comm, HMIs, historian, engineering WS, and legacy "
          "Windows XP/2000 HMIs with vendor-identity and fingerprint traffic.",
-         _ot_hosts, _ot_conversations)
+         _ot_hosts, _ot_conversations, _ot_segments)
 _reg_env("enterprise-mixed", "Mixed IT + OT Site", "mixed",
          "The full site: the IT organization and the OT plant together — the "
          "realistic converged network an analyser sees at an industrial site.",
-         _mixed_hosts, _mixed_conversations)
+         _mixed_hosts, _mixed_conversations, _mixed_segments)
 
 
 def get(key: str) -> Environment:

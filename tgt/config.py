@@ -11,6 +11,7 @@ from .packet import Endpoints
 class RunConfig:
     profiles: List[str] = field(default_factory=lambda: ["modbus"])
     env: Optional[str] = None            # modeled environment; overrides profiles
+    span: str = "access"                 # env capture point: access | core (routed hops too)
     incident: Optional[str] = None       # famous-incident scenario; overrides profiles
     sprinkle: List[str] = field(default_factory=list)  # incidents mixed into the base
     sprinkle_messages: int = 2           # exchanges per sprinkled incident (keeps it a minority)
@@ -37,6 +38,8 @@ class RunConfig:
             what = f"incident={self.incident}"
         elif self.env:
             what = f"env={self.env}"
+            if self.span != "access":
+                what += f" span={self.span}"
         else:
             what = f"profiles={','.join(self.profiles)}"
         if self.sprinkle or self.sprinkle_random:
