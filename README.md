@@ -183,14 +183,16 @@ Each host's OS profile shapes its traffic — TTL (128 Windows / 64 Linux / 30 S
 HTTP `User-Agent`, SMB dialect, DHCP/NetBIOS fields, MAC OUI (Rockwell `00:1d:9c`,
 Siemens `00:0e:8c`), and PLC identity strings (`1756-L71 LOGIX5571`, `6ES7 315-…`).
 
-**Endpoint EDR (CrowdStrike Falcon).** Every Windows host that can run a Falcon sensor
-(Win7 SP1+ / Server 2012+) keeps a TLS telemetry channel open to the CrowdStrike Security
-Cloud, egressing via its gateway like any internet-bound flow — so the sensor sees normal
-EDR traffic on each covered endpoint (protocol key `edr`). The tell is the SNI: the US-1
-cloud hosts `ts01-b.cloudsink.net` (sensor channel), `lfoup01-b` / `lfodown01-b.cloudsink.net`
-(telemetry / content) and `api.crowdstrike.com`. CrowdStrike publishes connectivity by FQDN
-(its cloud is AWS-hosted with dynamic IPs), so the destination addresses are representative
-AWS-range stand-ins, not an official allowlist. The EOL **WinXP / Win2000** hosts stay
+**Endpoint EDR (CrowdStrike Falcon).** Every Windows **and Linux** host that can run a
+Falcon sensor (Win7 SP1+ / Server 2012+, Linux servers) keeps a TLS telemetry channel open
+to the CrowdStrike Security Cloud, egressing via its gateway like any internet-bound flow —
+so the sensor sees normal EDR traffic on each covered endpoint (protocol key `edr`). The
+tell is the SNI: the **EU-1** cloud hosts `ts01-lanner-lion.cloudsink.net` (sensor channel),
+`lfoup01-` / `lfodown01-lanner-lion.cloudsink.net` (telemetry / content) and
+`api.eu-1.crowdstrike.com`. Each FQDN resolves to many AWS IPs, so the fleet's beacons are
+spread across CrowdStrike's published **EU-1 (eu-central-1 / Frankfurt) egress IP set**
+(`CROWDSTRIKE_CLOUD_IPS` in `tgt/enterprise.py`). The EOL **WinXP / Win2000** hosts and the
+**embedded OT devices** (PLCs, RTUs, relays, drives, meters, BACnet/JACE firmware) stay
 deliberately *uncovered* — a real gap an analyser should flag.
 
 Hosts sit in **segments**, each with its own VLAN, subnet, zone and gateway, routed by a core L3

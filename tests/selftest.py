@@ -666,14 +666,16 @@ def test_sprinkle_random_picks_varied_incidents() -> None:
     check(len(seen) >= 3, f"random sprinkle not varied enough: {seen}")
 
 
-def test_crowdstrike_edr_on_windows_hosts() -> None:
+def test_crowdstrike_edr_on_windows_and_linux_hosts() -> None:
     from tgt import enterprise
+    pool = set(enterprise.CROWDSTRIKE_CLOUD_IPS)
     for env in enterprise.all_environments():
         covered = {h.name for h in env.edr_hosts()}
-        # Falcon-supported Windows are covered; EOL XP/2000 are not; OT firmware
-        # and Linux never are.
+        # Falcon-supported Windows + Linux are covered; EOL XP/2000 and embedded
+        # OT devices (by vendor MAC OUI) are not.
         for h in env.hosts:
-            want = h.os in ("win7", "win10", "win2012", "win2019")
+            want = (h.os in enterprise.EDR_OS
+                    and h.mac[:8].lower() not in enterprise._EMBEDDED_OUIS)
             check((h.name in covered) == want,
                   f"{env.key}: {h.name} ({h.os}) EDR coverage wrong")
         if not covered:
@@ -681,14 +683,19 @@ def test_crowdstrike_edr_on_windows_hosts() -> None:
         check("edr" in env.protocols(), f"{env.key}: edr not advertised")
         labels = {k for k, _ in env.build(1)}
         check("edr" in labels, f"{env.key}: no EDR frames on the wire")
+        dst = set()
+        for k, f in env.build(1):
+            if k != "edr":
+                continue
+            # EDR egresses via the gateway on the host's own VLAN (never left raw)
+            check(_vlan(f) in {s.vlan for s in env.segments},
+                  f"{env.key}: EDR frame not tagged on an env VLAN")
+            dst.update(P.frame_ips(f) or ())
+        cloud = dst & pool
+        check(cloud, f"{env.key}: EDR traffic never reached a CrowdStrike cloud IP")
         blob = b"".join(f for k, f in env.build(1) if k == "edr")
         check(b"cloudsink.net" in blob,
               f"{env.key}: EDR traffic missing the CrowdStrike cloud SNI")
-        # EDR egresses via the gateway on the host's own VLAN (never left raw)
-        for k, f in env.build(1):
-            if k == "edr":
-                check(_vlan(f) in {s.vlan for s in env.segments},
-                      f"{env.key}: EDR frame not tagged on an env VLAN")
 
 
 def test_sprinkle_rides_inventory_without_an_env() -> None:
