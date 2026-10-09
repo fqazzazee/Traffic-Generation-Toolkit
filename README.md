@@ -416,6 +416,42 @@ outgoing frames, and a switch port configured to accept ingress on a SPAN destin
 would forward TGT's synthetic OT commands and attack traffic into the real network.
 Mirror traffic only on isolated segments you're authorized to test.
 
+### TGT VM — bring the send interface up (and promiscuous if needed)
+
+On the TGT VM, the send interface must be **UP** before TGT can transmit — `AF_PACKET`
+can't send on a down link. Bring it up (no IP is needed; it's a pure transmit port):
+
+```bash
+sudo ip link set eth0 up                 # the NIC TGT sends on (-i eth0 / TGT_IFACE)
+ip link show eth0                         # expect: state UP ... (and PROMISC if set below)
+```
+
+TGT builds every frame with a **synthetic source MAC** — vendor OUIs, the HSRP gateway
+MAC, the veth peer, not the vNIC's own address. A hypervisor vSwitch drops those by
+default because the source MAC doesn't match the one it assigned the port, so the sensor
+sees nothing. Two things fix it, and you usually need both:
+
+- **On the TGT VM**, put the send NIC in **promiscuous** mode so the guest hands all
+  crafted frames to the vNIC rather than only its own-MAC traffic:
+
+  ```bash
+  sudo ip link set eth0 promisc on         # PROMISC appears in `ip link show eth0`
+  sudo ip link set eth0 promisc off        # revert
+  ```
+
+- **On the hypervisor**, allow forged source MACs on the port group feeding TGT's vNIC —
+  on VMware that's **Promiscuous Mode + MAC Address Changes + Forged Transmits** set to
+  *Accept* ([`SPAN Configuration/VMware.md`](SPAN%20Configuration/VMware.md)); other
+  hypervisors have the equivalent. A plain Linux-bridge / Proxmox hub (below) floods
+  regardless, so it needs no forged-transmit flag.
+
+Both settings are runtime-only and reset on reboot. To make them durable, set the port
+group / portgroup policy on the hypervisor, and persist the guest link state the usual
+way — a systemd unit, a NetworkManager/`/etc/network/interfaces` stanza, or a `@reboot`
+cron entry running the `ip link set … up promisc on` above. A **veth** send interface
+(TGT's default, on the same host as the sensor) needs none of this: `iface create`
+already brings both ends up, and synthetic MACs flood freely across a local veth/bridge.
+
 ### Proxmox — feed a Traffic Analyser VM (hub bridge)
 
 Typical lab: **TGT in one VM, the analyser** (Zeek, Suricata, Security Onion, Malcolm,
