@@ -112,31 +112,44 @@ class Host:
 # ---------------------------------------------------------------------------
 # CrowdStrike Falcon EDR — the cloud every Windows host beacons to
 # ---------------------------------------------------------------------------
-# CrowdStrike publishes its sensor connectivity by FQDN, not by stable IP: the
-# Security Cloud is AWS-hosted (US-1 ≈ us-west-1) with dynamic addresses, so the
-# SNI is the authoritative EDR tell. The IPs below are representative AWS-range
-# stand-ins so the generated frames have a plausible destination for the
-# dissector — they are NOT an official allowlist. FQDNs are the real US-1 set.
-CROWDSTRIKE_CLOUD = [
-    ("CS-FALCON-TS", "ts01-b.cloudsink.net", "13.52.126.10"),      # sensor channel
-    ("CS-FALCON-UP", "lfoup01-b.cloudsink.net", "54.183.209.11"),  # telemetry upload
-    ("CS-FALCON-DOWN", "lfodown01-b.cloudsink.net", "13.57.119.12"),  # content
-    ("CS-FALCON-API", "api.crowdstrike.com", "13.57.204.13"),      # console / API
+# The sensor reaches the Security Cloud by FQDN — the SNI is the authoritative
+# EDR tell — and each name resolves to many AWS IPs. These are CrowdStrike's
+# EU-1 cloud (AWS eu-central-1 / Frankfurt): the FQDNs below and the published
+# egress IP set the fleet's beacons are spread across.
+CROWDSTRIKE_FQDNS = {
+    "ts": "ts01-lanner-lion.cloudsink.net",        # sensor channel (C2)
+    "up": "lfoup01-lanner-lion.cloudsink.net",     # telemetry upload
+    "down": "lfodown01-lanner-lion.cloudsink.net",  # content / policy download
+    "api": "api.eu-1.crowdstrike.com",             # OAuth2 API / console
+}
+
+CROWDSTRIKE_CLOUD_IPS = [
+    "18.158.187.80", "18.198.53.88", "3.121.187.176", "3.121.238.86",
+    "3.121.6.180", "3.125.15.130", "18.194.222.197", "18.197.35.253",
+    "3.122.135.178", "35.157.198.104", "63.179.114.102", "63.179.203.249",
+    "18.196.94.202", "3.121.28.37", "52.29.26.172", "18.158.141.230",
+    "18.184.139.200", "18.195.129.87", "3.64.87.158", "3.73.169.253",
+    "3.79.224.18", "52.28.120.115", "52.57.246.231", "3.123.89.179",
+    "3.126.96.195", "3.69.129.49", "18.184.114.155", "18.194.8.224",
+    "3.121.13.180", "3.123.240.202", "3.78.32.129", "35.156.219.65",
+    "3.69.184.79", "3.76.143.53", "3.77.82.22",
 ]
 
-# Falcon runs on modern Windows (Win7 SP1+ / Server 2012+); the EOL Windows
-# 2000/XP legacy hosts cannot, so they stay deliberately uncovered — a gap an
-# analyser should flag.
-EDR_OS = {"win7", "win10", "win2012", "win2019"}
+# Falcon runs on modern Windows (Win7 SP1+ / Server 2012+) and Linux servers;
+# the EOL Win2000/XP hosts and embedded OT devices (PLC/RTU/relay/drive/meter
+# and BACnet/JACE firmware, identified by their vendor MAC OUI) cannot, so they
+# stay deliberately uncovered — a gap an analyser should flag.
+EDR_OS = {"win7", "win10", "win2012", "win2019", "linux"}
+_EMBEDDED_OUIS = {OUI_ROCKWELL, OUI_SIEMENS, OUI_SCHNEIDER, OUI_JCI,
+                  OUI_TRIDIUM, OUI_SEL}
 
 
-def _crowdstrike_hosts() -> List[Host]:
-    return [Host(name, ip, f"02:00:5c:00:00:{i:02x}", "edr", "linux",
-                 "CrowdStrike", fqdn)
-            for i, (name, fqdn, ip) in enumerate(CROWDSTRIKE_CLOUD, 1)]
-
-
-CS_CLOUD_HOSTS: List[Host] = _crowdstrike_hosts()
+def _cs_cloud_host(ip: str, fqdn: str) -> Host:
+    """An on-the-fly CrowdStrike cloud endpoint for one (IP, FQDN) pair; its MAC
+    is cosmetic (``place`` rewrites it to the gateway as it egresses)."""
+    o = [int(x) for x in ip.split(".")]
+    return Host(f"CS-FALCON-{ip}", ip, "02:00:5c:%02x:%02x:%02x" % tuple(o[1:]),
+                "edr", "linux", "CrowdStrike", fqdn)
 
 
 @dataclass(frozen=True)
@@ -403,9 +416,11 @@ class Environment:
         return self._seg.get(host.name)
 
     def edr_hosts(self) -> List[Host]:
-        """Windows hosts that run a Falcon sensor (Win7 SP1+ / Server 2012+);
-        the EOL XP/2000 legacy hosts can't, so they stay uncovered."""
-        return [h for h in self.hosts if h.os in EDR_OS]
+        """Windows and Linux hosts that run a Falcon sensor. Excludes the EOL
+        XP/2000 Windows and embedded OT devices (by vendor MAC OUI), which
+        can't — so they stay uncovered."""
+        return [h for h in self.hosts if h.os in EDR_OS
+                and h.mac[:8].lower() not in _EMBEDDED_OUIS]
 
     def _edr_endpoints(self, win: Host, cloud: Host) -> Endpoints:
         return Endpoints(
@@ -417,28 +432,33 @@ class Environment:
 
     def _edr_streams(self, messages: int,
                      span: str) -> List[List[Tuple[str, List[bytes]]]]:
-        """Falcon EDR telemetry: every covered Windows host keeps a TLS channel
-        open to the CrowdStrike sensor cloud, egressing via its own gateway
-        (like any internet-bound flow). A representative host also exercises the
-        upload / download / API FQDNs so all of them appear on the wire."""
-        wins = self.edr_hosts()
-        if not wins:
+        """Falcon EDR telemetry: every covered Windows/Linux host keeps a TLS
+        channel open to the CrowdStrike sensor cloud, egressing via its own
+        gateway (like any internet-bound flow). Beacons spread across the EU-1
+        cloud IP pool; a representative host also exercises the upload / download
+        / API FQDNs so all of them appear on the wire."""
+        fleet = self.edr_hosts()
+        if not fleet:
             return []
-        ts, up, down, api = CS_CLOUD_HOSTS
+        ips, fq = CROWDSTRIKE_CLOUD_IPS, CROWDSTRIKE_FQDNS
 
-        def flow(win: Host, cloud: Host, n: int):
-            ep = self._edr_endpoints(win, cloud)
+        def flow(host: Host, ip: str, fqdn: str, n: int):
+            cloud = _cs_cloud_host(ip, fqdn)
+            ep = self._edr_endpoints(host, cloud)
             frames = protocols.get("edr").build(ep, max(1, n))
-            return [("edr", self.place(f, win, cloud, span, self.segment_or_none))
+            return [("edr", self.place(f, host, cloud, span, self.segment_or_none))
                     for f in frames]
 
-        # a low-and-slow beacon per host on the main sensor channel
-        streams = [flow(w, ts, 1) for w in wins]
+        # a low-and-slow beacon per host on the sensor channel, spread over the
+        # cloud IP pool so the whole published egress set appears
+        streams = [flow(h, ips[i % len(ips)], fq["ts"], 1)
+                   for i, h in enumerate(fleet)]
         # one host also uploads telemetry, pulls content and hits the API
-        anchor = next((w for w in wins
-                       if w.role in ("hist", "file", "dc", "scada")), wins[0])
-        streams += [flow(anchor, up, messages), flow(anchor, down, messages),
-                    flow(anchor, api, 1)]
+        anchor = next((h for h in fleet
+                       if h.role in ("hist", "file", "dc", "scada")), fleet[0])
+        streams += [flow(anchor, ips[-1], fq["up"], messages),
+                    flow(anchor, ips[-2], fq["down"], messages),
+                    flow(anchor, ips[-3], fq["api"], 1)]
         return streams
 
     def build(self, messages: int, span: str = "access",
