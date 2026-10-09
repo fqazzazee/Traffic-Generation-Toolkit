@@ -36,6 +36,9 @@ def hosts(env: Environment) -> List[Dict]:
         # self-announcements and ARP replies are not services
         if server != client and protocols.get(proto).transport != "l2":
             serves[server].add(_service(proto))
+    # Falcon-covered Windows hosts beacon EDR telemetry to the CrowdStrike cloud
+    for h in env.edr_hosts():
+        uses[h.name].add("edr")
     rows = []
     for h in env.hosts:
         seg = env.segment_of(h)

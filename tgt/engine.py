@@ -17,6 +17,10 @@ from .config import RunConfig
 from .pcap import PcapWriter
 from .sender import RateLimiter, RawSender
 
+# Inventory a sprinkle re-addresses onto when no environment preset is active —
+# a full Purdue plant, so IT and OT malware both find realistic host matches.
+DEFAULT_SPRINKLE_ENV = "industrial-site"
+
 
 @dataclass
 class Stats:
@@ -64,16 +68,24 @@ def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
         if not pool:
             return base
 
-        env = None
+        from . import enterprise
+        # Malware always rides on a real inventory so it looks like the same
+        # machines are infected. An env preset is that inventory (frames placed
+        # on its VLANs/trunk); otherwise a scenario/custom/protocol base has no
+        # hosts of its own, so we re-address onto a representative plant — the
+        # full Purdue site — keeping Windows→Windows and vendor-matched PLCs.
         if cfg.env:
-            from . import enterprise
-            env = enterprise.get(cfg.env)
+            env, tagged = enterprise.get(cfg.env), True
+        else:
+            env, tagged = enterprise.get(DEFAULT_SPRINKLE_ENV), False
 
         def cycle(i):
             inc = incidents.get(pool[i % len(pool)])
-            if env is not None:     # ride on the environment's real inventory
+            if tagged:              # ride on the env's VLANs/trunk directly
                 return inc.build_on(cfg.sprinkle_messages, env, span=cfg.span)
-            return inc.build(cfg.sprinkle_messages)
+            mapping = inc.map_onto(env)   # re-address only (base is untagged)
+            return inc.build(cfg.sprinkle_messages,
+                             resolve=lambda n, m=mapping: m.get(n) or inc.host(n))
 
         r = min(max(cfg.sprinkle_ratio, 0.0), 0.9)
         if r > 0 and base:

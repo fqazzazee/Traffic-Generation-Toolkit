@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import struct
 import zlib
+from dataclasses import replace
 from typing import Callable, List
 
 from . import packet as P
@@ -608,6 +609,21 @@ def https_flow(ep: Endpoints, count: int) -> List[bytes]:
     return _tcp_flow(ep, _sport(), 443, exchanges)
 
 
+def edr_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """CrowdStrike Falcon EDR telemetry: the sensor's outbound TLS channel to
+    the CrowdStrike Security Cloud.
+
+    It is an ordinary HTTPS/TLS session; the EDR tell is the SNI — a CrowdStrike
+    cloud host (``*.cloudsink.net`` for the sensor channel, ``*.crowdstrike.com``
+    for API/console). CrowdStrike publishes connectivity by FQDN (its cloud is
+    AWS-hosted with dynamic IPs), so the SNI is what a sensor fingerprints EDR
+    traffic on. Set the host via ``ep.meta['sni']``; defaults to the US-1 sensor
+    proxy."""
+    if not ep.meta.get("sni") and not ep.meta.get("domain"):
+        ep = replace(ep, meta={**ep.meta, "sni": "ts01-b.cloudsink.net"})
+    return https_flow(ep, count)
+
+
 def dhcp_flow(ep: Endpoints, count: int) -> List[bytes]:
     """DHCP (67/68): Discover + Offer with a fingerprint (option 55 + vendor 60).
 
@@ -770,6 +786,8 @@ _reg("http", "HTTP", "IT", "80", "tcp", http_flow,
      "Web browsing GET / 200 OK with per-host User-Agent")
 _reg("https", "HTTPS / TLS", "IT", "443", "tcp", https_flow,
      "TLS ClientHello/ServerHello with SNI + cipher list")
+_reg("edr", "CrowdStrike EDR", "IT", "443", "tcp", edr_flow,
+     "Falcon sensor TLS telemetry to the CrowdStrike cloud (cloudsink SNI)")
 _reg("smb", "SMB / CIFS", "IT", "445", "tcp", smb_flow,
      "Negotiate (SMBv1 legacy or SMB 3.0.2) + echo keep-alives")
 _reg("kerberos", "Kerberos", "IT", "88", "tcp", kerberos_flow,

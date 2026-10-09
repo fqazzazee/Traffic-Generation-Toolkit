@@ -360,10 +360,16 @@ class Incident:
                          server_mac=v.mac, server_ip=v.ip,
                          ttl_client=a.fp.ttl, ttl_server=v.fp.ttl, meta=m)
 
-    def build(self, messages: int) -> List[Tuple[str, bytes]]:
+    def build(self, messages: int,
+              resolve: Optional[Callable[[str], Host]] = None
+              ) -> List[Tuple[str, bytes]]:
+        """Build the incident's flows. ``resolve`` re-addresses each incident
+        host name onto another host (e.g. an environment's real inventory via
+        :meth:`map_onto`); by default each host keeps its own identity."""
+        resolve = resolve or self.host
         streams: List[List[Tuple[str, bytes]]] = []
         for aname, vname, atk, meta in self.flows:
-            ep = self._endpoints(self.host(aname), self.host(vname), meta)
+            ep = self._endpoints(resolve(aname), resolve(vname), meta)
             builder = ATTACKS[atk][0]
             frames = builder(ep, max(1, messages))
             streams.append([(atk, f) for f in frames])
@@ -383,23 +389,37 @@ class Incident:
         A candidate must share the role, or failing that the role family
         (see ``_ROLE_FAMILIES``); an embedded device must also come from the
         same vendor (by MAC OUI), so a Siemens S7 attack never lands on a
-        Rockwell PLC. Among candidates: exact role first, then a host not yet
-        used, then the same OS. Hosts with no candidate — and external
-        adversary infrastructure (see ``_is_external``) — keep their own
-        identity."""
+        Rockwell PLC.
+
+        Hosts are mapped top-down through the Purdue model (enterprise stages
+        first, plant floor last; see ``_purdue_level``) so the kill chain lands
+        as a coherent descent: an upstream stage anchors the zone, and each
+        downstream victim prefers a host in the same segment as a neighbour that
+        is already placed — keeping a cell's devices together and lateral
+        movement inside one zone. Among candidates: exact role first, then that
+        neighbour affinity, then a host not yet used, then the same OS. Hosts
+        with no candidate — and external adversary infrastructure (see
+        ``_is_external``) — keep their own identity."""
+        adj: Dict[str, set] = {}
+        for a, v, _, _ in self.flows:
+            adj.setdefault(a, set()).add(v)
+            adj.setdefault(v, set()).add(a)
+        internal = sorted((h for h in self.hosts if not _is_external(h)),
+                          key=lambda h: (-_purdue_level(h.role), h.name))
         used: set = set()
         mapping: Dict[str, Host] = {}
-        for ih in self.hosts:
-            if _is_external(ih):
-                continue
+        for ih in internal:
             vendor = _device_vendor(ih)
             cands = [h for h in env.hosts if _role_tier(ih.role, h.role)
                      and (vendor is None or _device_vendor(h) == vendor)]
             if not cands:
                 continue
-            pick = min(cands, key=lambda h: (-_role_tier(ih.role, h.role),
-                                             h.name in used, h.os != ih.os,
-                                             h.name))
+            neigh_segs = {env.segment_of(mapping[n])
+                          for n in adj.get(ih.name, ()) if n in mapping}
+            pick = min(cands, key=lambda h: (
+                -_role_tier(ih.role, h.role),
+                env.segment_of(h) not in neigh_segs,
+                h.name in used, h.os != ih.os, h.name))
             used.add(pick.name)
             mapping[ih.name] = pick
         return mapping
@@ -477,6 +497,23 @@ def _role_tier(want: str, have: str) -> int:
     if want == have:
         return 2
     return 1 if any(want in f and have in f for f in _ROLE_FAMILIES) else 0
+
+
+# Purdue level per role: higher = closer to the enterprise top (L4/L5), lower =
+# plant floor (L1). Used to map a kill chain top-down so malware traverses the
+# model from IT inward to the field devices, the way the real attacks did.
+_PURDUE_LEVEL = {
+    "ws": 5, "dc": 5, "dns": 5, "file": 5, "web": 5, "mail": 5, "db": 5,
+    "proxy": 5,
+    "jump": 4, "patch": 4, "av": 4,                       # IT/OT DMZ (L3.5)
+    "scada": 3, "hmi": 3, "hist": 3, "eng": 3, "opc": 3, "bms": 3,  # OT L3
+    "plc": 2, "rtu": 2, "relay": 2, "drive": 2,           # OT cell (L1-2)
+    "meter": 1,                                           # field sensor (L1)
+}
+
+
+def _purdue_level(role: str) -> int:
+    return _PURDUE_LEVEL.get(role, 3)
 
 
 def _device_vendor(host: Host):

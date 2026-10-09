@@ -142,7 +142,7 @@ def _one_flow(env_key: str, conv, span: str):
     base = enterprise.get(env_key)
     env = enterprise.Environment("t", "t", base.category, "", base.hosts,
                                  [conv], base.segments)
-    return env, [f for _, f in env.build(1, span=span)]
+    return env, [f for _, f in env.build(1, span=span, edr=False)]
 
 
 def test_cross_subnet_uses_gateway_and_tags() -> None:
@@ -284,7 +284,7 @@ _DISSECTS_AS = {
     "modbus": "mbtcp", "dnp3": "dnp3", "enip": "cip", "s7comm": "s7comm",
     "iec104": "iec60870_asdu", "bacnet": "bacapp", "opcua": "opcua",
     "enip-id": "enip", "s7-id": "s7comm", "arp": "arp", "icmp": "icmp",
-    "dns": "dns", "http": "http", "https": "tls", "smb": "smb2",
+    "dns": "dns", "http": "http", "https": "tls", "edr": "tls", "smb": "smb2",
     "kerberos": "kerberos", "ldap": "ldap", "dhcp": "dhcp", "netbios": "nbns",
     "ntp": "ntp",
 }
@@ -664,6 +664,69 @@ def test_sprinkle_random_picks_varied_incidents() -> None:
                                       messages=1))
         seen |= {k for k, _ in batch} & atk
     check(len(seen) >= 3, f"random sprinkle not varied enough: {seen}")
+
+
+def test_crowdstrike_edr_on_windows_hosts() -> None:
+    from tgt import enterprise
+    for env in enterprise.all_environments():
+        covered = {h.name for h in env.edr_hosts()}
+        # Falcon-supported Windows are covered; EOL XP/2000 are not; OT firmware
+        # and Linux never are.
+        for h in env.hosts:
+            want = h.os in ("win7", "win10", "win2012", "win2019")
+            check((h.name in covered) == want,
+                  f"{env.key}: {h.name} ({h.os}) EDR coverage wrong")
+        if not covered:
+            continue
+        check("edr" in env.protocols(), f"{env.key}: edr not advertised")
+        labels = {k for k, _ in env.build(1)}
+        check("edr" in labels, f"{env.key}: no EDR frames on the wire")
+        blob = b"".join(f for k, f in env.build(1) if k == "edr")
+        check(b"cloudsink.net" in blob,
+              f"{env.key}: EDR traffic missing the CrowdStrike cloud SNI")
+        # EDR egresses via the gateway on the host's own VLAN (never left raw)
+        for k, f in env.build(1):
+            if k == "edr":
+                check(_vlan(f) in {s.vlan for s in env.segments},
+                      f"{env.key}: EDR frame not tagged on an env VLAN")
+
+
+def test_sprinkle_rides_inventory_without_an_env() -> None:
+    # a scenario/protocol base has no hosts, so the sprinkle is re-addressed
+    # onto the default full-Purdue plant rather than the incident's own IPs
+    from tgt import enterprise, incidents
+    site = enterprise.get("industrial-site")
+    site_ips = {h.ip for h in site.hosts}
+    inc = incidents.get("stuxnet")
+    own_internal = {h.ip for h in inc.hosts if not incidents._is_external(h)}
+    cfg = RunConfig(profiles=["modbus", "s7comm"], sprinkle=["stuxnet"],
+                    messages=2, sprinkle_messages=2)
+    atk = set(incidents.ATTACKS)
+    hit = False
+    for k, f in build_batch(cfg):
+        if k not in atk:
+            continue
+        for ip in P.frame_ips(f) or ():
+            check(ip not in own_internal,
+                  f"sprinkle still uses the incident's own IP {ip}")
+            if ip in site_ips:
+                hit = True
+    check(hit, "sprinkle without an env did not land on the default inventory")
+
+
+def test_map_onto_descends_the_purdue_model() -> None:
+    from tgt import enterprise, incidents
+    site = enterprise.get("industrial-site")
+    # a two-PLC attack keeps its field devices together in one cell
+    pd = incidents.get("pipedream").map_onto(site)
+    segs = {site.segment_of(pd[n]).name
+            for n in ("PLC-MODICON", "PLC-OMRON")}
+    check(len(segs) == 1, f"pipedream PLCs scattered across cells: {segs}")
+    # and the engineering stage stays up in supervisory, the PLCs down in a cell
+    check(site.segment_of(pd["PIPEDREAM-ENGWS"]).zone == "OT-SUPERVISORY" and
+          all(site.segment_of(pd[n]).zone == "OT-CELL"
+              for n in ("PLC-MODICON", "PLC-OMRON")),
+          "pipedream did not descend supervisory -> cell")
 
 
 def test_replay_roundtrip() -> None:
