@@ -302,8 +302,18 @@ malware lands on Windows hosts and a PLC attack on a PLC. An embedded device mus
 by vendor (MAC OUI): Industroyer's IEC-104 RTU lands on a Siemens RTU or PLC, never a
 Rockwell one. The mapping runs **top-down through the Purdue model** — enterprise stages
 first, plant floor last — so a multi-stage attack descends IT → supervisory → cell as a
-coherent kill chain, with a cell's devices kept together. Hosts with no match, and external
-C2 or internet attackers, keep their own addresses.
+coherent kill chain, with a cell's devices kept together. Only the *internal* hosts are
+remapped — a C2 node or internet attacker keeps its own address, which is always a **public
+IP** (RFC 5737 TEST-NET, or the campaign's real C2 IOC such as Industroyer's `195.16.88.6`),
+so an infected inventory asset is seen beaconing *out to the internet*, never to some other
+internal subnet the sensor doesn't monitor.
+
+> **SPAN view matters for a sensor.** `--span core` emits *two copies* of every routed
+> packet (ingress on the sender's VLAN, egress on the receiver's VLAN, TTL−1) — it models a
+> capture taken at the core L3 switch. On a flat "TGT → one NIC → sensor" feed that just
+> doubles traffic with gateway-MAC rewriting, which a stream reassembler reads as
+> duplicates. For a single SPAN to one sensor, use the default **`--span access`** (each
+> frame once, on its sender's VLAN).
 
 In the TUI: **Run → Malware sprinkle** (toggle · variant · random · ratio); a red
 `☣ malware: <name>` banner shows while armed.
