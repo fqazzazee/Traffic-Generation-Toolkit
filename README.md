@@ -183,6 +183,16 @@ Each host's OS profile shapes its traffic — TTL (128 Windows / 64 Linux / 30 S
 HTTP `User-Agent`, SMB dialect, DHCP/NetBIOS fields, MAC OUI (Rockwell `00:1d:9c`,
 Siemens `00:0e:8c`), and PLC identity strings (`1756-L71 LOGIX5571`, `6ES7 315-…`).
 
+**Endpoint EDR (CrowdStrike Falcon).** Every Windows host that can run a Falcon sensor
+(Win7 SP1+ / Server 2012+) keeps a TLS telemetry channel open to the CrowdStrike Security
+Cloud, egressing via its gateway like any internet-bound flow — so the sensor sees normal
+EDR traffic on each covered endpoint (protocol key `edr`). The tell is the SNI: the US-1
+cloud hosts `ts01-b.cloudsink.net` (sensor channel), `lfoup01-b` / `lfodown01-b.cloudsink.net`
+(telemetry / content) and `api.crowdstrike.com`. CrowdStrike publishes connectivity by FQDN
+(its cloud is AWS-hosted with dynamic IPs), so the destination addresses are representative
+AWS-range stand-ins, not an official allowlist. The EOL **WinXP / Win2000** hosts stay
+deliberately *uncovered* — a real gap an analyser should flag.
+
 Hosts sit in **segments**, each with its own VLAN, subnet, zone and gateway, routed by a core L3
 switch whose gateway MACs are HSRP virtual MACs (`00:00:0c:07:ac:<vlan>`):
 
@@ -282,12 +292,18 @@ tgt run --env ot-plant --sprinkle-random --sprinkle-ratio 0.05  -i tgt0   # rand
 - **`--sprinkle-ratio 0.0–0.9`** — fixed malware fraction regardless of base size.
 - **`--sprinkle-random`** — random variant + jittered placement each cycle.
 
-On an `--env` base, the incident's hosts are re-addressed onto the environment's real
-assets, so the attack comes from and hits hosts that are in the inventory, on their VLANs.
-Each host maps onto one with the same role (or, failing that, a related role: PLC / RTU /
-relay / drive / meter, or SCADA / HMI / historian). An embedded device must also match by
-vendor (MAC OUI): Industroyer's IEC-104 RTU lands on a Siemens RTU or PLC, never a Rockwell
-one. Hosts with no match, and external C2 or internet attackers, keep their own addresses.
+The incident's hosts are always re-addressed onto a **real inventory**, so the same
+machines appear infected across cycles. On an `--env` base that inventory is the chosen
+environment and the attack rides on its VLANs; on a scenario / protocol base (which has no
+hosts of its own) the malware is mapped onto a representative full-Purdue plant so it still
+looks like real assets. Each host maps onto one with the same role (or, failing that, a
+related role: PLC / RTU / relay / drive / meter, or SCADA / HMI / historian), so Windows
+malware lands on Windows hosts and a PLC attack on a PLC. An embedded device must also match
+by vendor (MAC OUI): Industroyer's IEC-104 RTU lands on a Siemens RTU or PLC, never a
+Rockwell one. The mapping runs **top-down through the Purdue model** — enterprise stages
+first, plant floor last — so a multi-stage attack descends IT → supervisory → cell as a
+coherent kill chain, with a cell's devices kept together. Hosts with no match, and external
+C2 or internet attackers, keep their own addresses.
 
 In the TUI: **Run → Malware sprinkle** (toggle · variant · random · ratio); a red
 `☣ malware: <name>` banner shows while armed.

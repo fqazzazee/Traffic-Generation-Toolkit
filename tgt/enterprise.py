@@ -109,6 +109,36 @@ class Host:
         return FINGERPRINTS[self.os]
 
 
+# ---------------------------------------------------------------------------
+# CrowdStrike Falcon EDR — the cloud every Windows host beacons to
+# ---------------------------------------------------------------------------
+# CrowdStrike publishes its sensor connectivity by FQDN, not by stable IP: the
+# Security Cloud is AWS-hosted (US-1 ≈ us-west-1) with dynamic addresses, so the
+# SNI is the authoritative EDR tell. The IPs below are representative AWS-range
+# stand-ins so the generated frames have a plausible destination for the
+# dissector — they are NOT an official allowlist. FQDNs are the real US-1 set.
+CROWDSTRIKE_CLOUD = [
+    ("CS-FALCON-TS", "ts01-b.cloudsink.net", "13.52.126.10"),      # sensor channel
+    ("CS-FALCON-UP", "lfoup01-b.cloudsink.net", "54.183.209.11"),  # telemetry upload
+    ("CS-FALCON-DOWN", "lfodown01-b.cloudsink.net", "13.57.119.12"),  # content
+    ("CS-FALCON-API", "api.crowdstrike.com", "13.57.204.13"),      # console / API
+]
+
+# Falcon runs on modern Windows (Win7 SP1+ / Server 2012+); the EOL Windows
+# 2000/XP legacy hosts cannot, so they stay deliberately uncovered — a gap an
+# analyser should flag.
+EDR_OS = {"win7", "win10", "win2012", "win2019"}
+
+
+def _crowdstrike_hosts() -> List[Host]:
+    return [Host(name, ip, f"02:00:5c:00:00:{i:02x}", "edr", "linux",
+                 "CrowdStrike", fqdn)
+            for i, (name, fqdn, ip) in enumerate(CROWDSTRIKE_CLOUD, 1)]
+
+
+CS_CLOUD_HOSTS: List[Host] = _crowdstrike_hosts()
+
+
 @dataclass(frozen=True)
 class Segment:
     """One L2 broadcast domain: a VLAN carrying one IPv4 subnet.
@@ -372,12 +402,53 @@ class Environment:
         """Like :meth:`segment_of`, but ``None`` for a host not in this env."""
         return self._seg.get(host.name)
 
-    def build(self, messages: int,
-              span: str = "access") -> List[Tuple[str, bytes]]:
+    def edr_hosts(self) -> List[Host]:
+        """Windows hosts that run a Falcon sensor (Win7 SP1+ / Server 2012+);
+        the EOL XP/2000 legacy hosts can't, so they stay uncovered."""
+        return [h for h in self.hosts if h.os in EDR_OS]
+
+    def _edr_endpoints(self, win: Host, cloud: Host) -> Endpoints:
+        return Endpoints(
+            client_mac=win.mac, client_ip=win.ip,
+            server_mac=cloud.mac, server_ip=cloud.ip,
+            ttl_client=win.fp.ttl, ttl_server=64,
+            meta={"sni": cloud.product, "domain": cloud.product,
+                  "nbname": win.name, "ua": win.fp.ua})
+
+    def _edr_streams(self, messages: int,
+                     span: str) -> List[List[Tuple[str, List[bytes]]]]:
+        """Falcon EDR telemetry: every covered Windows host keeps a TLS channel
+        open to the CrowdStrike sensor cloud, egressing via its own gateway
+        (like any internet-bound flow). A representative host also exercises the
+        upload / download / API FQDNs so all of them appear on the wire."""
+        wins = self.edr_hosts()
+        if not wins:
+            return []
+        ts, up, down, api = CS_CLOUD_HOSTS
+
+        def flow(win: Host, cloud: Host, n: int):
+            ep = self._edr_endpoints(win, cloud)
+            frames = protocols.get("edr").build(ep, max(1, n))
+            return [("edr", self.place(f, win, cloud, span, self.segment_or_none))
+                    for f in frames]
+
+        # a low-and-slow beacon per host on the main sensor channel
+        streams = [flow(w, ts, 1) for w in wins]
+        # one host also uploads telemetry, pulls content and hits the API
+        anchor = next((w for w in wins
+                       if w.role in ("hist", "file", "dc", "scada")), wins[0])
+        streams += [flow(anchor, up, messages), flow(anchor, down, messages),
+                    flow(anchor, api, 1)]
+        return streams
+
+    def build(self, messages: int, span: str = "access",
+              edr: bool = True) -> List[Tuple[str, bytes]]:
         """One cycle: interleave every modeled conversation once.
 
         ``span`` is the capture point: ``access`` (each frame once, on its
         sender's VLAN) or ``core`` (routed frames also on the receiver's VLAN).
+        ``edr`` adds the CrowdStrike Falcon telemetry every covered Windows host
+        emits (on by default; the single-flow routing checks turn it off).
         """
         if span not in SPAN_VIEWS:
             raise ValueError(f"unknown span view {span!r}; use {SPAN_VIEWS}")
@@ -390,6 +461,8 @@ class Environment:
             frames = protocols.get(proto).build(ep, max(1, messages))
             streams.append([(proto, self._place(f, client, server, span))
                             for f in frames])
+        if edr:
+            streams += self._edr_streams(messages, span)
         out: List[Tuple[str, bytes]] = []
         i = 0
         while any(i < len(s) for s in streams):
@@ -401,8 +474,11 @@ class Environment:
         return out
 
     def protocols(self) -> List[str]:
-        """Protocols this environment's conversations use, in registry order."""
+        """Protocols this environment's conversations use, in registry order
+        (``edr`` is added when any Windows host runs a Falcon sensor)."""
         used = {proto for _, _, proto in self.conversations}
+        if self.edr_hosts():
+            used.add("edr")
         return [k for k in protocols.PROFILES if k in used]
 
     def legacy_hosts(self) -> List[Host]:
