@@ -12,6 +12,7 @@ Dragos**. Runs on a workstation, in **WSL**, or in a **Podman / Docker** contain
 `zero dependencies` · `pure Python stdlib` · `TUI + CLI` · `runs as a service`
 
 [![Blog](https://img.shields.io/badge/📖%20Blog-Read%20the%20Write--up-FF6C37)](https://blog.safeqbit.com/traffic-generation-toolkit-tgt-make-network-traffic-on-one-machine/)
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/fqazzazee)
 
 </div>
 
@@ -551,6 +552,12 @@ tgt/  packet · protocols · scenarios · enterprise · inventory · incidents �
 scripts/  tgtctl.sh (install + service)   setup-veth.sh
 tests/    selftest.py        Containerfile · docker-entrypoint.sh · Makefile · pyproject.toml
 ```
+
+---
+
+## Support
+
+If it saved you building a test network for your sensor, you can [buy me a coffee ☕](https://buymeacoffee.com/fqazzazee).
 
 ---
 
