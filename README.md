@@ -563,7 +563,27 @@ If it saved you building a test network for your sensor, you can [buy me a coffe
 
 ## License & security
 
-- **License:** [MIT](LICENSE).
+TGT is source-available, not open source. You can use it under either of two
+licenses, whichever fits you:
+
+- **[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)**
+  covers personal, hobby and home-lab use with no commercial purpose, plus
+  charities, schools, public research and government.
+- **[PolyForm Internal Use 1.0.0](https://polyformproject.org/licenses/internal-use/1.0.0)**
+  covers a company running TGT on its own networks to test its own monitoring,
+  at no cost.
+
+Using TGT to deliver work for someone else needs a commercial license. That
+includes consulting, freelancing, contracting, assessments, audits, and managed
+services, even if you work alone. Email fadi.qazzazee@gmail.com to arrange one.
+
+Versions published before this change were released under the MIT License, and
+copies of those versions stay under MIT. See [LICENSE](LICENSE) for the full
+terms.
+
+- **Contributing:** by sending a contribution, you license it to Fadi Qazzazee
+  under the MIT License. That lets it ship under the licenses above, including
+  commercial licenses.
 - **Security policy & vulnerability reporting:** [SECURITY.md](SECURITY.md).
 
 > **Built with AI assistance.** Parts of this project were written with the help of an
