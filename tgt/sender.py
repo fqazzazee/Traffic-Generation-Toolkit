@@ -6,6 +6,7 @@ fall back to pcap-only output, which needs nothing at all.
 """
 from __future__ import annotations
 
+import errno
 import socket
 import threading
 import time
@@ -21,6 +22,11 @@ def split_ifaces(spec: str) -> List[str]:
             out.append(name)
     return out
 
+
+
+# send() errnos meaning the bound interface no longer exists (a link that is
+# merely down, ENETDOWN, recovers on the same socket)
+_GONE = {errno.ENXIO, errno.ENODEV}
 
 class RawSender:
     """Bind an AF_PACKET raw socket to ``iface`` and blast frames.
@@ -111,6 +117,16 @@ class RawSender:
             except OSError as e:
                 self._fail(name, str(e))
                 last = e
+                if e.errno in _GONE:
+                    # the interface was deleted (and maybe recreated): this
+                    # socket is bound to a dead ifindex — drop it and reopen
+                    # by name on the retry schedule
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                    self.socks[name] = None
+                    self._retry_at[name] = time.monotonic() + self.RETRY
                 continue
             c["packets"] += 1
             c["bytes"] += len(frame)

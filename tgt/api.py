@@ -195,10 +195,15 @@ class ControlServer:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                if self.close_connection:
+                    self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
 
             def _err(self, code: int, msg: str) -> None:
+                # a rejected request's body may be unread: never parse it as
+                # the next request on a keep-alive connection
+                self.close_connection = True
                 self._send(code, {"ok": False, "error": msg})
 
             def _allowed(self) -> bool:
@@ -225,7 +230,12 @@ class ControlServer:
             def _params(self) -> Dict[str, str]:
                 q = {k: v[-1] for k, v in
                      parse_qs(urlsplit(self.path).query).items()}
-                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    raise ApiError("bad Content-Length") from None
+                if n < 0:
+                    raise ApiError("bad Content-Length")
                 if n > 65536:
                     raise ApiError("request body too large")
                 raw = self.rfile.read(n) if n else b""
