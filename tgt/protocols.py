@@ -709,32 +709,30 @@ def ldap_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def https_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """HTTPS (443): TLS ClientHello + ServerHello (SNI + cipher list).
+    """HTTPS (443): one TLS handshake, then ``count`` encrypted requests.
 
-    The SNI host and offered ciphers make the session fingerprintable
-    (JA3-style) so an analyser sees encrypted web traffic and its endpoints.
+    The ClientHello follows the client's TLS stack (``ep.meta['tls_client']``,
+    a :data:`tgt.tls.TEMPLATES` key: Chrome, Firefox, SChannel 10/7/XP/2000,
+    OpenSSL, Falcon; default Chrome), so JA3/JA4 identify the client OS and
+    software; the SNI is ``ep.meta['sni']``. The server
+    (``ep.meta['tls_server']``: openssl | schannel | schannel-legacy |
+    embedded) answers consistently — TLS 1.3 when both sides support it, else
+    TLS 1.2/1.0 with a certificate whose CN is the SNI — or refuses an
+    unsupported client with a fatal alert.
     """
-    sni = ep.meta.get("sni", ep.meta.get("host", "server.corp.local")).encode()
-    exchanges = []
-    for i in range(count):
-        # SNI extension
-        server_name = struct.pack("!BH", 0, len(sni)) + sni
-        sni_list = struct.pack("!H", len(server_name)) + server_name
-        sni_ext = struct.pack("!HH", 0x0000, len(sni_list)) + sni_list
-        exts = sni_ext
-        ciphers = struct.pack("!HHHH", 0x1301, 0x1302, 0xc02f, 0xc030)
-        body = (struct.pack("!H", 0x0303) + bytes(32) + b"\x00" +
-                struct.pack("!H", len(ciphers)) + ciphers +
-                b"\x01\x00" + struct.pack("!H", len(exts)) + exts)
-        hello = struct.pack("!B", 0x01) + struct.pack("!I", len(body))[1:] + body
-        rec = struct.pack("!BHH", 0x16, 0x0301, len(hello)) + hello  # handshake
-        # ServerHello record (minimal)
-        sh_body = struct.pack("!H", 0x0303) + bytes(32) + b"\x00" + \
-            struct.pack("!H", 0x1301) + b"\x00\x00\x00"
-        sh = struct.pack("!B", 0x02) + struct.pack("!I", len(sh_body))[1:] + sh_body
-        srec = struct.pack("!BHH", 0x16, 0x0303, len(sh)) + sh
-        exchanges.append((rec, srec))
-    return _tcp_flow(ep, _sport(), 443, exchanges)
+    from . import tls
+    sni = ep.meta.get("sni", ep.meta.get("host", "server.corp.local"))
+    tpl = tls.TEMPLATES.get(ep.meta.get("tls_client", ""),
+                            tls.TEMPLATES["chrome"])
+    srv = tls.SERVERS.get(ep.meta.get("tls_server", ""),
+                          tls.SERVERS["openssl"])
+    sport = _sport()
+    exchanges, handshake = tls.session(
+        tpl, srv, sni, count,
+        (ep.client_ip, ep.server_ip, sport, ep.meta.get("cycle", "")))
+    return _tcp_flow(ep, sport, 443, exchanges, idle_from=handshake,
+                     abort=(tpl.key in ("chrome", "firefox")
+                            and _aborts(ep, sport, 443)))
 
 
 def edr_flow(ep: Endpoints, count: int) -> List[bytes]:
@@ -747,9 +745,11 @@ def edr_flow(ep: Endpoints, count: int) -> List[bytes]:
     AWS-hosted with dynamic IPs), so the SNI is what a sensor fingerprints EDR
     traffic on. Set the host via ``ep.meta['sni']``; defaults to the US-1 sensor
     proxy."""
-    if not ep.meta.get("sni") and not ep.meta.get("domain"):
-        ep = replace(ep, meta={**ep.meta, "sni": "ts01-b.cloudsink.net"})
-    return https_flow(ep, count)
+    meta = dict(ep.meta)
+    if not meta.get("sni") and not meta.get("domain"):
+        meta["sni"] = "ts01-b.cloudsink.net"
+    meta.setdefault("tls_client", "falcon")
+    return https_flow(replace(ep, meta=meta), count)
 
 
 def dhcp_flow(ep: Endpoints, count: int) -> List[bytes]:
@@ -1015,7 +1015,7 @@ _reg("dns", "DNS", "IT", "53", "udp", dns_flow,
 _reg("http", "HTTP", "IT", "80", "tcp", http_flow,
      "Web browsing GET / 200 OK with per-host User-Agent")
 _reg("https", "HTTPS / TLS", "IT", "443", "tcp", https_flow,
-     "TLS ClientHello/ServerHello with SNI + cipher list")
+     "Per-OS TLS handshake (JA3/JA4, SNI, certificate) + app data")
 _reg("edr", "CrowdStrike EDR", "IT", "443", "tcp", edr_flow,
      "Falcon sensor TLS telemetry to the CrowdStrike cloud (cloudsink SNI)")
 _reg("smb", "SMB / CIFS", "IT", "445", "tcp", smb_flow,

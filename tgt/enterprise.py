@@ -23,7 +23,7 @@ import ipaddress
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from . import devices, protocols, stacks
+from . import devices, protocols, stacks, tls
 from .packet import (Endpoints, bytes_to_mac, frame_ips, mac_to_bytes,
                      rewrite_l2, set_ip_id)
 
@@ -416,6 +416,8 @@ class Environment:
             "device_type": 0x02 if server.role == "drive" else 0x0E,  # CIP
             "order": server.product or dflt_s7["order"],
             "server": "Microsoft-IIS/10.0" if server.os.startswith("win") else "Apache",
+            "tls_client": tls.client_for(client.os, client.role),
+            "tls_server": tls.server_for(server.os, server.embedded),
         }
         # the server's own identity: CIP vendor/product code/revision/serial,
         # S7 firmware + serial — so each device reports its own values
@@ -509,7 +511,8 @@ class Environment:
             server_mac=cloud.mac, server_ip=cloud.ip,
             ttl_client=win.fp.ttl, ttl_server=64,
             meta={"sni": cloud.product, "domain": cloud.product,
-                  "nbname": win.name, "ua": win.fp.ua},
+                  "nbname": win.name, "ua": win.fp.ua,
+                  "tls_client": "falcon", "tls_server": "openssl"},
             stack_client=win.stack, stack_server="linux")
 
     def _edr_streams(self, messages: int,

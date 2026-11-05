@@ -2046,6 +2046,159 @@ def test_tcp_segmentation_acks_and_rst() -> None:
     check(20 <= n <= 60, f"RST fraction off: {n}/240")
 
 
+def _hello(frames):
+    for f in frames:
+        v = _tcp_view(f)
+        if v and v[6][:1] == b"\x16" and v[6][5:6] == b"\x01":
+            return v[6]
+    return b""
+
+
+def test_tls_client_hello_templates() -> None:
+    from tgt import enterprise, tls
+
+    def ep(t, ip="10.5.5.5", srv="openssl"):
+        return Endpoints(client_ip=ip, meta={"sni": "app.corp.local",
+                                             "tls_client": t, "tls_server": srv})
+    for key in tls.TEMPLATES:
+        h = _hello(protocols.https_flow(ep(key), 1))
+        check(h and h[11:43] != bytes(32), f"{key}: zero/absent client random")
+        check(h != _hello(protocols.https_flow(ep(key, "10.5.5.6"), 1)),
+              f"{key}: identical ClientHello on two connections")
+    xp = _hello(protocols.https_flow(ep("schannel-xp"), 1))
+    check(xp[9:11] == b"\x03\x01" and b"app.corp.local" not in xp
+          and len(xp) == 5 + 4 + 2 + 32 + 1 + 2 + 22 + 2,
+          "XP ClientHello is not TLS 1.0 without extensions")
+    w7 = _hello(protocols.https_flow(ep("schannel7"), 1))
+    n = struct.unpack("!H", w7[44:46])[0]          # no session id
+    suites = struct.unpack(f"!{n // 2}H", w7[46:46 + n])
+    check(w7[9:11] == b"\x03\x03" and not any(0x1300 < c < 0x1310
+                                               for c in suites),
+          "Windows 7 offers TLS 1.3 suites")
+    # one ClientHello per TCP connection across a whole site cycle
+    per_conn: dict = {}
+    for k, f in enterprise.get("industrial-site").build(3):
+        v = _tcp_view(f)
+        if v and k in ("https", "edr") and v[6][:1] == b"\x16" \
+                and v[6][5:6] == b"\x01":
+            key = (v[0], _l4(f)[3])
+            per_conn[key] = per_conn.get(key, 0) + 1
+    check(per_conn and max(per_conn.values()) == 1,
+          "more than one ClientHello on a TCP connection")
+
+
+def test_tls_server_flights_consistent() -> None:
+    def flight(t, srv):
+        e = Endpoints(meta={"sni": "app.corp.local", "tls_client": t,
+                            "tls_server": srv})
+        return b"".join(_tcp_view(f)[6] for f in protocols.https_flow(e, 2)
+                        if _tcp_view(f)[0] == e.server_ip)
+
+    def records(blob):
+        out, i = [], 0
+        while i + 5 <= len(blob):
+            ln = struct.unpack("!H", blob[i + 3:i + 5])[0]
+            out.append((blob[i], blob[i + 1:i + 3], blob[i + 5:i + 5 + ln]))
+            i += 5 + ln
+        return out
+    r = records(flight("chrome", "openssl"))       # TLS 1.3
+    sh = r[0][2]
+    check(r[0][0] == 22 and sh[0] == 2 and b"\x00\x2b\x00\x02\x03\x04" in sh
+          and r[1][0] == 20 and r[2][0] == 23, "TLS 1.3 server flight shape")
+    check(struct.unpack("!H", sh[4 + 2 + 32 + 33:4 + 2 + 32 + 35])[0]
+          in (0x1301, 0x1302, 0x1303), "TLS 1.3 ServerHello suite")
+    r = records(flight("chrome", "schannel"))      # TLS 1.2
+    types = [x[2][0] for x in r if x[0] == 22]
+    check(types[:4] == [2, 11, 12, 14] and 20 in [x[0] for x in r],
+          f"TLS 1.2 server flight {types}")
+    sh = r[0][2]
+    check(sh[4:6] == b"\x03\x03" and
+          struct.unpack("!H", sh[4 + 2 + 32 + 33:4 + 2 + 32 + 35])[0]
+          not in (0x1301, 0x1302, 0x1303),
+          "TLS 1.2 ServerHello picked a TLS 1.3 suite")
+    r = records(flight("schannel-xp", "schannel"))  # XP: TLS 1.0, RSA
+    types = [x[2][0] for x in r if x[0] == 22]
+    check(r[0][1] == b"\x03\x01" and types[:3] == [2, 11, 14],
+          f"XP server flight {types}")
+    r = records(flight("schannel-2000", "schannel"))  # SSL 3.0 refused
+    check(len(r) == 1 and r[0][0] == 21 and r[0][2] == b"\x02\x46",
+          "SSL 3.0 client not refused with protocol_version")
+
+
+def test_tshark_tls_ja3_and_certificates() -> None:
+    """Optional: tshark computes a distinct JA3/JA4 per client family (stable
+    within a family), parses every certificate with CN = SAN = SNI, and finds
+    nothing malformed."""
+    import shutil
+    import subprocess
+    from tgt import enterprise, tls
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_tls_ja3_and_certificates")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/tls.pcap"
+        with PcapWriter(path) as w:
+            n = 0
+            for key in tls.TEMPLATES:
+                for srv in ("schannel", "openssl", "schannel-legacy"):
+                    for rep in range(2):
+                        n += 1
+                        e = Endpoints(client_ip=f"10.7.{n}.10",
+                                      server_ip=f"10.7.{n}.20",
+                                      meta={"sni": f"h{n}.corp.local",
+                                            "tls_client": key,
+                                            "tls_server": srv})
+                        for f in protocols.https_flow(e, 2):
+                            w.write(f)
+            for _, f in enterprise.get("industrial-site").build(1):
+                w.write(f)
+        rows = subprocess.run(
+            ["tshark", "-r", path, "-Y", "tls.handshake.type==1", "-T",
+             "fields", "-e", "ip.src", "-e", "tls.handshake.ja3",
+             "-e", "tls.handshake.ja4"],
+            capture_output=True, text=True).stdout.splitlines()
+        certs = subprocess.run(
+            ["tshark", "-r", path, "-T", "fields", "-E", "separator=|",
+             "-e", "tcp.stream", "-e", "tls.handshake.extensions_server_name",
+             "-e", "x509sat.uTF8String", "-e", "x509ce.dNSName",
+             "-Y", "tls.handshake.type==1 || tls.handshake.type==11"],
+            capture_output=True, text=True).stdout.splitlines()
+        expert = subprocess.run(["tshark", "-r", path, "-q", "-z", "expert"],
+                                capture_output=True, text=True).stdout
+    ja3: dict = {}
+    keys = list(tls.TEMPLATES)
+    for line in rows:
+        ip, j3, j4 = (line.split("\t") + ["", ""])[:3]
+        o = ip.split(".")
+        if o[:2] != ["10", "7"]:
+            continue
+        key = keys[(int(o[2]) - 1) // 6]
+        ja3.setdefault(key, set()).add((j3, j4))
+    check(set(ja3) == set(keys), f"no ClientHello seen for {set(keys) - set(ja3)}")
+    for key, vals in ja3.items():
+        check(len(vals) == 1, f"{key}: JA3/JA4 not stable: {vals}")
+    flat = [next(iter(v)) for v in ja3.values()]
+    check(len({a for a, _ in flat}) == len(flat)
+          and len({b for _, b in flat}) == len(flat),
+          "two client families share a JA3/JA4")
+    sni, ncert = {}, 0
+    for line in certs:
+        stream, name, utf8, dns = (line.split("|") + [""] * 3)[:4]
+        if name:
+            sni[stream] = name
+        elif dns:
+            ncert += 1
+            want = sni.get(stream, dns)
+            check(dns == want and utf8.split(",")[-1] == want,
+                  f"certificate CN/SAN {utf8}/{dns} != SNI {want}")
+    check(ncert >= 10, f"only {ncert} certificates parsed by tshark")
+    check("Malformed" not in expert and "Errors (" not in expert,
+          "tshark reports malformed TLS")
+    warn = expert.split("Warns (")[1].split("Notes (")[0] if "Warns (" in expert else ""
+    check(all("Connection reset" in ln for ln in warn.splitlines()[3:]
+              if ln.strip()), "tshark TLS warnings besides deliberate RSTs")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
