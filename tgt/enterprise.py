@@ -102,6 +102,13 @@ FINGERPRINTS: Dict[str, OSFingerprint] = {
     "moxa": OSFingerprint("moxa", "Moxa switch firmware", 64,
         smb="none", dhcp_vendor="",
         risk="Network device — SNMP/LLDP expose model + firmware"),
+    # vertical-site appliances (cameras, PDUs, medical devices, robots)
+    "linux-embedded": OSFingerprint("linux-embedded", "Embedded Linux", 64,
+        smb="none", dhcp_vendor="udhcp 1.36.1",
+        risk="Appliance firmware — vendor-patched only, no EDR agent"),
+    "rtos": OSFingerprint("rtos", "Embedded RTOS firmware", 64,
+        smb="none", dhcp_vendor="",
+        risk="Embedded device — vendor-patched only, no EDR agent"),
 }
 
 
@@ -461,6 +468,11 @@ class Environment:
     endpoint-meta overrides applied when the host is that side of a flow.
     ``timing`` maps a conversation to its optional ``period`` / ``jitter``
     (parsed from env files, kept for a time model; not yet used by build).
+
+    ``external`` lists endpoints outside every segment (a cloud MQTT broker,
+    a vendor's remote-service portal): conversations may name them, their
+    frames egress via the internal host's gateway like EDR beacons, and the
+    inventory lists them as external, not as assets.
     """
     key: str
     name: str
@@ -472,6 +484,7 @@ class Environment:
     options: Dict[str, Any] = field(default_factory=dict)
     host_meta: Dict[str, Dict[str, Dict[str, Any]]] = field(default_factory=dict)
     timing: Dict[Conversation, Dict[str, Any]] = field(default_factory=dict)
+    external: List[Host] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # what was declared, before options rewrite it (env export uses this)
@@ -493,9 +506,23 @@ class Environment:
                 raise ValueError(f"{self.key}: host {h.name} ({h.ip}) is in "
                                  f"{len(hit)} segments, expected 1")
             self._seg[h.name] = hit[0]
+        self._ext: Dict[str, Host] = {}
+        for h in self.external:
+            if h.name in self._seg or h.name in self._ext:
+                raise ValueError(f"{self.key}: external {h.name} duplicates "
+                                 "a host name")
+            if any(s.contains(h.ip) for s in self.segments):
+                raise ValueError(f"{self.key}: external {h.name} ({h.ip}) is "
+                                 "inside a segment")
+            self._ext[h.name] = h
         for c, sv, proto in self.conversations:
+            for n in (c, sv):
+                if n not in self._seg and n not in self._ext:
+                    raise ValueError(f"{self.key}: conversation {c} -> {sv} "
+                                     f"({proto}) names unknown host {n}")
             if (protocols.get(proto).link_local
-                    and self._seg[c] is not self._seg[sv]):
+                    and (self._seg.get(c) is None
+                         or self._seg.get(c) is not self._seg.get(sv))):
                 raise ValueError(f"{self.key}: {proto} is link-local but "
                                  f"{c} -> {sv} crosses segments")
 
@@ -539,7 +566,14 @@ class Environment:
         return str(self.options.get("snmp_community", "n0c-r3ad"))
 
     def host(self, name: str) -> Host:
-        return next(h for h in self.hosts if h.name == name)
+        """A host (or an ``external`` endpoint) by name."""
+        for h in self.hosts:
+            if h.name == name:
+                return h
+        return self._ext[name]
+
+    def is_external(self, name: str) -> bool:
+        return name in self._ext
 
     def segment_of(self, host: Host) -> Segment:
         return self._seg[host.name]
@@ -577,7 +611,7 @@ class Environment:
 
     def _place(self, frame: bytes, client: Host, server: Host,
                span: str) -> List[bytes]:
-        return self.place(frame, client, server, span, self.segment_of)
+        return self.place(frame, client, server, span, self.segment_or_none)
 
     def place(self, frame: bytes, client: Host, server: Host, span: str,
               seg_of) -> List[bytes]:
@@ -631,20 +665,24 @@ class Environment:
                 h = self.host(sv)
                 if c == client.name and sv != c and h not in peers:
                     peers.append(h)
-            return {"dns_names": [(f"{h.name.lower()}.{DNS_DOMAIN}", h.ip)
+            # internet names first: a client resolves its cloud endpoint
+            # before connecting, whatever the message count
+            peers.sort(key=lambda h: h.name not in self._ext)
+            return {"dns_names": [(h.fqdn if h.name in self._ext else
+                                   f"{h.name.lower()}.{DNS_DOMAIN}", h.ip)
                                   for h in peers or [server]]}
         if proto in ("bacnet-id", "enip-list"):
             # discovery broadcast to the client's subnet when the device
             # shares it; a routed device is browsed by unicast
             seg = self.segment_of(client)
-            same = self.segment_of(server) is seg
+            same = self.segment_or_none(server) is seg
             return {"bcast": str(ipaddress.ip_network(seg.subnet)
                                  .broadcast_address) if same else ""}
         if proto == "dhcp":
             seg = self.segment_of(client)
             meta = {"dhcp_router": seg.gateway, "dhcp_domain": DNS_DOMAIN,
                     "dhcp_mask": str(ipaddress.ip_network(seg.subnet).netmask)}
-            if self.segment_of(server) is not seg:
+            if self.segment_or_none(server) is not seg:
                 meta["dhcp_relay"] = seg.gateway
             return meta
         if proto in ("snmp", "snmpv3", "lldp", "cdp"):
@@ -653,6 +691,14 @@ class Environment:
             dev = client.device
             if dev is not None and dev.device_type == "switch":
                 return {"syslog_format": "3164"}
+        if proto in ("dicom", "hl7"):
+            # the SCU / sending application states its own identity: its
+            # catalog values and env-file meta, under a "client_" prefix
+            own = devices.identity_meta(client.device, client.firmware,
+                                        client.serial, client.name)
+            own.update(self.host_meta.get(client.name, {}).get("server", {}))
+            return {f"client_{k}": v for k, v in own.items()
+                    if k.startswith(proto + "_")}
         return {}
 
     def _agent_meta(self, proto: str, agent: Host) -> dict:
@@ -689,8 +735,9 @@ class Environment:
         for c, sv, proto in self.conversations:
             if proto == "dhcp":
                 dhcp.add(c)
-            if (c != sv and protocols.get(proto).transport != "l2"
-                    and self._seg[c] is self._seg[sv]
+            if (c != sv and c in peers
+                    and protocols.get(proto).transport != "l2"
+                    and self._seg.get(c) is self._seg.get(sv)
                     and sv not in peers[c]):
                 peers[c].append(sv)
         out: List[bytes] = []

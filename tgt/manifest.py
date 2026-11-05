@@ -146,7 +146,12 @@ class Recorder:
             for h in env.hosts:
                 self._host(h)
             for c, s, proto in env.conversations:
-                self._add(proto, env.host(c), env.host(s))
+                ch, sh = env.host(c), env.host(s)
+                # external endpoints (cloud brokers …) are keyed by IP,
+                # like the EDR cloud below
+                ext = env.is_external
+                self._add(proto, ch, sh, caid=ch.ip if ext(c) else None,
+                          said=sh.ip if ext(s) else None)
             for h, ip, fqdn, _ in env.edr_plan():
                 cloud = enterprise._cs_cloud_host(ip, fqdn)
                 self._add("edr", h, cloud, said=ip)
