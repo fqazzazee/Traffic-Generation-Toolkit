@@ -7,6 +7,7 @@
     tgt run ...              generate traffic (send and/or write pcap)
     tgt inventory -e ENV     export an environment's ground-truth asset list
     tgt env export ENV       write an environment as an env file (JSON)
+    tgt ctl ...              control a running "tgt run --api" (status, inject…)
 """
 from __future__ import annotations
 
@@ -57,6 +58,18 @@ def cmd_list(args) -> int:
         protos, extra = ", ".join(inc.protocols()), ", ".join(inc.attack_only())
         print(f"    protocols: {protos}{' + ' if protos and extra else ''}{extra}")
         print(f"    signals: {'; '.join(inc.indicators())}")
+    from . import plugins
+    if plugins.LOADED or plugins.ERRORS:
+        print("\nPlugins (TGT_PLUGIN_PATH, ~/.config/tgt/plugins):")
+        for _, path in plugins.LOADED:
+            mine = sorted(f"{kind} {k}" for kind, own in
+                          plugins.OWNERS.items() for k, p in own.items()
+                          if p == path)
+            print(f"  {path}")
+            if mine:
+                print(f"    adds: {', '.join(mine)}")
+        for path, msg in plugins.ERRORS:
+            print(f"  {path}  NOT LOADED: {msg}")
     return 0
 
 
@@ -192,6 +205,25 @@ def cmd_run(args) -> int:
         if not os.path.exists(replay):
             print(f"replay file not found: {replay}", file=sys.stderr)
             return 2
+        from . import pcapread
+        try:
+            pcapread.probe(replay)
+        except (OSError, pcapread.PcapError) as e:
+            print(f"cannot replay {replay}: {e}", file=sys.stderr)
+            return 2
+    remaps = [getattr(args, a, None) or [] for a in
+              ("remap_ip", "remap_subnet", "remap_mac")]
+    if any(remaps) and not replay:
+        print("--remap-ip/--remap-subnet/--remap-mac rewrite a --replay "
+              "capture.", file=sys.stderr)
+        return 2
+    tsresol = None
+    if getattr(args, "replay_tsresol", None):
+        tsresol = _parse_tsresol(args.replay_tsresol)
+        if tsresol is None:
+            print(f"bad --replay-tsresol {args.replay_tsresol!r}: use us, "
+                  "ns, ms or ticks per second", file=sys.stderr)
+            return 2
     sprinkle: list[str] = []
     for chunk in (getattr(args, "sprinkle", None) or []):
         sprinkle += [x.strip() for x in chunk.split(",") if x.strip()]
@@ -228,7 +260,20 @@ def cmd_run(args) -> int:
         manifest_path=getattr(args, "manifest", None),
         clock=getattr(args, "clock", "wall"),
         start_time=getattr(args, "start_time", None),
+        replay_speed=max(0.0, getattr(args, "replay_speed", 0.0) or 0.0),
+        replay_loop=max(0, getattr(args, "replay_loop", 0) or 0),
+        replay_tsresol=tsresol,
+        remap_ip=remaps[0], remap_subnet=remaps[1], remap_mac=remaps[2],
+        replay_vlan=args.vlan if replay else None,
     )
+    if replay:
+        from .replay import rewriter_for
+        from .rewrite import RewriteError
+        try:
+            rewriter_for(cfg)
+        except RewriteError as e:
+            print(str(e), file=sys.stderr)
+            return 2
     if not cfg.iface and not cfg.pcap_path:
         print("nothing to do: specify --iface to send and/or --pcap to write a "
               "file.", file=sys.stderr)
@@ -248,6 +293,11 @@ def cmd_run(args) -> int:
     print(f"TGT run: {cfg.summary()}", flush=True)
     eng = Engine(cfg, on_log=lambda m: print(f"  [engine] {m}", flush=True),
                  argv=getattr(args, "argv", None))
+    server = None
+    if getattr(args, "api", None):
+        server = _start_api(args, eng)
+        if server is None:
+            return 2
     # SIGTERM (systemctl/podman stop, timeout) and SIGHUP stop the engine like
     # Ctrl-C does, so the pcap is flushed + closed and the summary printed.
     caught: list[int] = []
@@ -283,6 +333,8 @@ def cmd_run(args) -> int:
         eng.join(timeout=3)
     finally:
         _restore_signal_handlers(old_handlers)
+        if server is not None:
+            server.close()
     if tty:
         print()
     if caught:
@@ -293,9 +345,116 @@ def cmd_run(args) -> int:
     if s.per_profile:
         for k, v in s.per_profile.items():
             print(f"  {k:10} {v}")
+    iface_errors = 0
+    if len(s.per_iface) > 1 or any(c["errors"] for c in s.per_iface.values()):
+        for name, c in s.per_iface.items():
+            iface_errors += c["errors"]
+            err = f"  ({c['last_error']})" if c["errors"] else ""
+            print(f"  iface {name:12} {c['packets']} packets, {c['bytes']} "
+                  f"bytes, {c['errors']} errors{err}")
+    for inj in eng.control.status():
+        print(f"  injection {inj['id']} {inj['incident']}: {inj['packets']} "
+              f"packets {inj['start'] or '-'} .. {inj['end'] or '-'}"
+              + (f" [{inj['error']}]" if inj.get("error") else ""))
     if s.last_error:
         print(f"last error: {s.last_error}")
-    return 0 if s.errors == 0 else 1
+    return 0 if s.errors == 0 and iface_errors == 0 else 1
+
+
+def _parse_tsresol(text: str):
+    """--replay-tsresol: us | ns | ms | ticks per second -> float or None."""
+    named = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
+    t = str(text).strip().lower()
+    if t in named:
+        return named[t]
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+def _start_api(args, eng):
+    """Start the --api control server for ``eng`` (None + message on error)."""
+    import os
+    from . import api
+    token = getattr(args, "api_token", None) or \
+        os.environ.get("TGT_API_TOKEN") or None
+    try:
+        host, port = api.parse_bind(args.api)
+        server = api.ControlServer(eng, host, port, token=token,
+                                   allow_remote=args.api_allow_remote)
+    except api.ApiError as e:
+        print(f"--api: {e}", file=sys.stderr)
+        return None
+    eng.record = True           # /manifest + injection records need it
+    server.start()
+    print(f"  [api] control API on {server.url} "
+          f"({'token required' if token else 'no token'}) — "
+          f"try: tgt ctl --api {host}:{server.port} status", flush=True)
+    return server
+
+
+def cmd_ctl(args) -> int:
+    """tgt ctl: client for a run's --api control server."""
+    import json
+    import os
+    from . import api
+    token = args.token or os.environ.get("TGT_API_TOKEN") or None
+    what = args.ctl_cmd
+    if what == "status":
+        method, path, params = "GET", "/status", None
+    elif what == "manifest":
+        method, path, params = "GET", "/manifest", None
+    elif what == "rate":
+        method, path, params = "POST", "/rate", {"pps": args.pps}
+    elif what == "inject":
+        method, path = "POST", "/inject"
+        params = {"incident": args.incident, "duration": args.duration,
+                  "ratio": args.ratio}
+    else:                               # stop | pause | resume
+        method, path, params = "POST", "/" + what, None
+    try:
+        code, doc = api.request(args.api, method, path, params, token)
+    except api.ApiError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if what == "manifest" and code == 200 and args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=1)
+            f.write("\n")
+        print(f"wrote manifest to {args.output}", file=sys.stderr)
+    elif args.json or what == "manifest" or code >= 300:
+        print(json.dumps(doc, indent=1))
+    elif what == "status":
+        _print_status(doc)
+    elif what == "inject":
+        i = doc.get("injection", {})
+        print(f"injection {i.get('id')}: {i.get('incident')} for "
+              f"{i.get('duration')}s at {i.get('ratio', 0):.0%} "
+              f"({i.get('state')})")
+    else:
+        print(json.dumps(doc))
+    return 0 if code < 300 else 1
+
+
+def _print_status(d: dict) -> None:
+    state = ("paused" if d.get("paused") else "running" if d.get("running")
+             else "finished")
+    print(f"{d.get('tool')}  {state}  up {d.get('uptime', 0):.1f}s  "
+          f"seed {d.get('seed')}")
+    print(f"  {d.get('summary')}")
+    print(f"  sent={d.get('packets')} bytes={d.get('bytes')} "
+          f"pps={d.get('pps')} errors={d.get('errors')} "
+          f"cycles={d.get('cycles')} rate={d.get('rate')}")
+    for name, c in (d.get("interfaces") or {}).items():
+        print(f"  iface {name}: {c['packets']} packets, {c['errors']} errors"
+              + (f" ({c['last_error']})" if c.get("last_error") else ""))
+    for i in d.get("injections") or []:
+        rem = f", {i['remaining']}s left" if "remaining" in i else ""
+        print(f"  injection {i['id']} {i['incident']}: {i['state']}{rem}, "
+              f"{i['packets']} packets, start {i['start'] or '-'}, "
+              f"end {i['end'] or '-'}")
 
 
 # Non-TTY stdout (service logs, pipes) gets one stats line this often.
@@ -459,7 +618,27 @@ def build_parser() -> argparse.ArgumentParser:
                    help="replay frames from a .pcap file instead of generating")
     r.add_argument("--replay-realtime", action="store_true",
                    help="honor the pcap's original inter-packet timing")
-    r.add_argument("--iface", "-i", help="interface to send on (needs root)")
+    r.add_argument("--replay-speed", type=float, default=0.0, metavar="X",
+                   help="replay with the capture's timing divided by X "
+                        "(2 = twice as fast, 0.5 = half speed); implies "
+                        "--replay-realtime")
+    r.add_argument("--replay-loop", type=int, default=0, metavar="N",
+                   help="stop after N passes over the capture "
+                        "(0 = loop until stopped; --once = one pass)")
+    r.add_argument("--replay-tsresol", metavar="RES",
+                   help="override the pcapng timestamp resolution: us, ns, "
+                        "ms or ticks per second")
+    r.add_argument("--remap-ip", action="append", metavar="OLD=NEW[,..]",
+                   help="replay: rewrite IPv4 addresses (IP + ARP, "
+                        "checksums recomputed); repeatable")
+    r.add_argument("--remap-subnet", action="append", metavar="A/N=B/N[,..]",
+                   help="replay: move a subnet, keeping host bits "
+                        "(e.g. 192.168.1.0/24=10.100.10.0/24)")
+    r.add_argument("--remap-mac", action="append", metavar="OLD=NEW[,..]",
+                   help="replay: rewrite MAC addresses (Ethernet + ARP)")
+    r.add_argument("--iface", "-i",
+                   help="interface(s) to send on (needs root); a,b,c sends "
+                        "the same frames to each (fan-out)")
     r.add_argument("--pcap", help="also/only write frames to this pcap file")
     r.add_argument("--rate", type=float, default=20.0,
                    help="packets per second (0 = as fast as possible)")
@@ -475,7 +654,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--client-ip", default="10.10.10.10")
     r.add_argument("--server-mac", default="02:00:00:00:00:02")
     r.add_argument("--server-ip", default="10.10.10.20")
-    r.add_argument("--vlan", type=int, default=None, help="802.1Q VLAN id")
+    r.add_argument("--vlan", type=int, default=None,
+                   help="802.1Q VLAN id (with --replay: retag every frame, "
+                        "0 = strip the tag)")
     r.add_argument("--seed", type=int, default=None,
                    help="run seed: same seed + options = identical frames "
                         "every cycle (default: random, printed)")
@@ -490,6 +671,43 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--start-time", metavar="ISO",
                    help="synthetic clock start, e.g. 2026-11-05T14:00:00Z "
                         "(default: now)")
+    r.add_argument("--api", metavar="[HOST:]PORT",
+                   help="serve the control API (status/stop/pause/resume/"
+                        "rate/inject/manifest) here, e.g. 127.0.0.1:8787; "
+                        "see 'tgt ctl'")
+    r.add_argument("--api-token", metavar="TOKEN",
+                   help="require 'Authorization: Bearer TOKEN' (default: "
+                        "$TGT_API_TOKEN)")
+    r.add_argument("--api-allow-remote", action="store_true",
+                   help="allow binding the API to a non-loopback address "
+                        "(needs a token)")
+
+    import os as _os
+    c = sub.add_parser("ctl", help="control a running 'tgt run --api' "
+                       "(status, stop, pause, resume, rate, inject)")
+    c.add_argument("--api", default=_os.environ.get("TGT_API",
+                                                     "127.0.0.1:8787"),
+                   metavar="[HOST:]PORT|URL",
+                   help="control API address (default $TGT_API or "
+                        "127.0.0.1:8787)")
+    c.add_argument("--token", help="bearer token (default $TGT_API_TOKEN)")
+    c.add_argument("--json", action="store_true", help="print raw JSON")
+    csub = c.add_subparsers(dest="ctl_cmd", required=True)
+    csub.add_parser("status", help="run status and counters")
+    csub.add_parser("stop", help="stop the run")
+    csub.add_parser("pause", help="hold sending")
+    csub.add_parser("resume", help="continue sending")
+    cr = csub.add_parser("rate", help="change the send rate")
+    cr.add_argument("pps", type=float, help="packets per second")
+    ci = csub.add_parser("inject", help="sprinkle an incident for a while")
+    ci.add_argument("incident", help="incident key (see 'tgt list')")
+    ci.add_argument("--duration", "-d", type=float, default=60.0,
+                    help="seconds to inject for (default 60)")
+    ci.add_argument("--ratio", type=float, default=None,
+                    help="injected share of frames (default: the run's "
+                         "--sprinkle-ratio, else 0.05)")
+    cm = csub.add_parser("manifest", help="fetch the live run manifest")
+    cm.add_argument("--output", "-o", metavar="FILE")
     return p
 
 
@@ -497,9 +715,12 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.argv = list(sys.argv[1:] if argv is None else argv)
-    if args.command not in ("iface",):
-        # env files in TGT_ENV_PATH / ~/.config/tgt/envs join the built-ins
-        from . import envfile
+    if args.command not in ("iface", "ctl"):
+        # plugins (TGT_PLUGIN_PATH / ~/.config/tgt/plugins) first, so env
+        # files may use plugin protocols; then env files in TGT_ENV_PATH /
+        # ~/.config/tgt/envs join the built-ins
+        from . import envfile, plugins
+        plugins.load_plugins()
         envfile.load_user_envs()
     if args.command in (None, "tui"):
         # SIGTERM/SIGHUP exit cleanly (curses restores the terminal) — and
@@ -511,7 +732,7 @@ def main(argv=None) -> int:
     return {
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,
         "inventory": cmd_inventory,
-        "score": cmd_score,
+        "score": cmd_score, "ctl": cmd_ctl,
     }[args.command](args)
 
 

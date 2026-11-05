@@ -116,6 +116,8 @@ class Recorder:
         self.last_seen: Dict[str, float] = {}
         self.flows: Dict[tuple, list] = {}
         self.events: Dict[tuple, list] = {}
+        self._inj: Dict[str, dict] = {}         # source label -> record
+        self.injections: List[dict] = []
 
     # -- index of who talks to whom ---------------------------------------
     def _aid(self, host) -> str:
@@ -140,7 +142,6 @@ class Recorder:
 
     def _index(self) -> None:
         from . import enterprise, incidents
-        from .engine import DEFAULT_SPRINKLE_ENV
         cfg, env = self.cfg, self.env
         if env is not None:
             for h in env.hosts:
@@ -164,19 +165,38 @@ class Recorder:
             for key in cfg.profiles:
                 self._add(key, c, s)
         if self.sprinkle and not cfg.replay_path:
-            senv = env or enterprise.get(DEFAULT_SPRINKLE_ENV)
             for key in self.sprinkle:
-                inc = incidents.get(key)
-                mapping = inc.map_onto(senv)
-                if env is not None:
-                    for h in inc.unmapped_hosts(env):
-                        aid = self._host(h)
-                        ip, incs = self.new_assets.setdefault(aid, (h.ip, []))
-                        incs.append(key)
-                for a, v, atk, _ in inc.flows:
-                    ah = mapping.get(a) or inc.host(a)
-                    vh = mapping.get(v) or inc.host(v)
-                    self._add(atk, ah, vh, self._known(ah), self._known(vh))
+                self._index_incident(key)
+
+    def _index_incident(self, key: str, label: Optional[str] = None) -> None:
+        """Index a sprinkled / injected incident's flows as the engine maps
+        them (onto the env inventory, else the default plant). New assets
+        are credited to ``label`` (an injection's source label), default
+        the sprinkled incident key."""
+        from . import enterprise, incidents
+        from .engine import DEFAULT_SPRINKLE_ENV
+        env = self.env
+        senv = env or enterprise.get(DEFAULT_SPRINKLE_ENV)
+        inc = incidents.get(key)
+        mapping = inc.map_onto(senv)
+        if env is not None:
+            for h in inc.unmapped_hosts(env):
+                aid = self._host(h)
+                ip, incs = self.new_assets.setdefault(aid, (h.ip, []))
+                if (label or key) not in incs:
+                    incs.append(label or key)
+        for a, v, atk, _ in inc.flows:
+            ah = mapping.get(a) or inc.host(a)
+            vh = mapping.get(v) or inc.host(v)
+            self._add(atk, ah, vh, self._known(ah), self._known(vh))
+
+    def add_injection(self, incident: str, label: str, record: dict) -> None:
+        """A timed injection (tgt.control) starts: frames sourced ``label``
+        update ``record`` (first/last frame time, packets); listed under
+        ``injections`` in the manifest."""
+        self._index_incident(incident, label)
+        self._inj[label] = record
+        self.injections.append(record)
 
     def _known(self, host) -> str:
         """Asset id of an incident host: its inventory/new-asset id if it has
@@ -207,7 +227,8 @@ class Recorder:
             c, sv = (s, d) if first == s else (d, s)
             rec = (self.addr_aid.get(c, c), self.addr_aid.get(sv, sv), c, sv)
         fkey = (rec[0], rec[1], key, source)
-        ekey = fkey if source.startswith(("sprinkle:", "incident:")) else None
+        ekey = fkey if source.startswith(("sprinkle:", "incident:",
+                                          "inject:")) else None
         return src_aid, fkey, ekey, rec
 
     def observe(self, ts: float, key: str, frame: bytes, source: str) -> None:
@@ -228,6 +249,13 @@ class Recorder:
             hit = self._cache[ck] = self._resolve(key, source, s, d,
                                                   smac, dmac)
         src_aid, fkey, ekey, rec = hit
+        if self._inj:
+            inj = self._inj.get(source)
+            if inj is not None:
+                if inj["first_ts"] is None:
+                    inj["first_ts"] = ts
+                inj["last_ts"] = ts
+                inj["packets"] += 1
         if src_aid not in self.first_seen:
             self.first_seen[src_aid] = ts
         self.last_seen[src_aid] = ts
@@ -271,14 +299,16 @@ class Recorder:
                 "source": source, "attack": key, "packets": n})
         for aid, (ip, incs) in self.new_assets.items():
             if aid in self.first_seen:
+                srcs = [i if ":" in i else f"sprinkle:{i}" for i in incs]
                 events.append({
                     "id": f"e{len(events) + 1}", "category": "new-asset",
                     "t_start": iso(self.first_seen[aid]),
                     "t_end": iso(self.last_seen[aid]),
                     "hosts": [aid], "src": ip, "dst": None, "protocol": None,
                     "detail": "host not in the inventory, introduced by "
-                              f"sprinkle: {', '.join(incs)}",
-                    "source": f"sprinkle:{incs[0]}"})
+                              + ", ".join(x.replace(":", ": ", 1)
+                                          for x in srcs),
+                    "source": srcs[0]})
         packets = self.packets
         return {
             "schema": SCHEMA,
@@ -304,7 +334,23 @@ class Recorder:
             "phases": [{"id": "main", "start": iso(self.first_ts),
                         "end": iso(self.last_ts), "packets": packets}],
             "events": events,
+            # --iface a,b fan-out: per-interface send counters
+            "interfaces": (json.loads(json.dumps(stats.per_iface))
+                           if stats is not None and
+                           getattr(stats, "per_iface", None) else {}),
+            # timed injections (control API / tgt ctl inject)
+            "injections": [self._injection_row(r) for r in
+                           list(self.injections)],
         }
+
+    @staticmethod
+    def _injection_row(r: dict) -> Dict:
+        return {"id": r["id"], "incident": r["incident"], "via": r["via"],
+                "requested": iso(r["requested_ts"]),
+                "start": iso(r["first_ts"]), "end": iso(r["last_ts"]),
+                "duration": r["duration"], "ratio": r["ratio"],
+                "packets": r["packets"],
+                "source": "inject:%s#%s" % (r["incident"], r["id"])}
 
     def write(self, path: str, stats=None) -> None:
         """Write atomically (temp file + rename) so readers never see a
