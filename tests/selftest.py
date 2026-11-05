@@ -1898,6 +1898,255 @@ def test_version_single_source() -> None:
           "pyproject.toml must take its version from tgt.__version__")
 
 
+# --- tgt score (W2-F, #55) ------------------------------------------------
+_SCORE_FIX = os.path.join(_REPO, "tests", "fixtures", "score")
+
+
+def _score_fixture(mode: str, **kw):
+    from tgt import score as S
+    truth = S.load_truth(os.path.join(
+        _SCORE_FIX, "manifest.json" if mode == "manifest"
+        else "truth-inventory.json"))
+    rows, info = S.read_export(os.path.join(_SCORE_FIX, "export-ctd.csv"),
+                               S.load_json_spec("claroty-ctd"))
+    info.update(source="export-ctd.csv", map="claroty-ctd.json")
+    alerts = S.read_alerts(os.path.join(_SCORE_FIX, "alerts.csv"),
+                           S.load_json_spec("alerts-generic"))
+    return S.score(truth, rows, info, zeek=os.path.join(_SCORE_FIX, "zeek"),
+                   alerts=alerts, **kw)
+
+
+def test_score_normalisation_helpers() -> None:
+    from tgt import score as S
+    for raw in ("00-1D-9C-00-70-21", "001d.9c00.7021", "001D9C007021"):
+        check(S.norm_mac(raw) == "00:1d:9c:00:70:21", f"norm_mac {raw}")
+    check(S.norm_ip("10.1.2.3/24") == "10.1.2.3" and S.norm_ip("x") is None,
+          "norm_ip")
+    for raw, want in (("EtherNet/IP", "enip"), ("CIP", "enip"),
+                      ("enip-id 44818/tcp", "enip"), ("S7Comm", "s7comm"),
+                      ("s7-id", "s7comm"), ("Modbus/TCP", "modbus"),
+                      ("IEC 60870-5-104", "iec104"), ("TLS", "https"),
+                      ("edr", "https"), ("OPC UA", "opcua")):
+        check(S.norm_protocol(raw) == want,
+              f"norm_protocol({raw!r}) = {S.norm_protocol(raw)!r}")
+    cases = (("vendor", "Siemens AG", ["Siemens"], "correct"),
+             ("vendor", "Rockwell Automation", ["Rockwell"], "partial"),
+             ("model", "1756-L83E/B", ["1756-L83E"], "partial"),
+             ("model", " 1756-l83e ", ["1756-L83E"], "correct"),
+             ("firmware", "3.2.8", ["V3.2.8"], "correct"),
+             ("firmware", "V3.2.6", ["V3.2.8"], "wrong"),
+             ("serial", "0x9b6bd709", ["9B6BD709"], "correct"),
+             ("os", "Windows 10 Pro", ["Windows 10"], "partial"))
+    for f, got, cands, want in cases:
+        check(S.compare(f, got, cands) == want,
+              f"compare {f} {got!r} vs {cands}: {S.compare(f, got, cands)}")
+    t = S.parse_time("2026-11-05T14:00:00.5Z")
+    check(t is not None and t.microsecond == 500000 and
+          S._iso(t) == "2026-11-05T14:00:00.500000Z", f"parse_time iso {t}")
+    check(S.parse_time("2026-11-05 16:00:00+02:00") ==
+          S.parse_time("2026-11-05T14:00:00Z") ==
+          S.parse_time(1793887200) == S.parse_time("1793887200000") ==
+          S.parse_time("11/05/2026 14:00:00"), "parse_time formats")
+    check(S.parse_time("2026-11-05 15:00:00", S._offset("+01:00")) ==
+          S.parse_time("2026-11-05T14:00:00Z"), "parse_time utc_offset")
+
+
+def test_score_inventory_truth_exact() -> None:
+    r = _score_fixture("inventory")
+    d = r["discovery"]
+    check((d["population"], d["found"], d["recall"]) == (9, 8, 0.8889),
+          f"score inv recall: {d['population']} {d['found']} {d['recall']}")
+    check((d["matched_assets"], d["duplicates"], d["false_positives"],
+           d["precision"], d["infrastructure"], d["external"]) ==
+          (8, 1, 1, 0.8, 2, 1), f"score inv precision/buckets: {d}")
+    check(d["by_method"] == {"mac": 4, "vlan-ip": 2, "ip": 1, "name": 1},
+          f"score match methods: {d['by_method']}")
+    check(d["missed"] == ["industrial-site:ENG02"], f"missed {d['missed']}")
+    check([x["row"] for x in d["duplicate_rows"]] == [5] and
+          [x["row"] for x in d["false_positive_rows"]] == [12] and
+          [x["row"] for x in d["infrastructure_rows"]] == [9, 10] and
+          [x["row"] for x in d["external_rows"]] == [11],
+          "score bucket rows")
+    want = {"vendor": ((7, 6, 0, 1, 0), (1, 1, 1, 0, 0)),
+            "model": ((2, 1, 1, 0, 0), (6, 3, 1, 2, 0)),
+            "firmware": ((2, 1, 0, 1, 0), (5, 1, 1, 0, 0)),
+            "serial": ((2, 1, 0, 0, 1), (2, 0, 0, 0, 0)),
+            "os": ((7, 1, 1, 1, 4), (1, 0, 0, 0, 0))}
+    for f, (ob, inf) in want.items():
+        o, i = r["fields"][f]["observable"], r["fields"][f]["inferred"]
+        got = ((o["n"], o["correct"], o["partial"], o["wrong"],
+                o["missing"]),
+               (i["n"], i["reported"], i["correct"], i["partial"],
+                i["wrong"]))
+        check(got == (ob, inf), f"score field {f}: {got} != {(ob, inf)}")
+    check(r["fields"]["vendor"]["observable"]["accuracy"] == 0.8571 and
+          r["fields"]["model"]["observable"]["accuracy_with_partial"] == 1.0,
+          "score field accuracy ratios")
+    p = r["protocols"]
+    check((p["assets"], p["tp"], p["exported"], p["truth"], p["precision"],
+           p["recall"]) == (8, 15, 16, 25, 0.9375, 0.6),
+          f"score protocols {p}")
+    pk1 = next(a for a in r["assets"] if a["name"] == "PLC-PK1")
+    check(pk1["protocols"]["extra"] == ["modbus"] and
+          pk1["protocols"]["missing"] == ["icmp"] and pk1["rows"] == [4, 5]
+          and pk1["fields"]["model"]["outcome"] == "partial",
+          f"score PLC-PK1 detail {pk1}")
+    check(r["new_assets"] == {"total": 1, "missed": [], "detected":
+                              ["industrial-site:SIS-TRICONEX"]},
+          f"score new assets {r['new_assets']}")
+    check(r["time_to_discover"] is None, "inventory truth has no ttd")
+    b = r["baseline"]
+    check((b["expected"], b["seen"], b["coverage"], b["conn_records"]) ==
+          (8, 6, 0.75, 9), f"score baseline {b['expected']} {b['seen']}")
+    check(sorted((m["client"], m["server"], m["protocol"])
+                 for m in b["missed"]) ==
+          [("WS20", "3.122.135.178", "edr"), ("WS20", "DC01", "ntp")],
+          f"score baseline missed {b['missed']}")
+    check([(u["orig"], u["resp"], u["dport"], u["conns"])
+           for u in b["unexpected"]] ==
+          [("10.10.20.20", "10.100.10.21", 44818, 2),
+           ("10.100.10.10", "10.100.10.99", 502, 1)],
+          f"score unexpected {b['unexpected']}")
+    check("note" in r["detections"], "inventory truth cannot score alerts")
+
+
+def test_score_manifest_truth_exact() -> None:
+    r = _score_fixture("manifest")
+    d = r["discovery"]
+    check((d["population"], d["found"], d["recall"], d["precision"]) ==
+          (8, 7, 0.875, 0.8), f"score manifest discovery {d}")
+    rtu = next(a for a in r["assets"] if a["name"] == "RTU-104")
+    check(rtu["status"] == "found (not emitted)", f"RTU-104 {rtu['status']}")
+    check(r["time_to_discover"] == {"n": 5, "median_s": 30.0,
+                                    "min_s": 10.0, "max_s": 80.0},
+          f"score ttd {r['time_to_discover']}")
+    b = r["baseline"]
+    check((b["basis"], b["expected"], b["seen"], len(b["unexpected"])) ==
+          ("manifest flows_seen", 5, 4, 4), f"score manifest baseline {b}")
+    det = r["detections"]
+    check((det["events"], det["detected"], det["rate"], det["median_ttd_s"],
+           det["alerts"], det["mapped_alerts"], det["matched_alerts"],
+           det["unmapped_alerts"]) == (5, 3, 0.6, 30.0, 6, 5, 3, 1),
+          f"score detections {det}")
+    check([e["id"] for e in det["missed"]] == ["e3", "e5"] and
+          [a["row"] for a in det["false_alerts"]] == [3, 6],
+          "score detection misses / false alerts")
+    pc = det["per_category"]
+    check(pc["plc-program"]["median_ttd_s"] == 55.0 and
+          pc["scan"]["rate"] == 0.0 and pc["ot-write"]["detected"] == 1,
+          f"score per-category {pc}")
+    # a longer tolerance lets the late scan alert count
+    r2 = _score_fixture("manifest", tolerance=600.0)
+    check(r2["detections"]["detected"] == 4 and
+          r2["detections"]["per_category"]["scan"]["median_ttd_s"] == 600.0,
+          "score tolerance widens the detection window")
+
+
+def test_score_inventory_self_score_is_perfect() -> None:
+    import io
+    import json
+    from tgt import enterprise, inventory
+    from tgt import score as S
+    env = enterprise.get("industrial-site")
+    buf = io.StringIO()
+    inventory.write_csv(env, buf, ["triton"])
+    with tempfile.TemporaryDirectory() as d:
+        csv_path = os.path.join(d, "inv.csv")
+        with open(csv_path, "w") as f:
+            f.write(buf.getvalue())
+        truth = S.Truth(json.loads(json.dumps(
+            inventory.to_json(env, ["triton"]))), "live")
+        rows, info = S.read_export(csv_path, S.load_json_spec("generic"))
+        info.update(source=csv_path, map="generic.json")
+        r = S.score(truth, rows, info)
+    d = r["discovery"]
+    check(d["recall"] == 1.0 and d["precision"] == 1.0 and
+          d["population"] == len(env.hosts) + 1,
+          f"self-score discovery {d['recall']} {d['precision']}")
+    for f, v in r["fields"].items():
+        o = v["observable"]
+        check(o["wrong"] == 0 and o["partial"] == 0,
+              f"self-score field {f}: {o}")
+    check(r["new_assets"]["missed"] == [], "self-score new assets")
+
+
+def test_score_zeek_json_and_known_hosts() -> None:
+    import json
+    from tgt import score as S
+    truth = S.load_truth(os.path.join(_SCORE_FIX, "truth-inventory.json"))
+    tsv = S.read_zeek(os.path.join(_SCORE_FIX, "zeek", "conn.log"))
+    check(len(tsv) == 9 and tsv[2]["duration"] is None and
+          tsv[0]["id.resp_p"] == "88", "read_zeek TSV unset/fields")
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "conn.log"), "w") as f:
+            for row in tsv:
+                f.write(json.dumps(row) + "\n")
+        check(S.baseline(truth, d)["seen"] == 6, "baseline from JSON conn.log")
+        kh = os.path.join(d, "known_hosts.log")
+        with open(kh, "w") as f:
+            f.write("#separator \\x09\n#fields\tts\thost\n"
+                    "#types\ttime\taddr\n"
+                    "1793887205.000000\t10.10.10.10\n"
+                    "1793887212.500000\t10.100.10.21\n"
+                    "1793887213.000000\t10.100.10.99\n")
+        rows, info = S.read_export(kh, S.load_json_spec("zeek-known-hosts"))
+        info.update(source=kh, map="zeek-known-hosts.json")
+        man = S.load_truth(os.path.join(_SCORE_FIX, "manifest.json"))
+        r = S.score(man, rows, info)
+        check((r["discovery"]["found"], r["discovery"]["false_positives"])
+              == (2, 1), f"known_hosts discovery {r['discovery']}")
+        check(r["time_to_discover"]["median_s"] == 5.25 and
+              r["fields"]["vendor"]["exported"] is False and
+              r["protocols"] is None, f"known_hosts ttd {r['time_to_discover']}")
+        # JSON export through a json_path
+        js = os.path.join(d, "assets.json")
+        with open(js, "w") as f:
+            json.dump({"result": [{"ip": ["10.100.10.21"], "vendor":
+                                   "Rockwell Automation",
+                                   "protocols": ["CIP", "NTP"]}]}, f)
+        m = {"format": "json", "json_path": "result",
+             "columns": {"ip": "ip", "vendor": "vendor",
+                         "protocols": "protocols"},
+             "normalize": {"vendor": {"rockwell automation": "Rockwell"}}}
+        rows, info = S.read_export(js, m)
+        check(rows[0]["ips"] == ["10.100.10.21"] and
+              rows[0]["vendor"] == "Rockwell" and
+              rows[0]["protocols"] == ["enip", "ntp"],
+              f"json export rows {rows}")
+
+
+def test_score_cli_reports() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        js, ht = os.path.join(d, "r.json"), os.path.join(d, "r.html")
+        p = _cli(["score", "--manifest",
+                  os.path.join(_SCORE_FIX, "manifest.json"), "--assets",
+                  os.path.join(_SCORE_FIX, "export-ctd.csv"), "--map",
+                  "claroty-ctd", "--zeek", os.path.join(_SCORE_FIX, "zeek"),
+                  "--alerts", os.path.join(_SCORE_FIX, "alerts.csv"),
+                  "--alert-map", "alerts-generic", "--json", js,
+                  "--html", ht])
+        out, _ = p.communicate(timeout=30)
+        check(p.returncode == 0, f"tgt score rc={p.returncode}: {out[-400:]}")
+        check("recall 7/8 87.5%" in out and "3/5 events (60.0%)" in out,
+              f"tgt score summary: {out}")
+        import json
+        with open(js) as f:
+            r = json.load(f)
+        with open(ht) as f:
+            page = f.read()
+        check(r["schema"] == "tgt-score/1" and
+              r["discovery"]["precision"] == 0.8, "tgt score --json")
+        check(page.startswith("<!doctype html>") and "<script" not in page
+              and "prefers-color-scheme:dark" in page and
+              "industrial-site:ENG02" in page and "Missed events" in page,
+              "tgt score --html")
+        bad = _cli(["score", "--truth", os.path.join(d, "nope.json"),
+                    "--assets", "x.csv", "--map", "generic"])
+        out, _ = bad.communicate(timeout=30)
+        check(bad.returncode == 2 and "tgt score:" in out,
+              f"tgt score bad input rc={bad.returncode}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

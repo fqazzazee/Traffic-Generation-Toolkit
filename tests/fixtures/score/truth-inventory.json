@@ -1,0 +1,885 @@
+{
+ "env": "industrial-site",
+ "name": "Industrial Site",
+ "category": "mixed",
+ "segments": [
+  {
+   "name": "CORP-SERVERS",
+   "vlan": 10,
+   "subnet": "10.10.10.0/24",
+   "zone": "IT",
+   "gateway": "10.10.10.1",
+   "gateway_mac": "00:00:0c:07:ac:0a"
+  },
+  {
+   "name": "CORP-USERS",
+   "vlan": 20,
+   "subnet": "10.10.20.0/24",
+   "zone": "IT",
+   "gateway": "10.10.20.1",
+   "gateway_mac": "00:00:0c:07:ac:14"
+  },
+  {
+   "name": "OT-OPS",
+   "vlan": 100,
+   "subnet": "10.100.0.0/24",
+   "zone": "OT-SUPERVISORY",
+   "gateway": "10.100.0.1",
+   "gateway_mac": "00:00:0c:07:ac:64"
+  },
+  {
+   "name": "AREA-PACKAGING",
+   "vlan": 110,
+   "subnet": "10.100.10.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.10.1",
+   "gateway_mac": "00:00:0c:07:ac:6e"
+  },
+  {
+   "name": "AREA-PROCESS",
+   "vlan": 120,
+   "subnet": "10.100.20.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.20.1",
+   "gateway_mac": "00:00:0c:07:ac:78"
+  },
+  {
+   "name": "AREA-UTILITIES",
+   "vlan": 130,
+   "subnet": "10.100.30.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.30.1",
+   "gateway_mac": "00:00:0c:07:ac:82"
+  },
+  {
+   "name": "SUBSTATION",
+   "vlan": 150,
+   "subnet": "10.100.50.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.50.1",
+   "gateway_mac": "00:00:0c:07:ac:96"
+  }
+ ],
+ "hosts": [
+  {
+   "name": "DC01",
+   "ip": "10.10.10.10",
+   "mac": "00:50:56:00:10:0a",
+   "mac_vendor": "VMware",
+   "vendor": "",
+   "product": "",
+   "role": "dc",
+   "os": "Windows Server 2019",
+   "segment": "CORP-SERVERS",
+   "vlan": 10,
+   "subnet": "10.10.10.0/24",
+   "zone": "IT",
+   "gateway": "10.10.10.1",
+   "legacy": false,
+   "risk": "",
+   "serves": [
+    "kerberos 88/tcp",
+    "ldap 389/tcp",
+    "ntp 123/udp"
+   ],
+   "uses": [
+    "edr",
+    "ldap"
+   ],
+   "asset_id": "industrial-site:DC01",
+   "model": "microsoft-windows-server-2019",
+   "firmware": "10.0.17763.5329",
+   "serial": "",
+   "purdue_level": "4",
+   "fqdn": "dc01.corp.local",
+   "embedded": false,
+   "edr": true,
+   "modules": [],
+   "known_cves": [],
+   "observability": {
+    "vendor": {
+     "value": "Microsoft",
+     "observable": true,
+     "evidence": [
+      "oui"
+     ]
+    },
+    "product": {
+     "value": "Windows Server 2019",
+     "observable": false,
+     "evidence": []
+    },
+    "model": {
+     "value": "microsoft-windows-server-2019",
+     "observable": false,
+     "evidence": []
+    },
+    "firmware": {
+     "value": "10.0.17763.5329",
+     "observable": false,
+     "evidence": []
+    },
+    "serial": {
+     "value": "",
+     "observable": false,
+     "evidence": []
+    },
+    "os": {
+     "value": "Windows Server 2019",
+     "observable": true,
+     "evidence": [
+      "ttl"
+     ]
+    },
+    "fqdn": {
+     "value": "dc01.corp.local",
+     "observable": true,
+     "evidence": [
+      "ldap"
+     ]
+    }
+   }
+  },
+  {
+   "name": "WS20",
+   "ip": "10.10.20.20",
+   "mac": "00:06:5b:00:20:14",
+   "mac_vendor": "Dell",
+   "vendor": "",
+   "product": "",
+   "role": "ws",
+   "os": "Windows 10",
+   "segment": "CORP-USERS",
+   "vlan": 20,
+   "subnet": "10.10.20.0/24",
+   "zone": "IT",
+   "gateway": "10.10.20.1",
+   "legacy": false,
+   "risk": "",
+   "serves": [],
+   "uses": [
+    "dhcp",
+    "dns",
+    "edr",
+    "http",
+    "https",
+    "kerberos",
+    "ldap",
+    "netbios",
+    "ntp",
+    "smb"
+   ],
+   "asset_id": "industrial-site:WS20",
+   "model": "microsoft-windows-10",
+   "firmware": "10.0.19044.3086",
+   "serial": "",
+   "purdue_level": "4",
+   "fqdn": "ws20.corp.local",
+   "embedded": false,
+   "edr": true,
+   "modules": [],
+   "known_cves": [],
+   "observability": {
+    "vendor": {
+     "value": "Microsoft",
+     "observable": true,
+     "evidence": [
+      "oui"
+     ]
+    },
+    "product": {
+     "value": "Windows 10 Enterprise",
+     "observable": false,
+     "evidence": []
+    },
+    "model": {
+     "value": "microsoft-windows-10",
+     "observable": false,
+     "evidence": []
+    },
+    "firmware": {
+     "value": "10.0.19044.3086",
+     "observable": false,
+     "evidence": []
+    },
+    "serial": {
+     "value": "",
+     "observable": false,
+     "evidence": []
+    },
+    "os": {
+     "value": "Windows 10",
+     "observable": true,
+     "evidence": [
+      "dhcp",
+      "http",
+      "smb",
+      "ttl"
+     ]
+    },
+    "fqdn": {
+     "value": "ws20.corp.local",
+     "observable": false,
+     "evidence": []
+    }
+   }
+  },
+  {
+   "name": "ENG02",
+   "ip": "10.100.0.21",
+   "mac": "00:06:5b:00:60:21",
+   "mac_vendor": "Dell",
+   "vendor": "",
+   "product": "",
+   "role": "eng",
+   "os": "Windows 7",
+   "segment": "OT-OPS",
+   "vlan": 100,
+   "subnet": "10.100.0.0/24",
+   "zone": "OT-SUPERVISORY",
+   "gateway": "10.100.0.1",
+   "legacy": true,
+   "risk": "EOL; SMBv1 enabled \u2192 MS17-010 (EternalBlue)",
+   "serves": [
+    "smb 445/tcp"
+   ],
+   "uses": [
+    "dns",
+    "edr",
+    "https",
+    "kerberos",
+    "s7-id",
+    "smb"
+   ],
+   "asset_id": "industrial-site:ENG02",
+   "model": "microsoft-windows-7",
+   "firmware": "6.1.7601.17514",
+   "serial": "",
+   "purdue_level": "3",
+   "fqdn": "eng02.corp.local",
+   "embedded": false,
+   "edr": true,
+   "modules": [],
+   "known_cves": [
+    "CVE-2017-0144",
+    "CVE-2019-0708"
+   ],
+   "observability": {
+    "vendor": {
+     "value": "Microsoft",
+     "observable": true,
+     "evidence": [
+      "oui"
+     ]
+    },
+    "product": {
+     "value": "Windows 7 Professional SP1",
+     "observable": false,
+     "evidence": []
+    },
+    "model": {
+     "value": "microsoft-windows-7",
+     "observable": false,
+     "evidence": []
+    },
+    "firmware": {
+     "value": "6.1.7601.17514",
+     "observable": false,
+     "evidence": []
+    },
+    "serial": {
+     "value": "",
+     "observable": false,
+     "evidence": []
+    },
+    "os": {
+     "value": "Windows 7",
+     "observable": true,
+     "evidence": [
+      "smb",
+      "ttl"
+     ]
+    },
+    "fqdn": {
+     "value": "eng02.corp.local",
+     "observable": false,
+     "evidence": []
+    }
+   }
+  },
+  {
+   "name": "HMI-PK1",
+   "ip": "10.100.10.10",
+   "mac": "00:06:5b:00:70:10",
+   "mac_vendor": "Dell",
+   "vendor": "",
+   "product": "",
+   "role": "hmi",
+   "os": "Windows 10",
+   "segment": "AREA-PACKAGING",
+   "vlan": 110,
+   "subnet": "10.100.10.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.10.1",
+   "legacy": false,
+   "risk": "",
+   "serves": [],
+   "uses": [
+    "dns",
+    "edr",
+    "enip",
+    "kerberos"
+   ],
+   "asset_id": "industrial-site:HMI-PK1",
+   "model": "microsoft-windows-10",
+   "firmware": "10.0.19044.3086",
+   "serial": "",
+   "purdue_level": "2",
+   "fqdn": "hmi-pk1.corp.local",
+   "embedded": false,
+   "edr": true,
+   "modules": [],
+   "known_cves": [],
+   "observability": {
+    "vendor": {
+     "value": "Microsoft",
+     "observable": true,
+     "evidence": [
+      "oui"
+     ]
+    },
+    "product": {
+     "value": "Windows 10 Enterprise",
+     "observable": false,
+     "evidence": []
+    },
+    "model": {
+     "value": "microsoft-windows-10",
+     "observable": false,
+     "evidence": []
+    },
+    "firmware": {
+     "value": "10.0.19044.3086",
+     "observable": false,
+     "evidence": []
+    },
+    "serial": {
+     "value": "",
+     "observable": false,
+     "evidence": []
+    },
+    "os": {
+     "value": "Windows 10",
+     "observable": true,
+     "evidence": [
+      "ttl"
+     ]
+    },
+    "fqdn": {
+     "value": "hmi-pk1.corp.local",
+     "observable": false,
+     "evidence": []
+    }
+   }
+  },
+  {
+   "name": "PLC-PK1",
+   "ip": "10.100.10.21",
+   "mac": "00:1d:9c:00:70:21",
+   "mac_vendor": "Rockwell Automation",
+   "vendor": "Rockwell",
+   "product": "1756-L83E ControlLogix 5580",
+   "role": "plc",
+   "os": "Rockwell Automation firmware",
+   "segment": "AREA-PACKAGING",
+   "vlan": 110,
+   "subnet": "10.100.10.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.10.1",
+   "legacy": false,
+   "risk": "OT asset \u2014 patch cadence slow; expose CIP/ENIP",
+   "serves": [
+    "enip 44818/tcp",
+    "enip-id 44818/tcp",
+    "icmp"
+   ],
+   "uses": [
+    "enip",
+    "ntp"
+   ],
+   "asset_id": "industrial-site:PLC-PK1",
+   "model": "rockwell-1756-l83e",
+   "firmware": "30.011",
+   "serial": "9B6BD709",
+   "purdue_level": "1",
+   "fqdn": "plc-pk1.corp.local",
+   "embedded": true,
+   "edr": false,
+   "modules": [
+    {
+     "rack": 0,
+     "slot": 0,
+     "catalog": "1756-L83E",
+     "desc": "ControlLogix 5580 controller, 10 MB"
+    },
+    {
+     "rack": 0,
+     "slot": 1,
+     "catalog": "1756-EN2T",
+     "desc": "EtherNet/IP bridge"
+    },
+    {
+     "rack": 0,
+     "slot": 2,
+     "catalog": "1756-IB16",
+     "desc": "16-pt 24 V DC input"
+    },
+    {
+     "rack": 0,
+     "slot": 3,
+     "catalog": "1756-OB16E",
+     "desc": "16-pt 24 V DC output"
+    },
+    {
+     "rack": 0,
+     "slot": 4,
+     "catalog": "1756-IF8",
+     "desc": "8-ch analog input"
+    }
+   ],
+   "known_cves": [
+    "CVE-2021-22681"
+   ],
+   "observability": {
+    "vendor": {
+     "value": "Rockwell",
+     "observable": true,
+     "evidence": [
+      "enip-id",
+      "oui"
+     ]
+    },
+    "product": {
+     "value": "1756-L83E ControlLogix 5580",
+     "observable": true,
+     "evidence": [
+      "enip-id"
+     ]
+    },
+    "model": {
+     "value": "rockwell-1756-l83e",
+     "observable": true,
+     "evidence": [
+      "enip-id"
+     ]
+    },
+    "firmware": {
+     "value": "30.011",
+     "observable": true,
+     "evidence": [
+      "enip-id"
+     ]
+    },
+    "serial": {
+     "value": "9B6BD709",
+     "observable": true,
+     "evidence": [
+      "enip-id"
+     ]
+    },
+    "os": {
+     "value": "Rockwell Automation firmware",
+     "observable": true,
+     "evidence": [
+      "enip-id",
+      "ttl"
+     ]
+    },
+    "fqdn": {
+     "value": "plc-pk1.corp.local",
+     "observable": false,
+     "evidence": []
+    }
+   }
+  },
+  {
+   "name": "PLC-PR4",
+   "ip": "10.100.20.24",
+   "mac": "00:0e:8c:00:80:24",
+   "mac_vendor": "Siemens",
+   "vendor": "Siemens",
+   "product": "6ES7 151-8AB01-0AB0",
+   "role": "plc",
+   "os": "Siemens SIMATIC firmware",
+   "segment": "AREA-PROCESS",
+   "vlan": 120,
+   "subnet": "10.100.20.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.20.1",
+   "legacy": false,
+   "risk": "OT asset \u2014 S7comm (legacy families) / IEC-104 unauthenticated",
+   "serves": [
+    "s7-id 102/tcp",
+    "s7comm 102/tcp"
+   ],
+   "uses": [
+    "ntp"
+   ],
+   "asset_id": "industrial-site:PLC-PR4",
+   "model": "siemens-im151-8-pndp",
+   "firmware": "V3.2.8",
+   "serial": "S C-T1S011089819",
+   "purdue_level": "1",
+   "fqdn": "plc-pr4.corp.local",
+   "embedded": true,
+   "edr": false,
+   "modules": [
+    {
+     "rack": 0,
+     "slot": 0,
+     "catalog": "6ES7 151-8AB01-0AB0",
+     "desc": "IM151-8 PN/DP CPU"
+    },
+    {
+     "rack": 0,
+     "slot": 1,
+     "catalog": "6ES7 131-4BD01-0AA0",
+     "desc": "4DI DC24V"
+    }
+   ],
+   "known_cves": [
+    "CVE-2016-9159"
+   ],
+   "observability": {
+    "vendor": {
+     "value": "Siemens",
+     "observable": true,
+     "evidence": [
+      "oui",
+      "s7-id"
+     ]
+    },
+    "product": {
+     "value": "6ES7 151-8AB01-0AB0",
+     "observable": true,
+     "evidence": [
+      "s7-id"
+     ]
+    },
+    "model": {
+     "value": "siemens-im151-8-pndp",
+     "observable": true,
+     "evidence": [
+      "s7-id"
+     ]
+    },
+    "firmware": {
+     "value": "V3.2.8",
+     "observable": true,
+     "evidence": [
+      "s7-id"
+     ]
+    },
+    "serial": {
+     "value": "S C-T1S011089819",
+     "observable": true,
+     "evidence": [
+      "s7-id"
+     ]
+    },
+    "os": {
+     "value": "Siemens SIMATIC firmware",
+     "observable": true,
+     "evidence": [
+      "s7-id",
+      "ttl"
+     ]
+    },
+    "fqdn": {
+     "value": "plc-pr4.corp.local",
+     "observable": false,
+     "evidence": []
+    }
+   }
+  },
+  {
+   "name": "METER-UT1",
+   "ip": "10.100.30.41",
+   "mac": "00:80:f4:00:90:41",
+   "mac_vendor": "Schneider Electric",
+   "vendor": "Schneider Electric",
+   "product": "PowerLogic PM5560",
+   "role": "meter",
+   "os": "Schneider Electric firmware",
+   "segment": "AREA-UTILITIES",
+   "vlan": 130,
+   "subnet": "10.100.30.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.30.1",
+   "legacy": false,
+   "risk": "OT asset \u2014 Modbus/TCP has no authentication",
+   "serves": [
+    "modbus 502/tcp"
+   ],
+   "uses": [],
+   "asset_id": "industrial-site:METER-UT1",
+   "model": "schneider-pm5560",
+   "firmware": "V2.7.4",
+   "serial": "0839563205",
+   "purdue_level": "1",
+   "fqdn": "meter-ut1.corp.local",
+   "embedded": true,
+   "edr": false,
+   "modules": [],
+   "known_cves": [],
+   "observability": {
+    "vendor": {
+     "value": "Schneider Electric",
+     "observable": true,
+     "evidence": [
+      "oui"
+     ]
+    },
+    "product": {
+     "value": "PowerLogic PM5560",
+     "observable": false,
+     "evidence": []
+    },
+    "model": {
+     "value": "schneider-pm5560",
+     "observable": false,
+     "evidence": []
+    },
+    "firmware": {
+     "value": "V2.7.4",
+     "observable": false,
+     "evidence": []
+    },
+    "serial": {
+     "value": "0839563205",
+     "observable": false,
+     "evidence": []
+    },
+    "os": {
+     "value": "Schneider Electric firmware",
+     "observable": true,
+     "evidence": [
+      "ttl"
+     ]
+    },
+    "fqdn": {
+     "value": "meter-ut1.corp.local",
+     "observable": false,
+     "evidence": []
+    }
+   }
+  },
+  {
+   "name": "RTU-104",
+   "ip": "10.100.50.30",
+   "mac": "00:0e:8c:00:b0:30",
+   "mac_vendor": "Siemens",
+   "vendor": "Siemens",
+   "product": "SICAM A8000 CP-8050",
+   "role": "rtu",
+   "os": "Siemens SIMATIC firmware",
+   "segment": "SUBSTATION",
+   "vlan": 150,
+   "subnet": "10.100.50.0/24",
+   "zone": "OT-CELL",
+   "gateway": "10.100.50.1",
+   "legacy": false,
+   "risk": "OT asset \u2014 S7comm (legacy families) / IEC-104 unauthenticated",
+   "serves": [
+    "iec104 2404/tcp"
+   ],
+   "uses": [],
+   "asset_id": "industrial-site:RTU-104",
+   "model": "siemens-sicam-cp-8050",
+   "firmware": "CPCI85 V04.92",
+   "serial": "BF609372049",
+   "purdue_level": "2",
+   "fqdn": "rtu-104.corp.local",
+   "embedded": true,
+   "edr": false,
+   "modules": [
+    {
+     "rack": 0,
+     "slot": 0,
+     "catalog": "6MF2805-0AA00",
+     "desc": "CP-8050 master module"
+    }
+   ],
+   "known_cves": [
+    "CVE-2023-28489"
+   ],
+   "observability": {
+    "vendor": {
+     "value": "Siemens",
+     "observable": true,
+     "evidence": [
+      "oui"
+     ]
+    },
+    "product": {
+     "value": "SICAM A8000 CP-8050",
+     "observable": false,
+     "evidence": []
+    },
+    "model": {
+     "value": "siemens-sicam-cp-8050",
+     "observable": false,
+     "evidence": []
+    },
+    "firmware": {
+     "value": "CPCI85 V04.92",
+     "observable": false,
+     "evidence": []
+    },
+    "serial": {
+     "value": "BF609372049",
+     "observable": false,
+     "evidence": []
+    },
+    "os": {
+     "value": "Siemens SIMATIC firmware",
+     "observable": true,
+     "evidence": [
+      "ttl"
+     ]
+    },
+    "fqdn": {
+     "value": "rtu-104.corp.local",
+     "observable": false,
+     "evidence": []
+    }
+   }
+  }
+ ],
+ "flows": [
+  {
+   "client": "WS20",
+   "server": "WS20",
+   "protocol": "netbios",
+   "service": "netbios 137/udp",
+   "dport": 137,
+   "transport": "udp"
+  },
+  {
+   "client": "WS20",
+   "server": "DC01",
+   "protocol": "kerberos",
+   "service": "kerberos 88/tcp",
+   "dport": 88,
+   "transport": "tcp"
+  },
+  {
+   "client": "WS20",
+   "server": "DC01",
+   "protocol": "ldap",
+   "service": "ldap 389/tcp",
+   "dport": 389,
+   "transport": "tcp"
+  },
+  {
+   "client": "WS20",
+   "server": "DC01",
+   "protocol": "ntp",
+   "service": "ntp 123/udp",
+   "dport": 123,
+   "transport": "udp"
+  },
+  {
+   "client": "HMI-PK1",
+   "server": "PLC-PK1",
+   "protocol": "enip",
+   "service": "enip 44818/tcp",
+   "dport": 44818,
+   "transport": "tcp"
+  },
+  {
+   "client": "ENG02",
+   "server": "PLC-PR4",
+   "protocol": "s7-id",
+   "service": "s7-id 102/tcp",
+   "dport": 102,
+   "transport": "tcp"
+  }
+ ],
+ "external": [
+  {
+   "ip": "18.158.187.80",
+   "fqdns": [
+    "ts01-lanner-lion.cloudsink.net"
+   ],
+   "talkers": [
+    "DC01"
+   ],
+   "kind": "edr-cloud",
+   "vendor": "CrowdStrike"
+  },
+  {
+   "ip": "3.122.135.178",
+   "fqdns": [
+    "ts01-lanner-lion.cloudsink.net"
+   ],
+   "talkers": [
+    "WS20"
+   ],
+   "kind": "edr-cloud",
+   "vendor": "CrowdStrike"
+  }
+ ],
+ "infrastructure": [
+  {
+   "kind": "hsrp-gateway",
+   "segment": "CORP-SERVERS",
+   "vlan": 10,
+   "ip": "10.10.10.1",
+   "mac": "00:00:0c:07:ac:0a",
+   "mac_vendor": "Cisco (HSRP virtual MAC)"
+  },
+  {
+   "kind": "hsrp-gateway",
+   "segment": "AREA-PACKAGING",
+   "vlan": 110,
+   "ip": "10.100.10.1",
+   "mac": "00:00:0c:07:ac:6e",
+   "mac_vendor": "Cisco (HSRP virtual MAC)"
+  }
+ ],
+ "new_assets": [
+  {
+   "asset_id": "industrial-site:SIS-TRICONEX",
+   "name": "SIS-TRICONEX",
+   "ip": "172.16.3.10",
+   "mac": "00:80:f4:03:88:0c",
+   "mac_vendor": "Schneider Electric",
+   "vendor": "",
+   "product": "Triconex 3008",
+   "role": "plc",
+   "os": "Schneider Electric firmware",
+   "segment": "",
+   "vlan": "",
+   "subnet": "",
+   "zone": "",
+   "gateway": "",
+   "legacy": false,
+   "risk": "new asset (sprinkle: triton)",
+   "serves": [
+    "tristation"
+   ],
+   "uses": []
+  }
+ ],
+ "sprinkle": {
+  "triton": {
+   "mapped": {
+    "TRITON-ENGWS": "ENG02"
+   },
+   "new_assets": [
+    "SIS-TRICONEX"
+   ]
+  }
+ }
+}
