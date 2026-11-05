@@ -893,7 +893,9 @@ def test_sprinkle_servers_serve_their_protocol() -> None:
     doc = inventory.to_json(plant, ["triton"])
     check(doc["sprinkle"]["triton"] == {
         "mapped": {"TRITON-ENGWS": "ENGWS01"},
-        "new_assets": ["SIS-TRICONEX"]}, "inventory JSON sprinkle mapping")
+        "new_assets": ["SIS-TRICONEX"],
+        "techniques": ["T0843", "T0846", "T0868", "T1046"]},
+        "inventory JSON sprinkle mapping")
 
 
 def serves_of(env, name: str) -> set:
@@ -6380,6 +6382,288 @@ def test_incident_mapping_never_self_flows() -> None:
             enterprise.get("electric-substation"))
         check(len({h.name for h in m.values()}) == len(m),
               "wannacry hosts collapse onto one substation host")
+
+
+# ---- W5-A: MITRE ATT&CK technique tags (#64) --------------------------------
+def test_w5a_attack_techniques_cover_attacks() -> None:
+    """Every built-in attack builder maps onto techniques that exist in
+    tgt/attack_ics.json; the table is well formed and fully used; incident
+    extras name real incidents/flows; label parsing and ID matching."""
+    import json
+    from tgt import incidents, plugins
+    from tgt import techniques as T
+    tab = T.load()
+    raw = json.load(open(T.TABLE_PATH, encoding="utf-8"))
+    check(set(tab) == {k for k in raw if not k.startswith("_")} and
+          len(tab) >= 20, "attack_ics.json: table not loaded")
+    tactics = {"initial-access", "execution", "persistence",
+               "privilege-escalation", "evasion", "defense-evasion",
+               "discovery", "lateral-movement", "collection",
+               "command-and-control", "inhibit-response-function",
+               "impair-process-control", "impact", "reconnaissance",
+               "credential-access", "exfiltration"}
+    for tid, v in tab.items():
+        ok = (v.get("name") and v.get("tactic") and
+              set(v["tactic"]) <= tactics and
+              v.get("matrix") in ("ics", "enterprise") and
+              T.parse_ids(tid) == [tid] and
+              (tid.startswith("T08")) == (v["matrix"] == "ics"))
+        check(bool(ok), f"attack_ics.json: bad entry {tid} {v}")
+    builtin = [k for k, (b, _) in incidents.ATTACKS.items()
+               if b.__module__ == "tgt.incidents"]
+    check(len(builtin) >= 14, "built-in attacks missing")
+    for k in builtin:
+        ids = T.for_attack(k)
+        check(bool(ids) and all(t in tab for t in ids) and
+              ids == sorted(set(ids)),
+              f"techniques: attack {k} -> {ids} (missing / not in table)")
+    probs = [p for p in T.validate()
+             if not p.startswith("attack ") or p.split()[1] in builtin]
+    check(not probs, f"techniques.validate: {probs}")
+    used = set()
+    for ik in incidents.INCIDENTS:
+        ids = T.for_incident(ik)
+        check(ids == sorted(set(ids)) and all(t in tab for t in ids),
+              f"techniques: incident {ik} -> {ids}")
+        used.update(ids)
+    check(set(tab) <= used, f"attack_ics.json lists techniques no incident "
+          f"shows: {sorted(set(tab) - used)}")
+    # spot checks the issue names
+    check("T0846" in T.for_attack("port-scan") and
+          "T0855" in T.for_attack("modbus-write") and
+          "T0855" in T.for_attack("iec104-command") and
+          "T0843" in T.for_attack("tristation") and
+          "T0886" in T.for_attack("smb-lateral") and
+          "T0869" in T.for_attack("c2-beacon"),
+          "techniques: issue examples not mapped")
+    check(T.for_flow("iec104-command", "industroyer") == ["T0806", "T0855"]
+          and T.for_flow("iec104-command") == ["T0855"] and
+          "T1568.002" in T.for_incident("sunburst") and
+          "T1568.002" not in T.for_incident("wannacry"),
+          "techniques: per-incident extras")
+    check(T.name("T0855") == "Unauthorized Command Message" and
+          T.name("T9999") == "" and T.for_attack("nope") == [] and
+          T.for_incident("nope") == [], "techniques: name / unknown keys")
+    check(T.incident_of("inject:wannacry#3") == "wannacry" and
+          T.incident_of("sprinkle:triton") == "triton" and
+          T.incident_of("incident:stuxnet") == "stuxnet" and
+          T.incident_of("baseline") is None and T.incident_of("") is None,
+          "techniques: source label parsing")
+    check(T.for_event("dga-dns", "inject:conficker#1") ==
+          ["T0869", "T1071.004", "T1568.002"], "techniques: for_event")
+    check(T.parse_ids("MITRE t0855; T1071.001,T0855 x") ==
+          ["T0855", "T1071.001"], "techniques: parse_ids")
+    check(T.shares(["T1071"], ["T1071.001"]) and
+          T.shares(["T1071.004"], ["T1071"]) and
+          not T.shares(["T1110.001"], ["T1110.003"]) and
+          not T.shares([], ["T0855"]) and T.shares(["T0855"], ["T0855"]),
+          "techniques: shares (parent / sub-technique)")
+    # plugins: techniques= on register_attack, validated and rolled back
+    try:
+        plugins.register_attack("w5a-x", lambda ep, n: [], "x",
+                                category="ot-write", techniques=["T9999"])
+        check(False, "plugins: unknown technique accepted")
+    except plugins.PluginError:
+        pass
+    plugins.unload_all()
+    plugins.register_attack("w5a-y", lambda ep, n: [], "y",
+                            category="ot-write", techniques=["T0855"])
+    check(T.for_attack("w5a-y") == ["T0855"], "plugins: attack techniques")
+    plugins.unload_all()
+    check("w5a-y" not in T.ATTACK_TECHNIQUES and
+          "w5a-y" not in incidents.ATTACKS,
+          "plugins: attack techniques not rolled back")
+
+
+def test_w5a_manifest_events_carry_techniques() -> None:
+    """Attack events of sprinkle, --incident and injection runs carry the
+    sorted technique IDs of their attack (+ incident extras); new-asset
+    events carry none; tgt inventory --sprinkle / tgt list show them."""
+    import contextlib
+    import io
+    from tgt import cli, enterprise, manifest
+    from tgt import techniques as T
+    from tgt.engine import build_batch as bb
+    cfg = RunConfig(env="it-org", sprinkle=["industroyer"], messages=2)
+    n = len(bb(cfg))
+    with tempfile.TemporaryDirectory() as d:
+        m = _manifest_run(d, "spr", RunConfig(
+            env="it-org", sprinkle=["industroyer"], messages=2, seed=3),
+            n + 50)
+        m2 = _manifest_run(d, "inc", RunConfig(
+            incident="triton", messages=2, seed=3), 60)
+    atk = [e for e in m["events"] if e.get("attack")]
+    check(atk and all(e["techniques"] == T.for_event(e["attack"],
+                                                      e["source"])
+                      and e["techniques"] for e in atk),
+          f"manifest: sprinkle events lack techniques "
+          f"{[(e['attack'], e.get('techniques')) for e in atk]}")
+    iec = [e for e in atk if e["attack"] == "iec104-command"]
+    check(iec and iec[0]["techniques"] == ["T0806", "T0855"],
+          f"manifest: industroyer extras {iec}")
+    check(all("techniques" not in e for e in m["events"]
+              if e["category"] == "new-asset"),
+          "manifest: new-asset event carries techniques")
+    atk2 = [e for e in m2["events"] if e.get("attack")]
+    check({e["attack"] for e in atk2} == {"tristation", "port-scan"} and
+          all(e["source"] == "incident:triton" and
+              e["techniques"] == T.for_attack(e["attack"]) for e in atk2),
+          f"manifest: --incident events {atk2}")
+    # an injection's events (control API / tgt ctl inject source label)
+    rec = manifest.Recorder(RunConfig(env="it-org"), 1, clock="synthetic")
+    rec.events[("a", "b", "dga-dns", "inject:sunburst#2")] = [
+        0.0, 1.0, 3, ("a", "b", "10.0.0.1", "10.0.0.2")]
+    ev = rec.to_dict()["events"][0]
+    check(ev["techniques"] == ["T0869", "T1071.004", "T1568.002"],
+          f"manifest: injection event techniques {ev}")
+    # tgt inventory --sprinkle (JSON inline, CSV on stderr) and tgt list
+    from tgt import inventory
+    doc = inventory.to_json(enterprise.get("it-org"), ["colonial"])
+    check(doc["sprinkle"]["colonial"]["techniques"] ==
+          T.for_incident("colonial"), "inventory JSON: sprinkle techniques")
+
+    class A:
+        env, env_file, format, output = "it-org", None, "csv", None
+        sprinkle = ["colonial"]
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        cli.cmd_inventory(A())
+    check("sprinkle colonial: ATT&CK T0869" in err.getvalue(),
+          f"inventory CSV: techniques note {err.getvalue()!r}")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_list(None)
+    txt = buf.getvalue()
+    check("techniques: " + ", ".join(T.for_incident("triton")) in txt and
+          "T0855     Unauthorized Command Message" in txt,
+          "tgt list: incident techniques / technique table missing")
+
+
+def _w5a_truth():
+    from tgt import score
+    hosts = [{"asset_id": "s:ENG", "name": "ENG", "ip": "10.0.0.1"},
+             {"asset_id": "s:PLC", "name": "PLC", "ip": "10.0.0.2"},
+             {"asset_id": "s:WS", "name": "WS", "ip": "10.0.0.3"}]
+
+    def ev(i, cat, atk, t0, src, dst, tech=None):
+        e = {"id": f"e{i}", "category": cat, "attack": atk,
+             "t_start": f"2026-11-05T14:{t0}Z",
+             "t_end": f"2026-11-05T14:{t0}Z", "src": src, "dst": dst,
+             "hosts": [], "source": "sprinkle:x", "detail": atk}
+        if tech is not None:
+            e["techniques"] = tech
+        return e
+    events = [
+        ev(1, "scan", "port-scan", "00:00", "10.0.0.1", "10.0.0.2",
+           ["T0846", "T1046"]),
+        ev(2, "ot-write", "modbus-write", "01:00", "10.0.0.1", "10.0.0.2",
+           ["T0836", "T0855"]),
+        ev(3, "ot-write", "modbus-write", "02:00", "10.0.0.3", "10.0.0.2",
+           ["T0836", "T0855"]),
+        ev(4, "c2", "https-c2", "03:00", "10.0.0.3", "198.51.100.9",
+           ["T0869", "T1071.001", "T1573"]),
+        # an old manifest without "techniques": derived from the attack
+        ev(5, "c2", "dga-dns", "04:00", "10.0.0.1", "10.0.0.3"),
+        {"id": "e6", "category": "new-asset", "t_start":
+         "2026-11-05T14:05:00Z", "t_end": "2026-11-05T14:05:00Z",
+         "hosts": ["10.0.0.9"], "src": "10.0.0.9", "dst": None,
+         "source": "sprinkle:x"}]
+    doc = {"schema": "tgt-manifest/1", "start": "2026-11-05T14:00:00Z",
+           "end": "2026-11-05T14:10:00Z", "inventory": {"hosts": hosts},
+           "first_seen": {}, "events": events}
+    return score.Truth(doc, "w5a")
+
+
+def test_w5a_score_by_technique_and_strict() -> None:
+    """tgt score: detections.by_technique counts (an event counts toward
+    each of its techniques), median TTD, tagged alerts via a technique
+    column and title regexes, --strict-technique, rendering."""
+    import json
+    from tgt import score
+    truth = _w5a_truth()
+    amap = {"format": "csv",
+            "columns": {"time": "time", "src": "src", "dst": "dst",
+                        "title": "title", "technique": "mitre"},
+            "categories": {"scan": "scan", "modbus write": "ot-write",
+                           "c2|beacon": "c2"},
+            "techniques": {"beacon": ["T1071.001"]}}
+    rows = ("time,src,dst,title,mitre\n"
+            # e1 scan, 10 s late, untagged
+            "2026-11-05T14:00:10Z,10.0.0.1,10.0.0.2,Port scan,\n"
+            # e2 modbus write, tagged with a shared technique
+            "2026-11-05T14:01:20Z,10.0.0.1,10.0.0.2,Modbus write,T0855\n"
+            # e3 modbus write, tagged with an unrelated technique
+            "2026-11-05T14:02:30Z,10.0.0.3,10.0.0.2,Modbus write,T0843\n"
+            # e4 c2: regex adds T1071.001 (shared)
+            "2026-11-05T14:03:40Z,10.0.0.3,198.51.100.9,TLS beacon,\n"
+            # e5 dga: column says T1071 (parent of T1071.004)
+            "2026-11-05T14:04:50Z,10.0.0.1,10.0.0.3,C2 lookup,T1071\n")
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "alerts.csv")
+        with open(p, "w") as f:
+            f.write(rows)
+        alerts = score.read_alerts(p, amap)
+        plain = score.read_alerts(p, dict(amap, techniques={},
+                                          columns=dict(amap["columns"],
+                                                       technique="nope")))
+    check([a["techniques"] for a in alerts] ==
+          [[], ["T0855"], ["T0843"], ["T1071.001"], ["T1071"]],
+          f"read_alerts techniques {[a['techniques'] for a in alerts]}")
+    check(all(a["techniques"] is None for a in plain),
+          "read_alerts: untagged map must give techniques None")
+    det = score.detections(truth, alerts, 300.0, 5.0)
+    bt = det["by_technique"]
+    want = {"T0836": (2, 2), "T0855": (2, 2), "T0846": (1, 1),
+            "T1046": (1, 1), "T0869": (2, 2), "T1071.001": (1, 1),
+            "T1573": (1, 1), "T1071.004": (1, 1)}
+    check({t: (v["events"], v["detected"]) for t, v in bt.items()} == want,
+          f"by_technique counts {bt}")
+    check(list(bt) == sorted(bt) and
+          set(bt["T0855"]) == {"name", "events", "detected", "rate",
+                               "median_ttd_s"} and
+          bt["T0855"]["name"] == "Unauthorized Command Message" and
+          bt["T0855"]["rate"] == 1.0 and
+          bt["T0855"]["median_ttd_s"] == 25.0 and
+          bt["T0846"]["median_ttd_s"] == 10.0,
+          f"by_technique shape {bt.get('T0855')}")
+    check(det["detected"] == 5 and det["strict_technique"] is False and
+          det["tagged_alerts"] == 4, f"detections {det['detected']}")
+    # strict: e3's alert (T0843) no longer matches; parent T1071 still does
+    sd = score.detections(truth, alerts, 300.0, 5.0, strict_technique=True)
+    sbt = sd["by_technique"]
+    check(sd["detected"] == 4 and sbt["T0855"]["detected"] == 1 and
+          sbt["T0855"]["rate"] == 0.5 and
+          sbt["T0855"]["median_ttd_s"] == 20.0 and
+          sbt["T1071.004"]["detected"] == 1 and
+          sbt["T0846"]["detected"] == 1 and sd["strict_technique"] and
+          len(sd["false_alerts"]) == 1,
+          f"strict technique: {sd['detected']} {sbt}")
+    nd = score.detections(truth, plain, 300.0, 5.0, strict_technique=True)
+    check(nd["detected"] == 5, "strict with an untagged map changed results")
+    # through score(): JSON-serialisable, summary + HTML tables; absent
+    # without alerts
+    res = score.score(truth, [], {"rows": 0, "columns": {}, "source": "x",
+                                  "map": "m", "protocol_ignore": [],
+                                  "normalize": lambda f, v: v},
+                      alerts=alerts, strict_technique=True)
+    check(res["detections"]["by_technique"]["T0855"]["detected"] == 1,
+          "score(): strict_technique not passed through")
+    json.dumps(res, default=str)
+    txt = score.summary(res)
+    check("techniques  ATT&CK coverage" in txt and "T0855" in txt and
+          "Unauthorized Command Message" in txt, f"summary: {txt}")
+    page = score.to_html(res)
+    check("Detections by ATT&amp;CK technique" in page and
+          "<td>T1071.004</td>" in page and "impair-process-control" in page,
+          "html: technique table missing")
+    res2 = score.score(truth, [], {"rows": 0, "columns": {}, "source": "x",
+                                   "map": "m", "protocol_ignore": [],
+                                   "normalize": lambda f, v: v})
+    check(res2["detections"] is None, "detections without alerts")
+    # the generic alert map's optional technique column and rules
+    gen = score.load_json_spec("alerts-generic")
+    check(gen["columns"].get("technique") and gen.get("techniques"),
+          "alerts-generic: optional technique fields missing")
 
 
 def main() -> int:
