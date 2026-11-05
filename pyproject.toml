@@ -30,7 +30,8 @@ Homepage = "https://example.local/tgt"
 packages = ["tgt"]
 
 [tool.setuptools.package-data]
-tgt = ["scoremaps/*.json", "envs/*.json", "envs/*.toml"]
+tgt = ["scoremaps/*.json", "envs/*.json", "envs/*.toml", "envs/sites/*.json",
+       "envs/sites/*.toml"]
 
 [tool.setuptools.dynamic]
 version = { attr = "tgt.__version__" }

@@ -672,11 +672,20 @@ def register(env: Environment) -> Environment:
     return env
 
 
+# Modeled sites that ship with TGT as data files (one per vertical: water
+# utility, substation, ...). They load like user env files but come first,
+# so a user file cannot shadow one.
+SITES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "envs", "sites")
+
+
 def search_path() -> List[str]:
-    """Directories (or files) environments are auto-loaded from:
-    ``TGT_ENV_PATH`` (os.pathsep-separated), then ``$XDG_CONFIG_HOME/tgt/envs``
-    (default ``~/.config/tgt/envs``)."""
-    out = [p for p in os.environ.get("TGT_ENV_PATH", "").split(os.pathsep) if p]
+    """Directories (or files) environments are auto-loaded from: the packaged
+    sites (:data:`SITES_DIR`), ``TGT_ENV_PATH`` (os.pathsep-separated), then
+    ``$XDG_CONFIG_HOME/tgt/envs`` (default ``~/.config/tgt/envs``)."""
+    out = [SITES_DIR]
+    out += [p for p in os.environ.get("TGT_ENV_PATH", "").split(os.pathsep)
+            if p]
     cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
         os.path.expanduser("~"), ".config")
     out.append(os.path.join(cfg, "tgt", "envs"))
