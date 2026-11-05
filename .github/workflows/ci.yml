@@ -16,7 +16,9 @@ concurrency:
 jobs:
   selftest:
     name: selftest (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    # setup-python has no 3.9 build for ubuntu-latest (26.04); keep the
+    # oldest supported Python covered on 24.04
+    runs-on: ${{ matrix.python == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
