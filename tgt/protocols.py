@@ -810,3 +810,7 @@ def get(key: str) -> Profile:
 
 def all_profiles() -> List[Profile]:
     return list(PROFILES.values())
+
+
+# Industrial L2 / substation profiles (PROFINET, IEC 61850, PTP) register here.
+from . import protocols_ind  # noqa: E402,F401

@@ -287,6 +287,9 @@ _DISSECTS_AS = {
     "dns": "dns", "http": "http", "https": "tls", "edr": "tls", "smb": "smb2",
     "kerberos": "kerberos", "ldap": "ldap", "dhcp": "dhcp", "netbios": "nbns",
     "ntp": "ntp",
+    # industrial L2 / substation (tgt/protocols_ind.py)
+    "pn-dcp": "pn_dcp", "pn-dcp-set": "pn_dcp", "pn-rt": "pn_io",
+    "goose": "goose", "sv": "sv", "mms": "mms", "ptp": "ptp", "ptp-l2": "ptp",
 }
 
 
@@ -775,6 +778,84 @@ def test_pcap_roundtrip() -> None:
         n += 1
     check(off == len(data), "pcap did not parse cleanly to EOF")
     check(n == len(frames), f"pcap record count {n} != {len(frames)}")
+
+
+def _ber_fields(buf: bytes) -> dict:
+    """Top-level BER TLVs of ``buf`` -> {tag: value} (short/long lengths)."""
+    out, i = {}, 0
+    while i + 2 <= len(buf):
+        tag, ln = buf[i], buf[i + 1]
+        i += 2
+        if ln & 0x80:
+            k = ln & 0x7F
+            ln = int.from_bytes(buf[i:i + k], "big")
+            i += k
+        out[tag] = buf[i:i + ln]
+        i += ln
+    return out
+
+
+def test_industrial_l2_protocols() -> None:
+    """PROFINET DCP/RT, GOOSE, SV, MMS and PTP: EtherTypes, multicast MACs,
+    priority tags, GOOSE stNum/sqNum semantics and endpoint-meta identity."""
+    meta = {"host": "BAY1IED", "station": "ET200SP-Line3", "vendor": "ABB",
+            "model": "REF615", "revision": "5.0 FP1"}
+    ep = Endpoints(meta=meta)
+    for key in ("pn-dcp", "pn-dcp-set", "pn-rt", "goose", "sv", "ptp-l2"):
+        check(protocols.get(key).transport == "l2",
+              f"{key} must register as l2 so envs keep it on one segment")
+        for f in protocols.get(key).build(ep, 4):
+            check(len(f) >= 60, f"{key}: frame shorter than Ethernet minimum")
+            check(P.frame_ips(f) is None, f"{key}: L2 frame carries IPv4")
+
+    dcp = protocols.get("pn-dcp").build(ep, 1)
+    check(dcp[0][:6] == P.mac_to_bytes("01:0e:cf:00:00:00") and
+          dcp[0][12:16] == b"\x88\x92\xfe\xfe", "DCP Identify All framing")
+    check(b"et200sp-line3" in dcp[1] and b"\x00\x2a\x01\x0e" in dcp[1],
+          "DCP response lacks NameOfStation / Siemens vendor+device ID")
+    sets = protocols.get("pn-dcp-set").build(ep, 2)
+    check(any(f[16:18] == b"\x04\x00" for f in sets), "DCP Set request missing")
+
+    goose = protocols.get("goose").build(ep, 8)
+    seen = []
+    for f in goose:
+        check(f[12:14] == b"\x81\x00" and f[14] >> 5 == 4 and
+              f[16:18] == b"\x88\xb8", "GOOSE not 802.1Q prio 4 / 0x88b8")
+        check(f[:3] == b"\x01\x0c\xcd", "GOOSE dst not 01:0c:cd multicast")
+        pdu = _ber_fields(_ber_fields(f[26:])[0x61])
+        seen.append((int.from_bytes(pdu[0x85], "big"),
+                     int.from_bytes(pdu[0x86], "big"), pdu[0xAB]))
+        check(pdu[0x80].startswith(b"BAY1IEDLD0/LLN0$GO$"), "GOOSE gocbRef")
+    for (st0, sq0, d0), (st1, sq1, d1) in zip(seen, seen[1:]):
+        if st1 == st0:
+            check(sq1 == sq0 + 1 and d1 == d0, "GOOSE retransmission broke "
+                  "sqNum++ / same data")
+        else:
+            check(st1 == st0 + 1 and sq1 == 0 and d1 != d0,
+                  "GOOSE state change must bump stNum, reset sqNum")
+
+    sv = protocols.get("sv").build(ep, 3)
+    check(all(f[16:18] == b"\x88\xba" and f[:3] == b"\x01\x0c\xcd"
+              for f in sv), "SV framing")
+
+    mms = b"".join(protocols.get("mms").build(ep, 2))
+    for needle in (b"ABB", b"REF615", b"5.0 FP1", b"BAY1IEDLD0",
+                   b"MMXU1$MX$TotW", b"\x28\xca\x22\x02\x03"):
+        check(needle in mms, f"MMS flow missing {needle!r}")
+
+    for f in protocols.get("ptp").build(ep, 2):
+        verify_ip_l4(f, "ptp")
+        check(P.frame_ips(f)[1] == "224.0.1.129" and f[14 + 8] == 1,
+              "PTP must be link-local multicast with TTL 1")
+        check(struct.unpack("!H", f[36:38])[0] in (319, 320), "PTP port")
+
+
+def test_substation_scenarios_build() -> None:
+    for key in ("substation", "profinet-cell"):
+        sc = scenarios.get(key)
+        batch = build_batch(RunConfig(profiles=sc.profiles, messages=2))
+        check({k for k, _ in batch} == set(sc.profiles),
+              f"scenario {key} did not emit every profile")
 
 
 def main() -> int:
