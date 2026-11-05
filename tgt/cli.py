@@ -28,20 +28,35 @@ VERSION = __version__
 
 
 # ---------------------------------------------------------------------------
+def _columns(rows, mins) -> list:
+    """``rows`` (tuples of str) formatted as aligned columns, each as wide as
+    its longest value (at least ``mins``); the last column is left as is."""
+    w = [max([m] + [len(r[i]) for r in rows]) for i, m in enumerate(mins)]
+    return [" ".join(f"{v:{n}}" for v, n in zip(r, w)) +
+            "".join(f" {v}" for v in r[len(w):]) for r in rows]
+
+
 def cmd_list(args) -> int:
     print("Protocols:")
-    print(f"  {'key':10} {'name':22} {'cat':4} {'port':7} {'xport':6} desc")
-    for p in protocols.all_profiles():
-        print(f"  {p.key:10} {p.name:22} {p.category:4} {p.port:7} "
-              f"{p.transport:6} {p.desc}")
+    for line in _columns([("key", "name", "cat", "port", "xport", "desc")] +
+                         [(p.key, p.name, p.category, p.port, p.transport,
+                           p.desc) for p in protocols.all_profiles()],
+                         (10, 22, 4, 7, 6)):
+        print(f"  {line}")
     print("\nScenarios (curated protocol mixes):")
-    for s in scenarios.all_scenarios():
-        print(f"  {s.key:14} {s.name:26} [{', '.join(s.profiles)}]")
+    scen = scenarios.all_scenarios()
+    lines = _columns([(s.key, s.name, f"[{', '.join(s.profiles)}]")
+                      for s in scen], (14, 26))
+    for s, line in zip(scen, lines):
+        print(f"  {line}")
         print(f"    {s.desc}")
     print("\nEnvironments (modeled organizations — use with --env):")
     from . import envfile
-    for e in enterprise.all_environments():
-        print(f"  {e.key:18} {e.name:22} [{e.category}]")
+    envs = enterprise.all_environments()
+    lines = _columns([(e.key, e.name, f"[{e.category}]") for e in envs],
+                     (18, 22))
+    for e, line in zip(envs, lines):
+        print(f"  {line}")
         if envfile.source_of(e):
             print(f"    file: {envfile.source_of(e)}")
         print(f"    {e.summary()}")
@@ -54,8 +69,11 @@ def cmd_list(args) -> int:
     from . import incidents
     print("\nIncidents (famous attacks — detection-test traffic; use with "
           "--incident):")
-    for inc in incidents.all_incidents():
-        print(f"  {inc.key:14} {inc.name:26} [{inc.category} · {inc.year}]")
+    incs = incidents.all_incidents()
+    lines = _columns([(i.key, i.name, f"[{i.category} · {i.year}]")
+                      for i in incs], (14, 26))
+    for inc, line in zip(incs, lines):
+        print(f"  {line}")
         print(f"    {inc.desc}")
         protos, extra = ", ".join(inc.protocols()), ", ".join(inc.attack_only())
         print(f"    protocols: {protos}{' + ' if protos and extra else ''}{extra}")
@@ -370,8 +388,9 @@ def _run_engine(cfg: RunConfig, args) -> int:
               + (f" ({s.packets / s.elapsed:,.0f} frames/s)"
                  if s.elapsed > 0 else ""))
     if s.per_profile:
-        for k, v in s.per_profile.items():
-            print(f"  {k:10} {v}")
+        for line in _columns([(k, str(v))
+                              for k, v in s.per_profile.items()], (10,)):
+            print(f"  {line}")
     iface_errors = 0
     if len(s.per_iface) > 1 or any(c["errors"] for c in s.per_iface.values()):
         for name, c in s.per_iface.items():

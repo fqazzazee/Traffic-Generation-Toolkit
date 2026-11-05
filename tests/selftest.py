@@ -5563,6 +5563,39 @@ def test_w4c_netbios_broadcast_announcements() -> None:
                   f"tshark: NBNS registration not decoded: {out[:3]}")
 
 
+def test_w4c_list_columns_aligned() -> None:
+    """tgt list sizes each column to its longest value (modbus-write,
+    firmware-update, electric-substation...)."""
+    import contextlib
+    import io
+    from tgt import cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_list(None)
+    lines = buf.getvalue().splitlines()
+    head = lines.index("Protocols:") + 1
+    hdr = lines[head]
+    cols = [(hdr + " ").index(f" {c} ") + 1
+            for c in ("name", "cat", "port", "xport", "desc")]
+    for p in protocols.all_profiles():
+        ln = next(x for x in lines[head + 1:] if x.startswith(f"  {p.key} "))
+        vals = (p.name, p.category, p.port, p.transport, p.desc)
+        check(all(ln[c - 1] == " " and ln[c:].startswith(v)
+                  for c, v in zip(cols, vals)),
+              f"tgt list: misaligned protocol row {ln!r}")
+    # scenario / environment / incident rows: the '[' column lines up
+    for title in ("Scenarios", "Environments", "Incidents"):
+        i = next(n for n, x in enumerate(lines) if x.startswith(title))
+        rows = []
+        for x in lines[i + 1:]:
+            if not x.strip():
+                break
+            if x.startswith("  ") and not x.startswith("    "):
+                rows.append(x)
+        check(len(rows) > 2 and len({x.index(" [") for x in rows}) == 1,
+              f"tgt list: {title} columns misaligned")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
