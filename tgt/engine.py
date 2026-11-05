@@ -446,6 +446,9 @@ class Engine:
         sched = schedule.Scheduler(seed, epoch0, cfg.day_profile,
                                    phases[0].utc_offset if phases else 0.0,
                                    min_period=cfg.min_period)
+        # --sprinkle-ratio: sprinkle streams' periods follow the target
+        # fraction of wire frames (schedule.Scheduler._ratio_interval)
+        sched.ratio = min(max(cfg.sprinkle_ratio or 0.0, 0.0), 0.9)
         if recorder is not None and cfg.campaign:
             recorder.campaign(phases)
         wall0 = time.perf_counter()

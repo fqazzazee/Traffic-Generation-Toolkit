@@ -263,6 +263,7 @@ class Stream:
         self.alive = True
         self.next_t = INF
         self.occ = 0                 # occurrences so far
+        self.wire = 0                # wire frames so far (sprinkle ratio)
         self.builds = 0              # builder calls so far
         self.seed = 0
         self.rng = random.Random(0)
@@ -706,6 +707,11 @@ class Scheduler:
         self.injected = 0
         self.ports: Dict[tuple, Stream] = {}    # open persistent 4-tuples
         self.gen: Dict[tuple, int] = {}         # restarts per stream id
+        # --sprinkle-ratio: target fraction of wire frames from sprinkle
+        # streams (0 = their natural periods); frames so far by sprinkle?
+        self.ratio = 0.0
+        self.wire: Dict[bool, int] = {False: 0, True: 0}
+        self._n_sprinkle = 0
 
     # -- stream management --------------------------------------------------
     def load(self, streams: List[Stream], t: float, hosts=(),
@@ -740,11 +746,14 @@ class Scheduler:
                     s.ep.meta["enip_rpi_us"] = int(s.period * 1e6)
             first = soon.get(sid)
             if first is None:
-                first = s.rng.uniform(0, s.period if initial
-                                      else min(s.period, 30.0))
+                first = s.rng.uniform(0, s.period if initial and not (
+                    self.ratio and s.source.startswith("sprinkle:"))
+                    else min(s.period, 30.0))
             self._schedule(s, t + first, step=False)
             self.streams[sid] = s
             started.append(s)
+        self._n_sprinkle = sum(1 for x in self.streams.values()
+                               if x.source.startswith("sprinkle:"))
         return started, stopped
 
     def inject(self, t: float, key: str, frames: List[List[bytes]],
@@ -766,8 +775,11 @@ class Scheduler:
         """Queue ``s``'s next occurrence: one interval after ``t`` (or at
         ``t`` itself with ``step=False``). Under a day profile, candidate
         times come ``peak`` times as often and each is kept with probability
-        factor/peak (thinning), so the class's rate follows the hour."""
-        if timing.DAY_PROFILES.get(self.day_profile or "flat", {}).get(s.cls):
+        factor/peak (thinning), so the class's rate follows the hour. With a
+        sprinkle ratio, sprinkle streams follow :meth:`_ratio_interval`."""
+        if step and self.ratio > 0 and s.source.startswith("sprinkle:"):
+            t += self._ratio_interval(s, t)
+        elif timing.DAY_PROFILES.get(self.day_profile or "flat", {}).get(s.cls):
             peak = timing.peak(self.day_profile, s.cls)
             if step:
                 t += s.interval() / peak
@@ -780,6 +792,24 @@ class Scheduler:
         s.next_t = t
         self._n += 1
         heapq.heappush(self._sheap, (t, self._n, s))
+
+    def _ratio_interval(self, s: Stream, t: float) -> float:
+        """Next interval of sprinkle stream ``s`` so that sprinkle frames
+        make up ``ratio`` of the wire: the sprinkle streams share the frame
+        rate ``baseline rate * r / (1 - r)`` equally, each recurring as often
+        as its mean frames per occurrence allow, sped up (or slowed down, at
+        most 4x) while the sprinkle total so far is short of (or over) its
+        target. The baseline rate is measured, so it follows day profiles
+        and campaign phases."""
+        r = min(self.ratio, 0.9)
+        base, spr = self.wire[False], self.wire[True]
+        want = base / max(t, 1.0) * r / (1.0 - r)      # sprinkle frames/s
+        if want <= 0 or s.occ == 0:
+            return s.interval()
+        iv = (s.wire / s.occ) * max(1, self._n_sprinkle) / want
+        target = base * r / (1.0 - r)
+        iv *= min(max((spr + 1.0) / (target + 1.0), 0.25), 4.0)
+        return max(1e-3, iv * (1.0 + s.rng.uniform(-s.jitter, s.jitter)))
 
     # -- the merged stream -----------------------------------------------------
     def run(self, t_end: float = INF) -> Iterator[Item]:
@@ -794,9 +824,13 @@ class Scheduler:
                 t, _, s = pop(sheap)
                 if not s.alive or t != s.next_t:
                     continue
+                spr = s.source.startswith("sprinkle:")
                 for ft, copies, occ in s.occur(t, self):
                     self._n += 1
                     push(fheap, (ft, self._n, s.key, copies, s.source, occ))
+                    self.wire[spr] += len(copies)
+                    if spr:
+                        s.wire += len(copies)
                 self._schedule(s, t)
             if not fheap or fheap[0][0] >= t_end:
                 return

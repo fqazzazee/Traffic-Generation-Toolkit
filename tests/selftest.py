@@ -5664,6 +5664,43 @@ def test_w4c_iec104_timed_gi_and_sequence() -> None:
           "iec104: N(S)/N(R) do not wrap at 2^15")
 
 
+def _w4c_ratio_run(env_key: str, inc: str, ratio: float,
+                   dur: float = 600.0) -> float:
+    from tgt import campaign, schedule
+    cfg = RunConfig(env=env_key, sprinkle=[inc], sprinkle_ratio=ratio,
+                    schedule="timed", duration=dur, seed=3)
+    ph = campaign.phases_for(cfg)[0]
+    sch = schedule.Scheduler(3)
+    sch.ratio = ratio
+    sch.load(campaign.phase_streams(ph, cfg), 0.0, ph.hosts, initial=True)
+    n = {False: 0, True: 0}
+    for _, _, _, copies, source, _ in sch.run(dur):
+        n[source.startswith("sprinkle:")] += len(copies)
+    return n[True] / max(1, sum(n.values()))
+
+
+def test_w4c_sprinkle_ratio_timed() -> None:
+    """--sprinkle-ratio under --schedule timed: sprinkle streams recur so
+    that they make up the requested fraction of wire frames; 0 keeps their
+    natural periods. The engine honours it end to end."""
+    natural = _w4c_ratio_run("it-org", "wannacry", 0.0)
+    check(natural < 0.02, f"timed natural sprinkle share {natural:.3f}")
+    for r in (0.05, 0.2):
+        got = _w4c_ratio_run("it-org", "wannacry", r)
+        check(abs(got - r) / r < 0.2,
+              f"timed --sprinkle-ratio {r}: observed {got:.4f}")
+    got = _w4c_ratio_run("industrial-site", "industroyer", 0.1, 300.0)
+    check(abs(got - 0.1) / 0.1 < 0.25,
+          f"timed --sprinkle-ratio 0.1 on industrial-site: {got:.4f}")
+    with tempfile.TemporaryDirectory() as d:
+        recs, m = _timed_run(d, "r", env="it-org", duration=300.0,
+                             sprinkle=["wannacry"], sprinkle_ratio=0.3)
+    spr = sum(e.get("packets", 0) for e in m["events"]
+              if e["source"].startswith("sprinkle:"))
+    check(recs and 0.2 < spr / len(recs) < 0.4,
+          f"engine timed sprinkle share {spr}/{len(recs)}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
