@@ -264,8 +264,12 @@ def test_inventory_export() -> None:
         buf = io.StringIO()
         inventory.write_csv(env, buf)
         rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
-        check(len(rows) == len(env.hosts), f"inventory {env.key}: row count")
-        check(all(r["segment"] and r["vlan"] and r["zone"] for r in rows),
+        # one row per host, plus one per device behind a gateway (no IP,
+        # so no VLAN: "behind" names its gateway)
+        check(len(rows) == len(env.hosts) + len(env.field_devices),
+              f"inventory {env.key}: row count")
+        check(all(r["segment"] and (r["vlan"] or r["behind"]) and r["zone"]
+                  for r in rows),
               f"inventory {env.key}: host without segment/VLAN/zone")
         doc = json.loads(json.dumps(inventory.to_json(env)))
         check(len(doc["flows"]) == len(env.conversations),
@@ -6380,6 +6384,357 @@ def test_incident_mapping_never_self_flows() -> None:
             enterprise.get("electric-substation"))
         check(len({h.name for h in m.values()}) == len(m),
               "wannacry hosts collapse onto one substation host")
+
+
+# ---------------------------------------------------------------------------
+# W5-D (#67): serial-to-Ethernet gateways and IIoT
+# ---------------------------------------------------------------------------
+# no stock Wireshark dissector on these ports (RTU-over-TCP / DNP3 serial /
+# RealCOM decode with decode-as, see test_w5d_tshark_gateways_decode_as)
+_DISSECTS_AS.update({
+    "modbus-rtu-tcp": "tcp", "dnp3-serial": "tcp", "realcom": "tcp",
+    "realcom-cmd": "tcp", "moxa-discovery": "udp", "bacnet-sc": "tls",
+    "lorawan-udp": "udp",
+})
+_W5D_DECODE_AS = {"modbus-rtu-tcp": ("tcp.port==4001,mbrtu", "mbrtu"),
+                  "dnp3-serial": ("tcp.port==4001,dnp3", "dnp3"),
+                  "realcom": ("tcp.port==950,mbrtu", "mbrtu")}
+
+
+def _w5d_site():
+    from tgt import envfile
+    return envfile.load(os.path.join(envfile.SITES_DIR, "iiot-retrofit.json"))
+
+
+def test_w5d_modbus_rtu_over_tcp_framing() -> None:
+    """RTU-over-TCP: every payload is slave id + PDU + CRC-16/Modbus (low
+    byte first) with no MBAP header, the slaves behind the port are polled
+    in turn, and the device server's port N maps to TCP 4000 + N."""
+    from tgt import protocols_iiot as iiot
+    check(iiot.crc16_modbus(b"123456789") == 0x4B37,
+          "CRC-16/MODBUS check value")
+    check(iiot.rtu_frame(1, b"\x03\x00\x00\x00\x0a") ==
+          bytes.fromhex("01030000000ac5cd"), "RTU frame / CRC byte order")
+    ep = Endpoints(meta={"serial_addresses": [3, 4, 7],
+                         "serial_tcp_port": 4002})
+    protocols.begin_build(5, 0)
+    frames = protocols.get("modbus-rtu-tcp").build(ep, 30)
+    reqs = _payloads(frames, to_port=4002)
+    rsps = _payloads(frames, from_port=4002)
+    check(len(reqs) == len(rsps) == 30, f"rtu: {len(reqs)}/{len(rsps)}")
+    for pl in reqs + rsps:
+        check(iiot.crc16_modbus(pl[:-2]) == struct.unpack("<H", pl[-2:])[0],
+              f"rtu: bad CRC in {pl.hex()}")
+        check(pl[1] & 0x7F in (1, 2, 3, 4, 6), f"rtu: function {pl[1]}")
+    check([p[0] for p in reqs[:6]] == [3, 4, 7, 3, 4, 7],
+          "rtu: slaves not polled in turn")
+    check(all(a[0] == b[0] for a, b in zip(reqs, rsps)),
+          "rtu: reply from another slave")
+    check(any(p[1] == 0x06 for p in reqs) and any(p[1] == 0x83 for p in rsps),
+          "rtu: no FC 6 write / exception reply")
+    check(iiot.ports("modbus-rtu-tcp", 3) == {"serial_tcp_port": 4003} and
+          iiot.ports("realcom", 2) == {"realcom_data_port": 951,
+                                       "realcom_cmd_port": 967},
+          "device-server port numbering")
+
+
+def test_w5d_dnp3_serial_realcom_and_search() -> None:
+    """DNP3 serial frames to each outstation on the line in turn; RealCOM
+    data (950) carries the serial bytes and the command channel (966)
+    PORT_INIT then POLLING/ALIVE pairs; the Moxa search is the 8-byte
+    broadcast request and 24-byte unicast replies."""
+    ep = Endpoints(meta={"serial_addresses": [11, 12], "dnp3_master": 100})
+    protocols.begin_build(5, 0)
+    frames = protocols.get("dnp3-serial").build(ep, 6)
+    reqs = _payloads(frames, to_port=4001)
+    check(len(reqs) == 6 and all(p[:2] == b"\x05\x64" for p in reqs),
+          "dnp3-serial: no DNP3 link frames on 4001")
+    check([struct.unpack("<H", p[4:6])[0] for p in reqs[:4]] ==
+          [11, 12, 11, 12] and
+          {struct.unpack("<H", p[6:8])[0] for p in reqs} == {100},
+          "dnp3-serial: outstations not polled in turn")
+    rc = protocols.get("realcom").build(
+        Endpoints(meta={"serial_protocol": "dnp3", "realcom_data_port": 951}),
+        3)
+    check(all(p[:2] == b"\x05\x64" for p in _payloads(rc, to_port=951)),
+          "realcom: DNP3 bytes not carried on the data channel")
+    cmd = protocols.get("realcom-cmd").build(Endpoints(), 4)
+    up, down = _payloads(cmd, to_port=966), _payloads(cmd, from_port=966)
+    check(up[0][:2] == b"\x2c\x08" and up[0][2] == 6 and
+          down[0][0] == 0x2C, "realcom-cmd: no PORT_INIT (9600 8N1)")
+    polls, alive = down[1:], up[1:]
+    check(len(polls) == len(alive) == 4 and
+          all(p[0] == 0x27 and a[0] == 0x28 and p[2] == a[2]
+              for p, a in zip(polls, alive)),
+          "realcom-cmd: POLLING / ALIVE pairs do not match")
+    ep = Endpoints(meta={"moxa_product_id": 0x5650})
+    search = protocols.get("moxa-discovery").build(ep, 2)
+    req, rep = search[0], search[1]
+    check(req[:6] == b"\xff" * 6 and _udp_tcp_payload(req) ==
+          bytes.fromhex("0100000800000000") and _l4(req)[4] == 4800,
+          "moxa search request")
+    body = _udp_tcp_payload(rep)
+    check(len(body) == 24 and body[:4] == b"\x81\x00\x00\x18" and
+          P.mac_to_bytes(ep.server_mac) in body and _l4(rep)[3] == 4800
+          and _l4(rep)[2] == ep.client_ip, "moxa search reply")
+
+
+def test_w5d_bacnet_sc_tls13_heartbeats() -> None:
+    """BACnet/SC: a TLS 1.3-only ClientHello (ALPN http/1.1, SNI = hub), a
+    TLS 1.3 ServerHello, then only application_data records — including the
+    small heartbeat-sized ones — closed by Disconnect + close_notify."""
+    ep = Endpoints(meta={"sni": "sc-hub01.corp.local"})
+    protocols.begin_build(5, 0)
+    frames = protocols.get("bacnet-sc").build(ep, 6)
+    up, down = _payloads(frames, to_port=443), _payloads(frames, from_port=443)
+    hello = up[0]
+    check(hello[0] == 0x16 and hello[5] == 0x01, "bsc: no ClientHello")
+    check(b"sc-hub01.corp.local" in hello and b"\x08http/1.1" in hello,
+          "bsc: SNI / ALPN missing")
+    check(b"\x00\x2b\x00\x03\x02\x03\x04" in hello,
+          "bsc: supported_versions is not TLS 1.3 only")
+    check(down[0][0] == 0x16 and b"\x00\x2b\x00\x02\x03\x04" in down[0],
+          "bsc: server did not pick TLS 1.3")
+
+    def records(stream):
+        out, i = [], 0
+        while i + 5 <= len(stream):
+            n = struct.unpack("!H", stream[i + 3:i + 5])[0]
+            out.append((stream[i], n))
+            i += 5 + n
+        return out
+    cli, hub = records(b"".join(up)), records(b"".join(down))
+    later = cli[1:] + hub[1:]
+    check(cli[0][0] == hub[0][0] == 22 and later and
+          all(t == 23 for t, _ in later),
+          f"bsc: non-application_data record after the hellos: {later[:4]}")
+    # Heartbeat-Request: 4-byte BVLC-SC in a masked WebSocket frame (10 B)
+    # + inner type + 16-byte tag = 27; the hub's unmasked ACK 6 + 17 = 23.
+    # 6 messages: 4 heartbeats + 2 encapsulated NPDUs, then Disconnect
+    check(sum(n == 27 for _, n in cli) == 5 and
+          sum(n == 23 for _, n in hub) == 5,
+          f"bsc: heartbeat-sized records {[n for _, n in cli]}")
+
+
+def test_w5d_lorawan_semtech_udp() -> None:
+    """Semtech UDP forwarder: version 2 headers, PUSH_DATA / PULL_DATA /
+    TX_ACK from the gateway (EUI = MAC with FFFE) each acknowledged by the
+    server with the same token, rxpk JSON whose base64 PHYPayload carries
+    the configured DevAddrs with FCnts advancing per device across cycles,
+    and PULL_RESP txpk downlinks (ACK bit) answering confirmed uplinks."""
+    import base64
+    import json
+    from tgt import protocols_iiot as iiot
+    devs = [0x26011B01, 0x26011B02]
+    ep = Endpoints(client_mac="70:76:ff:01:02:03",
+                   meta={"lora_devices": devs})
+    fcnts = {d: [] for d in devs}
+    seen_ids = set()
+    for cycle in (0, 1):
+        protocols.begin_build(5, cycle)
+        frames = protocols.get("lorawan-udp").build(ep, 8)
+        pending = {}
+        for f in frames:
+            t = _l4(f)
+            pl = _udp_tcp_payload(f)
+            check(pl[0] == 2, "lorawan: protocol version != 2")
+            tok, ident = struct.unpack("!H", pl[1:3])[0], pl[3]
+            seen_ids.add(ident)
+            check(tok & 0xFF > 0x10, "lorawan: token low byte <= 0x10")
+            from_gw = t[4] == 1700
+            check(from_gw == (ident in (0, 2, 5)), f"lorawan: {ident} "
+                  "sent by the wrong side")
+            if ident in (0, 2, 5):
+                check(pl[4:12] == bytes.fromhex("7076fffffe010203"),
+                      "lorawan: gateway EUI")
+            if ident in (0, 2, 3):
+                pending[tok] = ident
+            elif ident in (1, 4, 5):
+                want = {1: 0, 4: 2, 5: 3}[ident]
+                check(pending.pop(tok, None) == want,
+                      f"lorawan: ack {ident} without its request")
+            if ident == 0:
+                doc = json.loads(pl[12:])
+                for pk in doc.get("rxpk", []):
+                    phy = base64.b64decode(pk["data"])
+                    check(pk["size"] == len(phy) and pk["modu"] == "LORA",
+                          "lorawan: rxpk size / modulation")
+                    mhdr, addr, _, fcnt = struct.unpack("<BIBH", phy[:8])
+                    check(mhdr in (0x40, 0x80) and addr in devs,
+                          f"lorawan: PHYPayload {phy.hex()}")
+                    fcnts[addr].append(fcnt)
+            if ident == 3:
+                txpk = json.loads(pl[4:])["txpk"]
+                phy = base64.b64decode(txpk["data"])
+                check(phy[0] == 0x60 and phy[5] & 0x20 and txpk["ipol"],
+                      "lorawan: downlink is not an ACK")
+        check(not pending, f"lorawan: unacknowledged {pending}")
+    check(seen_ids == {0, 1, 2, 3, 4, 5}, f"lorawan: identifiers {seen_ids}")
+    for d, f in fcnts.items():
+        check(f == list(range(len(f))) and len(f) == 8,
+              f"lorawan: {d:08X} FCnt {f}")
+    check(iiot.gateway_eui("00:08:00:4a:5b:6c").hex() == "000800fffe4a5b6c",
+          "gateway EUI derivation")
+
+
+def test_w5d_iiot_site_field_devices_behind_gateways() -> None:
+    """iiot-retrofit: the devices behind gateways are inventory assets with
+    'behind' set and no IP/MAC, the gateway flows poll exactly their
+    addresses (and run on the right serial port's TCP port), and a scorer
+    leaves them out of the discovery population (inventory and manifest
+    truth); the env file round-trips and rejects bad field devices."""
+    import copy
+    import io
+    import json
+    from tgt import envfile, inventory, score
+    env = _w5d_site()
+    fd = {d["name"]: d for d in env.field_devices}
+    check(len(fd) == 21, f"iiot-retrofit: {len(fd)} field devices")
+    doc = inventory.to_json(env)
+    rows = {h["name"]: h for h in doc["hosts"]}
+    for name, d in fd.items():
+        r = rows.get(name)
+        check(r is not None and r["behind"] == d["behind"] and not r["ip"]
+              and not r["mac"] and r["model"] == d["model"] and
+              not any(o["observable"] for o in r["observability"].values()),
+              f"inventory row for {name}: {r}")
+    buf = io.StringIO()
+    inventory.write_csv(env, buf)
+    check(sum(1 for ln in buf.getvalue().splitlines()
+              if ln.startswith("PM-MAIN-")) == 6, "CSV lacks field devices")
+    flows = {(f["client"], f["server"], f["protocol"]): f
+             for f in doc["flows"]}
+    check(flows[("SCADA01", "NPORT-MCC1", "dnp3-serial")]["dport"] == 4003
+          and flows[("SCADA01", "NPORT-MCC1", "modbus-rtu-tcp")]["dport"]
+          == 4001, "gateway flow ports")
+    truth = score.Truth(doc, env.key)
+    pop = {a["name"] for a in truth.population()}
+    check(not pop & set(fd) and {"NPORT-MCC1", "LORA-GW01"} <= pop,
+          "field devices counted in the discovery population")
+
+    def ep(c, s, p):
+        return env.conv_endpoints(env.host(c), env.host(s), p)
+    check(ep("HIST01", "MGATE-PWR1", "modbus").meta["modbus_units"] ==
+          [1, 2, 3, 4, 5, 6], "MGate units")
+    m = ep("SCADA01", "NPORT-MCC1", "dnp3-serial").meta
+    check(m["serial_addresses"] == [11, 12] and m["serial_tcp_port"] == 4003,
+          f"dnp3-serial meta {m}")
+    protocols.begin_build(3, 0)
+    batch = env.build(4)
+    lora = {d["address"] for d in fd.values()
+            if d["behind"] == "LORA-GW01"}
+    import base64
+    heard = set()
+    for k, f in batch:
+        if k == "lorawan-udp" and _l4(f)[4] == 1700 and \
+                _l4(f)[5][8 + 3] == 0:
+            for pk in json.loads(_l4(f)[5][8 + 12:]).get("rxpk", []):
+                heard.add(struct.unpack("<I", base64.b64decode(
+                    pk["data"])[1:5])[0])
+    check(heard and heard <= lora | {d["address"] for d in fd.values()
+                                     if d["behind"] == "LORA-GW02"},
+          f"LoRa uplinks from unknown DevAddrs {heard}")
+    mb = [_l4(f)[5] for k, f in batch if k == "modbus" and _l4(f)[4] == 502]
+    units = {pl[(pl[12] >> 4) * 4 + 6] for pl in mb
+             if len(pl) > (pl[12] >> 4) * 4 + 7}
+    check(units == {1, 2, 3, 4}, f"MGate polls units {units}")
+    # env export round trip, validation
+    d = envfile.to_dict(env)
+    env2 = envfile.from_dict(json.loads(json.dumps(d)))
+    check(env2.field_devices == env.field_devices, "field_devices export")
+    bad = [({"via": "http"}, "via"), ({"address": 300}, "address"),
+           ({"behind": "NOPE"}, "behind"), ({"port": 2}, "port"),
+           ({"protocol": "dnp3"}, "protocol")]
+    for patch, what in bad:
+        d2 = copy.deepcopy(d)
+        d2["field_devices"].append(dict(
+            {"name": "X1", "behind": "NPORT-MCC1", "via": "modbus-rtu-tcp",
+             "address": 9}, **patch))
+        try:
+            envfile.from_dict(d2)
+            _failures.append(f"field_devices: bad {what} accepted")
+        except envfile.EnvFileError as e:
+            check(what in str(e), f"field_devices {what}: {e}")
+    d2 = copy.deepcopy(d)
+    d2["field_devices"].append({"name": "X1", "behind": "NPORT-MCC1",
+                                "address": 2})
+    try:
+        envfile.from_dict(d2)
+        _failures.append("field_devices: duplicate slave address accepted")
+    except envfile.EnvFileError:
+        pass
+
+
+def test_w5d_timed_serial_turnaround_and_manifest() -> None:
+    """Timed run of iiot-retrofit: a serial gateway answers a poll only
+    after the line round trip (tens of ms, not the sub-ms of a switched
+    Ethernet device); the field devices never show up in first_seen and the
+    manifest truth leaves them out of the population."""
+    from tgt import envfile, score
+    envfile.load_user_envs(warn=lambda m: None, force=True)
+    names = {d["name"] for d in _w5d_site().field_devices}
+    with tempfile.TemporaryDirectory() as d:
+        recs, m = _timed_run(d, "iiot", env="iiot-retrofit", duration=120.0)
+    rows = _tcp_rows(recs, 4001)
+    lat = []
+    for a, b in zip(rows, rows[1:]):
+        if a[4] == 4001 and a[8] > 0 and b[3] == 4001 and b[8] > 0:
+            lat.append(b[0] - a[0])
+    check(len(lat) > 10 and min(lat) > 0.02,
+          f"rtu turnaround {sorted(lat)[:3]} ({len(lat)} polls)")
+    fs = set(m.get("first_seen") or {})
+    check(fs and not {k.split(":", 1)[-1] for k in fs} & names,
+          "field devices in first_seen")
+    truth = score.Truth(m, "iiot-retrofit")
+    check(not {a["name"] for a in truth.population()} & names,
+          "manifest population includes field devices")
+
+
+def test_w5d_tshark_gateways_decode_as() -> None:
+    """Optional: with Wireshark's decode-as, RTU-over-TCP and the RealCOM
+    data channel dissect as Modbus RTU with good CRCs and DNP3 serial as
+    DNP3; a full iiot-retrofit cycle has no expert warnings."""
+    import shutil
+    import subprocess
+    if not shutil.which("tshark"):
+        _skipped.append("test_w5d_tshark_gateways_decode_as")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        for key, (rule, layer) in _W5D_DECODE_AS.items():
+            path = f"{d}/{key}.pcap"
+            protocols.begin_build(2, 0)
+            with PcapWriter(path) as w:
+                for f in protocols.get(key).build(
+                        Endpoints(meta={"serial_addresses": [1, 2]}), 8):
+                    w.write(f)
+            args = ["tshark", "-r", path, "-d", rule, "-o",
+                    "mbrtu.crc_verification:TRUE"]
+            out = subprocess.run(args + ["-T", "fields", "-e",
+                                         "frame.protocols"],
+                                 capture_output=True, text=True).stdout
+            check(sum(layer in ln.split(":") for ln in out.splitlines()) == 16,
+                  f"tshark: {key} not decoded as {layer}")
+            exp = subprocess.run(args + ["-q", "-z", "expert,warn"],
+                                 capture_output=True, text=True).stdout
+            check("Warnings" not in exp and "Errors" not in exp,
+                  f"tshark: {key}: {exp.strip()[:200]}")
+        path = f"{d}/site.pcap"
+        protocols.begin_build(2, 0)
+        with PcapWriter(path) as w:
+            for _, f in _w5d_site().build(3):
+                w.write(f)
+        args = ["tshark", "-r", path, "-d", "tcp.port==4001,mbrtu", "-d",
+                "tcp.port==4003,dnp3", "-d", "tcp.port==950,mbrtu", "-o",
+                "mbrtu.crc_verification:TRUE"]
+        out = subprocess.run(args + ["-T", "fields", "-e", "frame.protocols"],
+                             capture_output=True, text=True).stdout
+        layers = {x for ln in out.splitlines() for x in ln.split(":")}
+        check({"mbrtu", "dnp3", "mbtcp", "tls", "snmp"} <= layers,
+              f"tshark: site layers {sorted(layers)}")
+        exp = subprocess.run(args + ["-q", "-z", "expert,warn"],
+                             capture_output=True, text=True).stdout
+        check("Warnings" not in exp and "Errors" not in exp,
+              f"tshark: iiot-retrofit: {exp.strip()[:300]}")
 
 
 def main() -> int:
