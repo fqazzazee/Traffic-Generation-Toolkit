@@ -25,7 +25,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import devices, protocols, stacks, tls
 from .packet import (ETH_P_ARP, Endpoints, arp, bytes_to_mac, ethernet,
-                     frame_ips, mac_to_bytes, rewrite_l2, set_ip_id)
+                     frame_ips, mac_to_bytes, rewrite_ips, rewrite_l2,
+                     set_ip_id)
 
 # Vendor OUIs — an analyser also fingerprints assets by MAC prefix.
 OUI_WIN = "00:50:56"        # VMware-hosted Windows/Linux
@@ -102,6 +103,14 @@ FINGERPRINTS: Dict[str, OSFingerprint] = {
     "moxa": OSFingerprint("moxa", "Moxa switch firmware", 64,
         smb="none", dhcp_vendor="",
         risk="Network device — SNMP/LLDP expose model + firmware"),
+    # vendor firmware without a dedicated fingerprint: IEDs, flow computers,
+    # analyzers (RTOS) and cellular / VSAT routers, panel HMIs (Linux-based)
+    "embedded": OSFingerprint("embedded", "Embedded device firmware (RTOS)",
+        64, smb="none", dhcp_vendor="",
+        risk="OT asset — vendor firmware, no EDR; cleartext OT protocols"),
+    "embedded-linux": OSFingerprint("embedded-linux",
+        "Embedded Linux (vendor firmware)", 64, smb="none", dhcp_vendor="",
+        risk="Network / edge device — exposed management services"),
 }
 
 
@@ -211,16 +220,34 @@ class Segment:
 
     ``gateway`` is the segment's SVI on the core L3 switch. Its MAC is the HSRP
     virtual MAC for group = VLAN (0000.0c07.acXX), which is what hosts ARP for.
+
+    ``options`` (not part of equality/hash) holds per-segment knobs:
+
+    * ``gateway_mac``: the gateway's MAC when it is not the HSRP virtual MAC
+      (e.g. a remote site's cellular router).
+    * ``nat``: ``{"outside_ip": IP, "outside_mac"?: MAC, "local"?: bool}`` —
+      the segment is a remote site behind a NAT router whose outside (WAN)
+      address is ``outside_ip``; see :meth:`Environment.place`.
+    * ``wan_rtt_ms``: round-trip latency of the WAN link that reaches this
+      segment (a hint for the time model; see :meth:`Environment.rtt_ms`).
     """
     name: str
     vlan: int
     subnet: str        # CIDR, e.g. "10.20.10.0/24"
     zone: str          # IT | DMZ (L3.5) | OT-SUPERVISORY (L3) | OT-CELL (L1-2)
     gateway: str       # default-gateway IP
+    options: Dict[str, Any] = field(default_factory=dict, compare=False,
+                                    hash=False)
 
     @property
     def gateway_mac(self) -> str:
-        return f"00:00:0c:07:ac:{self.vlan & 0xFF:02x}"
+        return (self.options.get("gateway_mac") or
+                f"00:00:0c:07:ac:{self.vlan & 0xFF:02x}")
+
+    @property
+    def nat(self) -> Optional[Dict[str, Any]]:
+        """The segment's NAT spec (``options["nat"]``), or ``None``."""
+        return self.options.get("nat") or None
 
     def contains(self, ip: str) -> bool:
         return ipaddress.ip_address(ip) in ipaddress.ip_network(self.subnet)
@@ -461,6 +488,28 @@ class Environment:
     endpoint-meta overrides applied when the host is that side of a flow.
     ``timing`` maps a conversation to its optional ``period`` / ``jitter``
     (parsed from env files, kept for a time model; not yet used by build).
+
+    ``findings`` lists the deliberately planted issues a monitor should flag
+    (``{"id", "title", "severity"?, "category"?, "hosts": [...],
+    "flows": [{"client", "server", "proto"}, ...], "detail"?}``), carried
+    into ``tgt inventory`` JSON as ground truth.
+
+    Remote sites behind NAT: a segment whose ``options["nat"]`` is set (see
+    :class:`Segment`) sits behind a router whose outside address is
+    ``outside_ip``. Frames between such a host and anything outside its site
+    are seen as the HQ SPAN sees them — the remote host's address translated
+    to ``outside_ip`` (static port forwarding inbound, port-preserving
+    source NAT outbound; TCP/UDP checksums recomputed, TTL -1 for the router
+    hop on the way out) and its MAC replaced by the router's
+    (``outside_mac``, else the MAC of the host that owns ``outside_ip``, else
+    the segment's ``gateway_mac``). The translated endpoint is placed in the
+    segment that holds ``outside_ip`` (a WAN transit VLAN at HQ), or, when no
+    segment does (a carrier / internet address), reaches the HQ peer through
+    its gateway like any foreign host. Segments sharing an ``outside_ip``
+    form one site and talk untranslated. Frames that never leave the site
+    (its LAN traffic, ARP, broadcasts) are invisible from HQ and dropped,
+    unless ``local: true`` keeps them on the site VLAN as a site-side sensor
+    would see them.
     """
     key: str
     name: str
@@ -472,6 +521,7 @@ class Environment:
     options: Dict[str, Any] = field(default_factory=dict)
     host_meta: Dict[str, Dict[str, Dict[str, Any]]] = field(default_factory=dict)
     timing: Dict[Conversation, Dict[str, Any]] = field(default_factory=dict)
+    findings: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # what was declared, before options rewrite it (env export uses this)
@@ -498,6 +548,97 @@ class Environment:
                     and self._seg[c] is not self._seg[sv]):
                 raise ValueError(f"{self.key}: {proto} is link-local but "
                                  f"{c} -> {sv} crosses segments")
+        self._init_nat()
+
+    # -- remote sites behind NAT ------------------------------------------
+    def _init_nat(self) -> None:
+        """Resolve each NAT segment's outside address, MAC and segment."""
+        self._nat: Dict[str, Dict[str, Any]] = {}
+        self._nat_twins: Dict[Tuple[str, str], Host] = {}
+        nat_segs = [s for s in self.segments if s.nat]
+        for s in nat_segs:
+            nat = s.nat or {}
+            out = str(nat.get("outside_ip", ""))
+            try:
+                ipaddress.IPv4Address(out)
+            except ValueError:
+                raise ValueError(f"{self.key}: segment {s.name}: nat needs an "
+                                 f"IPv4 outside_ip, got {out!r}") from None
+            inside = [x for x in nat_segs if x.contains(out)]
+            if inside:
+                raise ValueError(f"{self.key}: segment {s.name}: nat "
+                                 f"outside_ip {out} is inside NAT segment "
+                                 f"{inside[0].name}")
+            outseg = next((x for x in self.segments if x.contains(out)), None)
+            owner = next((h for h in self.hosts if h.ip == out), None)
+            mac = (nat.get("outside_mac") or (owner.mac if owner else "")
+                   or s.gateway_mac).lower()
+            self._nat[s.name] = {"outside_ip": out, "outside_mac": mac,
+                                 "outside_seg": outseg,
+                                 "local": bool(nat.get("local", False)),
+                                 "site": out}
+
+    def nat_of(self, host: Host) -> Optional[Dict[str, Any]]:
+        """The resolved NAT spec of ``host``'s segment (``None`` when it is
+        not behind NAT, or not in this environment)."""
+        if not self._nat:
+            return None
+        seg = self._seg.get(host.name)
+        if seg is None or not seg.contains(host.ip):
+            return None
+        return self._nat.get(seg.name)
+
+    def _nat_twin(self, host: Host, nat: Dict[str, Any]) -> Host:
+        """``host`` as seen from outside its NAT site."""
+        key = (host.name, nat["site"])
+        twin = self._nat_twins.get(key)
+        if twin is None:
+            twin = self._nat_twins[key] = replace(
+                host, ip=nat["outside_ip"], mac=nat["outside_mac"])
+        return twin
+
+    def nat_view(self, a: Host, b: Host) -> Tuple[Host, Host]:
+        """The two ends of an ``a`` <-> ``b`` flow as the wire outside any
+        NAT site shows them (translated hosts carry the outside IP/MAC)."""
+        na, nb = self.nat_of(a), self.nat_of(b)
+        if (na is None and nb is None) or (
+                na is not None and nb is not None
+                and na["site"] == nb["site"]):
+            return a, b
+        return (self._nat_twin(a, na) if na else a,
+                self._nat_twin(b, nb) if nb else b)
+
+    def gateway_mac(self, seg: Segment) -> str:
+        """MAC that answers for ``seg``'s gateway: its ``gateway_mac``
+        option, else (a NAT site) the NAT router's, else the HSRP MAC."""
+        if not seg.options.get("gateway_mac") and seg.name in self._nat:
+            return self._nat[seg.name]["outside_mac"]
+        return seg.gateway_mac
+
+    def nat_address(self, host: Host) -> str:
+        """The address ``host`` appears as outside its site ("" if none)."""
+        nat = self.nat_of(host)
+        return nat["outside_ip"] if nat else ""
+
+    def hidden(self, host: Host) -> bool:
+        """True when ``host``'s own LAN frames are not on the capture (it is
+        behind NAT without ``local: true``)."""
+        nat = self.nat_of(host)
+        return nat is not None and not nat["local"]
+
+    def rtt_ms(self, a: Host, b: Host) -> float:
+        """WAN round-trip hint for an ``a`` <-> ``b`` flow: the
+        ``wan_rtt_ms`` of each end's segment the path leaves (0 within one
+        segment or one NAT site). A time model can stretch request/response
+        gaps by it."""
+        sa, sb = self._seg.get(a.name), self._seg.get(b.name)
+        if sa is sb:
+            return 0.0
+        na, nb = self.nat_of(a), self.nat_of(b)
+        if na is not None and nb is not None and na["site"] == nb["site"]:
+            return 0.0
+        return float(sum((s.options.get("wan_rtt_ms") or 0)
+                         for s in (sa, sb) if s is not None))
 
     def _apply_options(self) -> None:
         """Rewrite segments/hosts/conversations for the topology knobs."""
@@ -591,10 +732,49 @@ class Environment:
         follows on the receiver's VLAN with TTL-1. When exactly one side is
         foreign the frame is tagged with the internal host's VLAN and reaches
         it via that segment's gateway MAC; when both are foreign it is left
-        untouched.
+        untouched. A frame that crosses a NAT site boundary is translated
+        first (see the class docstring); one that stays inside a NAT site is
+        dropped (``[]``) unless the site is ``local``.
         """
         from_client = frame[6:12] == mac_to_bytes(client.mac)
         src, dst = (client, server) if from_client else (server, client)
+        if self._nat:
+            ns, nd = self.nat_of(src), self.nat_of(dst)
+            if ns is not None or nd is not None:
+                inside = ns is not None and (
+                    frame[0] & 0x01 or (nd is not None
+                                        and nd["site"] == ns["site"]))
+                if inside:              # never leaves the remote site
+                    if not ns["local"]:
+                        return []
+                elif not (frame[0] & 0x01):
+                    frame, src, dst, seg_of = self._nat_translate(
+                        frame, src, dst, ns, nd, seg_of)
+        return self._route(frame, src, dst, span, seg_of)
+
+    def _nat_translate(self, frame: bytes, src: Host, dst: Host,
+                       ns: Optional[Dict[str, Any]],
+                       nd: Optional[Dict[str, Any]], seg_of):
+        """Rewrite a frame crossing NAT site boundaries: inside addresses
+        become the site's outside IP/MAC; returns the frame, the translated
+        ends and a ``seg_of`` that places them where the outside IP lives."""
+        s2 = self._nat_twin(src, ns) if ns else src
+        d2 = self._nat_twin(dst, nd) if nd else dst
+        frame = rewrite_ips(frame, s2.ip if ns else None,
+                            d2.ip if nd else None, ttl_delta=-1 if ns else 0)
+        frame = rewrite_l2(frame, s2.mac, d2.mac, None)
+
+        def seg2(h: Host):
+            if ns is not None and h is s2:
+                return ns["outside_seg"]
+            if nd is not None and h is d2:
+                return nd["outside_seg"]
+            return seg_of(h)
+        return frame, s2, d2, seg2
+
+    def _route(self, frame: bytes, src: Host, dst: Host, span: str,
+               seg_of) -> List[bytes]:
+        """Placement of a frame from ``src`` to ``dst`` (see :meth:`place`)."""
         sseg, dseg = seg_of(src), seg_of(dst)
         if sseg is None and dseg is None:
             return [frame]
@@ -695,9 +875,12 @@ class Environment:
                 peers[c].append(sv)
         out: List[bytes] = []
         for i, h in enumerate(self.hosts):
+            if self.hidden(h):          # behind NAT: not on this capture
+                continue
             seg = self.segment_of(h)
             gw = Endpoints(client_mac=h.mac, client_ip=h.ip,
-                           server_mac=seg.gateway_mac, server_ip=seg.gateway,
+                           server_mac=self.gateway_mac(seg),
+                           server_ip=seg.gateway,
                            vlan=seg.vlan)
             out += arp_build(gw, 1)
             if h.name in dhcp or i % 8 == 0:
@@ -744,8 +927,10 @@ class Environment:
             cloud = _cs_cloud_host(ip, fqdn)
             ep = self._edr_endpoints(host, cloud)
             frames = protocols.get("edr").build(ep, max(1, n))
-            return [("edr", self.place(f, host, cloud, span, self.segment_or_none))
-                    for f in frames]
+            placed = [("edr", self.place(f, host, cloud, span,
+                                         self.segment_or_none))
+                      for f in frames]
+            return [p for p in placed if p[1]]
 
         return [flow(h, ip, fqdn, messages if bulk else 1)
                 for h, ip, fqdn, bulk in self.edr_plan()]
@@ -792,8 +977,9 @@ class Environment:
             if proto == "cdp":      # native-VLAN TLV (frame itself is untagged)
                 ep.vlan = self.segment_of(server).vlan
             frames = protocols.get(proto).build(ep, max(1, messages))
-            streams.append([(proto, self._place(f, client, server, span))
-                            for f in frames])
+            placed = [(proto, self._place(f, client, server, span))
+                      for f in frames]
+            streams.append([p for p in placed if p[1]])   # NAT may hide
         if edr:
             streams += self._edr_streams(messages, span)
         # each cycle opens with address resolution, as after a cache flush

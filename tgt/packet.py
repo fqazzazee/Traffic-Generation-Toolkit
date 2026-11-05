@@ -251,3 +251,39 @@ def set_ip_id(frame: bytes, ident: int) -> bytes:
     hdr[10:12] = b"\x00\x00"
     hdr[10:12] = struct.pack("!H", checksum16(bytes(hdr)))
     return frame[:off] + bytes(hdr) + frame[off + ihl:]
+
+
+def rewrite_ips(frame: bytes, src_ip: str | None = None,
+                dst_ip: str | None = None, ttl_delta: int = 0) -> bytes:
+    """``frame`` with its IPv4 source and/or destination replaced, as a NAT
+    router forwards it: the IP header checksum and the TCP/UDP checksum (whose
+    pseudo-header covers the addresses) are recomputed, and ``ttl_delta``
+    (e.g. -1 for the router hop) is applied to the TTL. Ethernet padding is
+    kept; non-IPv4 frames are returned unchanged."""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    if frame[off - 2:off] != b"\x08\x00" or len(frame) < off + 20:
+        return frame
+    ihl = (frame[off] & 0x0F) * 4
+    total = struct.unpack("!H", frame[off + 2:off + 4])[0]
+    hdr = bytearray(frame[off:off + ihl])
+    if src_ip:
+        hdr[12:16] = ip_to_bytes(src_ip)
+    if dst_ip:
+        hdr[16:20] = ip_to_bytes(dst_ip)
+    if ttl_delta:
+        hdr[8] = max(1, min(255, hdr[8] + ttl_delta))
+    hdr[10:12] = b"\x00\x00"
+    hdr[10:12] = struct.pack("!H", checksum16(bytes(hdr)))
+    l4 = bytearray(frame[off + ihl:off + total])
+    frag = struct.unpack("!H", bytes(hdr[6:8]))[0] & 0x1FFF
+    proto, s, d = hdr[9], hdr[12:16], hdr[16:20]
+    at = {IPPROTO_TCP: 16, IPPROTO_UDP: 6}.get(proto)
+    if at is not None and not frag and len(l4) >= at + 2 and \
+            (proto != IPPROTO_UDP or l4[6:8] != b"\x00\x00"):
+        l4[at:at + 2] = b"\x00\x00"
+        pseudo = bytes(s) + bytes(d) + struct.pack("!BBH", 0, proto, len(l4))
+        chk = checksum16(pseudo + bytes(l4))
+        if proto == IPPROTO_UDP and chk == 0:
+            chk = 0xFFFF
+        l4[at:at + 2] = struct.pack("!H", chk)
+    return frame[:off] + bytes(hdr) + bytes(l4) + frame[off + total:]
