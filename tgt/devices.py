@@ -1220,3 +1220,58 @@ def _site_reindex() -> None:
 
 
 _site_reindex()
+
+
+# ---------------------------------------------------------------------------
+# Secure protocol variants (tgt/protocols_sec.py)
+# ---------------------------------------------------------------------------
+# model id -> {secure protocol: minimum firmware, as _numbers() reads it;
+# () = every release}. A model listed with {} is known NOT to speak any (a
+# ControlLogix 5570 needs a 1756-EN4TR module for CIP Security; S7-300 has
+# no TLS). Models not listed are unknown: an environment may opt them in.
+SECURE: Dict[str, Dict[str, Tuple[int, ...]]] = {
+    # CIP Security on the controller's embedded Ethernet port: ControlLogix
+    # 5580 and CompactLogix 5380 from firmware v32
+    "rockwell-1756-l83e": {"enip-tls": (32,), "enip-dtls": (32,)},
+    "rockwell-5069-l320er": {"enip-tls": (32,), "enip-dtls": (32,)},
+    "rockwell-1756-l71": {},
+    "rockwell-1769-l36erm": {},
+    # S7-1500: secure PG/HMI communication (TLS 1.3) from V2.9 (TIA Portal
+    # V17); the CPU's OPC UA server offers Basic256Sha256 from V2.0
+    "siemens-cpu-1516-3pndp": {"s7plus-tls": (2, 9),
+                               "opcua-sign-encrypt": (2, 0)},
+    "siemens-cpu-1515r-2pn": {"s7plus-tls": (2, 9),
+                              "opcua-sign-encrypt": (2, 0)},
+    "siemens-cpu-315-2pndp": {},
+    "siemens-cpu-317-2pndp": {},
+    "siemens-im151-8-pndp": {},
+    # IEC 60870-5-104 secured per IEC 62351-3 (SICAM A8000), DNP3 over TLS
+    # (SEL RTAC)
+    "siemens-sicam-cp-8050": {"iec104-tls": ()},
+    "sel-3530": {"dnp3-tls": ()},
+    # embedded OPC UA servers with SignAndEncrypt endpoints
+    "phoenix-axc-f-2152": {"opcua-sign-encrypt": ()},
+    "beckhoff-cx5140": {"opcua-sign-encrypt": ()},
+}
+
+
+def secure_support(model: Optional[DeviceModel], firmware: str,
+                   proto: str) -> Optional[bool]:
+    """Whether a device of ``model`` running ``firmware`` speaks the secure
+    variant ``proto``: True / False from :data:`SECURE`, ``None`` when the
+    catalog does not know (no model, or a model not listed)."""
+    if model is None or model.model_id not in SECURE:
+        return None
+    floor = SECURE[model.model_id].get(proto)
+    if floor is None:
+        return False
+    return not floor or _numbers(firmware) >= list(floor)
+
+
+def secure_protocols(model: Optional[DeviceModel],
+                     firmware: str) -> List[str]:
+    """The secure variants a device of ``model`` at ``firmware`` supports."""
+    if model is None:
+        return []
+    return sorted(p for p in SECURE.get(model.model_id, {})
+                  if secure_support(model, firmware, p))

@@ -20,6 +20,7 @@ from typing import Dict, List, Sequence, Set, TextIO
 
 from . import packet, protocols
 from .protocols_ot import ENGINEERING, OPERATIONS
+from .protocols_sec import CERTS_IN_CLEAR, ENCRYPTION
 from .enterprise import (CROWDSTRIKE_CLOUD_IPS, OUI_VENDORS, Environment,
                          Host)
 
@@ -67,6 +68,15 @@ _ANNOUNCES = {
 # A flow "to" a host that the host does not serve: a NetBIOS name
 # registration/announce is the sender's, whoever it is addressed to.
 _NOT_SERVED = {"netbios"}
+# Secure OT variants (tgt.protocols_sec): the application payload — and the
+# identity a device states in it — is encrypted, so these flows reveal
+# nothing of the plaintext protocol's; only certificates exchanged in clear
+# (TLS / DTLS 1.2, OPC UA OpenSecureChannel; not TLS 1.3) name the host.
+for _p, (_srv, _cli) in CERTS_IN_CLEAR.items():
+    if _srv:
+        _FROM_SERVER[_p] = ("fqdn",)       # server certificate subject / SAN
+    if _cli:
+        _FROM_CLIENT[_p] = ("fqdn",)       # client certificate (mutual auth)
 
 
 def _service(proto: str) -> str:
@@ -263,6 +273,8 @@ def _flow(c: str, sv: str, p: str) -> Dict:
     if p in OPERATIONS:            # benign engineering / operator activity
         flow["activity"] = "engineering" if p in ENGINEERING else "operations"
         flow["note"] = OPERATIONS[p]
+    if p in ENCRYPTION:            # payload unreadable to a passive monitor
+        flow["encryption"] = ENCRYPTION[p]
     return flow
 
 
@@ -292,6 +304,13 @@ def to_json(env: Environment, sprinkle: Sequence[str] = ()) -> Dict:
         if env.nat_address(h):          # how the HQ capture sees it
             row["nat_ip"] = env.nat_address(h)
             row["nat_hidden"] = env.hidden(h)
+        sec = sorted({p for c, sv, p in env.conversations
+                      if p in ENCRYPTION and h.name in (c, sv)})
+        if sec:                         # encrypted OT the host takes part in
+            row["encrypted"] = [
+                {"protocol": p, "encryption": ENCRYPTION[p],
+                 "certificates": "clear" if any(CERTS_IN_CLEAR[p])
+                 else "encrypted"} for p in sec]
     doc = {
         "env": env.key, "name": env.name, "category": env.category,
         "segments": [_segment(env, s) for s in env.segments],

@@ -62,6 +62,15 @@ that matches nothing is an error. Optional ``period`` (seconds, or "500ms",
 "1s", "2m", or "1s±5%") and ``jitter`` ("5%" or a fraction) set the flow's
 recurrence under the timed scheduler (``--schedule timed``; the defaults
 come from :data:`tgt.timing.PERIODS`); the cycle builder ignores them.
+Optional ``secure`` (true / false) selects the protocol's secure variant
+(``modbus`` -> ``modbus-sec``, ``enip`` -> ``enip-tls``, ``enip-io`` ->
+``enip-dtls``, ``s7plus`` -> ``s7plus-tls``, ``opcua`` ->
+``opcua-sign-encrypt``, ``iec104`` -> ``iec104-tls``, ``dnp3`` ->
+``dnp3-tls``; see :mod:`tgt.protocols_sec`). A server host whose ``meta``
+holds ``"secure": true`` gets the secure variant on every flow that has one,
+unless the flow says ``"secure": false``. A device the catalog knows not to
+support the variant (model, or firmware below the release that added it —
+:data:`tgt.devices.SECURE`) is an error.
 
 **segments[]** optional keys — ``gateway_mac`` (the gateway's MAC when it
 is not the HSRP virtual MAC), ``wan_rtt_ms`` (round-trip time of the WAN
@@ -125,7 +134,7 @@ _HOST_KEYS = {"name", "ip", "role", "os", "model", "vendor", "product", "mac",
               "firmware", "serial", "fqdn", "count", "start", "ip_start",
               "meta", "client_meta"}
 _FLOW_KEYS = {"client", "server", "from", "to", "proto", "mode", "period",
-              "jitter"}
+              "jitter", "secure"}
 _OPTION_KEYS = {"arp", "flat", "dual_homed", "snmp_community",
                 "default_snmp_community", "day_profile", "utc_offset"}
 _DUAL_KEYS = {"host", "ip", "mac", "flows"}
@@ -327,9 +336,11 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
 
     conv: List[Conversation] = []
     timing: Dict[Conversation, Dict[str, Any]] = {}
+    by_name = {h.name: h for h in list(hosts) + list(external)}
     for i, raw in enumerate(cx.list(doc.get("flows", []), "flows")):
         path = f"flows[{i}]"
         pairs, t = _flows(cx, raw, path, hosts, seg_of, segments, external)
+        pairs = _secure(cx, raw, path, pairs, by_name, host_meta)
         conv += pairs
         if t:
             for c in pairs:
@@ -627,7 +638,40 @@ def _flows(cx: _Ctx, raw: Any, path: str, hosts: List[Host],
     return pairs, timing
 
 
-_DUR = re.compile(r"\s*([0-9]*\.?[0-9]+)\s*(ms|s|m|h)?\s*$")
+def _secure(cx: _Ctx, raw: Dict[str, Any], path: str,
+            pairs: List[Conversation], by_name: Dict[str, Host],
+            host_meta: Dict[str, Dict[str, Dict[str, Any]]]
+            ) -> List[Conversation]:
+    """A flow's conversations with the secure variant selected — by the
+    flow's ``secure``, else by the server's meta ``"secure": true`` — and
+    every secure conversation checked against the device catalog."""
+    from .protocols_sec import PLAIN_OF, SECURE_OF
+    flag = raw.get("secure")
+    if flag is not None:
+        flag = cx.bool(flag, f"{path}.secure")
+    out: List[Conversation] = []
+    for c, s, proto in pairs:
+        want = flag
+        if want is None:
+            want = (host_meta.get(s, {}).get("server", {}).get("secure")
+                    is True and proto in SECURE_OF)
+        if want and proto not in PLAIN_OF:
+            if proto not in SECURE_OF:
+                known = ", ".join(sorted(SECURE_OF))
+                raise cx.err(f"{path}.secure", f"{proto!r} has no secure "
+                             f"variant (one of {known})")
+            proto = SECURE_OF[proto]
+        if proto in PLAIN_OF:
+            h = by_name[s]
+            if devices.secure_support(h.device, h.firmware, proto) is False:
+                raise cx.err(f"{path}.secure" if want else f"{path}.proto",
+                             f"{s} ({h.model}, firmware {h.firmware}) does "
+                             f"not support {proto}")
+        out.append((c, s, proto))
+    return out
+
+
+_DUR =re.compile(r"\s*([0-9]*\.?[0-9]+)\s*(ms|s|m|h)?\s*$")
 _PCT = re.compile(r"\s*([0-9]*\.?[0-9]+)\s*%\s*$")
 
 
@@ -776,8 +820,12 @@ def to_dict(env: Environment) -> Dict[str, Any]:
     if env.external:
         doc["external"] = [_host_dict(env, h) for h in env.external]
     flows = []
+    from .protocols_sec import SECURE_OF
     for c in conv:
         f: Dict[str, Any] = {"client": c[0], "server": c[1], "proto": c[2]}
+        if c[2] in SECURE_OF and env.host_meta.get(c[1], {}).get(
+                "server", {}).get("secure") is True:
+            f["secure"] = False         # kept plaintext on a secure host
         f.update(env.timing.get(c, {}))
         flows.append(f)
     doc["flows"] = flows

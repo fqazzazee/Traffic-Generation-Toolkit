@@ -276,6 +276,9 @@ DNS_DOMAIN = "corp.local"
 # Purdue level by zone for general-purpose hosts (OT-CELL splits L1/L2 by role)
 _ZONE_LEVEL = {"IT": "4", "DMZ": "3.5", "OT-SUPERVISORY": "3"}
 _FIELD_ROLES = {"plc", "drive", "meter", "relay", "rtu"}
+# Modbus/TCP Security role a client's certificate carries, by host role
+_MBSEC_ROLE = {"eng": "Engineer", "hist": "Monitor", "scada": "Operator",
+               "hmi": "Operator", "nms": "Monitor"}
 
 
 def _ot_addressing(client: "Host", server: "Host") -> dict:
@@ -894,6 +897,12 @@ class Environment:
             own.update(self.host_meta.get(client.name, {}).get("server", {}))
             return {f"client_{k}": v for k, v in own.items()
                     if k.startswith(proto + "_")}
+        from .protocols_sec import PLAIN_OF
+        if proto in PLAIN_OF:
+            # mutual TLS: the client's certificate names the client; a
+            # Modbus/TCP Security client's states its role
+            return {"tls_client_cn": client.fqdn,
+                    "mbsec_role": _MBSEC_ROLE.get(client.role, "Operator")}
         return {}
 
     def _agent_meta(self, proto: str, agent: Host) -> dict:
