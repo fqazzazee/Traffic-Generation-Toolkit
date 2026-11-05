@@ -11,9 +11,11 @@ conversation rather than orphaned segments.
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import random
 import struct
+import threading
 import zlib
 from dataclasses import replace
 from typing import Callable, List
@@ -242,6 +244,27 @@ def begin_build(seed: int | None, cycle: int = 0,
 
 def build_context() -> BuildContext:
     return _bctx
+
+
+# Builds run on more than one thread (the engine prebuilds the next cycle in
+# the background while the control API's injections build on the engine
+# thread); a build holds this lock from begin_build to its last frame.
+BUILD_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def isolated_build(seed: int | None, cycle: int = 0, sport_stride: int = 0):
+    """A build of its own: under :data:`BUILD_LOCK`, with a fresh context
+    for ``(seed, cycle)``, the caller's context and port allocator restored
+    afterwards — so an out-of-band build (an injection) neither waits on nor
+    perturbs the run's own seeded builds."""
+    global _bctx, _next_sport
+    with BUILD_LOCK:
+        saved = (_bctx, _next_sport)
+        try:
+            yield begin_build(seed, cycle, sport_stride)
+        finally:
+            _bctx, _next_sport = saved
 
 
 def _rand32() -> int:

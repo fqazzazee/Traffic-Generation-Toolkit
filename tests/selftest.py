@@ -5701,6 +5701,46 @@ def test_w4c_sprinkle_ratio_timed() -> None:
           f"engine timed sprinkle share {spr}/{len(recs)}")
 
 
+def test_w4c_injection_keeps_seeded_baseline() -> None:
+    """Injections build in isolation: a seeded run's own frames are the
+    same with and without a (heavy) injection, and the injected frames are
+    themselves reproducible."""
+    from tgt.engine import Engine
+
+    def run(inject: bool):
+        cfg = RunConfig(env="it-org", seed=21, messages=2, rate=0,
+                        clock="synthetic", start_time="2026-11-05T14:00:00Z")
+        cfg.count = 5000
+        eng = Engine(cfg)
+        seen = []
+        feed = eng.control.feed
+
+        def spy(batch, stop):
+            for idx, item in feed(batch, stop):
+                seen.append(item)
+                yield idx, item
+        eng.control.feed = spy
+        if inject:
+            eng.control.inject("wannacry", duration=600.0, ratio=0.5)
+        eng.start()
+        eng.join(120)
+        return ([f for _, f, s in seen if not s.startswith("inject:")],
+                [f for _, f, s in seen if s.startswith("inject:")])
+    base, _ = run(False)
+    b1, inj1 = run(True)
+    b2, inj2 = run(True)
+    check(len(inj1) > 1000 and len(b1) > 1000,
+          f"injection run sizes {len(b1)}/{len(inj1)}")
+    check(base[:len(b1)] == b1 and b1 == b2,
+          "seeded baseline frames changed by an injection")
+    check(inj1 == inj2, "injected frames not reproducible from the seed")
+    # isolated_build restores the caller's build context
+    ctx = protocols.begin_build(9, 4)
+    with protocols.isolated_build(1, 1):
+        protocols._rand32()
+    check(protocols.build_context() is ctx, "isolated_build leaked context")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
