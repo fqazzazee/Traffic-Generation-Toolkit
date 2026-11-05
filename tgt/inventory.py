@@ -47,6 +47,9 @@ _FROM_SERVER = {
     "sel-telnet": ("vendor", "product", "model", "firmware", "serial", "os"),
 }
 _FROM_CLIENT = {
+    # DICOM C-STORE data set: Manufacturer, Model Name, Device Serial
+    # Number, Software Versions of the modality (the SCU)
+    "dicom": ("vendor", "product", "model", "firmware", "serial"),
     "http": ("os",),             # User-Agent
     "smb": ("os",),              # dialect set (SMBv1 = legacy Windows)
     "dhcp": ("os",),             # vendor class + option-55 fingerprint
@@ -79,10 +82,12 @@ def hosts(env: Environment) -> List[Dict]:
     serves: Dict[str, set] = {h.name: set() for h in env.hosts}
     uses: Dict[str, set] = {h.name: set() for h in env.hosts}
     for client, server, proto in env.conversations:
-        uses[client].add(proto)
+        if client in uses:                  # not an external endpoint
+            uses[client].add(proto)
         # self-announcements, NetBIOS announces and ARP replies are not
         # services
-        if (server != client and protocols.get(proto).transport != "l2"
+        if (server != client and server in serves
+                and protocols.get(proto).transport != "l2"
                 and proto not in _NOT_SERVED):
             serves[server].add(_service(proto))
     # Falcon-covered Windows hosts beacon EDR telemetry to the CrowdStrike cloud
@@ -117,6 +122,8 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
     hidden = {h.name for h in env.hosts if env.hidden(h)}
 
     def emits(name: str, proto: str) -> None:
+        if name not in ev:                     # an external endpoint
+            return
         if name not in hidden:                 # behind NAT: the router's MAC
             ev[name]["vendor"].add("oui")      # every frame shows the MAC
         if protocols.get(proto).transport != "l2":
@@ -125,6 +132,8 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
     for client, server, proto in env.conversations:
         emits(client, proto)
         emits(server, proto)                    # every builder has replies
+        if client not in ev or server not in ev:
+            continue
         for f in _FROM_CLIENT.get(proto, ()):
             ev[client][f].add(proto)
         if server != client:
@@ -189,6 +198,18 @@ def external(env: Environment) -> List[Dict]:
                                  "kind": "edr-cloud", "vendor": "CrowdStrike"})
         e["fqdns"].add(fqdn)
         e["talkers"].add(h.name)
+    # declared external endpoints (cloud brokers, vendor portals)
+    ext = {h.name: h for h in env.external}
+    for h in ext.values():
+        e = plan.setdefault(h.ip, {"ip": h.ip, "fqdns": set(),
+                                   "talkers": set(), "kind": h.role,
+                                   "vendor": h.vendor})
+        if h.fqdn:
+            e["fqdns"].add(h.fqdn)
+    for c, sv, _ in env.conversations:
+        for a, b in ((c, sv), (sv, c)):
+            if a in ext and b not in ext:
+                plan[ext[a].ip]["talkers"].add(b)
     by_ip = {h.ip: h.name for h in env.hosts}
     for h in env.hosts:                 # remote sites seen through NAT
         if env.nat_address(h):
@@ -198,7 +219,9 @@ def external(env: Environment) -> List[Dict]:
         if not ips:
             continue
         for a, b in (ips, ips[::-1]):
-            if a in by_ip or a in plan or not ipaddress.ip_address(a).is_global:
+            addr = ipaddress.ip_address(a)
+            if (a in by_ip or a in plan or not addr.is_global
+                    or addr.is_multicast):      # e.g. KNX 224.0.23.12
                 continue
             plan[a] = {"ip": a, "fqdns": set(), "talkers": set(),
                        "kind": "unknown", "vendor": ""}

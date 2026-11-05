@@ -147,10 +147,16 @@ class Recorder:
                 self._host(h)
             for c, s, proto in env.conversations:
                 ch, sh = env.host(c), env.host(s)
-                self._add(proto, ch, sh)
+                # external endpoints (cloud brokers …) are keyed by IP,
+                # like the EDR cloud below
+                ext = env.is_external
+                caid = ch.ip if ext(c) else None
+                said = sh.ip if ext(s) else None
+                self._add(proto, ch, sh, caid=caid, said=said)
                 vc, vs = env.nat_view(ch, sh)    # as seen through NAT
                 if vc is not ch or vs is not sh:
-                    self._add(proto, vc, vs, self._aid(ch), self._aid(sh))
+                    self._add(proto, vc, vs, caid or self._aid(ch),
+                              said or self._aid(sh))
             for h, ip, fqdn, _ in env.edr_plan():
                 cloud = enterprise._cs_cloud_host(ip, fqdn)
                 self._add("edr", h, cloud, said=ip)

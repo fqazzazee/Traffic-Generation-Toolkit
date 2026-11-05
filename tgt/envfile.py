@@ -80,6 +80,14 @@ the HQ capture and are dropped unless ``local`` is true. See
 "flows"?: [{"client", "server", "proto"}...], "detail"?}``; flows must be
 among the environment's flows. ``tgt inventory -f json`` lists them.
 
+**external[]** — endpoints outside every segment (a cloud MQTT broker, a
+vendor's remote-service portal), with the ``hosts[]`` keys (``name``, a
+public ``ip``, ``role``, ``os``, ``vendor``, ``product``, ``fqdn``,
+``meta``). Flows name them like hosts (selectors match them by exact
+name, role or ``zone:external``, never by a name glob or ``@SEGMENT``);
+their traffic egresses through the internal host's gateway, DNS answers their
+``fqdn`` and ``tgt inventory`` lists them under ``external``, not as assets.
+
 **options** — ``arp`` (default true: start-of-cycle ARP for gateway and
 peers), ``flat`` (one VLAN for every segment), ``dual_homed`` (list of
 ``{"host": NAME, "ip": IP, "mac"?: MAC, "flows"?: [[SERVER, PROTO], ...]}``),
@@ -103,7 +111,8 @@ from .enterprise import Conversation, Environment, Host, Segment
 ZONES = ("IT", "DMZ", "OT-SUPERVISORY", "OT-CELL")
 CATEGORIES = ("IT", "OT", "mixed")
 _TOP_KEYS = {"key", "name", "category", "description", "options", "segments",
-             "hosts", "flows", "findings"}
+             "hosts", "flows", "findings",
+             "external"}
 _SEG_KEYS = {"name", "vlan", "subnet", "zone", "gateway", "gateway_mac", "nat",
              "wan_rtt_ms"}
 _NAT_KEYS = {"outside_ip", "outside_mac", "local"}
@@ -296,12 +305,29 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
                 host_meta[h.name] = meta
     if not hosts:
         raise cx.err("hosts", "at least one host is required")
+    external: List[Host] = []
+    for i, raw in enumerate(cx.list(doc.get("external", []), "external")):
+        path = f"external[{i}]"
+        for h, meta in _hosts(cx, raw, path):
+            if h.name in where:
+                raise cx.err(f"{path}.name", f"duplicate host name {h.name!r} "
+                             f"(also {where[h.name]})")
+            if h.ip in by_ip:
+                raise cx.err(f"{path}.ip", f"{h.ip} already used by "
+                             f"{by_ip[h.ip]}")
+            if any(s.contains(h.ip) for s in segments):
+                raise cx.err(f"{path}.ip", f"{h.name} ({h.ip}) is inside a "
+                             "segment; external endpoints sit outside them")
+            where[h.name], by_ip[h.ip] = path, h.ip
+            external.append(h)
+            if meta:
+                host_meta[h.name] = meta
 
     conv: List[Conversation] = []
     timing: Dict[Conversation, Dict[str, Any]] = {}
     for i, raw in enumerate(cx.list(doc.get("flows", []), "flows")):
         path = f"flows[{i}]"
-        pairs, t = _flows(cx, raw, path, hosts, seg_of, segments)
+        pairs, t = _flows(cx, raw, path, hosts, seg_of, segments, external)
         conv += pairs
         if t:
             for c in pairs:
@@ -317,7 +343,8 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
             raise cx.err(f"findings[{i}].id", f"duplicate finding id {fid!r}")
     try:
         env = Environment(key, name, category, desc, hosts, conv, segments,
-                          options, host_meta, timing, findings)
+                          options, host_meta, timing,
+                          findings=findings, external=external)
     except ValueError as e:
         raise EnvFileError(f"{source}: {e}") from None
     env.source = source             # type: ignore[attr-defined]
@@ -517,12 +544,19 @@ def select(sel: str, hosts: List[Host], seg_of: Dict[str, Segment],
                          f"{', '.join(_SEL_KINDS)})")
     out = []
     for h in hosts:
-        if seg and seg_of[h.name].name != seg:
+        hseg = seg_of.get(h.name)            # None: an external endpoint
+        if seg and (hseg is None or hseg.name != seg):
+            continue
+        # an external endpoint is picked by exact name or by role/os/vendor,
+        # never by a name glob ("PUMP-*" must not grab PUMP-VENDOR-CLOUD)
+        if hseg is None and (value == "*" or
+                             (kind == "name" and value != h.name)):
             continue
         if not value and seg:
             out.append(h)
             continue
-        field = {"name": h.name, "role": h.role, "zone": seg_of[h.name].zone,
+        field = {"name": h.name, "role": h.role,
+                 "zone": hseg.zone if hseg else "external",
                  "model": h.model, "os": h.os, "vendor": h.vendor}[kind]
         if (value == "*" or field == value or
                 (kind == "name" and fnmatch.fnmatchcase(field, value))):
@@ -533,13 +567,14 @@ def select(sel: str, hosts: List[Host], seg_of: Dict[str, Segment],
 
 
 def _flows(cx: _Ctx, raw: Any, path: str, hosts: List[Host],
-           seg_of: Dict[str, Segment], segments: List[Segment]):
+           seg_of: Dict[str, Segment], segments: List[Segment],
+           external: List[Host] = ()):
     d = cx.obj(raw, path, _FLOW_KEYS, ("proto",))
     proto = cx.str(d["proto"], f"{path}.proto")
     if proto not in protocols.PROFILES:
         raise cx.err(f"{path}.proto", f"unknown protocol {proto!r} (see "
                      "'tgt list')")
-    names = {h.name for h in hosts}
+    names = {h.name for h in hosts} | {h.name for h in external}
     timing = _timing(cx, d, path)
     if "client" in d or "server" in d:
         for k in ("from", "to", "mode"):
@@ -558,7 +593,7 @@ def _flows(cx: _Ctx, raw: Any, path: str, hosts: List[Host],
     def pick(k: str) -> List[Host]:
         sel = cx.str(d[k], f"{path}.{k}")
         try:
-            got = select(sel, hosts, seg_of, segments)
+            got = select(sel, list(hosts) + list(external), seg_of, segments)
         except ValueError as e:
             raise cx.err(f"{path}.{k}", f"{sel!r}: {e}") from None
         if not got:
@@ -720,6 +755,8 @@ def to_dict(env: Environment) -> Dict[str, Any]:
                             **copy.deepcopy(s.options))
                        for s in segments]
     doc["hosts"] = [_host_dict(env, h) for h in hosts]
+    if env.external:
+        doc["external"] = [_host_dict(env, h) for h in env.external]
     flows = []
     for c in conv:
         f: Dict[str, Any] = {"client": c[0], "server": c[1], "proto": c[2]}

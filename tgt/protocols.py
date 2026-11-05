@@ -1408,3 +1408,4 @@ from . import protocols_ind  # noqa: E402,F401
 from . import protocols_infra  # noqa: E402,F401  (registers SNMP, LLDP, MQTT…)
 from . import protocols_eng  # noqa: E402,F401  (registers FTP, SSH, RDP, FINS…)
 from . import protocols_util  # noqa: E402,F401  (registers SEL ASCII engineering)
+from . import protocols_site  # noqa: E402,F401  (registers MRP, DLR, DICOM, HL7…)
