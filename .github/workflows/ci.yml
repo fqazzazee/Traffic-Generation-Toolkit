@@ -57,7 +57,9 @@ jobs:
           tgt --version
           test "$(tgt --version)" = "tgt $(python -c 'import tgt; print(tgt.__version__)')"
           tgt run -p modbus --count 10 --rate 0 --pcap ci.pcap
-          tshark -r ci.pcap -q -z io,stat,0
+          # stdin: Ubuntu 26.04 runners confine tshark's own file opens
+          # ("You don't have permission to read the file")
+          tshark -r - -q -z io,stat,0 < ci.pcap
 
   shellcheck:
     runs-on: ubuntu-latest
