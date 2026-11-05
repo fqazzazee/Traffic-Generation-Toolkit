@@ -299,16 +299,27 @@ def iec104_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def bacnet_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """BACnet/IP (47808/UDP): BVLC + NPDU + APDU ReadProperty."""
+    """BACnet/IP (47808/UDP): BVLC + NPDU + APDU ReadProperty of an
+    analog-input's present-value, answered by a ComplexACK carrying the REAL."""
+    def bvll(npdu: bytes, apdu: bytes) -> bytes:   # Original-Unicast-NPDU
+        return struct.pack("!BBH", 0x81, 0x0A, 4 + len(npdu) + len(apdu)) + \
+            npdu + apdu
+
+    base = zlib.crc32(P.ip_to_bytes(ep.client_ip))
     frames = []
     for i in range(count):
-        # APDU: confirmed-request, ReadProperty (svc 12), object analog-input 1
-        apdu = struct.pack("!BBB", 0x00, 0x05, 0x0C) + \
-            b"\x0c\x00\x00\x00\x01\x19\x55"
-        npdu = struct.pack("!BB", 0x01, 0x00)
-        bvlc = struct.pack("!BBH", 0x81, 0x0A, 4 + len(npdu) + len(apdu))
-        payload = bvlc + npdu + apdu
-        frames.append(P.udp_frame(ep, True, 47808, 47808, payload, ident=i))
+        invoke = (base + i) & 0xFF
+        # context [0] object id analog-input:N, context [1] present-value (85)
+        obj = b"\x0c" + struct.pack("!I", (0 << 22) | (1 + i % 4)) + b"\x19\x55"
+        # Confirmed-Request, max-segs 0 / max-APDU 1476, invoke id, svc 12
+        req = struct.pack("!BBBB", 0x00, 0x05, invoke, 0x0C) + obj
+        # ComplexACK, same invoke id: [3] { REAL } property value
+        ack = struct.pack("!BBB", 0x30, invoke, 0x0C) + obj + b"\x3e\x44" + \
+            struct.pack("!f", 21.5 + 0.25 * i) + b"\x3f"
+        frames.append(P.udp_frame(ep, True, 47808, 47808,
+                                  bvll(b"\x01\x04", req), ident=i))  # expect reply
+        frames.append(P.udp_frame(ep, False, 47808, 47808,
+                                  bvll(b"\x01\x00", ack), ident=i))
     return frames
 
 
@@ -769,7 +780,7 @@ _reg("s7comm", "S7comm (Siemens)", "OT", "102", "tcp", s7comm_flow,
 _reg("iec104", "IEC 60870-5-104", "OT", "2404", "tcp", iec104_flow,
      "STARTDT, interrogation + M_ME_NC_1 floats, S-frame acks")
 _reg("bacnet", "BACnet/IP", "OT", "47808", "udp", bacnet_flow,
-     "BVLC/NPDU ReadProperty on analog-input objects")
+     "ReadProperty on analog-input objects + ComplexACK replies")
 _reg("opcua", "OPC UA", "OT", "4840", "tcp", opcua_flow,
      "Hello/Ack, OpenSecureChannel, ReadRequest/Response, Close")
 # OT asset identity / fingerprint
