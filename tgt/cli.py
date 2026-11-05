@@ -9,6 +9,7 @@
     tgt env export ENV       write an environment as an env file (JSON)
     tgt campaign PLAN        phased run: baseline, then changes (timed)
     tgt ctl ...              control a running "tgt run --api" (status, inject…)
+    tgt bench ...            seeded evaluation suite -> bundle -> scorecard
 """
 from __future__ import annotations
 
@@ -645,6 +646,11 @@ def cmd_score(args) -> int:
     return score.run(args)
 
 
+def cmd_bench(args) -> int:
+    from . import bench
+    return bench.main(args)
+
+
 def cmd_tui(args) -> int:
     from . import tui
     return tui.run()
@@ -692,6 +698,10 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_arguments(sub.add_parser(
         "score", help="score a monitor's asset/alert export against TGT "
                       "ground truth (manifest or inventory JSON)"))
+    from . import bench
+    bench.add_arguments(sub.add_parser(
+        "bench", help="play a fixed, seeded evaluation suite and score a "
+                      "monitor on it (list, run, score, compare)"))
 
     pi = sub.add_parser("iface", help="manage virtual interfaces")
     isub = pi.add_subparsers(dest="iface_cmd", required=True)
@@ -919,6 +929,7 @@ def main(argv=None) -> int:
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,
         "inventory": cmd_inventory,
         "score": cmd_score, "campaign": cmd_campaign, "ctl": cmd_ctl,
+        "bench": cmd_bench,
     }[args.command](args)
 
 
