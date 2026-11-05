@@ -37,6 +37,9 @@ jobs:
         run: |
           echo "wireshark-common wireshark-common/install-setuid boolean false" \
             | sudo debconf-set-selections
+          # Ubuntu 24.04 ships tshark 4.2, whose GOOSE/MMS dissectors trip an
+          # internal assertion; the wireshark-dev stable PPA has a current one.
+          sudo -E add-apt-repository -y ppa:wireshark-dev/stable
           sudo -E apt-get update -qq
           sudo -E apt-get install -y -qq --no-install-recommends tshark
           tshark --version | head -n 1

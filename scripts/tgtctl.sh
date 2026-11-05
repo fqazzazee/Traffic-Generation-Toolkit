@@ -207,7 +207,7 @@ daemon_stop() {
         pid=$(cat "$PID_FILE")
         kill "$pid" 2>/dev/null || true
         for _ in 1 2 3 4 5; do daemon_running || break; sleep 0.5; done
-        daemon_running && kill -9 "$pid" 2>/dev/null || true
+        if daemon_running; then kill -9 "$pid" 2>/dev/null || true; fi
         ok "stopped"
     else
         warn "not running"
@@ -295,10 +295,10 @@ cmd_unregister() {
         ok "daemon stopped"
     fi
     # shellcheck disable=SC1090
-    [ -f "$CONF_FILE" ] && . "$CONF_FILE" 2>/dev/null || true
+    if [ -f "$CONF_FILE" ]; then . "$CONF_FILE" 2>/dev/null || true; fi
     iface="${TGT_IFACE:-tgt0}"
     if command -v ip >/dev/null 2>&1 && ip link show "$iface" >/dev/null 2>&1; then
-        ip link del "$iface" 2>/dev/null && info "removed veth $iface" || true
+        if ip link del "$iface" 2>/dev/null; then info "removed veth $iface"; fi
     fi
     warn "config kept at $CONF_FILE (delete manually if desired)"
 }

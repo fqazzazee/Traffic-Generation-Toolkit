@@ -333,7 +333,28 @@ def test_tshark_dissects_every_builder() -> None:
     if "Errors (" in expert or "Warns (" in expert:
         detail = [ln.strip() for ln in expert.splitlines()
                   if "Malformed" in ln or "Warning" in ln or "incorrect" in ln]
-        _failures.append("tshark expert warnings: " + "; ".join(detail[:5]))
+        real = [ln for ln in detail if not _tshark_dissector_bug(ln)]
+        if real or not detail:
+            _failures.append("tshark expert warnings: " + "; ".join(
+                (real or detail)[:5]))
+
+
+def _tshark_version() -> tuple:
+    import re
+    import subprocess
+    out = subprocess.run(["tshark", "--version"], capture_output=True,
+                         text=True).stdout
+    m = re.search(r"TShark \(Wireshark\) (\d+)\.(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def _tshark_dissector_bug(line: str) -> bool:
+    """Wireshark < 4.4's BER-based GOOSE/MMS dissectors trip an internal
+    ``failed assertion "recursion_depth <= 100"`` on valid frames (fixed in
+    later releases; 4.6 decodes the same bytes cleanly). That is a dissector
+    bug, not a malformed frame, so it is not held against the builder."""
+    return ("failed assertion" in line and "recursion_depth" in line
+            and _tshark_version() < (4, 4))
 
 
 def test_tshark_incidents_not_malformed() -> None:
