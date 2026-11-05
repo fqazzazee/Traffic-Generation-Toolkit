@@ -810,3 +810,6 @@ def get(key: str) -> Profile:
 
 def all_profiles() -> List[Profile]:
     return list(PROFILES.values())
+
+
+from . import protocols_infra  # noqa: E402,F401  (registers SNMP, LLDP, MQTT…)
