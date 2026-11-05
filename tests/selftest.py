@@ -150,7 +150,8 @@ def _one_flow(env_key: str, conv, span: str):
     base = enterprise.get(env_key)
     env = enterprise.Environment("t", "t", base.category, "", base.hosts,
                                  [conv], base.segments)
-    return env, [f for _, f in env.build(1, span=span, edr=False)]
+    # the flow's own frames, without the start-of-cycle ARP
+    return env, [f for k, f in env.build(1, span=span, edr=False) if k != "arp"]
 
 
 def test_cross_subnet_uses_gateway_and_tags() -> None:
@@ -316,17 +317,22 @@ def test_tshark_dissects_every_builder() -> None:
     groups = {k: protocols.get(k).build(Endpoints(), 3) for k in _DISSECTS_AS}
     groups["smb1"] = protocols.smb_flow(Endpoints(meta={"smb": "smb1"}), 3)
     site = [f for _, f in enterprise.get("industrial-site").build(2)]
+    # the site cycle gets its own capture: its ARP would otherwise flag the
+    # default Endpoints() addresses as duplicates of real site hosts
+    layers, expert = [], ""
     with tempfile.TemporaryDirectory() as d:
-        path = f"{d}/all.pcap"
-        with PcapWriter(path) as w:
-            for frames in list(groups.values()) + [site]:
-                for f in frames:
-                    w.write(f)
-        layers = subprocess.run(
-            ["tshark", "-r", path, "-T", "fields", "-e", "frame.protocols"],
-            capture_output=True, text=True).stdout.splitlines()
-        expert = subprocess.run(["tshark", "-r", path, "-q", "-z", "expert,warn"],
-                                capture_output=True, text=True).stdout
+        for name, chunk in (("all", list(groups.values())), ("site", [site])):
+            path = f"{d}/{name}.pcap"
+            with PcapWriter(path) as w:
+                for frames in chunk:
+                    for f in frames:
+                        w.write(f)
+            layers += subprocess.run(
+                ["tshark", "-r", path, "-T", "fields", "-e", "frame.protocols"],
+                capture_output=True, text=True).stdout.splitlines()
+            expert += subprocess.run(
+                ["tshark", "-r", path, "-q", "-z", "expert,warn"],
+                capture_output=True, text=True).stdout
     seen = {x for line in layers for x in line.split(":")}
     for key, layer in list(_DISSECTS_AS.items()) + [("smb1", "smb")]:
         check(layer in seen, f"tshark: {key} never dissected as {layer}")
@@ -2554,6 +2560,545 @@ def test_tshark_eng_protocols_clean() -> None:
             capture_output=True, text=True).stdout.split()
     check(not out, "eng protocols: tshark expert warnings: " +
           " ".join(out[:8]))
+
+# ---------------------------------------------------------------------------
+# W2-D: data-defined environments (#50) + topology realism (#52)
+# ---------------------------------------------------------------------------
+def _seeded_build(env, span="access"):
+    """One deterministic cycle (ephemeral ports restart from a fixed value)."""
+    protocols.begin_build(7, 0)      # same seed + cycle -> identical build
+    return env.build(2, span=span)
+
+
+def test_env_file_export_load_parity() -> None:
+    """export -> load -> build gives the same frames and inventory for every
+    built-in env; the shipped example files load and build."""
+    import glob
+    import json
+    from tgt import enterprise, envfile, inventory
+    for env in [e for e in enterprise.all_environments()
+                if e.key in envfile.BUILTIN_KEYS]:
+        text = envfile.export(env)
+        back = envfile.loads(text, source=f"{env.key}.json")
+        for span in ("access", "core"):
+            check(_seeded_build(env, span) == _seeded_build(back, span),
+                  f"env-file parity: {env.key} {span} frames differ")
+        check(json.dumps(inventory.to_json(env)) ==
+              json.dumps(inventory.to_json(back)),
+              f"env-file parity: {env.key} inventory differs")
+        check(envfile.to_dict(back) == envfile.to_dict(env),
+              f"env-file parity: {env.key} re-export differs")
+        check(back.protocols() == env.protocols(),
+              f"env-file parity: {env.key} protocols differ")
+    try:
+        import tomllib  # noqa: F401
+        exts = ("json", "toml")
+    except ImportError:
+        exts = ("json",)
+    shipped = [f for x in exts for f in
+               glob.glob(os.path.join(_REPO, "tgt", "envs", f"*.{x}"))]
+    check(len(shipped) >= 5, f"tgt/envs/ examples missing: {shipped}")
+    for path in shipped:
+        env = envfile.load(path)
+        check(len(env.build(1)) > 0, f"{path}: builds no frames")
+
+
+def test_env_file_selectors_templates_timing() -> None:
+    from tgt import devices, envfile
+    doc = {
+        "key": "t-sel", "category": "OT",
+        "segments": [
+            {"name": "OPS", "vlan": 100, "subnet": "10.9.0.0/24",
+             "zone": "OT-SUPERVISORY"},
+            {"name": "CELL", "vlan": 110, "subnet": "10.9.1.0/24",
+             "zone": "OT-CELL", "gateway": "10.9.1.254"}],
+        "hosts": [
+            {"name": "HIST", "ip": "10.9.0.10", "role": "hist", "os": "linux"},
+            {"name": "HMI{n}", "count": 2, "ip_start": "10.9.1.10",
+             "role": "hmi", "os": "win10", "meta": {"ua": "X"}},
+            {"name": "PLC-{n:02}", "count": 3, "start": 7,
+             "ip_start": "10.9.1.21", "model": "rockwell-1756-l71"},
+            {"name": "SW", "ip": "10.9.1.2", "model": "moxa-eds-508a",
+             "mac": "00-90-E8-00-00-01"}],
+        "flows": [
+            {"from": "role:hmi@CELL", "to": "role:plc", "proto": "enip",
+             "mode": "round-robin", "period": "1s±5%"},
+            {"from": "HIST", "to": "PLC-*", "proto": "enip-id",
+             "period": "500ms", "jitter": 0.1},
+            {"from": "zone:OT-CELL", "to": "HIST", "proto": "ntp"},
+            {"from": "model:moxa-eds-508a", "proto": "lldp"},
+            {"from": "@OPS", "to": "SW", "proto": "snmp"}]}
+    env = envfile.from_dict(doc, "t.json")
+    names = [h.name for h in env.hosts]
+    check(names == ["HIST", "HMI1", "HMI2", "PLC-07", "PLC-08", "PLC-09", "SW"],
+          f"env-file host expansion: {names}")
+    plc = env.host("PLC-08")
+    dev = devices.get("rockwell-1756-l71")
+    check((plc.ip, plc.role, plc.os, plc.vendor, plc.product, plc.model)
+          == ("10.9.1.22", "plc", "rockwell", dev.vendor, dev.aliases[0],
+              "rockwell-1756-l71"), "env-file model defaults wrong")
+    check(plc.mac == "00:1d:9c:09:01:16", f"auto MAC {plc.mac}")
+    check(env.host("SW").mac == "00:90:e8:00:00:01" and
+          env.host("SW").role == "switch" and env.host("SW").os == "moxa",
+          "explicit MAC / switch defaults")
+    check(env.segments[1].gateway == "10.9.1.254" and
+          env.segments[0].gateway == "10.9.0.1", "segment gateway default")
+    conv = env.conversations
+    rr = [c for c in conv if c[2] == "enip"]
+    check(rr == [("HMI1", "PLC-07", "enip"), ("HMI2", "PLC-08", "enip"),
+                 ("HMI1", "PLC-09", "enip")], f"round-robin pairs: {rr}")
+    check(len([c for c in conv if c[2] == "enip-id"]) == 3, "glob selector")
+    check({c[0] for c in conv if c[2] == "ntp"} ==
+          {"HMI1", "HMI2", "PLC-07", "PLC-08", "PLC-09", "SW"}, "zone selector")
+    check(("SW", "SW", "lldp") in conv and ("HIST", "SW", "snmp") in conv,
+          "self / @segment selectors")
+    check(env.timing[("HMI2", "PLC-08", "enip")] ==
+          {"jitter": 0.05, "period": 1.0}, "period±jitter not parsed")
+    check(env.timing[("HIST", "PLC-09", "enip-id")] ==
+          {"period": 0.5, "jitter": 0.1}, "period/jitter not parsed")
+    check(env.host_meta["HMI2"] == {"server": {"ua": "X"}}, "host meta")
+    check(all(len(c) == 3 for c in conv), "Conversation tuple shape changed")
+    again = envfile.loads(envfile.export(env), source="re")
+    check(again.timing == env.timing and envfile.to_dict(again) ==
+          envfile.to_dict(env), "timing/meta lost on re-export")
+    check(_seeded_build(again) == _seeded_build(env), "re-export frames")
+
+
+def test_env_file_schema_errors_are_clear() -> None:
+    import copy
+    import sys as _sys
+    from tgt import envfile
+    base = {"key": "t-err", "segments": [
+        {"name": "A", "vlan": 10, "subnet": "10.8.0.0/24", "zone": "IT"}],
+        "hosts": [{"name": "H1", "ip": "10.8.0.10", "role": "ws",
+                   "os": "win10"},
+                  {"name": "H2", "ip": "10.8.0.11", "role": "ws",
+                   "os": "win10"}],
+        "flows": [{"client": "H1", "server": "H2", "proto": "smb"}]}
+    envfile.from_dict(copy.deepcopy(base), "ok.json")       # valid baseline
+    cases = [
+        (lambda d: d["hosts"][1].update(ip="10.8.0.300"), "hosts[1].ip"),
+        (lambda d: d["hosts"][1].update(ip="10.7.0.5"), "hosts[1].ip"),
+        (lambda d: d["hosts"][0].update(os="beos"), "hosts[0].os"),
+        (lambda d: d["hosts"][0].update(model="nope"), "hosts[0].model"),
+        (lambda d: d["hosts"][0].update(colour="red"), "hosts[0].colour"),
+        (lambda d: d["hosts"][1].update(name="H1"), "duplicate host name"),
+        (lambda d: d["hosts"][1].pop("role"), "hosts[1]: missing required"),
+        (lambda d: d["segments"][0].update(vlan=5000), "segments[0].vlan"),
+        (lambda d: d["segments"][0].update(zone="LAN"), "segments[0].zone"),
+        (lambda d: d["segments"][0].update(subnet="10.8.0.5/24"),
+         "segments[0].subnet"),
+        (lambda d: d["segments"][0].update(gateway="10.9.0.1"),
+         "segments[0].gateway"),
+        (lambda d: d["flows"][0].update(proto="smtp"), "flows[0].proto"),
+        (lambda d: d["flows"][0].update(server="H9"), "flows[0].server"),
+        (lambda d: d["flows"].append({"from": "role:plc", "to": "H1",
+                                      "proto": "modbus"}), "flows[1].from"),
+        (lambda d: d["flows"].append({"from": "kind:x", "proto": "arp"}),
+         "flows[1].from"),
+        (lambda d: d["flows"][0].update(period="soon"), "flows[0].period"),
+        (lambda d: d["hosts"].append({"name": "P", "count": 2,
+                                      "ip_start": "10.8.0.40", "role": "plc",
+                                      "os": "rockwell"}), "hosts[2].name"),
+        (lambda d: d.update(options={"flat": "yes"}), "options.flat"),
+        (lambda d: d.update(options={"dual_homed": [{"host": "H9",
+                                                     "ip": "10.8.0.99"}]}),
+         "options.dual_homed[0].host"),
+        (lambda d: d.update(key="bad key"), "key"),
+        (lambda d: d.update(category="ICS"), "category"),
+    ]
+    for mutate, want in cases:
+        d = copy.deepcopy(base)
+        mutate(d)
+        try:
+            envfile.from_dict(d, "site.json")
+        except envfile.EnvFileError as e:
+            check(str(e).startswith("site.json: ") and want in str(e),
+                  f"schema error for {want!r} unclear: {e}")
+        else:
+            _failures.append(f"schema error not raised for {want!r}")
+    # the Environment checks still apply (a link-local protocol across
+    # segments), reported with the file name
+    d = copy.deepcopy(base)
+    d["segments"].append({"name": "B", "vlan": 20, "subnet": "10.8.1.0/24",
+                          "zone": "IT"})
+    d["hosts"][1]["ip"] = "10.8.1.11"
+    d["flows"] = [{"client": "H1", "server": "H2", "proto": "lldp"}]
+    try:
+        envfile.from_dict(d, "site.json")
+        _failures.append("cross-segment LLDP in an env file accepted")
+    except envfile.EnvFileError as e:
+        check("site.json" in str(e) and "link-local" in str(e), str(e))
+    for bad, want in (("{\n  \"key\": ,", "line 2"), ("[]", "expected an object")):
+        try:
+            envfile.loads(bad, source="x.json")
+            _failures.append(f"bad JSON accepted: {bad!r}")
+        except envfile.EnvFileError as e:
+            check(want in str(e), f"bad JSON message: {e}")
+    # TOML without tomllib (Python 3.9/3.10) fails gracefully
+    saved = _sys.modules.get("tomllib", "missing")
+    _sys.modules["tomllib"] = None          # makes `import tomllib` fail
+    try:
+        envfile.loads("key = 'x'", "toml", source="x.toml")
+        _failures.append("TOML without tomllib did not raise")
+    except envfile.EnvFileError as e:
+        check("Python 3.11" in str(e), f"TOML fallback message: {e}")
+    finally:
+        if saved == "missing":
+            del _sys.modules["tomllib"]
+        else:
+            _sys.modules["tomllib"] = saved
+
+
+def test_env_file_directories_cli_and_tui() -> None:
+    import io
+    import json
+    import shutil
+    import subprocess
+    from tgt import enterprise, envfile, tui
+    src = os.path.join(_REPO, "tgt", "envs", "example-site.json")
+    with tempfile.TemporaryDirectory() as d:
+        envdir = os.path.join(d, "envs")
+        os.makedirs(envdir)
+        shutil.copy(src, envdir)
+        with open(os.path.join(envdir, "bad.json"), "w") as f:
+            f.write('{"key": "x"}')
+        shadow = json.loads(open(src).read())
+        shadow["key"] = "it-org"
+        with open(os.path.join(envdir, "shadow.json"), "w") as f:
+            json.dump(shadow, f)
+        old = os.environ.get("TGT_ENV_PATH")
+        os.environ["TGT_ENV_PATH"] = envdir
+        warnings: list = []
+        try:
+            got = envfile.load_user_envs(warn=warnings.append, force=True)
+        finally:
+            if old is None:
+                del os.environ["TGT_ENV_PATH"]
+            else:
+                os.environ["TGT_ENV_PATH"] = old
+        try:
+            check(got == ["example-site"], f"user envs loaded: {got}")
+            check(len(warnings) == 2 and any("bad.json" in w for w in warnings)
+                  and any("'it-org'" in w for w in warnings),
+                  f"env dir warnings: {warnings}")
+            check(enterprise.get("it-org") is not None and
+                  envfile.source_of(enterprise.get("it-org")) is None,
+                  "a directory file shadowed a built-in")
+            ui = tui.UI()
+            ui.engine = None
+            keys = [c[1] for _, c, _, _ in tui._preset_items(ui) if c[0] == "e"]
+            check("example-site" in keys, "TUI preset list misses a file env")
+        finally:
+            enterprise.ENVIRONMENTS.pop("example-site", None)
+        # CLI: list / run / inventory / env export through a subprocess
+        penv = dict(os.environ, PYTHONPATH=_REPO, TGT_ENV_PATH=envdir)
+
+        def run(args):
+            return subprocess.run([sys.executable, "-m", "tgt"] + args,
+                                  cwd=_REPO, env=penv, capture_output=True,
+                                  text=True, timeout=60)
+        out = run(["list"])
+        check(out.returncode == 0 and "example-site" in out.stdout and
+              "file: " in out.stdout, "tgt list misses the env-dir file")
+        pcap = os.path.join(d, "f.pcap")
+        out = run(["run", "--env-file", src, "--pcap", pcap, "--once",
+                   "--rate", "0"])
+        check(out.returncode == 0 and len(_pcap_records(pcap)) > 100,
+              f"run --env-file: {out.stdout[-300:]}{out.stderr[-300:]}")
+        out = run(["run", "--env", "example-site", "--pcap", pcap, "--once",
+                   "--rate", "0"])
+        check(out.returncode == 0, "run --env <dir file key> failed")
+        out = run(["inventory", "--env-file", src, "-f", "json"])
+        check(out.returncode == 0 and
+              json.loads(out.stdout)["env"] == "example-site",
+              "inventory --env-file")
+        exp = os.path.join(d, "ot.json")
+        out = run(["env", "export", "ot-plant", "-o", exp])
+        check(out.returncode == 0 and
+              envfile.load(exp).key == "ot-plant", "env export -o")
+        bad = os.path.join(d, "bad.json")
+        with open(bad, "w") as f:
+            f.write('{"key": "b", "segments": [], "hosts": []}')
+        out = run(["run", "--env-file", bad, "--pcap", pcap])
+        check(out.returncode == 2 and "segments" in out.stderr,
+              f"bad --env-file not reported: {out.stderr}")
+        check(run(["env"]).returncode == 0, "plain 'tgt env' broke")
+
+
+def _gw_macs(env) -> set:
+    return {P.mac_to_bytes(s.gateway_mac) for s in env.segments}
+
+
+def test_arp_for_gateway_and_peers_every_host() -> None:
+    from tgt import enterprise
+    for env in enterprise.all_environments():
+        batch = env.build(1)
+        n_arp = 0
+        while n_arp < len(batch) and batch[n_arp][0] == "arp":
+            n_arp += 1
+        arps = [f for k, f in batch if k == "arp"]
+        check(len(arps) > 0 and n_arp >= 2 * len(env.hosts),
+              f"{env.key}: ARP does not open the cycle")
+        req, rep, grat = set(), set(), set()
+        for f in arps:
+            if struct.unpack("!H", f[16:18])[0] != P.ETH_P_ARP:
+                continue
+            op = struct.unpack("!H", f[18 + 6:18 + 8])[0]
+            spa, tpa = f[18 + 14:18 + 18], f[18 + 24:18 + 28]
+            sha = f[18 + 8:18 + 14]
+            vlan = _vlan(f)
+            if op == 1 and f[0:6] == b"\xff" * 6:
+                (grat if spa == tpa else req).add((spa, tpa, vlan))
+            elif op == 2:
+                rep.add((spa, tpa, sha, vlan))
+        for h in env.hosts:
+            seg = env.segment_of(h)
+            ip, gw = P.ip_to_bytes(h.ip), P.ip_to_bytes(seg.gateway)
+            check((ip, gw, seg.vlan) in req,
+                  f"{env.key}: {h.name} never ARPs for its gateway")
+            check((gw, ip, P.mac_to_bytes(seg.gateway_mac), seg.vlan) in rep,
+                  f"{env.key}: gateway never answers {h.name}")
+        check(grat, f"{env.key}: no gratuitous ARP")
+    plant = enterprise.get("ot-plant")
+    hmi, plc = plant.host("HMI-RW"), plant.host("PLC-RW1")
+    blob = b"".join(f for k, f in plant.build(1) if k == "arp")
+    check(P.arp(1, hmi.mac, hmi.ip, "00:00:00:00:00:00", plc.ip) in blob and
+          P.arp(2, plc.mac, plc.ip, hmi.mac, hmi.ip) in blob,
+          "HMI-RW does not ARP for its same-segment PLC")
+    check(P.ip_to_bytes(enterprise.get("it-org").host("DC01").ip) not in
+          b"".join(f[18 + 24:18 + 28] for k, f in
+                   enterprise.get("it-org").build(1) if k == "arp"
+                   and P.frame_ips(f) is None and
+                   f[18 + 14:18 + 18] == P.ip_to_bytes(
+                       enterprise.get("it-org").host("WS20").ip)),
+          "WS20 ARPs for DC01 across segments")
+    off = enterprise.Environment("t", "t", "IT", "", plant.hosts,
+                                 plant.conversations, plant.segments,
+                                 options={"arp": False})
+    check("arp" not in {k for k, _ in off.build(1)} and
+          "arp" not in off.protocols(), "options.arp=False still ARPs")
+
+
+def test_enterprise_mixed_has_a_dmz() -> None:
+    from tgt import enterprise
+    mixed = enterprise.get("enterprise-mixed")
+    zone = {h.name: mixed.segment_of(h).zone for h in mixed.hosts}
+    check("DMZ" in set(zone.values()), "enterprise-mixed: no DMZ segment")
+    roles = {h.role for h in mixed.hosts if zone[h.name] == "DMZ"}
+    check({"hist", "jump", "patch"} <= roles, f"DMZ roles: {roles}")
+    ot = {"OT-SUPERVISORY", "OT-CELL"}
+    pairs = [(zone[c], zone[s], (c, s, p)) for c, s, p in mixed.conversations]
+    check(any(a == "IT" and b == "DMZ" for a, b, _ in pairs), "no IT -> DMZ")
+    check(any(a == "DMZ" and b in ot for a, b, _ in pairs), "no DMZ -> OT")
+    check(any(a in ot and b == "DMZ" for a, b, _ in pairs), "no OT -> DMZ")
+    bypass = [x for a, b, x in pairs if {a, b} & {"IT"} and {a, b} & ot]
+    check(bypass == [enterprise.MIXED_DMZ_BYPASS],
+          f"enterprise-mixed IT<->OT bypassing the DMZ: {bypass}")
+
+
+def test_rewrite_l2_preserves_pcp() -> None:
+    from tgt import enterprise
+    from tgt.protocols_ind import goose_flow
+    frame = goose_flow(Endpoints(), 1)[0]           # priority-tagged, PCP 4
+    check(frame[12:14] == b"\x81\x00" and frame[14] >> 5 == 4,
+          "GOOSE builder lost its priority tag")
+    re_tag = P.rewrite_l2(frame, "02:00:00:00:00:09", "01:0c:cd:01:00:01", 150)
+    tci = struct.unpack("!H", re_tag[14:16])[0]
+    check(tci >> 13 == 4 and tci & 0x0FFF == 150, f"re-tag TCI {tci:#06x}")
+    check(re_tag[16:] == frame[16:], "re-tag changed the payload")
+    untagged = P.rewrite_l2(frame, "02:00:00:00:00:09", "01:0c:cd:01:00:01",
+                            None)
+    check(struct.unpack("!H", untagged[14:16])[0] == 0x8000,
+          "vlan=None dropped the priority tag")
+    plain = P.ethernet("02:00:00:00:00:02", "02:00:00:00:00:01", 0x0800,
+                       b"x" * 40)
+    check(struct.unpack("!H", P.rewrite_l2(plain, "02:00:00:00:00:01",
+                                           "02:00:00:00:00:02", 7)[14:16])[0]
+          == 7, "untagged frame gained a PCP")
+    site = enterprise.get("industrial-site")
+    env = enterprise.Environment(
+        "t", "t", "OT", "", site.hosts,
+        [("RELAY1", "RELAY2", "goose"), ("RELAY1", "RELAY2", "sv"),
+         ("PLC-PK1", "PLC-PK2", "pn-rt")], site.segments,
+        options={"arp": False})
+    for k, f in env.build(2, span="core", edr=False):
+        tci = struct.unpack("!H", f[14:16])[0]
+        want = 6 if k == "pn-rt" else 4
+        check(f[12:14] == b"\x81\x00" and tci >> 13 == want,
+              f"{k}: placed frame PCP {tci >> 13}, want {want}")
+        check(tci & 0x0FFF == env.segment_of(env.host("RELAY1" if k != "pn-rt"
+                                                      else "PLC-PK1")).vlan,
+              f"{k}: placed frame not on its segment VLAN")
+
+
+def test_link_local_frames_never_routed() -> None:
+    from tgt import enterprise
+    check(all(protocols.get(k).link_local for k in
+              ("ptp", "lldp", "cdp", "arp", "goose", "mdns", "llmnr")),
+          "link_local flag missing on a link-local profile")
+    check(not protocols.get("snmp").link_local, "snmp marked link-local")
+    plant = enterprise.get("ot-plant")
+    for proto in ("ptp", "mdns", "llmnr", "nbns", "ssdp"):
+        try:
+            enterprise.Environment("t", "t", "OT", "", plant.hosts,
+                                   [("HMI-RW", "PLC-S7-1", proto)],
+                                   plant.segments)
+            _failures.append(f"{proto} across segments was accepted")
+        except ValueError:
+            pass
+    conv = [("HMI-RW", "PLC-RW1", "ptp"), ("SW-CELL-RW", "SW-CELL-RW", "lldp"),
+            ("OT-SW01", "OT-SW01", "cdp"), ("HMI-RW", "PLC-RW1", "mdns"),
+            ("HMI-RW", "PLC-RW1", "llmnr"), ("HMI-RW", "PLC-RW1", "ptp-l2")]
+    env = enterprise.Environment("t", "t", "OT", "", plant.hosts, conv,
+                                 plant.segments, options={"arp": False})
+    access = env.build(2, span="access", edr=False)
+    core = env.build(2, span="core", edr=False)
+    check(len(access) == len(core), "core view routed link-local frames")
+    gws = _gw_macs(env)
+    for k, f in core:
+        check(f[0:6] not in gws and f[6:12] not in gws,
+              f"{k}: link-local frame carries a gateway MAC")
+        if k == "ptp":
+            check(f[18 + 8] == 1, "PTP TTL changed from 1")
+    # and in every built-in env's core view
+    for e in enterprise.all_environments():
+        gws = _gw_macs(e)
+        for k, f in e.build(1, span="core"):
+            if protocols.get(k).link_local and k != "arp":
+                check(f[0:6] not in gws and f[6:12] not in gws,
+                      f"{e.key}: {k} frame routed via a gateway")
+
+
+def test_managed_switches_lldp_snmp_syslog() -> None:
+    from tgt import devices, enterprise, inventory
+    for env in enterprise.all_environments():
+        sws = [h for h in env.hosts if h.role == "switch"]
+        check(len(sws) >= len(env.segments) - 1,
+              f"{env.key}: {len(sws)} switches for {len(env.segments)} VLANs")
+        conv = set(env.conversations)
+        for sw in sws:
+            dev = sw.device
+            check(dev is not None and dev.device_type == "switch" and
+                  sw.mac[:8] in dev.ouis, f"{env.key}: {sw.name} catalog/OUI")
+            check((sw.name, sw.name, "lldp") in conv,
+                  f"{env.key}: {sw.name} sends no LLDP")
+            check(((sw.name, sw.name, "cdp") in conv) == (sw.os == "ios"),
+                  f"{env.key}: {sw.name} CDP only on Cisco")
+            nms = [c for c, s, p in conv if s == sw.name and p == "snmp"]
+            check(nms and all(env.host(n).role == "nms" for n in nms) and
+                  any(c == sw.name and env.host(s).role == "nms"
+                      and p == "syslog" for c, s, p in conv),
+                  f"{env.key}: {sw.name} not polled / not logging")
+        blob = b"".join(f for k, f in env.build(1)
+                        if k in ("snmp", "lldp", "cdp"))
+        for sw in sws:
+            descr = devices.banner(sw.device, "snmp_sysdescr", sw.name,
+                                   sw.firmware, sw.serial).encode()
+            check(descr in blob, f"{env.key}: {sw.name} sysDescr not on wire")
+        check(b"n0c-r3ad" in blob and b"public" not in blob,
+              f"{env.key}: SNMP community not the site's")
+        rows = {r["name"]: r for r in inventory.hosts(env)}
+        for sw in sws:
+            check("snmp 161/udp" in rows[sw.name]["serves"] and
+                  rows[sw.name]["purdue_level"] == env.purdue_level(sw) and
+                  bool(rows[sw.name]["purdue_level"]),
+                  f"{env.key}: {sw.name} inventory row")
+    site = enterprise.get("industrial-site")
+    lv = {h.name: site.purdue_level(h) for h in site.hosts}
+    check(lv["CORE-SW01"] == "4" and lv["DMZ-SW01"] == "3.5" and
+          lv["OT-CORE01"] == "3" and lv["SW-PK"] == "2",
+          "switch Purdue level should follow its zone")
+    doc = inventory.to_json(site)
+    ob = {h["name"]: h["observability"] for h in doc["hosts"]}
+    check(ob["SW-PR"]["firmware"]["observable"] and
+          {"snmp", "lldp"} <= set(ob["SW-PR"]["firmware"]["evidence"]),
+          "switch firmware not observable via SNMP/LLDP")
+    if shutil_which("tshark"):
+        _tshark_clean(site.build(1, span="core"), "industrial-site core")
+
+
+def shutil_which(name: str):
+    import shutil
+    return shutil.which(name)
+
+
+def _tshark_clean(batch, label: str) -> None:
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/x.pcap"
+        with PcapWriter(path) as w:
+            for _, f in batch:
+                w.write(f)
+        expert = subprocess.run(["tshark", "-r", path, "-q", "-z",
+                                 "expert,warn"], capture_output=True,
+                                text=True).stdout
+    bad = [ln for ln in expert.splitlines()
+           if ("Malformed" in ln or "Duplicate IP" in ln or "incorrect" in ln
+               or "Bad checksum" in ln)]
+    check(not bad, f"tshark {label}: {bad[:3]}")
+
+
+def test_misconfiguration_knobs() -> None:
+    from tgt import enterprise, envfile, inventory
+    base = enterprise.get("enterprise-mixed")
+
+    def mk(**opts):
+        return enterprise.Environment("t-knob", "t", "mixed", "",
+                                      base.spec[0], base.spec[1],
+                                      base.spec[2], options=opts)
+    flat = mk(flat=True)
+    vlans = {_vlan(f) for _, f in flat.build(1)}
+    check(vlans == {base.segments[0].vlan}, f"flat: VLANs on wire {vlans}")
+    check(len({s.subnet for s in flat.segments}) == len(base.segments),
+          "flat: subnets lost")
+    dual = mk(dual_homed=[{"host": "WS25", "ip": "172.16.0.99",
+                           "flows": [["HISTORIAN", "smb"]]}])
+    twin = dual.host("WS25/nic2")
+    ws = dual.host("WS25")
+    check(dual.segment_of(twin).zone == "OT-SUPERVISORY" and
+          dual.segment_of(ws).zone == "IT", "dual-homed: zones")
+    check((twin.fqdn, twin.serial, twin.model) == (ws.fqdn, ws.serial,
+                                                   ws.model)
+          and twin.mac != ws.mac, "dual-homed twin identity")
+    nb = [f for k, f in dual.build(1) if k == "netbios"]
+    srcs = {P.frame_ips(f)[0] for f in nb if b"FHFDDCDFCA" in f}  # "WS25"
+    check({ws.ip, twin.ip} <= srcs, f"dual-homed: NetBIOS name from {srcs}")
+    check(("WS25/nic2", "HISTORIAN", "smb") in dual.conversations,
+          "dual-homed flows")
+    check(len(base.hosts) + 1 == len(dual.hosts) and
+          len(dual.spec[0]) == len(base.hosts), "dual-homed spec")
+    rt = envfile.loads(envfile.export(dual), source="d")
+    check(_seeded_build(rt) == _seeded_build(dual) and
+          [h.name for h in rt.hosts] == [h.name for h in dual.hosts],
+          "dual-homed env-file round trip")
+    pub = mk(default_snmp_community=True)
+    blob = b"".join(f for k, f in pub.build(1) if k == "snmp")
+    check(b"public" not in blob and b"private" in blob, "switch community")
+    plc = enterprise.Environment("t", "t", "OT", "", base.hosts,
+                                 [("OT-NMS", "PLC-RW1", "snmp")],
+                                 base.segments,
+                                 options={"default_snmp_community": True})
+    check(b"public" in b"".join(f for k, f in plc.build(1) if k == "snmp"),
+          "default community on a PLC")
+    check(mk(snmp_community="s3cret").snmp_community(base.host("CORE-SW01"))
+          == "s3cret", "snmp_community option")
+    try:
+        mk(dual_homed=[{"host": "NOPE", "ip": "172.16.0.99"}])
+        _failures.append("dual_homed with an unknown host accepted")
+    except ValueError:
+        pass
+    inv = {r["name"]: r for r in inventory.hosts(flat)}
+    check(len({r["vlan"] for r in inv.values()}) == 1, "flat inventory VLAN")
+
+
+def test_netbios_announce_is_not_a_service() -> None:
+    from tgt import enterprise, inventory
+    rows = {r["name"]: r for r in inventory.hosts(enterprise.get("ot-plant"))}
+    check(not any(s.startswith("netbios") for s in rows["HISTORIAN"]["serves"]),
+          f"HISTORIAN serves {rows['HISTORIAN']['serves']}")
+    check("netbios" in rows["HMI-XP"]["uses"], "HMI-XP netbios use lost")
+    check("arp" in rows["PLC-RW1"]["uses"], "ARP use not in inventory")
 
 
 def main() -> int:

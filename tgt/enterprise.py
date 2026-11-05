@@ -20,11 +20,12 @@ in :mod:`tgt.protocols`, driving them between arbitrary host pairs.
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import devices, protocols
-from .packet import Endpoints, bytes_to_mac, mac_to_bytes, rewrite_l2
+from .packet import (ETH_P_ARP, Endpoints, arp, bytes_to_mac, ethernet,
+                     mac_to_bytes, rewrite_l2)
 
 # Vendor OUIs — an analyser also fingerprints assets by MAC prefix.
 OUI_WIN = "00:50:56"        # VMware-hosted Windows/Linux
@@ -91,6 +92,16 @@ FINGERPRINTS: Dict[str, OSFingerprint] = {
     "sel": OSFingerprint("sel", "SEL device firmware", 64,
         smb="none", dhcp_vendor="",
         risk="Electrical asset — DNP3 without Secure Authentication"),
+    # managed switches (network infrastructure)
+    "ios": OSFingerprint("ios", "Cisco IOS / IOS XE", 255,
+        smb="none", dhcp_vendor="",
+        risk="Network device — SNMP/CDP expose model + firmware"),
+    "hios": OSFingerprint("hios", "Hirschmann HiOS", 64,
+        smb="none", dhcp_vendor="",
+        risk="Network device — SNMP/LLDP expose model + firmware"),
+    "moxa": OSFingerprint("moxa", "Moxa switch firmware", 64,
+        smb="none", dhcp_vendor="",
+        risk="Network device — SNMP/LLDP expose model + firmware"),
 }
 
 
@@ -224,6 +235,39 @@ def _mac(oui: str, n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Managed network infrastructure: switches announce themselves (LLDP, plus
+# CDP on Cisco), answer the NMS's SNMP polls and log to its syslog collector
+# ---------------------------------------------------------------------------
+_SWITCH_OS = {"cisco-c9300-48p": "ios", "cisco-ie-4000-8gt4g-e": "ios",
+              "hirschmann-rsp35": "hios", "moxa-eds-508a": "moxa"}
+
+
+def _switch_host(name: str, ip: str, model: str, n: int) -> Host:
+    """A managed switch at ``ip`` (its management SVI) with a burned-in MAC
+    from its catalog model's first OUI."""
+    dev = devices.get(model)
+    return Host(name, ip, _mac(dev.ouis[0], n), "switch", _SWITCH_OS[model],
+                dev.vendor, dev.product, model=model)
+
+
+def _infra_conversations(switches: List[str], nms: str,
+                         hosts: List[Host]) -> List[Conversation]:
+    """LLDP (+ CDP on Cisco) self-announcements, NMS SNMP polls and syslog
+    for each switch in ``switches`` (missing names are skipped)."""
+    by = {x.name: x for x in hosts}
+    conv: List[Conversation] = []
+    for sw in switches:
+        h = by.get(sw)
+        if h is None:
+            continue
+        conv.append((sw, sw, "lldp"))
+        if h.os == "ios":
+            conv.append((sw, sw, "cdp"))
+        conv += [(nms, sw, "snmp"), (sw, nms, "syslog")]
+    return conv
+
+
+# ---------------------------------------------------------------------------
 # IT organization: 11 servers + 12 users
 # ---------------------------------------------------------------------------
 def _it_hosts() -> List[Host]:
@@ -243,6 +287,10 @@ def _it_hosts() -> List[Host]:
     for i, os_ in enumerate(user_os, start=20):
         h.append(Host(f"WS{i:02d}", f"10.20.20.{i}", _mac(OUI_WIN, 0x200 + i),
                       "ws", os_))
+    # network management + the core/access switches it watches
+    h.append(Host("NMS01", "10.20.10.30", _mac(OUI_WIN, 0x130), "nms", "linux"))
+    h.append(_switch_host("CORE-SW01", "10.20.10.2", "cisco-c9300-48p", 0x1002))
+    h.append(_switch_host("ACC-SW01", "10.20.20.2", "cisco-c9300-48p", 0x2002))
     return h
 
 
@@ -283,6 +331,7 @@ def _it_conversations(hosts: List[Host]) -> List[Conversation]:
         ("WEB01", "SQL01", "https"), ("MAIL01", "DC01", "ldap"),
         ("BACKUP01", "FILE01", "smb"), ("FS-LEGACY", "DC01", "smb"),
     ]
+    conv += _infra_conversations(["CORE-SW01", "ACC-SW01"], "NMS01", hosts)
     return [c for c in conv if c[0] in by and c[1] in by]
 
 
@@ -314,6 +363,13 @@ def _ot_hosts() -> List[Host]:
              "siemens", "Siemens", "6ES7 315-2EH14-0AB0"),
         Host("PLC-S7-2", "172.16.2.22", _mac(OUI_SIEMENS, 0x22), "plc",
              "siemens", "Siemens", "6ES7 151-8AB01-0AB0"),
+    ]
+    # OT network management + an industrial switch per segment
+    h += [
+        Host("OT-NMS", "172.16.0.40", _mac(OUI_WIN, 0x305), "nms", "linux"),
+        _switch_host("OT-SW01", "172.16.0.2", "cisco-ie-4000-8gt4g-e", 0x0002),
+        _switch_host("SW-CELL-RW", "172.16.1.2", "hirschmann-rsp35", 0x0102),
+        _switch_host("SW-CELL-S7", "172.16.2.2", "moxa-eds-508a", 0x0202),
     ]
     return h
 
@@ -347,6 +403,8 @@ def _ot_conversations(hosts: List[Host]) -> List[Conversation]:
         # supervisory IT chatter
         ("SCADA01", "HISTORIAN", "https"), ("ENGWS01", "HISTORIAN", "dns"),
     ]
+    conv += _infra_conversations(["OT-SW01", "SW-CELL-RW", "SW-CELL-S7"],
+                                 "OT-NMS", hosts)
     return [c for c in conv if c[0] in by and c[1] in by]
 
 
@@ -355,6 +413,30 @@ def _ot_conversations(hosts: List[Host]) -> List[Conversation]:
 # ---------------------------------------------------------------------------
 @dataclass
 class Environment:
+    """A modeled organization.
+
+    ``options`` holds topology switches and misconfiguration knobs (all
+    optional; built-ins leave them off unless noted):
+
+    * ``arp`` (default ``True``): each cycle starts with every host ARPing
+      for its gateway (HSRP virtual MAC answers) and for the same-segment
+      peers it talks to, plus an occasional gratuitous ARP.
+    * ``flat``: no segmentation — every segment rides the first segment's
+      VLAN (one broadcast domain, subnets multinetted on one SVI).
+    * ``dual_homed``: list of ``{"host": NAME, "ip": IP, "mac": MAC?,
+      "flows": [[SERVER, PROTO], ...]?}`` — the host gets a second NIC (a
+      twin asset ``NAME/nic2`` with the same name/FQDN/model/serial) in the
+      segment holding ``IP``, announcing itself and running ``flows``.
+    * ``snmp_community``: the v1/v2c community every SNMP poll uses
+      (default ``"n0c-r3ad"``); ``default_snmp_community: true`` sets it to
+      ``"public"`` (write-capable devices answer ``"private"``) — the
+      cleartext-credential finding a monitor should raise.
+
+    ``host_meta`` maps a host name to ``{"server": {...}, "client": {...}}``
+    endpoint-meta overrides applied when the host is that side of a flow.
+    ``timing`` maps a conversation to its optional ``period`` / ``jitter``
+    (parsed from env files, kept for a time model; not yet used by build).
+    """
     key: str
     name: str
     category: str      # IT | OT | mixed
@@ -362,10 +444,18 @@ class Environment:
     hosts: List[Host]
     conversations: List[Conversation]
     segments: List[Segment]
+    options: Dict[str, Any] = field(default_factory=dict)
+    host_meta: Dict[str, Dict[str, Dict[str, Any]]] = field(default_factory=dict)
+    timing: Dict[Conversation, Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        # what was declared, before options rewrite it (env export uses this)
+        self.spec = (list(self.hosts), list(self.conversations),
+                     list(self.segments))
+        self._alias: Dict[str, str] = {}       # second-NIC twin -> host name
+        self._apply_options()
         vlans = [s.vlan for s in self.segments]
-        if len(set(vlans)) != len(vlans):
+        if len(set(vlans)) != len(vlans) and not self.options.get("flat"):
             raise ValueError(f"{self.key}: duplicate VLAN in {vlans}")
         for s in self.segments:
             if not s.contains(s.gateway):
@@ -379,10 +469,49 @@ class Environment:
                                  f"{len(hit)} segments, expected 1")
             self._seg[h.name] = hit[0]
         for c, sv, proto in self.conversations:
-            if (protocols.get(proto).transport == "l2"
+            if (protocols.get(proto).link_local
                     and self._seg[c] is not self._seg[sv]):
-                raise ValueError(f"{self.key}: {proto} is L2-only but "
+                raise ValueError(f"{self.key}: {proto} is link-local but "
                                  f"{c} -> {sv} crosses segments")
+
+    def _apply_options(self) -> None:
+        """Rewrite segments/hosts/conversations for the topology knobs."""
+        opts = self.options
+        if opts.get("flat") and self.segments:
+            vlan = self.segments[0].vlan
+            self.segments = [replace(s, vlan=vlan) for s in self.segments]
+        twins: List[Host] = []
+        conv: List[Conversation] = []
+        for d in opts.get("dual_homed") or ():
+            base = next((h for h in self.hosts if h.name == d["host"]), None)
+            if base is None:
+                raise ValueError(f"{self.key}: dual_homed host {d['host']!r} "
+                                 "is not in the environment")
+            mac = d.get("mac") or "%s:%02x:%s" % (
+                base.mac[:8], int(base.mac[9:11], 16) ^ 0x80, base.mac[12:])
+            twin = Host(f"{base.name}/nic2", d["ip"], mac, base.role, base.os,
+                        base.vendor, base.product, model=base.model,
+                        firmware=base.firmware, serial=base.serial,
+                        modules=base.modules, fqdn=base.fqdn)
+            twins.append(twin)
+            self._alias[twin.name] = base.name
+            conv.append((twin.name, twin.name, "netbios"))
+            conv += [(twin.name, sv, p) for sv, p in d.get("flows") or ()]
+        if twins:
+            self.hosts = list(self.hosts) + twins
+            self.conversations = list(self.conversations) + conv
+
+    @property
+    def arp_enabled(self) -> bool:
+        return bool(self.options.get("arp", True))
+
+    def snmp_community(self, server: Host) -> str:
+        """The community an SNMP poll of ``server`` carries."""
+        if self.options.get("default_snmp_community"):
+            dev = server.device
+            return "private" if dev is not None and dev.device_type == "switch" \
+                else "public"
+        return str(self.options.get("snmp_community", "n0c-r3ad"))
 
     def host(self, name: str) -> Host:
         return next(h for h in self.hosts if h.name == name)
@@ -397,8 +526,8 @@ class Environment:
             "ua": client.fp.ua,
             "smb": client.fp.smb if client.fp.smb != "none" else "smb2",
             "dhcp_vendor": client.fp.dhcp_vendor,   # "" = no option 60
-            "nbname": client.name,
-            "host": server.name,
+            "nbname": self._alias.get(client.name, client.name),
+            "host": self._alias.get(server.name, server.name),
             "sni": server.fqdn,
             "realm": "CORP.LOCAL",
             "dn": f"CN={client.name},DC=corp,DC=local",
@@ -440,8 +569,10 @@ class Environment:
         sseg, dseg = seg_of(src), seg_of(dst)
         if sseg is None and dseg is None:
             return [frame]
-        if frame[0:6] == b"\xff" * 6 and sseg is not None:
-            # L2 broadcast (e.g. DHCP Discover): stays in the sender's VLAN
+        if frame[0] & 0x01 and sseg is not None:
+            # L2 broadcast / multicast (DHCP Discover, LLDP, PTP, GOOSE, mDNS):
+            # stays in the sender's VLAN — never routed, no gateway MAC, no
+            # TTL decrement
             return [rewrite_l2(frame, bytes_to_mac(frame[6:12]),
                                bytes_to_mac(frame[0:6]), sseg.vlan)]
         if sseg is dseg:
@@ -480,7 +611,70 @@ class Environment:
             if self.segment_of(server) is not seg:
                 meta["dhcp_relay"] = seg.gateway
             return meta
+        if proto in ("snmp", "snmpv3", "lldp", "cdp"):
+            return self._agent_meta(proto, server)
+        if proto == "syslog":
+            dev = client.device
+            if dev is not None and dev.device_type == "switch":
+                return {"syslog_format": "3164"}
         return {}
+
+    def _agent_meta(self, proto: str, agent: Host) -> dict:
+        """SNMP agent / LLDP / CDP identity of ``agent`` from its catalog
+        banners (sysDescr, sysObjectID, CDP platform) and placement."""
+        name = self._alias.get(agent.name, agent.name)
+        meta: Dict[str, Any] = {"snmp_sysname": name, "lldp_sysname": name,
+                                "cdp_device_id": name,
+                                "snmp_syslocation": f"{self.name}, "
+                                f"{self.segment_of(agent).name}"}
+        if proto == "snmp":
+            meta["snmp_community"] = self.snmp_community(agent)
+        dev = agent.device
+        if dev is None:
+            return meta
+        for key in ("snmp_sysdescr", "snmp_sysobjectid", "cdp_platform"):
+            val = devices.banner(dev, key, name, agent.firmware, agent.serial)
+            if val:
+                meta[key] = val
+        if "snmp_sysdescr" in meta:
+            meta["lldp_sysdescr"] = meta["cdp_software"] = meta["snmp_sysdescr"]
+        return meta
+
+    def _arp_frames(self) -> List[bytes]:
+        """Start-of-cycle address resolution, on each host's own VLAN: every
+        host ARPs for its gateway (answered from the HSRP virtual MAC) and
+        for each same-segment peer it opens IP flows to; DHCP clients and
+        every eighth host also send a gratuitous ARP."""
+        if not self.arp_enabled:
+            return []
+        arp_build = protocols.get("arp").build
+        peers: Dict[str, List[str]] = {h.name: [] for h in self.hosts}
+        dhcp = set()
+        for c, sv, proto in self.conversations:
+            if proto == "dhcp":
+                dhcp.add(c)
+            if (c != sv and protocols.get(proto).transport != "l2"
+                    and self._seg[c] is self._seg[sv]
+                    and sv not in peers[c]):
+                peers[c].append(sv)
+        out: List[bytes] = []
+        for i, h in enumerate(self.hosts):
+            seg = self.segment_of(h)
+            gw = Endpoints(client_mac=h.mac, client_ip=h.ip,
+                           server_mac=seg.gateway_mac, server_ip=seg.gateway,
+                           vlan=seg.vlan)
+            out += arp_build(gw, 1)
+            if h.name in dhcp or i % 8 == 0:
+                out.append(ethernet("ff:ff:ff:ff:ff:ff", h.mac, ETH_P_ARP,
+                                    arp(1, h.mac, h.ip, "00:00:00:00:00:00",
+                                        h.ip), vlan=seg.vlan))
+            for name in peers[h.name]:
+                peer = self.host(name)
+                ep = Endpoints(client_mac=h.mac, client_ip=h.ip,
+                               server_mac=peer.mac, server_ip=peer.ip)
+                for f in arp_build(ep, 1):
+                    out += self._place(f, h, peer, "access")
+        return out
 
     def segment_or_none(self, host: Host):
         """Like :meth:`segment_of`, but ``None`` for a host not in this env."""
@@ -490,7 +684,8 @@ class Environment:
         """Windows and Linux hosts that run a Falcon sensor. Excludes the EOL
         XP/2000 Windows and embedded OT devices (by catalog model, else
         vendor MAC OUI), which can't — so they stay uncovered."""
-        return [h for h in self.hosts if h.os in EDR_OS and not h.embedded]
+        return [h for h in self.hosts if h.os in EDR_OS and not h.embedded
+                and h.name not in self._alias]     # one sensor per machine
 
     def _edr_endpoints(self, win: Host, cloud: Host) -> Endpoints:
         return Endpoints(
@@ -554,12 +749,17 @@ class Environment:
             client, server = self.host(cname), self.host(sname)
             ep = self._endpoints(client, server)
             ep.meta.update(self._proto_meta(proto, client, server))
+            ep.meta.update(self.host_meta.get(sname, {}).get("server", {}))
+            ep.meta.update(self.host_meta.get(cname, {}).get("client", {}))
+            if proto == "cdp":      # native-VLAN TLV (frame itself is untagged)
+                ep.vlan = self.segment_of(server).vlan
             frames = protocols.get(proto).build(ep, max(1, messages))
             streams.append([(proto, self._place(f, client, server, span))
                             for f in frames])
         if edr:
             streams += self._edr_streams(messages, span)
-        out: List[Tuple[str, bytes]] = []
+        # each cycle opens with address resolution, as after a cache flush
+        out: List[Tuple[str, bytes]] = [("arp", f) for f in self._arp_frames()]
         i = 0
         while any(i < len(s) for s in streams):
             for s in streams:
@@ -575,13 +775,16 @@ class Environment:
         used = {proto for _, _, proto in self.conversations}
         if self.edr_hosts():
             used.add("edr")
+        if self.arp_enabled and self.hosts:
+            used.add("arp")
         return [k for k in protocols.PROFILES if k in used]
 
     def purdue_level(self, host: Host) -> str:
         """Purdue level ("0".."4", "3.5" = IT/OT DMZ): fixed by the catalog
         model for embedded devices, else by where the host sits."""
         dev = host.device
-        if dev is not None and dev.purdue_level:
+        if (dev is not None and dev.purdue_level
+                and dev.device_type != "switch"):   # a switch: where it sits
             return dev.purdue_level
         zone = self.segment_of(host).zone
         if zone == "OT-CELL":
@@ -602,16 +805,49 @@ class Environment:
                 f"{len(self.conversations)} conversations; {leg} legacy/at-risk")
 
 
+def _dmz_hosts() -> List[Host]:
+    """The IT/OT DMZ (L3.5) that joins the IT org to the OT plant."""
+    return [
+        Host("HIST-REP", "10.20.50.10", _mac(OUI_WIN, 0x500), "hist", "win2019"),
+        Host("JUMP01", "10.20.50.11", _mac(OUI_WIN, 0x501), "jump", "win2019"),
+        Host("PATCH01", "10.20.50.12", _mac(OUI_WIN, 0x502), "patch", "win2019"),
+        _switch_host("DMZ-SW01", "10.20.50.2", "cisco-c9300-48p", 0x5002),
+    ]
+
+
 def _mixed_hosts() -> List[Host]:
-    return _it_hosts() + _ot_hosts()
+    return _it_hosts() + _ot_hosts() + _dmz_hosts()
 
 
 def _mixed_segments() -> List[Segment]:
-    return _it_segments() + _ot_segments()
+    return _it_segments() + _ot_segments() + [
+        Segment("IT-OT-DMZ", 50, "10.20.50.0/24", "DMZ", "10.20.50.1")]
+
+
+# enterprise-mixed's one deliberate IT -> OT flow that bypasses the DMZ: an
+# office PC with the PLC programming suite going online with a cell PLC
+MIXED_DMZ_BYPASS: Conversation = ("WS31", "PLC-RW1", "enip")
 
 
 def _mixed_conversations(hosts: List[Host]) -> List[Conversation]:
-    return _it_conversations(hosts) + _ot_conversations(hosts)
+    by = {x.name: x for x in hosts}
+    conv = _it_conversations(hosts) + _ot_conversations(hosts)
+    dmz: List[Conversation] = [
+        # IT -> DMZ: users read the historian replica, admins reach the jump
+        # host; the DMZ uses the IT domain and patches via the IT proxy
+        ("WS21", "HIST-REP", "https"), ("WS22", "HIST-REP", "https"),
+        ("WS20", "JUMP01", "https"), ("JUMP01", "DC01", "kerberos"),
+        ("JUMP01", "DNS01", "dns"), ("PATCH01", "PROXY01", "http"),
+        # OT <-> DMZ: historian replication out, supervised remote access in,
+        # patches and AV pulled from the DMZ
+        ("HISTORIAN", "HIST-REP", "https"), ("JUMP01", "ENGWS01", "https"),
+        ("JUMP01", "ENGWS01", "smb"), ("SCADA01", "PATCH01", "http"),
+        ("ENGWS01", "PATCH01", "http"), ("HISTORIAN", "PATCH01", "http"),
+        MIXED_DMZ_BYPASS,
+    ]
+    conv += [c for c in dmz if c[0] in by and c[1] in by]
+    conv += _infra_conversations(["DMZ-SW01"], "NMS01", hosts)
+    return conv
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +960,30 @@ def _site_hosts() -> List[Host]:
             "relay", "sel", "SEL", prod)
     add("RTU-104", "10.100.50.30", OUI_SIEMENS, 0xB030, "rtu", "siemens",
         "Siemens", "SICAM A8000 CP-8050")
+
+    # Network management (corporate + OT) and a managed switch per segment
+    add("NMS01", "10.10.10.18", OUI_WIN, 0x1018, "nms", "linux")
+    add("OT-NMS", "10.100.0.17", OUI_WIN, 0x6017, "nms", "linux")
+    for name, ip, model in _SITE_SWITCHES:
+        h.append(_switch_host(name, ip, model,
+                              int(ip.split(".")[2]) << 8 | 0x02))
     return h
+
+
+# (name, management IP, catalog model): Catalysts on the corporate side and
+# DMZ, Cisco IE in operations/packaging, Hirschmann in process/substation,
+# Moxa in utilities/BMS
+_SITE_SWITCHES = [
+    ("CORE-SW01", "10.10.10.2", "cisco-c9300-48p"),
+    ("ACC-SW01", "10.10.20.2", "cisco-c9300-48p"),
+    ("DMZ-SW01", "10.10.50.2", "cisco-c9300-48p"),
+    ("OT-CORE01", "10.100.0.2", "cisco-ie-4000-8gt4g-e"),
+    ("SW-PK", "10.100.10.2", "cisco-ie-4000-8gt4g-e"),
+    ("SW-PR", "10.100.20.2", "hirschmann-rsp35"),
+    ("SW-UT", "10.100.30.2", "moxa-eds-508a"),
+    ("SW-BMS", "10.100.40.2", "moxa-eds-508a"),
+    ("SW-SUB", "10.100.50.2", "hirschmann-rsp35"),
+]
 
 
 def _site_conversations(hosts: List[Host]) -> List[Conversation]:
@@ -793,6 +1052,12 @@ def _site_conversations(hosts: List[Host]) -> List[Conversation]:
     # Policy violation an analyser should flag: an IT laptop polling a
     # utilities meter directly (L4 -> L1), bypassing the DMZ.
     conv.append(("WS-CONTRACTOR", "METER-UT1", "modbus"))
+    # network management: the corporate NMS watches IT + DMZ switches, the
+    # OT NMS the plant's
+    conv += _infra_conversations(["CORE-SW01", "ACC-SW01", "DMZ-SW01"],
+                                 "NMS01", hosts)
+    conv += _infra_conversations([n for n, ip, _ in _SITE_SWITCHES
+                                  if ip.startswith("10.100.")], "OT-NMS", hosts)
     return [c for c in conv if c[0] in by and c[1] in by]
 
 
@@ -816,8 +1081,10 @@ _reg_env("ot-plant", "OT Plant", "OT",
          "Windows XP/2000 HMIs with vendor-identity and fingerprint traffic.",
          _ot_hosts, _ot_conversations, _ot_segments)
 _reg_env("enterprise-mixed", "Mixed IT + OT Site", "mixed",
-         "The full site: the IT organization and the OT plant together — the "
-         "realistic converged network an analyser sees at an industrial site.",
+         "The full site: the IT organization and the OT plant joined through "
+         "an IT/OT DMZ (historian replica, jump host, patch server) — the "
+         "realistic converged network an analyser sees at an industrial site, "
+         "with one office PC reaching a PLC directly.",
          _mixed_hosts, _mixed_conversations, _mixed_segments)
 _reg_env("industrial-site", "Industrial Site", "mixed",
          "A large Purdue-model plant: corporate IT, an IT/OT DMZ, L3 site "

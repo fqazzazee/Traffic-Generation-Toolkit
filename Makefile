@@ -1,4 +1,4 @@
-.PHONY: help tui list env veth veth-clean pcap image test install
+.PHONY: help tui list env envs veth veth-clean pcap image test install
 
 IFACE ?= tgt0
 
@@ -14,6 +14,10 @@ list:            ## list protocols and scenarios
 
 env:             ## show detected environment
 	python3 -m tgt env
+
+envs:            ## regenerate the example env-file exports in tgt/envs/
+	for e in it-org ot-plant enterprise-mixed industrial-site; do \
+	  python3 -m tgt env export $$e -o tgt/envs/$$e.json; done
 
 veth:            ## create the tgt0 <-> tgt0-mon veth pair (needs sudo)
 	sudo python3 -m tgt iface create $(IFACE)

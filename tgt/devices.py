@@ -315,6 +315,49 @@ _sel("sel-3530", "SEL-3530 Real-Time Automation Controller (RTAC)", "rtu",
      {"role": "master+outstation"})
 
 # ---------------------------------------------------------------------------
+# Managed Ethernet switches — LLDP/CDP, SNMP agent, syslog. A switch's Purdue
+# level is where it is installed (``Environment.purdue_level`` uses its zone);
+# the catalog value is only the typical placement. sysObjectIDs sit under each
+# vendor's enterprise arc (9 Cisco, 248 Hirschmann, 8691 Moxa) and are
+# representative. ``cdp_platform`` is the CDP Platform TLV (Cisco only).
+# ---------------------------------------------------------------------------
+_CISCO_ENT = ("70:0f:6a", "a0:3d:6f")       # Catalyst 9300 burned-in MACs
+_CISCO_IE = ("f8:7b:20", "58:97:bd")        # IE-4000 burned-in MACs
+_HIRSCHMANN = ("ec:e5:55", "00:80:63")
+_MOXA = ("00:90:e8",)
+
+
+def _switch(model_id, vendor, product, ouis, level, os_family, fw, serial,
+            sysdescr, objid, platform="", aliases=()):
+    banners = {"http": "", "snmp_sysdescr": sysdescr, "snmp_sysobjectid": objid}
+    if platform:
+        banners["cdp_platform"] = platform
+    _add(DeviceModel(model_id, vendor, product, "switch", ouis, level,
+                     os_family, fw, serial, banners=banners, aliases=aliases))
+
+
+_switch("cisco-c9300-48p", "Cisco Systems", "Catalyst 9300-48P", _CISCO_ENT,
+        "4", "Cisco IOS XE", ("17.6.5", "17.9.4a", "17.12.3"), "FOC####?###",
+        "Cisco IOS Software [Cupertino], Catalyst L3 Switch Software "
+        "(CAT9K_IOSXE), Version {firmware}, RELEASE SOFTWARE (fc1)",
+        "1.3.6.1.4.1.9.1.2494", "cisco C9300-48P", ("C9300-48P",))
+_switch("cisco-ie-4000-8gt4g-e", "Cisco Systems", "Industrial Ethernet "
+        "IE-4000-8GT4G-E", _CISCO_IE, "2", "Cisco IOS",
+        ("15.2(7)E4", "15.2(7)E6", "15.2(8)E2"), "FDO####?###",
+        "Cisco IOS Software, IE4000 Software (IE4000-UNIVERSALK9-M), "
+        "Version {firmware}, RELEASE SOFTWARE (fc2)",
+        "1.3.6.1.4.1.9.1.2057", "cisco IE-4000-8GT4G-E", ("IE-4000-8GT4G-E",))
+_switch("hirschmann-rsp35", "Hirschmann Automation and Control",
+        "RSP35 Rail Switch Power", _HIRSCHMANN, "2", "HiOS-3S",
+        ("08.7.02", "09.0.04", "09.1.00"), "942######?#########",
+        "Hirschmann Rail Switch Power RSP35 HiOS-3S-{firmware}",
+        "1.3.6.1.4.1.248.11.2.1.6", aliases=("RSP35",))
+_switch("moxa-eds-508a", "Moxa", "EDS-508A managed Ethernet switch", _MOXA,
+        "2", "Moxa EDS firmware", ("V3.8", "V3.9", "V3.11"), "T?????#######",
+        "EDS-508A {firmware}", "1.3.6.1.4.1.8691.7.6", aliases=("EDS-508A",))
+
+
+# ---------------------------------------------------------------------------
 # General-purpose OS families (IT, supervisory, HMIs, engineering stations)
 # ---------------------------------------------------------------------------
 def _os(model_id, vendor, product, dtype, os_family, fw, banners, edr,

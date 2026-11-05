@@ -970,8 +970,21 @@ class Profile:
         self.build = build
         self.desc = desc
 
+    @property
+    def link_local(self) -> bool:
+        """Frames never leave the sender's L2 segment: every ``l2`` profile,
+        plus IP profiles in :data:`LINK_LOCAL` (TTL-1 / link-scope multicast
+        or subnet broadcast), which an environment must not route."""
+        return self.transport == "l2" or self.key in LINK_LOCAL
+
 
 PROFILES: dict[str, Profile] = {}
+
+# IP-transported profiles that are link-local: PTP over UDP (224.0.1.129,
+# TTL 1), mDNS (224.0.0.251) and LLMNR (224.0.0.252, link-scope multicast),
+# SSDP (239.255.255.250, TTL 2, not multicast-routed) and NBNS name queries
+# (subnet broadcast). Modules registering more such profiles add them here.
+LINK_LOCAL: set = {"ptp", "mdns", "llmnr", "ssdp", "nbns"}
 
 
 def _reg(key, name, category, port, transport, build, desc):

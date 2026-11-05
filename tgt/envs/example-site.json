@@ -1,0 +1,47 @@
+{
+  "key": "example-site",
+  "name": "Example Packaging Plant",
+  "category": "mixed",
+  "description": "Hand-written env-file example: a small corporate LAN, an IT/OT DMZ, plant operations and a Rockwell packaging cell with managed switches. Shows repeated hosts (count + name templates), catalog models, selector flows with periods, and options. Run: tgt run --env-file tgt/envs/example-site.json --pcap site.pcap --once --rate 0",
+  "options": {"snmp_community": "plant-ro"},
+  "segments": [
+    {"name": "CORP", "vlan": 10, "subnet": "10.50.10.0/24", "zone": "IT"},
+    {"name": "DMZ", "vlan": 50, "subnet": "10.50.50.0/24", "zone": "DMZ"},
+    {"name": "OPS", "vlan": 100, "subnet": "10.150.0.0/24", "zone": "OT-SUPERVISORY"},
+    {"name": "AREA-PACKAGING", "vlan": 110, "subnet": "10.150.10.0/24", "zone": "OT-CELL", "gateway": "10.150.10.1"}
+  ],
+  "hosts": [
+    {"name": "DC01", "ip": "10.50.10.10", "role": "dc", "os": "win2019"},
+    {"name": "WS{n:02}", "count": 5, "ip_start": "10.50.10.101", "role": "ws", "os": "win10"},
+    {"name": "WS-OLD", "ip": "10.50.10.120", "role": "ws", "os": "win7"},
+    {"name": "HIST-DMZ", "ip": "10.50.50.10", "role": "hist", "os": "win2019"},
+    {"name": "JUMP01", "ip": "10.50.50.11", "role": "jump", "os": "win2019"},
+    {"name": "HIST01", "ip": "10.150.0.10", "role": "hist", "os": "win2019"},
+    {"name": "ENG01", "ip": "10.150.0.20", "role": "eng", "os": "win10"},
+    {"name": "OT-NMS", "ip": "10.150.0.30", "role": "nms", "os": "linux"},
+    {"name": "OT-SW01", "ip": "10.150.0.2", "model": "cisco-ie-4000-8gt4g-e"},
+    {"name": "HMI-PK{n}", "count": 2, "ip_start": "10.150.10.10", "role": "hmi", "os": "win10"},
+    {"name": "PLC-PK{n:02}", "count": 4, "ip_start": "10.150.10.21", "model": "rockwell-1756-l71"},
+    {"name": "DRV-PK{n:02}", "count": 4, "ip_start": "10.150.10.41", "model": "rockwell-powerflex-755"},
+    {"name": "SW-PK", "ip": "10.150.10.2", "model": "hirschmann-rsp35"}
+  ],
+  "flows": [
+    {"from": "role:ws", "to": "DC01", "proto": "kerberos"},
+    {"from": "role:ws", "to": "DC01", "proto": "dns"},
+    {"from": "role:ws", "proto": "netbios"},
+    {"from": "role:ws", "to": "HIST-DMZ", "proto": "https"},
+    {"client": "WS01", "server": "JUMP01", "proto": "https"},
+    {"client": "JUMP01", "server": "DC01", "proto": "kerberos"},
+    {"client": "JUMP01", "server": "ENG01", "proto": "https"},
+    {"client": "HIST01", "server": "HIST-DMZ", "proto": "https", "period": "30s"},
+    {"from": "role:hmi@AREA-PACKAGING", "to": "role:plc@AREA-PACKAGING", "proto": "enip", "mode": "round-robin", "period": "1s±5%"},
+    {"from": "HIST01", "to": "role:plc", "proto": "enip", "period": "5s", "jitter": "10%"},
+    {"from": "ENG01", "to": "role:plc", "proto": "enip-id"},
+    {"from": "ENG01", "to": "role:drive", "proto": "enip-id"},
+    {"from": "PLC-PK*", "to": "role:drive", "proto": "enip", "mode": "round-robin", "period": "100ms"},
+    {"from": "role:switch", "proto": "lldp"},
+    {"from": "OT-SW01", "proto": "cdp"},
+    {"from": "OT-NMS", "to": "role:switch", "proto": "snmp", "period": "5m"},
+    {"from": "role:switch", "to": "OT-NMS", "proto": "syslog"}
+  ]
+}

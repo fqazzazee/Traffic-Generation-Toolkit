@@ -6,6 +6,7 @@
     tgt iface ...            create / delete / list virtual interfaces
     tgt run ...              generate traffic (send and/or write pcap)
     tgt inventory -e ENV     export an environment's ground-truth asset list
+    tgt env export ENV       write an environment as an env file (JSON)
 """
 from __future__ import annotations
 
@@ -35,8 +36,11 @@ def cmd_list(args) -> int:
         print(f"  {s.key:14} {s.name:26} [{', '.join(s.profiles)}]")
         print(f"    {s.desc}")
     print("\nEnvironments (modeled organizations — use with --env):")
+    from . import envfile
     for e in enterprise.all_environments():
         print(f"  {e.key:18} {e.name:22} [{e.category}]")
+        if envfile.source_of(e):
+            print(f"    file: {envfile.source_of(e)}")
         print(f"    {e.summary()}")
         print(f"    protocols: {', '.join(e.protocols())}")
         segs = ", ".join(f"{s.name} v{s.vlan} {s.subnet}" for s in e.segments)
@@ -67,6 +71,8 @@ def _iface_line(i: dict) -> str:
 
 
 def cmd_env(args) -> int:
+    if getattr(args, "env_cmd", None) == "export":
+        return cmd_env_export(args)
     e = net.detect_env()
     print(f"environment : {e.kind}  ({e.detail})")
     print(f"root/CAP_NET: {'yes' if e.is_root else 'no — sending needs sudo'}")
@@ -78,6 +84,33 @@ def cmd_env(args) -> int:
         print(f"\nnote: on {e.kind}, run TGT and your sensor (Zeek/Suricata/tcpdump) "
               "inside the same\n      network namespace so both see the veth pair.")
     return 0
+
+
+def cmd_env_export(args) -> int:
+    from . import envfile
+    if args.key not in enterprise.ENVIRONMENTS:
+        print(f"unknown environment: {args.key}. Try 'tgt list'.",
+              file=sys.stderr)
+        return 2
+    text = envfile.export(enterprise.get(args.key))
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"wrote environment {args.key} to {args.output}",
+              file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def _load_env_file(path: str):
+    """Load + register ``--env-file``; returns its key or None (reported)."""
+    from . import envfile
+    try:
+        return envfile.register(envfile.load(path)).key
+    except envfile.EnvFileError as e:
+        print(f"bad environment file: {e}", file=sys.stderr)
+        return None
 
 
 def cmd_iface(args) -> int:
@@ -132,6 +165,15 @@ def _resolve_profiles(args) -> list[str]:
 def cmd_run(args) -> int:
     from . import incidents
     env = getattr(args, "env", None)
+    if getattr(args, "env_file", None):
+        key = _load_env_file(args.env_file)
+        if key is None:
+            return 2
+        if env and env != key:
+            print(f"--env {env} and --env-file (key {key}) disagree.",
+                  file=sys.stderr)
+            return 2
+        env = key
     incident = getattr(args, "incident", None)
     replay = getattr(args, "replay", None)
     if env and env not in enterprise.ENVIRONMENTS:
@@ -292,6 +334,10 @@ def _restore_signal_handlers(old: dict) -> None:
 
 def cmd_inventory(args) -> int:
     from . import inventory
+    if getattr(args, "env_file", None):
+        args.env = _load_env_file(args.env_file)
+        if args.env is None:
+            return 2
     if args.env not in enterprise.ENVIRONMENTS:
         print(f"unknown environment: {args.env}. Try 'tgt list'.",
               file=sys.stderr)
@@ -338,13 +384,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
 
     sub.add_parser("list", help="list protocols and scenarios")
-    sub.add_parser("env", help="show detected environment and interfaces")
+    pe = sub.add_parser("env", help="show detected environment and "
+                        "interfaces; 'env export' writes an env file")
+    esub = pe.add_subparsers(dest="env_cmd")
+    ee = esub.add_parser("export", help="write an environment (built-in or "
+                         "loaded) in the env-file JSON format")
+    ee.add_argument("key", help="environment key (see 'tgt list')")
+    ee.add_argument("--output", "-o", metavar="FILE",
+                    help="write here instead of stdout")
     sub.add_parser("tui", help="launch the text UI (default)")
 
     pv = sub.add_parser("inventory",
                         help="export an environment's ground-truth assets")
-    pv.add_argument("--env", "-e", required=True,
-                    help="environment to export (see 'tgt list')")
+    pvg = pv.add_mutually_exclusive_group(required=True)
+    pvg.add_argument("--env", "-e",
+                     help="environment to export (see 'tgt list')")
+    pvg.add_argument("--env-file", metavar="FILE",
+                     help="environment defined in a JSON/TOML env file")
     pv.add_argument("--format", "-f", choices=["csv", "json"], default="csv",
                     help="csv = one row per host; json adds segments + flows")
     pv.add_argument("--output", "-o", metavar="FILE",
@@ -380,6 +436,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--env", "-e",
                    help="modeled environment: it-org | ot-plant | "
                         "enterprise-mixed | industrial-site (see 'tgt list')")
+    r.add_argument("--env-file", metavar="FILE",
+                   help="modeled environment from a JSON (or, on Python "
+                        "3.11+, TOML) env file; see 'tgt env export'")
     r.add_argument("--span", choices=enterprise.SPAN_VIEWS, default="access",
                    help="--env capture point: access = each frame once on its "
                         "sender's VLAN; core = also the routed copy on the "
@@ -438,6 +497,10 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.argv = list(sys.argv[1:] if argv is None else argv)
+    if args.command not in ("iface",):
+        # env files in TGT_ENV_PATH / ~/.config/tgt/envs join the built-ins
+        from . import envfile
+        envfile.load_user_envs()
     if args.command in (None, "tui"):
         # SIGTERM/SIGHUP exit cleanly (curses restores the terminal) — and
         # at all when running as PID 1 in a container

@@ -44,6 +44,16 @@ _FROM_CLIENT = {
 }
 OBSERVABLE_FIELDS = ("vendor", "product", "model", "firmware", "serial", "os",
                      "fqdn")
+# SNMP sysDescr/sysObjectID (polled agent) and LLDP/CDP system description
+# (self-announcement) name the device's vendor, model and firmware.
+_FROM_SERVER.update({"snmp": ("vendor", "product", "model", "firmware", "os")})
+_ANNOUNCES = {
+    "lldp": ("vendor", "product", "model", "firmware", "os"),
+    "cdp": ("vendor", "product", "model", "firmware", "os"),
+}
+# A flow "to" a host that the host does not serve: a NetBIOS name
+# registration/announce is the sender's, whoever it is addressed to.
+_NOT_SERVED = {"netbios"}
 
 
 def _service(proto: str) -> str:
@@ -61,12 +71,17 @@ def hosts(env: Environment) -> List[Dict]:
     uses: Dict[str, set] = {h.name: set() for h in env.hosts}
     for client, server, proto in env.conversations:
         uses[client].add(proto)
-        # self-announcements and ARP replies are not services
-        if server != client and protocols.get(proto).transport != "l2":
+        # self-announcements, NetBIOS announces and ARP replies are not
+        # services
+        if (server != client and protocols.get(proto).transport != "l2"
+                and proto not in _NOT_SERVED):
             serves[server].add(_service(proto))
     # Falcon-covered Windows hosts beacon EDR telemetry to the CrowdStrike cloud
     for h in env.edr_hosts():
         uses[h.name].add("edr")
+    if env.arp_enabled:                 # every host ARPs each cycle
+        for h in env.hosts:
+            uses[h.name].add("arp")
     rows = []
     for h in env.hosts:
         seg = env.segment_of(h)
@@ -103,8 +118,14 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
         if server != client:
             for f in _FROM_SERVER.get(proto, ()):
                 ev[server][f].add(proto)
+        else:
+            for f in _ANNOUNCES.get(proto, ()):
+                ev[server][f].add(proto)
     for h in env.edr_hosts():
         emits(h.name, "edr")
+    if env.arp_enabled:
+        for h in env.hosts:
+            emits(h.name, "arp")
     return ev
 
 
