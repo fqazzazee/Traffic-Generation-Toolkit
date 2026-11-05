@@ -2356,6 +2356,205 @@ def test_score_recall_ignores_external_first_seen() -> None:
     check(v[dc]["value"] == row["mac_vendor"],
           "OUI-only vendor truth should be the NIC vendor")
 
+# --- remote access / file transfer / vendor engineering (protocols_eng) ----
+_ENG_KEYS = ("ftp", "tftp", "http-fw", "ssh", "rdp", "vnc", "telnet",
+             "s7plus", "fins", "slmp", "hart-ip", "srtp")
+# s7plus / slmp / srtp have no stock Wireshark dissector: the carrier layer
+_DISSECTS_AS.update({
+    "ftp": "ftp-data", "tftp": "tftp", "http-fw": "mime_multipart",
+    "ssh": "ssh", "rdp": "rdp", "vnc": "vnc", "telnet": "telnet",
+    "s7plus": "cotp", "fins": "omron", "slmp": "tcp", "hart-ip": "hart_ip",
+    "srtp": "tcp",
+})
+
+
+def _payloads(frames, from_port=None, to_port=None) -> list:
+    """Non-empty TCP/UDP payloads of untagged IPv4 frames, optionally
+    filtered by source / destination port."""
+    out = []
+    for f in frames:
+        ihl = (f[14] & 0x0F) * 4
+        sp, dp = struct.unpack("!HH", f[14 + ihl:18 + ihl])
+        if from_port is not None and sp != from_port:
+            continue
+        if to_port is not None and dp != to_port:
+            continue
+        pl = _udp_tcp_payload(f)
+        if pl:
+            out.append(pl)
+    return out
+
+
+def test_eng_protocols_registered_and_framed() -> None:
+    for key in _ENG_KEYS:
+        check(key in protocols.PROFILES, f"protocol {key} not registered")
+    check(protocols.get("tftp").transport == "udp"
+          and protocols.get("fins").transport == "udp", "tftp/fins not udp")
+    for key in ("remote-access", "firmware-update", "multi-vendor-ot"):
+        check(key in scenarios.SCENARIOS, f"scenario {key} missing")
+        for p in scenarios.get(key).profiles if key in scenarios.SCENARIOS else ():
+            check(p in protocols.PROFILES, f"{key}: unknown profile {p}")
+    for key in _ENG_KEYS:
+        frames = protocols.get(key).build(Endpoints(), 5)
+        check(bool(frames), f"{key}: no frames")
+        for f in frames:
+            verify_ip_l4(f, key)
+            check(len(f) <= 1514, f"{key}: {len(f)}-byte frame exceeds MTU")
+
+
+def test_eng_file_transfer_and_remote_access_wire() -> None:
+    ep = Endpoints()
+    # FTP: cleartext login; each PASV port carries a data connection
+    fr = protocols.get("ftp").build(ep, 2)
+    ctl = b"".join(_payloads(fr, to_port=21) + _payloads(fr, from_port=21))
+    check(b"USER admin\r\n" in ctl and b"PASS " in ctl and b"SYST" in ctl,
+          "ftp: login/SYST missing")
+    import re
+    ports = [int(a) * 256 + int(b) for a, b in
+             re.findall(rb"227 Entering Passive Mode \(\d+,\d+,\d+,\d+,"
+                        rb"(\d+),(\d+)\)", ctl)]
+    syn_ports = {struct.unpack("!H", f[36:38])[0] for f in fr
+                 if f[47] == P.SYN}
+    check(len(ports) == 2 and set(ports) <= syn_ports,
+          "ftp: PASV ports have no data connection")
+    check(b"STOR " in ctl and b"RETR " in ctl, "ftp: RETR/STOR missing")
+    # TFTP: RRQ to 69, answered from a new TID, ends in a short block
+    fr = protocols.get("tftp").build(ep, 2)
+    rrq = _payloads(fr, to_port=69)
+    check(rrq and rrq[0][:2] == b"\x00\x01" and b"octet" in rrq[0]
+          and _payloads(fr, to_port=69)[1][:2] == b"\x00\x02",
+          "tftp: RRQ/WRQ missing")
+    data = [p for p in _payloads(fr) if p[:2] == b"\x00\x03"]
+    check(data and len(data[0]) == 516 and any(len(d) < 516 for d in data),
+          "tftp: DATA blocks not 512 bytes + short final block")
+    check(not _payloads(fr, from_port=69), "tftp: server answered from 69")
+    # HTTP firmware upload with Basic auth
+    req = b"".join(_payloads(protocols.get("http-fw").build(ep, 2), to_port=80))
+    check(b"POST /cgi-bin/firmware_upgrade.cgi" in req and b"PUT " in req
+          and b"Authorization: Basic " in req and b"FWUP" in req,
+          "http-fw: upload request incomplete")
+    # SSH: per-side KEXINIT, server implementation follows the meta
+    for meta, banner in (({}, b"OpenSSH_8.9p1"),
+                         ({"vendor": "Cisco Systems"}, b"Cisco-1.25"),
+                         ({"vendor": "Moxa"}, b"dropbear_"),
+                         ({"server": "Microsoft-IIS/10.0"},
+                          b"OpenSSH_for_Windows")):
+        fr = protocols.get("ssh").build(Endpoints(meta=meta), 2)
+        srv = b"".join(_payloads(fr, from_port=22))
+        cli = b"".join(_payloads(fr, to_port=22))
+        check(srv.startswith(b"SSH-2.0-") and banner in srv.split(b"\r\n")[0],
+              f"ssh {meta}: server banner not {banner!r}")
+        check(b"\x14" in srv and b"\x14" in cli and
+              srv[srv.index(b"\r\n") + 7:][:1] == b"\x14",
+              f"ssh {meta}: KEXINIT missing")
+    # RDP: CR with cookie + NEG_REQ(SSL|HYBRID), CC selecting HYBRID, TLS
+    fr = protocols.get("rdp").build(Endpoints(meta={"host": "HMI01"}), 2)
+    cr = _payloads(fr, to_port=3389)[0]
+    cc = _payloads(fr, from_port=3389)[0]
+    check(cr[5] == 0xE0 and b"Cookie: mstshash=" in cr and
+          cr[-8:] == struct.pack("<BBHI", 1, 0, 8, 3), "rdp: X.224 CR wrong")
+    check(cc[5] == 0xD0 and cc[-8] == 0x02 and
+          struct.unpack("<I", cc[-4:])[0] == 2, "rdp: NEG_RSP not HYBRID")
+    srv = b"".join(_payloads(fr, from_port=3389)[1:])
+    check(srv[:1] == b"\x16" and b"HMI01" in srv, "rdp: no TLS cert flight")
+    # VNC: RFB 3.8 both ways, ServerInit desktop name
+    fr = protocols.get("vnc").build(Endpoints(meta={"host": "HMI-7"}), 2)
+    s_pl, c_pl = _payloads(fr, from_port=5900), _payloads(fr, to_port=5900)
+    check(s_pl[0] == c_pl[0] == b"RFB 003.008\n", "vnc: version exchange")
+    check(any(p.endswith(b"\x00\x00\x00\x05HMI-7") for p in s_pl),
+          "vnc: ServerInit desktop name missing")
+    # Telnet: IAC negotiation, cleartext login
+    fr = protocols.get("telnet").build(ep, 2)
+    s_pl, c_pl = _payloads(fr, from_port=23), _payloads(fr, to_port=23)
+    check(s_pl[0][:2] == b"\xff\xfd" and c_pl[0][:2] == b"\xff\xfb",
+          "telnet: DO/WILL negotiation missing")
+    check(b"login: " in b"".join(s_pl) and b"admin\r\n" in c_pl,
+          "telnet: login exchange missing")
+
+
+def test_eng_vendor_protocols_wire() -> None:
+    from tgt import devices
+    # S7CommPlus: 0x72 header length matches, trailer follows
+    fr = protocols.get("s7plus").build(Endpoints(), 3)
+    pdus = [p for p in _payloads(fr) if p[4] == 0x02 and p[7] == 0x72]
+    check(len(pdus) >= 6, "s7plus: too few 0x72 PDUs")
+    for p in pdus:
+        ver, ln = p[8], struct.unpack("!H", p[9:11])[0]
+        check(p[11 + ln:] == bytes([0x72, ver, 0, 0]) and
+              struct.unpack("!H", p[2:4])[0] == len(p),
+              "s7plus: PDU length / trailer mismatch")
+    check(b"6ES7 516-3AN01-0AB0" in b"".join(pdus),
+          "s7plus: CreateObject response lacks the order number")
+    # catalog identity flows into FINS / SLMP / HART-IP
+    for mid, key, needle in (("omron-nj501-1500", "fins", b"NJ501-1500"),
+                             ("mitsubishi-r04cpu", "slmp", b"R04CPU"),
+                             ("mitsubishi-q03udvcpu", "slmp",
+                              b"Q03UDVCPU       \x66\x03")):
+        m = devices.get(mid)
+        meta = devices.identity_meta(m, m.firmware[0], "1234567890")
+        wire = b"".join(_payloads(protocols.get(key).build(
+            Endpoints(meta=meta), 2)))
+        check(needle in wire, f"{key}: {mid} identity not on the wire")
+    m = devices.get("emerson-1410s-gateway")
+    meta = devices.identity_meta(m, m.firmware[0], "7654321")
+    check(meta.get("hart_manufacturer_id") == 0x26
+          and meta.get("hart_device_id") == 7654321 % (1 << 24),
+          "hart: identity_meta keys missing")
+    # FINS: response ICF / swapped nodes / same SID
+    fr = protocols.get("fins").build(Endpoints(), 4)
+    pl = _payloads(fr)
+    for req, rsp in zip(pl[::2], pl[1::2]):
+        check(req[0] == 0x80 and rsp[0] == 0xC0 and req[9] == rsp[9] and
+              req[4] == rsp[7] and req[7] == rsp[4] and req[10:12] == rsp[10:12]
+              and rsp[12:14] == b"\x00\x00", "fins: request/response mismatch")
+    # SLMP 3E: subheaders and request-data length
+    for p in _payloads(protocols.get("slmp").build(Endpoints(), 6)):
+        check(p[:2] in (b"\x50\x00", b"\xd0\x00") and
+              struct.unpack("<H", p[7:9])[0] == len(p) - 9,
+              "slmp: 3E header length wrong")
+    # HART-IP: message length, HART checksum (XOR of the PDU is 0)
+    for p in _payloads(protocols.get("hart-ip").build(Endpoints(), 6)):
+        check(p[0] == 1 and struct.unpack("!H", p[6:8])[0] == len(p),
+              "hart-ip: header length wrong")
+        if p[2] == 3:
+            x = 0
+            for b in p[8:]:
+                x ^= b
+            check(x == 0, "hart-ip: HART PDU checksum wrong")
+    # SRTP: 56-byte header, sequence at 2 and 30, text length at 4
+    pl = _payloads(protocols.get("srtp").build(Endpoints(), 4))
+    check(pl[0] == bytes(56) and pl[1][0] == 0x01, "srtp: init exchange")
+    for p in pl[2:]:
+        check(len(p) == 56 + struct.unpack("<H", p[4:6])[0] and p[2] == p[30]
+              and p[31] in (0xC0, 0x94, 0xD4), "srtp: header fields wrong")
+
+
+def test_tshark_eng_protocols_clean() -> None:
+    """Optional: no per-packet Warn/Error expert info on the new builders
+    (some dissectors, e.g. omron, do not report through ``-z expert``)."""
+    import shutil
+    import subprocess
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_eng_protocols_clean")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/eng.pcap"
+        with PcapWriter(path) as w:
+            for key in _ENG_KEYS:
+                for f in protocols.get(key).build(Endpoints(), 6):
+                    w.write(f)
+            for meta in ({"vendor": "Cisco Systems"}, {"vendor": "Moxa"},
+                         {"ssh_client": "linux"}):
+                for f in protocols.get("ssh").build(Endpoints(meta=meta), 2):
+                    w.write(f)
+        out = subprocess.run(
+            ["tshark", "-r", path, "-2", "-Y",
+             "_ws.expert.severity >= 6291456", "-T", "fields",
+             "-e", "_ws.expert.message"],
+            capture_output=True, text=True).stdout.split()
+    check(not out, "eng protocols: tshark expert warnings: " +
+          " ".join(out[:8]))
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

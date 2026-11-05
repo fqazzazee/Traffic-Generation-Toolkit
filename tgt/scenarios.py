@@ -62,6 +62,24 @@ SCENARIOS = {
         ["mqtt", "sparkplug", "opcua"],
         "MQTT telemetry and Sparkplug B edge-node birth/data/death alongside "
         "OPC UA — IIoT and cloud-edge visibility."),
+    "remote-access": Scenario(
+        "remote-access", "Remote Access",
+        ["ssh", "rdp", "vnc", "telnet"],
+        "Administrative remote sessions: SSH (per-side KEXINIT / HASSH), RDP "
+        "with NLA over TLS, VNC to an HMI and a cleartext Telnet login — to "
+        "exercise remote-access inventory and insecure-protocol findings."),
+    "firmware-update": Scenario(
+        "firmware-update", "Firmware Update",
+        ["ftp", "tftp", "http-fw"],
+        "Device maintenance: FTP config backup + firmware upload (cleartext "
+        "login), TFTP image fetch / config backup and an HTTP firmware "
+        "upload — the file-transfer events a monitor should flag."),
+    "multi-vendor-ot": Scenario(
+        "multi-vendor-ot", "Multi-Vendor OT",
+        ["s7plus", "fins", "slmp", "hart-ip", "srtp", "enip", "modbus"],
+        "Engineering / HMI traffic across vendors: Siemens S7CommPlus, Omron "
+        "FINS, Mitsubishi SLMP, HART-IP, GE SRTP, EtherNet/IP and Modbus — "
+        "vendor coverage for protocol classification and asset identity."),
 }
 
 
