@@ -858,6 +858,12 @@ class Environment:
             same = self.segment_or_none(server) is seg
             return {"bcast": str(ipaddress.ip_network(seg.subnet)
                                  .broadcast_address) if same else ""}
+        if proto == "netbios":
+            # B-node broadcasts to the announcer's own subnet; the host
+            # announcement states its OS version
+            seg = self.segment_of(client)
+            return {"bcast": str(ipaddress.ip_network(seg.subnet)
+                                 .broadcast_address), "nb_os": client.os}
         if proto == "dhcp":
             seg = self.segment_of(client)
             meta = {"dhcp_router": seg.gateway, "dhcp_domain": DNS_DOMAIN,

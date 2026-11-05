@@ -5471,6 +5471,98 @@ def test_plugins_example_registers_everything() -> None:
     check("acme-plant" not in out, "plugins: TGT_NO_PLUGINS ignored")
 
 
+# ---------------------------------------------------------------------------
+# W4-C correctness polish
+# ---------------------------------------------------------------------------
+def _w4c_envs() -> list:
+    """The four built-in environments plus every packaged site, the sites
+    loaded straight from their files."""
+    from tgt import enterprise, envfile
+    out = [enterprise.get(k) for k in ("it-org", "ot-plant",
+                                       "enterprise-mixed", "industrial-site")]
+    for f in sorted(os.listdir(envfile.SITES_DIR)):
+        if f.endswith(".json"):
+            out.append(envfile.load(os.path.join(envfile.SITES_DIR, f)))
+    return out
+
+
+def test_w4c_netbios_broadcast_announcements() -> None:
+    """NetBIOS: B-node broadcasts (ff:ff:ff:ff:ff:ff, the sender's subnet
+    broadcast, its own VLAN) — a name registration on 137 and a Browser host
+    announcement on 138 with the host name and OS version; nobody answers
+    and no host 'serves' netbios in the inventory."""
+    import ipaddress
+    from tgt import enterprise, inventory
+    for env in _w4c_envs():
+        protocols.begin_build(3, 0)
+        nb = [f for k, f in env.build(1) if k == "netbios"]
+        talkers = {c for c, _, p in env.conversations if p == "netbios"
+                   and not env.hidden(env.host(c))}
+        check(bool(nb) == bool(talkers), f"{env.key}: netbios frames")
+        by_ip = {h.ip: h for h in env.hosts}
+        seen = set()
+        for f in nb:
+            src, dst = P.frame_ips(f)
+            h = by_ip.get(src)
+            seg = env.segment_of(h) if h else None
+            vlan = struct.unpack("!H", f[14:16])[0] & 0xFFF \
+                if f[12:14] == b"\x81\x00" else None
+            ok = (h is not None and f[0:6] == b"\xff" * 6 and
+                  dst == str(ipaddress.ip_network(seg.subnet)
+                             .broadcast_address) and vlan == seg.vlan)
+            if not ok:
+                check(False, f"{env.key}: netbios frame {src}->{dst} "
+                             f"vlan {vlan} not a subnet broadcast")
+                break
+            seen.add(h.name)
+        check(seen == talkers, f"{env.key}: announcers {sorted(seen)} "
+                               f"!= {sorted(talkers)}")
+        rows = inventory.hosts(env)
+        bad = [r["name"] for r in rows
+               if any(s.startswith("netbios") for s in r["serves"])]
+        check(not bad, f"{env.key}: hosts 'serve' netbios: {bad}")
+    # the host announcement: name, OS version, mailslot; HMI-XP is XP (5.1)
+    env = enterprise.get("ot-plant")
+    protocols.begin_build(3, 0)
+    nb = [f for k, f in env.build(1) if k == "netbios"]
+    ann = [f for f in nb if b"\\MAILSLOT\\BROWSE\x00" in f]
+    reg = [f for f in nb if f not in ann]
+    check(ann and reg, "netbios: registration + host announcement")
+    for f in ann:
+        i = f.index(b"\\MAILSLOT\\BROWSE\x00") + 17
+        name, major, minor = f[i + 6:i + 22], f[i + 22], f[i + 23]
+        check(f[i] == 0x01 and name.rstrip(b"\x00") == b"HMI-XP" and
+              (major, minor) == (5, 1), f"host announcement {f[i:i + 30]!r}")
+        check(struct.unpack("!HH", f[38:42]) == (138, 138),
+              "host announcement ports")
+    # a netbios flow "to" a host: that host sends nothing for it
+    ev = inventory._evidence(enterprise.Environment(
+        "t", "t", "OT", "", env.hosts, [("HMI-XP", "PLC-RW1", "netbios")],
+        env.segments, options={"arp": False}))
+    check(not ev["PLC-RW1"]["vendor"] and ev["HMI-XP"]["os"] >=
+          {"netbios"}, "netbios evidence")
+    # profile-only run: /24 broadcast of the client
+    fr = protocols.get("netbios").build(Endpoints(client_ip="10.1.2.3"), 2)
+    check(all(P.frame_ips(f) == ("10.1.2.3", "10.1.2.255") for f in fr),
+          "netbios: profile-only broadcast address")
+    if shutil_which("tshark"):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "nb.pcap")
+            with PcapWriter(path) as w:
+                for f in nb:
+                    w.write(f)
+            out = subprocess.run(
+                ["tshark", "-r", path, "-T", "fields", "-e",
+                 "browser.command", "-e", "browser.os_major", "-e",
+                 "browser.os_minor", "-e", "nbns.flags.opcode"],
+                capture_output=True, text=True).stdout.split("\n")
+            check(any(ln.startswith("0x01\t5\t1") for ln in out),
+                  f"tshark: host announcement not decoded: {out[:3]}")
+            check(any(ln.strip() == "5" for ln in out),
+                  f"tshark: NBNS registration not decoded: {out[:3]}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
