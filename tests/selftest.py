@@ -6523,6 +6523,29 @@ def test_review_sender_reopens_deleted_iface() -> None:
     check(s.socks["b"] is not None, "sender: link-down socket dropped")
 
 
+def test_review_injection_worker_ends_with_run() -> None:
+    """RunControl.close waits for a pass still building on the injection
+    worker: one left running would restore its saved build context over a
+    context set after the run ended (the CI-only 'isolated_build leaked
+    context' flake)."""
+    import time
+    from tgt.control import RunControl
+    rc = RunControl()
+
+    def slow(inj, n):
+        with protocols.isolated_build(1, 1):
+            time.sleep(0.3)
+        return []
+    rc._build = slow
+    rc._submit(None, 1)
+    time.sleep(0.05)                    # the worker now holds the context
+    rc.close()
+    ctx = protocols.begin_build(9, 4)
+    time.sleep(0.4)
+    check(protocols.build_context() is ctx,
+          "injection worker outlived close() and clobbered the context")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

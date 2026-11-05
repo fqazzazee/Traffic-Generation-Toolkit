@@ -209,8 +209,12 @@ class RunControl:
                     yield idx, extra
 
     def close(self) -> None:
+        """End the injection worker with the run: queued passes are dropped
+        and one in flight finishes, so no build outlives the engine (it would
+        restore a stale build context over a later caller's)."""
         if self._pool is not None:
-            self._pool.shutdown(wait=False)
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
 
     def _submit(self, inj: Injection, n: int):
         """Build pass ``n`` of ``inj`` on the injection worker, so the send
