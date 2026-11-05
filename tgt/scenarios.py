@@ -50,6 +50,18 @@ SCENARIOS = {
         "Siemens PROFINET cell: DCP Identify discovery, a DCP Set (IP / "
         "NameOfStation change), cyclic RT IO data and S7 engineering "
         "access. DCP/RT are raw Layer 2."),
+    "infra": Scenario(
+        "infra", "Network Infrastructure",
+        ["snmp", "snmpv3", "lldp", "cdp", "syslog", "mdns", "ssdp", "llmnr",
+         "nbns"],
+        "Management and discovery chatter — SNMP polling/traps, LLDP/CDP "
+        "neighbour adverts, syslog and mDNS/SSDP/LLMNR/NBNS name queries — "
+        "to drive asset enrichment (sysDescr, model, firmware, host names)."),
+    "iiot": Scenario(
+        "iiot", "IIoT / Edge Messaging",
+        ["mqtt", "sparkplug", "opcua"],
+        "MQTT telemetry and Sparkplug B edge-node birth/data/death alongside "
+        "OPC UA — IIoT and cloud-edge visibility."),
 }
 
 

@@ -1047,6 +1047,207 @@ def test_tshark_dns_responses_matched() -> None:
         check(total > 0 and count("dns.response_to") == total,
               "tshark: DNS responses not matched to their queries")
 
+# --- IT / infrastructure protocols (tgt/protocols_infra.py, issue #46) ------
+_DISSECTS_AS.update({
+    "snmp": "snmp", "snmpv3": "snmp", "lldp": "lldp", "cdp": "cdp",
+    "syslog": "syslog", "mdns": "mdns", "ssdp": "ssdp", "llmnr": "llmnr",
+    "nbns": "nbns", "mqtt": "mqtt", "sparkplug": "sparkplugb",
+})
+
+
+def _udp_tcp_payload(frame: bytes) -> bytes:
+    """L4 payload of an untagged IPv4 TCP/UDP frame."""
+    ihl = (frame[14] & 0x0F) * 4
+    l4 = frame[14 + ihl:]
+    return l4[8:] if frame[23] == P.IPPROTO_UDP else l4[(l4[12] >> 4) * 4:]
+
+
+def _ber_walk(data: bytes) -> bool:
+    """True when ``data`` is a sequence of well-formed BER TLVs, recursing
+    into constructed ones (SEQUENCE, SNMP PDUs)."""
+    off = 0
+    while off < len(data):
+        if off + 2 > len(data):
+            return False
+        tag, n = data[off], data[off + 1]
+        off += 2
+        if n & 0x80:
+            k = n & 0x7F
+            n = int.from_bytes(data[off:off + k], "big")
+            off += k
+        if off + n > len(data):
+            return False
+        if tag & 0x20 and not _ber_walk(data[off:off + n]):
+            return False
+        off += n
+    return off == len(data)
+
+
+def _pb_fields(data: bytes) -> list:
+    """Minimal protobuf decoder: [(field, wiretype, value)], raising on any
+    truncation so a malformed hand-encoding fails the test."""
+    def varint(i):
+        v = s = 0
+        while True:
+            b = data[i]
+            v |= (b & 0x7F) << s
+            i, s = i + 1, s + 7
+            if not b & 0x80:
+                return v, i
+    out, i = [], 0
+    while i < len(data):
+        key, i = varint(i)
+        f, wt = key >> 3, key & 7
+        if wt == 0:
+            v, i = varint(i)
+        elif wt == 1:
+            v, i = data[i:i + 8], i + 8
+        elif wt == 5:
+            v, i = data[i:i + 4], i + 4
+        elif wt == 2:
+            n, i = varint(i)
+            v, i = data[i:i + n], i + n
+        else:
+            raise ValueError(f"wire type {wt}")
+        if i > len(data):
+            raise ValueError("truncated")
+        out.append((f, wt, v))
+    return out
+
+
+def test_infra_protocols_registered() -> None:
+    for key in ("snmp", "snmpv3", "lldp", "cdp", "syslog", "mdns", "ssdp",
+                "llmnr", "nbns", "mqtt", "sparkplug"):
+        check(key in protocols.PROFILES, f"protocol {key} not registered")
+    check(protocols.get("lldp").transport == "l2"
+          and protocols.get("cdp").transport == "l2", "LLDP/CDP must be l2")
+    check("infra" in scenarios.SCENARIOS and "iiot" in scenarios.SCENARIOS,
+          "infra / iiot scenarios missing")
+
+
+def test_snmp_ber_and_meta_identity() -> None:
+    ep = Endpoints(meta={"snmp_community": "s3cret", "host": "ups01",
+                         "snmp_sysdescr": "APC Web/SNMP Management Card",
+                         "snmp_sysobjectid": "1.3.6.1.4.1.318.1.3.27"})
+    frames = protocols.get("snmp").build(ep, 3)
+    blobs = [_udp_tcp_payload(f) for f in frames]
+    for b in blobs + [_udp_tcp_payload(f) for f in
+                      protocols.get("snmpv3").build(Endpoints(), 3)]:
+        check(_ber_walk(b), "snmp: malformed BER message")
+    check(all(b"s3cret" in b for b in blobs), "snmp: community not on wire")
+    rsp = blobs[1]
+    check(b"APC Web/SNMP Management Card" in rsp and b"ups01" in rsp,
+          "snmp: sysDescr/sysName not taken from meta")
+    # 1.3.6.1.4.1.318.1.3.27 -> 2b 06 01 04 01 82 3e 01 03 1b
+    check(b"\x06\x0a\x2b\x06\x01\x04\x01\x82\x3e\x01\x03\x1b" in rsp,
+          "snmp: sysObjectID OID encoding wrong")
+    dports = [struct.unpack("!H", f[36:38])[0] for f in frames]
+    check(dports.count(162) == 2, "snmp: expected v1 trap + inform to 162")
+
+
+def test_lldp_cdp_frames() -> None:
+    ep = Endpoints(vlan=30, meta={"host": "sw12"})
+    lldp = protocols.get("lldp").build(ep, 1)[0]
+    check(lldp[:6] == b"\x01\x80\xc2\x00\x00\x0e" and lldp[12:14] == b"\x88\xcc",
+          "lldp: wrong dst MAC / EtherType (or tagged)")
+    off, types = 14, []
+    while off < len(lldp):
+        hdr = struct.unpack("!H", lldp[off:off + 2])[0]
+        types.append(hdr >> 9)
+        off += 2 + (hdr & 0x1FF)
+    check(off == len(lldp) and types[:3] == [1, 2, 3] and types[-1] == 0,
+          f"lldp: bad TLV chain {types}")
+    # CDP checksum with Cisco's odd-length quirk (vector validated by tshark)
+    cdp = protocols.get("cdp").build(
+        Endpoints(server_ip="10.10.10.200", meta={"host": "sw12"}), 1)[0]
+    check(cdp[:6] == b"\x01\x00\x0c\xcc\xcc\xcc"
+          and struct.unpack("!H", cdp[12:14])[0] == len(cdp) - 14
+          and cdp[14:22] == b"\xaa\xaa\x03\x00\x00\x0c\x20\x00",
+          "cdp: wrong 802.3/SNAP framing")
+    check((len(cdp) - 22) % 2 == 1 and cdp[24:26] == b"\xac\xd8",
+          "cdp: odd-length checksum quirk regressed")
+
+
+def test_discovery_multicast_addressing() -> None:
+    def mc_mac(ip: bytes) -> bytes:
+        return b"\x01\x00\x5e" + bytes([ip[1] & 0x7F]) + ip[2:]
+    for key, group, ttl in (("mdns", "224.0.0.251", 255),
+                            ("ssdp", "239.255.255.250", 2),
+                            ("llmnr", "224.0.0.252", 1)):
+        g = P.ip_to_bytes(group)
+        mc = [f for f in protocols.get(key).build(Endpoints(), 2)
+              if f[30:34] == g]
+        check(len(mc) >= 2, f"{key}: no frames to {group}")
+        for f in mc:
+            check(f[:6] == mc_mac(g) and f[22] == ttl,
+                  f"{key}: multicast MAC/TTL wrong")
+    ssdp = b"".join(_udp_tcp_payload(f)
+                    for f in protocols.get("ssdp").build(
+                        Endpoints(meta={"ssdp_server": "X/1 UPnP/1.0 Y/2"}), 1))
+    check(b"M-SEARCH" in ssdp and b"ssdp:alive" in ssdp
+          and ssdp.count(b"SERVER: X/1 UPnP/1.0 Y/2") == 2,
+          "ssdp: M-SEARCH/NOTIFY/SERVER banner missing")
+    nb = protocols.get("nbns").build(Endpoints(), 2)
+    check(nb[0][:6] == b"\xff" * 6 and nb[0][30:34] == b"\x0a\x0a\x0a\xff",
+          "nbns: name query not broadcast")
+    check(P.mac_to_bytes(Endpoints().server_mac) in nb[3],
+          "nbns: NBSTAT response lacks the MAC (unit ID)")
+
+
+def test_syslog_formats() -> None:
+    lines = [_udp_tcp_payload(f).decode() for f in
+             protocols.get("syslog").build(Endpoints(meta={"nbname": "rtac1"}), 4)]
+    check(lines[0].startswith("<") and " rtac1 " in lines[0]
+          and not lines[0].split(">", 1)[1].startswith("1 "),
+          "syslog: first message is not RFC 3164")
+    check(lines[1].split(">", 1)[1].startswith("1 2025-")
+          and "[meta sequenceId=" in lines[1], "syslog: second not RFC 5424")
+
+
+def test_mqtt_and_sparkplug_encoding() -> None:
+    from tgt import protocols_infra as I
+    check(I._mqtt(0x30, bytes(200))[:3] == b"\x30\xc8\x01",
+          "mqtt: remaining-length varint wrong")
+    pay = [_udp_tcp_payload(f) for f in protocols.get("mqtt").build(
+        Endpoints(meta={"mqtt_client_id": "gw7", "mqtt_user": "u"}), 4)]
+    pay = [p for p in pay if p]
+    check(pay[0][0] == 0x10 and b"gw7" in pay[0] and pay[0][9] & 0x80,
+          "mqtt: CONNECT client id / username flag")
+    types = [p[0] >> 4 for p in pay]
+    for t in (1, 2, 3, 4, 8, 9, 12, 13, 14):
+        check(t in types, f"mqtt: control packet type {t} missing")
+    check(any(p[0] == 0x32 for p in pay), "mqtt: no QoS 1 PUBLISH")
+
+    pubs = []
+    for f in protocols.get("sparkplug").build(Endpoints(), 3):
+        p = _udp_tcp_payload(f)
+        if p and p[0] >> 4 == 3:
+            n, i, s = 0, 1, 0
+            while True:                        # remaining length varint
+                n |= (p[i] & 0x7F) << s
+                i, s = i + 1, s + 7
+                if not p[i - 1] & 0x80:
+                    break
+            tl = struct.unpack("!H", p[i:i + 2])[0]
+            topic = p[i + 2:i + 2 + tl].decode()
+            body = p[i + 2 + tl + (2 if p[0] & 0x06 else 0):]
+            pubs.append((topic, body))
+    kinds = [t.split("/")[2] for t, _ in pubs]
+    check(kinds == ["NBIRTH", "NDATA", "NDATA", "NDATA", "NDEATH"]
+          and all(t.startswith("spBv1.0/Plant1/") for t, _ in pubs),
+          f"sparkplug: topic sequence {kinds}")
+    try:
+        seqs = []
+        for topic, body in pubs:
+            fields = _pb_fields(body)
+            for f, wt, v in fields:
+                if f == 2:
+                    _pb_fields(v)              # each Metric decodes cleanly
+            seqs += [v for f, _, v in fields if f == 3]
+        check(seqs == [0, 1, 2, 3], f"sparkplug: seq numbers {seqs}")
+    except (ValueError, IndexError) as e:
+        check(False, f"sparkplug: protobuf payload malformed ({e})")
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
