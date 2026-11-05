@@ -53,9 +53,11 @@ OPERATIONS: Dict[str, str] = {
     "dnp3-time": "SCADA master time synchronisation (Delay Measure + "
                  "g50v1 write)",
     "iec104-time": "SCADA master clock synchronisation (C_CS_NA_1)",
+    "sel-telnet": "relay settings session: SEL ACC/2AC login, ID, SHO and "
+                  "a SET change from the engineering laptop",
 }
 # ... of which the engineering-workstation ones (the rest are operator / SCADA)
-ENGINEERING = frozenset({"s7-eng", "enip-eng"})
+ENGINEERING = frozenset({"s7-eng", "enip-eng", "sel-telnet"})
 
 
 def _bcast_or_unicast(ep: Endpoints, sport: int, dport: int, payload: bytes,

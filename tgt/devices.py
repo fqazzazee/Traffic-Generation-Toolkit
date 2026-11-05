@@ -679,4 +679,201 @@ def identity_meta(model: Optional[DeviceModel], firmware: str,
         digits = "".join(c for c in serial if c.isdigit())
         if digits:
             meta["hart_device_id"] = int(digits) % (1 << 24)
+    # IEC 61850 MMS Identify (vendorName / modelName / revision) and the SEL
+    # ASCII ID command (tgt/protocols_util.py)
+    mms = model.identity.get("mms")
+    if mms:
+        meta["vendor"] = mms.get("vendor", model.vendor)
+        meta["model"] = mms.get("model", model.product)
+        if firmware:
+            meta["revision"] = firmware
+    sel = model.identity.get("sel")
+    if sel:
+        meta["sel_model"] = sel.get("model", model.product)
+        meta["sel_firmware"] = firmware
+        meta["sel_serial"] = serial
+    desktop = banner(model, "vnc_desktop", host_name, firmware, serial)
+    if desktop:                         # a panel HMI's VNC desktop name
+        meta["vnc_desktop"] = desktop
     return meta
+
+
+# ---------------------------------------------------------------------------
+# Utility & energy sites (tgt/envs/sites: water-utility, electric-substation,
+# oil-gas-pipeline): RTUs, protection IEDs, merging units, clocks, flow
+# computers, analyzers, drives, panel HMIs, cellular / VSAT routers and a
+# VPN firewall. OUIs are as Wireshark's manuf lists them; the IEC 61850 MMS
+# vendor/model strings are what the IEDs report to Identify; firmware lists,
+# serial formats, product codes and sysObjectIDs (under each vendor's
+# enterprise arc) are representative.
+# ---------------------------------------------------------------------------
+_UTIL_SCHNEIDER = ("00:00:54", "00:80:f4")
+_UTIL_SIEMENS_GRID = ("b4:b1:5a", "00:0e:8c")    # Siemens Energy Management
+_UTIL_SIERRA = ("00:a0:d5", "28:a3:31")
+_UTIL_DIGI = ("00:40:9d",)
+_UTIL_ABB_MV = ("00:21:c1",)                     # ABB Oy Medium Voltage
+_UTIL_GE_GRID = ("c4:b5:12",)                    # GE Digital Energy
+_UTIL_OUTSTATION = {"role": "outstation"}
+
+
+def _util(model_id, vendor, product, dtype, ouis, level, os_family, fw,
+          serial, identity=None, banners=None, stack="embedded", aliases=(),
+          cves=()):
+    _add(DeviceModel(model_id, vendor, product, dtype, ouis, level, os_family,
+                     fw, serial, identity=identity or {},
+                     banners=dict({"http": ""}, **(banners or {})),
+                     known_cves=cves, aliases=aliases, stack=stack))
+
+
+def _modbus_id(vendor, code, name, url=""):
+    return {"vendor": vendor, "vendor_url": url, "product_code": code,
+            "product_name": name}
+
+
+# -- water / wastewater: RTUs, drives, analyzers, panel HMIs ----------------
+_util("schneider-scadapack-474", "Schneider Electric",
+      "SCADAPack 474 smart RTU", "rtu", _UTIL_SCHNEIDER, "1",
+      "SCADAPack x70 firmware", ("9.1.1", "9.2.0", "9.4.0"), "D#######",
+      {"modbus": _modbus_id("Schneider Electric", "TBUP474",
+                            "SCADAPack 474", "www.se.com"),
+       "dnp3": dict(_UTIL_OUTSTATION, product_name="SCADAPack 474")},
+      aliases=("SCADAPack 474",))
+_util("schneider-scadapack-334e", "Schneider Electric",
+      "SCADAPack 334E RTU (end of life)", "rtu", _UTIL_SCHNEIDER, "1",
+      "SCADAPack 300 firmware", ("2.36", "2.43"), "A#######",
+      {"modbus": _modbus_id("Schneider Electric", "SP334E",
+                            "SCADAPack 334E", "www.se.com"),
+       "dnp3": dict(_UTIL_OUTSTATION, product_name="SCADAPack 334E")},
+      aliases=("SCADAPack 334E",))
+_util("danfoss-fc202", "Danfoss", "VLT AQUA Drive FC 202 (MCA 122 Modbus "
+      "TCP)", "drive", ("00:1b:08",), "0", "VLT drive firmware",
+      ("4.48", "5.11", "5.33"), "######G###",
+      {"modbus": _modbus_id("Danfoss", "FC-202P", "VLT AQUA Drive FC 202",
+                            "www.danfoss.com")},
+      aliases=("VLT AQUA Drive FC 202",))
+_util("hach-sc4500", "Hach", "SC4500 controller (chlorine / turbidity "
+      "analyzers)", "analyzer", ("00:0e:1c",), "1", "Hach SC firmware",
+      ("1.30", "1.50", "2.00"), "##########",
+      {"modbus": _modbus_id("Hach", "LXV525", "SC4500", "www.hach.com")},
+      aliases=("SC4500",))
+_util("weintek-cmt3072xh", "Weintek", "cMT3072XH HMI panel", "hmi-panel",
+      ("00:0c:26",), "2", "Weintek cMT OS (Linux)",
+      ("20210913", "20230118", "20240325"), "#########",
+      banners={"vnc_desktop": "cMT3072XH {name}"}, stack="linux",
+      aliases=("cMT3072XH",))
+
+# -- cellular / VSAT routers and the VPN firewall ---------------------------
+_util("sierra-airlink-rv50x", "Sierra Wireless", "AirLink RV50X LTE gateway",
+      "router", _UTIL_SIERRA, "2", "ALEOS (Linux)",
+      ("4.13.0.017", "4.14.0.004", "4.16.0.012"), "LA##########",
+      banners={"snmp_sysdescr": "Sierra Wireless AirLink RV50X, ALEOS "
+                                "{firmware}",
+               "snmp_sysobjectid": "1.3.6.1.4.1.20542.9.1"},
+      stack="linux", aliases=("AirLink RV50X",))
+_util("digi-ix20", "Digi International", "Digi IX20 LTE router", "router",
+      _UTIL_DIGI, "2", "Digi Accelerated Linux",
+      ("22.11.48.62", "23.6.1.105", "24.3.28.88"), "IX20-######",
+      banners={"snmp_sysdescr": "Digi IX20 {firmware}",
+               "snmp_sysobjectid": "1.3.6.1.4.1.332.11.6"},
+      stack="linux", aliases=("Digi IX20",))
+_util("moxa-oncell-g3150a", "Moxa", "OnCell G3150A-LTE cellular gateway",
+      "router", ("00:90:e8",), "2", "Moxa OnCell firmware (Linux)",
+      ("V1.4", "V1.7", "V2.1"), "TAJCB#######",
+      banners={"snmp_sysdescr": "OnCell G3150A-LTE-US {firmware}",
+               "snmp_sysobjectid": "1.3.6.1.4.1.8691.15.35"},
+      stack="linux", aliases=("OnCell G3150A-LTE",))
+_util("hughes-ht2000w", "Hughes Network Systems", "HT2000W VSAT terminal",
+      "router", ("00:80:ae",), "2", "Hughes HT firmware (Linux)",
+      ("6.9.0.43", "6.10.0.24", "7.1.0.12"), "HT2K##########",
+      banners={"snmp_sysdescr": "Hughes HT2000W Satellite Router {firmware}",
+               "snmp_sysobjectid": "1.3.6.1.4.1.20048.1.2"},
+      stack="linux", aliases=("HT2000W",))
+_util("fortinet-fortigate-100f", "Fortinet", "FortiGate 100F firewall / SSL "
+      "VPN", "firewall", ("00:09:0f",), "3.5", "FortiOS",
+      ("v7.0.15", "v7.2.8", "v7.4.4"), "FG100FTK########",
+      banners={"snmp_sysdescr": "FortiGate-100F {firmware}",
+               "snmp_sysobjectid": "1.3.6.1.4.1.12356.101.1.1004"},
+      stack="linux", aliases=("FortiGate-100F",))
+
+# -- substation: protection IEDs, merging units, the station clock ----------
+_util("sel-451", "Schweitzer Engineering Laboratories",
+      "SEL-451 protection, automation and bay control", "relay", _SEL, "1",
+      "SEL firmware", ("R320-V1", "R322-V0", "R323-V2"), "##########",
+      {"dnp3": dict(_UTIL_OUTSTATION, product_name="SEL-451"),
+       "mms": {"vendor": "SEL", "model": "SEL-451"},
+       "sel": {"model": "SEL-451"}},
+      {"snmp_sysdescr": "{product} {firmware}"}, stack="sel",
+      aliases=("SEL-451",))
+_util("sel-401", "Schweitzer Engineering Laboratories",
+      "SEL-401 protection, automation and control merging unit",
+      "merging-unit", _SEL, "1", "SEL firmware", ("R100-V2", "R101-V0"),
+      "##########",
+      {"mms": {"vendor": "SEL", "model": "SEL-401"},
+       "sel": {"model": "SEL-401"}}, stack="sel", aliases=("SEL-401",))
+_util("sel-2488", "Schweitzer Engineering Laboratories",
+      "SEL-2488 satellite-synchronized network clock (PTP grandmaster)",
+      "clock", _SEL, "2", "SEL firmware", ("R105-V1", "R107-V0", "R108-V2"),
+      "##########",
+      {"sel": {"model": "SEL-2488"}},
+      {"snmp_sysdescr": "SEL-2488 Satellite-Synchronized Network Clock "
+                        "{firmware}",
+       "snmp_sysobjectid": "1.3.6.1.4.1.30290.2488"},
+      stack="sel", aliases=("SEL-2488",))
+_util("abb-ref615", "ABB", "Relion REF615 feeder protection and control",
+      "relay", _UTIL_ABB_MV, "1", "Relion 615 series firmware",
+      ("5.0.3", "5.0.6", "5.1.2"), "1VHR9#######",
+      {"mms": {"vendor": "ABB", "model": "REF615"}}, aliases=("REF615",))
+_util("ge-multilin-850", "GE Grid Solutions", "Multilin 850 feeder "
+      "protection system", "relay", _UTIL_GE_GRID, "1", "Multilin 8 Series "
+      "firmware", ("3.70", "4.10", "4.30"), "ML??#####",
+      {"mms": {"vendor": "GE Multilin", "model": "850"}},
+      aliases=("Multilin 850",))
+_util("siemens-siprotec5-7sj85", "Siemens", "SIPROTEC 5 7SJ85 overcurrent "
+      "protection", "relay", _UTIL_SIEMENS_GRID, "1", "SIPROTEC 5 firmware",
+      ("V08.30", "V09.40", "V09.50"), "BF#########",
+      {"mms": {"vendor": "SIEMENS", "model": "7SJ85"}},
+      aliases=("SIPROTEC 5 7SJ85",))
+_util("siemens-siprotec5-6mu85", "Siemens", "SIPROTEC 5 6MU85 merging unit",
+      "merging-unit", _UTIL_SIEMENS_GRID, "1", "SIPROTEC 5 firmware",
+      ("V09.40", "V09.50"), "BF#########",
+      {"mms": {"vendor": "SIEMENS", "model": "6MU85"}},
+      aliases=("SIPROTEC 5 6MU85",))
+
+# -- oil & gas: flow computers ----------------------------------------------
+_util("emerson-roc800", "Emerson", "ROC800 (ROC809) remote operations "
+      "controller / flow computer", "flow-computer", ("00:80:74",), "1",
+      "ROC800 firmware", ("3.70", "3.80", "3.90"), "W##########",
+      {"modbus": _modbus_id("Emerson Process Management", "ROC809",
+                            "ROC800", "www.emerson.com")},
+      aliases=("ROC809",))
+_util("abb-totalflow-xfcg5", "ABB", "Totalflow XFCG5 6413 flow computer",
+      "flow-computer", ("00:13:86",), "1", "Totalflow G5 flash",
+      ("2105457-033", "2105457-041", "2105457-046"), "XF########",
+      {"modbus": _modbus_id("ABB Totalflow", "XFCG5-6413", "XFC G5",
+                            "www.abb.com")},
+      aliases=("XFCG5 6413",))
+
+# -- rogue / transient devices a substation monitor should notice -----------
+# (general-purpose hardware: not embedded OT assets, no EDR)
+_add(DeviceModel(
+    "omicron-cmc-356", "OMICRON electronics", "CMC 356 protection relay test "
+    "set (IEC 61850 GOOSE / SV)", "test-set", ("20:b7:c0",), "",
+    "OMICRON Test Universe embedded firmware", ("4.10", "4.20", "4.30"),
+    "JE###?", banners={"http": ""}, embedded=False, aliases=("CMC 356",)))
+_add(DeviceModel(
+    "raspberry-pi-4", "Raspberry Pi Trading", "Raspberry Pi 4 Model B",
+    "sbc", ("dc:a6:32", "e4:5f:01", "d8:3a:dd"), "", "Raspberry Pi OS (Linux)",
+    ("6.1.21-v8+", "6.6.31-v8+"), "", banners={"http": "Apache"},
+    embedded=False, stack="linux", aliases=("Raspberry Pi 4",)))
+for _m in (CATALOG["omicron-cmc-356"], CATALOG["raspberry-pi-4"]):
+    for _o in _m.ouis:                  # label the MAC prefix all the same
+        OUI_VENDORS.setdefault(_o, _m.vendor)
+
+# refresh the derived tables for the models above (idempotent)
+_ALIASES.update({a: m.model_id for m in CATALOG.values() for a in m.aliases})
+for _m in CATALOG.values():
+    if _m.embedded:
+        for _o in _m.ouis:
+            OUI_VENDORS.setdefault(_o, _m.vendor)
+EMBEDDED_OUIS = frozenset(o for m in CATALOG.values() if m.embedded
+                          for o in m.ouis)
