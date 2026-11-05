@@ -150,13 +150,15 @@ Type=simple
 EnvironmentFile=$CONF_FILE
 Environment=PYTHONPATH=$REPO_ROOT
 WorkingDirectory=$REPO_ROOT
-# Create the veth pair before generating (idempotent).
-ExecStartPre=/bin/sh -c 'ip link show "\$TGT_IFACE" >/dev/null 2>&1 || { ip link add "\$TGT_IFACE" type veth peer name "\$TGT_IFACE-mon" && ip link set "\$TGT_IFACE" up && ip link set "\$TGT_IFACE-mon" up; }'
+# Create the veth pair(s) before generating (idempotent). TGT_IFACE may list
+# several interfaces (a,b: the same frames to each).
+ExecStartPre=/bin/sh -c '. "$CONF_FILE" && for i in \$\$(echo "\$\$TGT_IFACE" | tr , " "); do ip link show "\$\$i" >/dev/null 2>&1 || { ip link add "\$\$i" type veth peer name "\$\$i-mon" && ip link set "\$\$i" up && ip link set "\$\$i-mon" up; } || exit 1; done'
 # Self-contained: cd into the repo and set PYTHONPATH inline so the tgt package
 # resolves even if the WorkingDirectory/Environment directives above are ignored.
 # The config is sourced by sh (its values are shell-quoted) and TGT_RUN_ARGS is
 # a shell-quoted argument list, expanded with eval so quoted paths survive.
-ExecStart=/bin/sh -c '. "$CONF_FILE" && cd "$REPO_ROOT" && eval "set -- \$\$TGT_RUN_ARGS" && PYTHONPATH="$REPO_ROOT" exec $PY -m tgt run --iface "\$\$TGT_IFACE" "\$\$@"'
+# TGT_CMD picks the subcommand: run (default) or campaign (a phased plan).
+ExecStart=/bin/sh -c '. "$CONF_FILE" && cd "$REPO_ROOT" && eval "set -- \$\$TGT_RUN_ARGS" && PYTHONPATH="$REPO_ROOT" exec $PY -m tgt "\$\${TGT_CMD:-run}" --iface "\$\$TGT_IFACE" "\$\$@"'
 Restart=on-failure
 RestartSec=5
 # Least privilege: only the caps raw packet I/O actually needs.
@@ -181,7 +183,7 @@ daemon_start() {
     preflight_check
     # shellcheck disable=SC1090
     . "$CONF_FILE"
-    ensure_veth "${TGT_IFACE:-tgt0}"
+    for i in $(echo "${TGT_IFACE:-tgt0}" | tr , " "); do ensure_veth "$i"; done
     info "starting TGT daemon (logs: $LOG_FILE)"
     # TGT_RUN_ARGS is a shell-quoted argument list (the TUI writes it with
     # shlex); eval re-splits it so quoted paths with spaces stay one argument.
@@ -195,9 +197,10 @@ daemon_start() {
     fi
 }
 
-# Launch `tgt run` in the background with the given extra arguments.
+# Launch `tgt run` (or $TGT_CMD, e.g. campaign) in the background with the
+# given extra arguments.
 daemon_exec() {
-    PYTHONPATH="$REPO_ROOT" nohup "$PY" -m tgt run \
+    PYTHONPATH="$REPO_ROOT" nohup "$PY" -m tgt "${TGT_CMD:-run}" \
         --iface "${TGT_IFACE:-tgt0}" "$@" \
         >>"$LOG_FILE" 2>&1 &
 }
@@ -296,10 +299,11 @@ cmd_unregister() {
     fi
     # shellcheck disable=SC1090
     if [ -f "$CONF_FILE" ]; then . "$CONF_FILE" 2>/dev/null || true; fi
-    iface="${TGT_IFACE:-tgt0}"
-    if command -v ip >/dev/null 2>&1 && ip link show "$iface" >/dev/null 2>&1; then
-        if ip link del "$iface" 2>/dev/null; then info "removed veth $iface"; fi
-    fi
+    for iface in $(echo "${TGT_IFACE:-tgt0}" | tr , " "); do
+        if command -v ip >/dev/null 2>&1 && ip link show "$iface" >/dev/null 2>&1; then
+            if ip link del "$iface" 2>/dev/null; then info "removed veth $iface"; fi
+        fi
+    done
     warn "config kept at $CONF_FILE (delete manually if desired)"
 }
 
