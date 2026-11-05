@@ -31,6 +31,14 @@ class RunConfig:
     manifest_path: Optional[str] = None  # write the run manifest (JSON ground truth) here
     clock: str = "wall"                  # pcap/manifest timestamps: wall | synthetic
     start_time: Optional[str] = None     # synthetic clock start (ISO-8601 UTC)
+    # time model: "cycle" = every conversation once per batch at --rate;
+    # "timed" = each conversation on its own period/jitter/RTT (tgt.schedule)
+    schedule: str = "cycle"
+    speed: float = 1.0                   # timed + wall clock: time compression
+    day_profile: Optional[str] = None    # timed: flat | shift (diurnal activity)
+    min_period: float = 0.0              # timed: floor every period (volume knob)
+    campaign: Optional[str] = None       # timed: phased campaign plan file
+    force: bool = False                  # campaign: skip phase-length checks
 
     def summary(self) -> str:
         target = self.iface or "(pcap only)"
@@ -51,5 +59,15 @@ class RunConfig:
             ratio = f"@{self.sprinkle_ratio:.0%}" if self.sprinkle_ratio else ""
             what += f" +malware[{variants}{ratio}]"
         seed = "" if self.seed is None else f" seed={self.seed}"
+        if self.campaign:
+            what = f"campaign={self.campaign} {what}"
+        if self.schedule == "timed":
+            timed = " schedule=timed"
+            if self.speed != 1.0:
+                timed += f" speed={self.speed:g}x"
+            if self.day_profile:
+                timed += f" day-profile={self.day_profile}"
+            cap = f"rate-cap={self.rate:g}pps" if self.rate else "rate-cap=none"
+            return f"{what} iface={target} {cap} {stop}{timed}{seed}"
         return (f"{what} iface={target} "
                 f"rate={self.rate}pps {stop} loop={self.loop}{seed}")

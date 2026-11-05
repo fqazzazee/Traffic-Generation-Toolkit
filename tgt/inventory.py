@@ -300,6 +300,13 @@ def to_json(env: Environment, sprinkle: Sequence[str] = ()) -> Dict:
     }
     if env.findings:                    # planted issues a monitor should flag
         doc["findings"] = [dict(f) for f in env.findings]
+    # nominal recurrence under the timed scheduler (env file, else
+    # tgt.timing defaults) — what a baselining monitor should learn
+    from . import timing
+    for fl, conv in zip(doc["flows"], env.conversations):
+        tm = timing.conversation_timing(env, conv)
+        fl["period_s"] = round(tm["period"], 3)
+        fl["jitter"] = tm["jitter"]
     if sprinkle:
         doc["new_assets"] = new_assets(env, sprinkle)
         doc["sprinkle"] = sprinkle_mapping(env, sprinkle)

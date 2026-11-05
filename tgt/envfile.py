@@ -59,9 +59,9 @@ hosts in that segment (``@AREA-PACKAGING`` alone selects the whole segment).
 ``from`` hosts. Without ``to`` each ``from`` host talks to itself (NetBIOS /
 LLDP announcements). ``proto`` is a protocol key (``tgt list``). A selector
 that matches nothing is an error. Optional ``period`` (seconds, or "500ms",
-"1s", "2m", or "1s±5%") and ``jitter`` ("5%" or a fraction) are kept on the
-environment's ``timing`` map for a later time model; the cycle builder does
-not use them yet.
+"1s", "2m", or "1s±5%") and ``jitter`` ("5%" or a fraction) set the flow's
+recurrence under the timed scheduler (``--schedule timed``; the defaults
+come from :data:`tgt.timing.PERIODS`); the cycle builder ignores them.
 
 **segments[]** optional keys — ``gateway_mac`` (the gateway's MAC when it
 is not the HSRP virtual MAC), ``wan_rtt_ms`` (round-trip time of the WAN
@@ -92,7 +92,9 @@ their traffic egresses through the internal host's gateway, DNS answers their
 peers), ``flat`` (one VLAN for every segment), ``dual_homed`` (list of
 ``{"host": NAME, "ip": IP, "mac"?: MAC, "flows"?: [[SERVER, PROTO], ...]}``),
 ``snmp_community`` (string), ``default_snmp_community`` (true: polls use
-"public"/"private"). See :class:`tgt.enterprise.Environment`.
+"public"/"private"), ``day_profile`` ("flat" | "shift": the timed
+scheduler's diurnal activity, see :mod:`tgt.timing`) and ``utc_offset``
+(site local time, hours east of UTC). See :class:`tgt.enterprise.Environment`.
 """
 from __future__ import annotations
 
@@ -125,7 +127,7 @@ _HOST_KEYS = {"name", "ip", "role", "os", "model", "vendor", "product", "mac",
 _FLOW_KEYS = {"client", "server", "from", "to", "proto", "mode", "period",
               "jitter"}
 _OPTION_KEYS = {"arp", "flat", "dual_homed", "snmp_community",
-                "default_snmp_community"}
+                "default_snmp_community", "day_profile", "utc_offset"}
 _DUAL_KEYS = {"host", "ip", "mac", "flows"}
 
 # catalog device class -> host role, and embedded vendor -> OS fingerprint,
@@ -673,6 +675,20 @@ def _options(cx: _Ctx, raw: Any, path: str, where: Dict[str, str],
     if "snmp_community" in d:
         out["snmp_community"] = cx.str(d["snmp_community"],
                                        f"{path}.snmp_community")
+    if "day_profile" in d:                  # timed scheduler (tgt.timing)
+        from . import timing
+        prof = cx.str(d["day_profile"], f"{path}.day_profile")
+        if prof not in timing.DAY_PROFILES:
+            raise cx.err(f"{path}.day_profile", f"{prof!r} is not one of "
+                         f"{', '.join(timing.DAY_PROFILES)}")
+        out["day_profile"] = prof
+    if "utc_offset" in d:
+        v = d["utc_offset"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not -14 <= v <= 14:
+            raise cx.err(f"{path}.utc_offset", "expected hours east of UTC "
+                         f"(-14..14), got {v!r}")
+        out["utc_offset"] = float(v)
     if "dual_homed" in d:
         dual = []
         for i, e in enumerate(cx.list(d["dual_homed"], f"{path}.dual_homed")):

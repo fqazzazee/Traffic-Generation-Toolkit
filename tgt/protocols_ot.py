@@ -41,7 +41,8 @@ from .packet import Endpoints
 from .protocols import (TcpSession, _cp56, _cpf, _dnp3_req, _dnp3_rsp,
                         _dnp3_time, _DNP3_EPOCH_MS, _enip, _enip_identity_item,
                         _enip_rr, _iec104_asdu, _iec104_i, _iec104_s,
-                        _iec104_u, _reg, _s7, _s7_connect, _sport, _tcp_flow)
+                        _iec104_u, _reg, _s7, _s7_connect, _sport, _tcp_flow,
+                        _cycle_base)
 
 # Ground-truth notes for the operations profiles (``tgt inventory`` flows).
 OPERATIONS: Dict[str, str] = {
@@ -314,7 +315,9 @@ def enip_io_flow(ep: Endpoints, count: int) -> List[bytes]:
     o2t_id = 0x7E000000 | ((seed >> 8) & 0xFFFF)    # chosen by the target
     serial, orig_serial = (seed >> 16) & 0xFFFF, 0x00C0FFEE
     o2t_data, t2o_data = 8, 8                       # command/ref, status/fbk
-    rpi = 20000                                     # µs
+    # requested packet interval (µs): 20 ms unless the timed scheduler
+    # polls at another rate, so the Forward_Open matches the wire
+    rpi = int(ep.meta.get("enip_rpi_us", 20000))
     key = struct.pack("<BBHHHBB", 0x34, 0x04, vendor, dtype, code,
                       major & 0x7F, minor)
     path = key + bytes([0x20, 0x04, 0x24, 0x06, 0x2C, 0x02, 0x2C, 0x01])
@@ -339,16 +342,18 @@ def enip_io_flow(ep: Endpoints, count: int) -> List[bytes]:
     s.response(_enip(0x0065, session, struct.pack("<HH", 1, 0)))
     s.request(_enip_rr(session, fwd_open, 1))
     s.response(_enip_rr(session, fwd_open_rsp, 1))
+    cb = _cycle_base(count)      # sequence counts continue across builds
     for i in range(max(1, count)):
-        seq = i + 1
+        seq = (cb + i + 1) & 0xFFFFFFFF
         o2t = _cpf((0x8002, struct.pack("<II", o2t_id, seq)),
                    (0x00B1, struct.pack("<HI", seq & 0xFFFF, 1) +
                     struct.pack("<HHI", 0x047F, 0, 1750 + i)))   # RUN
         t2o = _cpf((0x8002, struct.pack("<II", t2o_id, seq)),
                    (0x00B1, struct.pack("<H", seq & 0xFFFF) +
                     struct.pack("<HHI", 0x0F07, 0, 1748 + i)))
-        s.frames.append(P.udp_frame(ep, True, 2222, 2222, o2t, ident=seq))
-        s.frames.append(P.udp_frame(ep, False, 2222, 2222, t2o, ident=seq))
+        ident = seq & 0xFFFF
+        s.frames.append(P.udp_frame(ep, True, 2222, 2222, o2t, ident=ident))
+        s.frames.append(P.udp_frame(ep, False, 2222, 2222, t2o, ident=ident))
     s.request(_enip_rr(session, fwd_close, 2))
     s.response(_enip_rr(session, fwd_close_rsp, 2))
     s.request(_enip(0x0066, session, b""))

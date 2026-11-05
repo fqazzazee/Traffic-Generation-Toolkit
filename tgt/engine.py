@@ -35,6 +35,7 @@ class Stats:
     cycle_frames: int = 0          # frames in one built (or replayed) cycle
     cycles: int = 0                # cycles started
     seed: Optional[int] = None     # run seed (reproduces every cycle)
+    sim_time: float = 0.0          # timed schedule: simulated seconds sent
     per_profile: dict = field(default_factory=dict)
 
     @property
@@ -306,6 +307,9 @@ class Engine:
                 recorder = Recorder(cfg, seed, self.argv, cfg.clock)
                 self.log(f"manifest -> {cfg.manifest_path}")
             last_manifest = time.monotonic()
+            if cfg.schedule == "timed" and not cfg.replay_path:
+                self._run_timed(sender, pcap, recorder, seed, synthetic, pace)
+                return
 
             limiter = RateLimiter(cfg.rate if pace else 0)
             offsets = None      # realtime replay: send time of each frame
@@ -410,6 +414,108 @@ class Engine:
             self.stats.finished = True
             self.log(f"done: {self.stats.packets} pkts, "
                      f"{self.stats.bytes} bytes, {self.stats.errors} errors")
+
+    def _run_timed(self, sender, pcap, recorder, seed: int, synthetic: bool,
+                   pace: bool) -> None:
+        """The timed scheduler: phases (one, or a campaign's) of streams on
+        their own periods, frames sent at their scheduled time — real time
+        (``speed`` compressed) when pacing, else as fast as possible with
+        synthetic timestamps. ``rate`` only caps the packet rate."""
+        from . import campaign, schedule
+        cfg = self.cfg
+        tb = time.perf_counter()
+        phases = campaign.phases_for(cfg)
+        wall_epoch = time.time()
+        epoch0 = parse_start(cfg.start_time) if synthetic else wall_epoch
+        speed = cfg.speed if cfg.speed and cfg.speed > 0 else 1.0
+        sched = schedule.Scheduler(seed, epoch0, cfg.day_profile,
+                                   phases[0].utc_offset if phases else 0.0,
+                                   min_period=cfg.min_period)
+        if recorder is not None and cfg.campaign:
+            recorder.campaign(phases)
+        wall0 = time.perf_counter()
+
+        def ts_of(t: float) -> float:
+            return epoch0 + (t if synthetic else t / speed)
+
+        t = 0.0
+        last_manifest = time.monotonic()
+        for i, ph in enumerate(phases):
+            if self._stop.is_set():
+                break
+            self.stats.cycles = i + 1
+            streams = campaign.phase_streams(ph, cfg)
+            sched.day_profile = ph.day_profile or cfg.day_profile
+            started, _ = sched.load(streams, t, ph.hosts, initial=(i == 0),
+                                    soon=ph.soon)
+            for delay, key, frames in ph.inject:
+                sched.inject(t + delay, key, frames)
+            if i == 0:
+                self.log(f"timed schedule: {len(started)} streams for "
+                         f"[{ph.label}] in {time.perf_counter() - tb:.2f}s "
+                         f"(seed {seed})")
+            elif cfg.campaign:
+                self.log(f"phase {ph.id} '{ph.name}': {len(started)} new "
+                         f"streams, {len(ph.events)} change events")
+            if recorder is not None:
+                recorder.begin_phase(ph, ts_of(t))
+            cap = ph.rate if ph.rate is not None else cfg.rate
+            limiter = RateLimiter(cap if pace and cap and cap > 0 else 0)
+            t_end = t + ph.duration if ph.duration else float("inf")
+            if cfg.duration and not cfg.campaign:
+                t_end = min(t_end, cfg.duration)
+            for ft, _, key, copies, source, occ in sched.run(t_end):
+                if self._stop.is_set():
+                    break
+                if pace:
+                    self._sleep_until(wall0 + ft / speed)
+                    if limiter.interval:
+                        limiter.wait(self._stop)
+                    if self._stop.is_set():
+                        break
+                for frame in copies:
+                    sent = True
+                    if sender is not None:
+                        try:
+                            sender.send(frame)
+                        except OSError as e:
+                            sent = False
+                            self.stats.errors += 1
+                            self.stats.last_error = str(e)
+                    if sent:
+                        ts = epoch0 + ft if synthetic else time.time()
+                        if pcap is not None:
+                            pcap.write(frame, ts=ts)
+                        if recorder is not None:
+                            recorder.observe(ts, key, frame, source, occ)
+                            occ = False
+                        self.stats.packets += 1
+                        self.stats.bytes += len(frame)
+                        self.stats.per_profile[key] = \
+                            self.stats.per_profile.get(key, 0) + 1
+                    if cfg.count and (self.stats.packets
+                                      + self.stats.errors) >= cfg.count:
+                        self._stop.set()
+                        break
+                self.stats.sim_time = ft
+                if (recorder is not None and time.monotonic()
+                        - last_manifest >= self.MANIFEST_INTERVAL):
+                    last_manifest = time.monotonic()
+                    self._write_manifest(recorder)
+            if self._stop.is_set():
+                if recorder is not None:
+                    recorder.end_phase(None)
+                break
+            t = t_end
+            if t == float("inf"):
+                break
+            self.stats.sim_time = t
+            if recorder is not None:
+                recorder.end_phase(ts_of(t) if synthetic or not pace
+                                   else time.time())
+            if pace:
+                self._sleep_until(wall0 + t / speed)
+        self.stats.cycles = max(self.stats.cycles, 1)
 
     def _write_manifest(self, recorder) -> None:
         try:
