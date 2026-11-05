@@ -797,19 +797,28 @@ _NTP_EPOCH = 4000276800        # 2026-10-06 12:00:00 UTC in NTP-era seconds
 # ---------------------------------------------------------------------------
 def enip_identity_flow(ep: Endpoints, count: int) -> List[bytes]:
     """EtherNet/IP (44818): List Identity carrying a Rockwell/Allen-Bradley
-    product name — what a monitor reads to inventory the PLC vendor and model."""
+    product name — what a monitor reads to inventory the PLC vendor and model.
+
+    Per-device identity comes from ``ep.meta`` (see ``tgt.devices``):
+    ``cip_product_code``, ``cip_revision`` (major, minor) and ``cip_serial``;
+    without them it reports product code 55, revision 20.11 and a serial
+    derived from the server MAC."""
     product = ep.meta.get("product", "1756-L71/B LOGIX5571").encode()[:32]
     vendor_id = ep.meta.get("vendor_id", 0x0001)   # 0x0001 = Rockwell Automation
     dev_type = ep.meta.get("device_type", 0x000E)  # 0x0E PLC, 0x02 AC drive
-    serial = zlib.crc32(P.mac_to_bytes(ep.server_mac))
+    code = ep.meta.get("cip_product_code", 55)
+    major, minor = ep.meta.get("cip_revision", (20, 11))
+    serial = ep.meta.get("cip_serial")
+    if serial is None:
+        serial = zlib.crc32(P.mac_to_bytes(ep.server_mac))
     sock = struct.pack(">hHI8s", 2, 44818,
                        int.from_bytes(P.ip_to_bytes(ep.server_ip), "big"),
                        bytes(8))
-    # version, socket, vendor, device type, product code, revision 20.11,
+    # version, socket, vendor, device type, product code, revision,
     # status, serial, product name (SHORT_STRING), state 3 = operational
     ident = struct.pack("<H", 1) + sock + struct.pack(
-        "<HHHBBHI", vendor_id, dev_type, 55, 20, 11, 0x0060, serial) + \
-        bytes([len(product)]) + product + b"\x03"
+        "<HHHBBHI", vendor_id, dev_type, code, major, minor, 0x0060,
+        serial) + bytes([len(product)]) + product + b"\x03"
     exchanges = []
     for i in range(count):
         exchanges.append((_enip(0x0063, 0, b"", context=i + 1),
@@ -820,23 +829,45 @@ def enip_identity_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 def s7_identity_flow(ep: Endpoints, count: int) -> List[bytes]:
     """S7comm (102): SZL 0x0011 read returning the Siemens order number
-    (e.g. 6ES7 ...) and firmware version — how monitors fingerprint S7 PLCs."""
+    (e.g. 6ES7 ...) and firmware version, then SZL 0x001C returning the
+    station/module name and serial number — how monitors fingerprint S7 PLCs.
+
+    Per-device identity comes from ``ep.meta`` (see ``tgt.devices``):
+    ``s7_firmware`` (major, minor, patch), ``s7_serial`` and ``s7_module``;
+    without them it reports V3.2.0 and a serial derived from the server MAC."""
     order = ep.meta.get("order", "6ES7 315-2EH14-0AB0").encode().ljust(20)[:20]
+    fw = bytes([0x56]) + bytes(ep.meta.get("s7_firmware", (3, 2, 0)))  # 'V'3.2.0
     # SZL 0x0011 records (28 bytes): index, MlfB, BGTyp, Ausbg, Ausbe
     recs = struct.pack("!H20sHHH", 0x0001, order, 0, 0x0001, 0x0001) + \
         struct.pack("!H20sHHH", 0x0006, order, 0, 0x0001, 0x0001) + \
-        struct.pack("!H20sHHH", 0x0007, b" " * 20, 0, 0x5603, 0x0200)  # V3.2
+        struct.pack("!H20sH4s", 0x0007, b" " * 20, 0, fw)
     szl = struct.pack("!HHHH", 0x0011, 0x0000, 28, 3) + recs
+    # SZL 0x001C component identification (34-byte records): index + text
+    serial = ep.meta.get("s7_serial") or "S C-%012d" % (
+        zlib.crc32(P.mac_to_bytes(ep.server_mac)) % 10 ** 12)
+    module = ep.meta.get("s7_module", "CPU 315-2 PN/DP")
+    station = ep.meta.get("host", "SIMATIC 300(1)")
+
+    def comp(index: int, text: str, width: int = 24) -> bytes:
+        return struct.pack("!H", index) + \
+            text.encode()[:width].ljust(width, b"\x00").ljust(32, b"\x00")
+
+    comps = [comp(0x0001, station), comp(0x0002, module), comp(0x0003, ""),
+             comp(0x0004, "Original Siemens Equipment", 26),
+             comp(0x0005, serial), comp(0x0007, module)]
+    szl1c = struct.pack("!HHHH", 0x001C, 0x0000, 34, len(comps)) + \
+        b"".join(comps)
     exchanges = _s7_connect()
     for i in range(count):
-        ref = i + 1
-        # userdata: CPU functions (0x4) request, subfunction read SZL
-        req = _s7(7, ref, b"\x00\x01\x12\x04\x11\x44\x01\x00",
-                  b"\xff\x09\x00\x04\x00\x11\x00\x00")    # SZL 0x0011 idx 0
-        rsp = _s7(7, ref, b"\x00\x01\x12\x08\x12\x84\x01" + bytes([ref & 0xFF]) +
-                  b"\x00\x00\x00\x00",
-                  b"\xff\x09" + struct.pack("!H", len(szl)) + szl)
-        exchanges.append((req, rsp))
+        for k, (szl_id, body) in enumerate(((0x0011, szl), (0x001C, szl1c))):
+            ref = 2 * i + k + 1
+            # userdata: CPU functions (0x4) request, subfunction read SZL
+            req = _s7(7, ref, b"\x00\x01\x12\x04\x11\x44\x01\x00",
+                      b"\xff\x09\x00\x04" + struct.pack("!HH", szl_id, 0))
+            rsp = _s7(7, ref, b"\x00\x01\x12\x08\x12\x84\x01" +
+                      bytes([ref & 0xFF]) + b"\x00\x00\x00\x00",
+                      b"\xff\x09" + struct.pack("!H", len(body)) + body)
+            exchanges.append((req, rsp))
     return _tcp_flow(ep, _sport(), 102, exchanges)
 
 

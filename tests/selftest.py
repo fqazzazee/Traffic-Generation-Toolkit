@@ -1366,6 +1366,249 @@ def test_mqtt_and_sparkplug_encoding() -> None:
     except (ValueError, IndexError) as e:
         check(False, f"sparkplug: protobuf payload malformed ({e})")
 
+# ---------------------------------------------------------------------------
+# Device-profile catalog + ground-truth enrichment (#43, #53)
+# ---------------------------------------------------------------------------
+_EMBEDDED_FPS = {"rockwell", "siemens", "schneider", "bacnet", "sel"}
+_FIELD_ROLES = {"plc", "drive", "meter", "relay", "rtu"}
+
+
+def _looks_embedded(h) -> bool:
+    from tgt import devices
+    return (h.os in _EMBEDDED_FPS or h.role in _FIELD_ROLES
+            or h.mac[:8].lower() in devices.EMBEDDED_OUIS)
+
+
+def test_device_catalog_complete() -> None:
+    import shutil
+    import subprocess
+    from tgt import devices, enterprise
+    for env in enterprise.all_environments():
+        for h in env.hosts:
+            dev = h.device
+            check(dev is not None, f"{env.key}: {h.name} has no catalog model")
+            if dev is None:
+                continue
+            if _looks_embedded(h):
+                check(dev.embedded, f"{env.key}: {h.name} model {h.model} "
+                      "is not an embedded device")
+                check(h.mac[:8].lower() in dev.ouis,
+                      f"{env.key}: {h.name} MAC OUI not one of {h.model}'s")
+            check(h.firmware in dev.firmware,
+                  f"{env.key}: {h.name} firmware {h.firmware!r} not offered")
+            check(bool(env.purdue_level(h)),
+                  f"{env.key}: {h.name} has no Purdue level")
+    for m in devices.CATALOG.values():
+        check(bool(m.firmware), f"{m.model_id}: no firmware choices")
+        check(bool(m.ouis) and all(o == o.lower() and len(o) == 8
+                                   for o in m.ouis), f"{m.model_id}: bad OUIs")
+        check(all(c.startswith("CVE-") for c in m.known_cves),
+              f"{m.model_id}: malformed CVE id")
+        if not m.embedded:
+            continue
+        check(bool(m.serial_format) and bool(m.purdue_level),
+              f"{m.model_id}: embedded model without serial format/level")
+        check(not m.edr_capable, f"{m.model_id}: embedded but EDR-capable")
+    # IT OS families agree with the EDR coverage rule
+    for os_key, mid in devices.OS_DEFAULT_MODEL.items():
+        check(devices.get(mid).edr_capable == (os_key in enterprise.EDR_OS),
+              f"{mid}: edr_capable disagrees with EDR_OS")
+    # compatibility shims still answer like the old tables
+    check(enterprise.OUI_VENDORS.get(enterprise.OUI_ROCKWELL)
+          == "Rockwell Automation", "OUI_VENDORS shim lost Rockwell")
+    check(enterprise.OUI_WIN not in enterprise._EMBEDDED_OUIS,
+          "_EMBEDDED_OUIS shim includes the VMware OUI")
+    if not shutil.which("tshark"):
+        _skipped.append("test_device_catalog_complete")
+        return
+    manuf = subprocess.run(["tshark", "-G", "manuf"], capture_output=True,
+                           text=True).stdout
+    known = {ln.split()[0].lower() for ln in manuf.splitlines()
+             if ln[:1].isalnum() and len(ln.split()[0]) == 8}
+    for m in devices.CATALOG.values():
+        for o in m.ouis:
+            check(o in known, f"{m.model_id}: OUI {o} not in Wireshark manuf")
+
+
+def test_device_firmware_serial_deterministic() -> None:
+    import re
+    from tgt import devices, enterprise
+    m = devices.get("siemens-cpu-315-2pndp")
+    check(devices.pick_firmware(m, "PLC-X") == devices.pick_firmware(m, "PLC-X"),
+          "firmware pick not deterministic")
+    check(re.fullmatch(r"S C-[A-Z]\d[A-Z]\d{9}", devices.make_serial(m, "PLC-X"))
+          is not None, "S7 serial does not follow its format")
+    a = enterprise.Host("PLC-X", "10.0.0.1", "00:0e:8c:00:00:01", "plc",
+                        "siemens", "Siemens", "6ES7 315-2EH14-0AB0")
+    b = enterprise.Host("PLC-X", "10.0.0.2", "00:0e:8c:00:00:02", "plc",
+                        "siemens", "Siemens", "6ES7 315-2EH14-0AB0")
+    check(a.model == "siemens-cpu-315-2pndp", "product did not resolve to model")
+    check((a.firmware, a.serial) == (b.firmware, b.serial),
+          "same host name gave different firmware/serial")
+    c = enterprise.Host("PLC-X", "10.0.0.1", "00:0e:8c:00:00:01", "plc",
+                        "siemens", "Siemens", "6ES7 315-2EH14-0AB0",
+                        firmware="V3.2.8", serial="S C-A1B000000001")
+    check((c.firmware, c.serial) == ("V3.2.8", "S C-A1B000000001"),
+          "explicit firmware/serial overridden")
+    # rebuilt environments report the same values (stable ground truth)
+    again = {h.name: (h.firmware, h.serial) for h in enterprise._site_hosts()}
+    site = enterprise.get("industrial-site")
+    check(all(again[h.name] == (h.firmware, h.serial) for h in site.hosts),
+          "industrial-site firmware/serial not stable across builds")
+    serials = [h.serial for h in site.hosts if h.serial]
+    check(len(serials) == len(set(serials)), "duplicate serial numbers")
+    check(devices.cip_revision("33.011") == (33, 11)
+          and devices.s7_version("V3.2.17") == (3, 2, 17),
+          "firmware -> protocol revision parsing")
+
+
+def test_inventory_ground_truth_fields() -> None:
+    import csv
+    import io
+    import ipaddress
+    from tgt import enterprise, inventory
+    old = ["name", "ip", "mac", "mac_vendor", "vendor", "product", "role",
+           "os", "segment", "vlan", "subnet", "zone", "gateway", "legacy",
+           "risk", "serves", "uses"]
+    check(inventory.COLUMNS[:len(old)] == old, "CSV columns reordered")
+    for col in ("asset_id", "model", "firmware", "serial", "purdue_level"):
+        check(col in inventory.COLUMNS, f"CSV missing {col}")
+    site = enterprise.get("industrial-site")
+    buf = io.StringIO()
+    inventory.write_csv(site, buf)
+    rows = {r["name"]: r for r in csv.DictReader(io.StringIO(buf.getvalue()))}
+    pk1 = site.host("PLC-PK1")
+    check(rows["PLC-PK1"]["asset_id"] == "industrial-site:PLC-PK1",
+          "asset_id not env:name")
+    check(rows["PLC-PK1"]["firmware"] == pk1.firmware != "", "CSV firmware")
+    check(rows["PLC-PK1"]["purdue_level"] == "1"
+          and rows["WS20"]["purdue_level"] == "4"
+          and rows["JUMP01"]["purdue_level"] == "3.5"
+          and rows["HMI-PK1"]["purdue_level"] == "2", "Purdue levels wrong")
+    doc = inventory.to_json(site)
+    hosts = {h["name"]: h for h in doc["hosts"]}
+    ob = hosts["PLC-PK1"]["observability"]
+    check(ob["firmware"] == {"value": pk1.firmware, "observable": True,
+                             "evidence": ["enip-id"]},
+          f"PLC-PK1 firmware observability: {ob['firmware']}")
+    check(ob["serial"]["observable"] and ob["vendor"]["observable"],
+          "PLC-PK1 serial/vendor not observable")
+    check(hosts["PLC-PR1"]["observability"]["serial"]["evidence"] == ["s7-id"],
+          "S7 serial not observable via s7-id")
+    meter = hosts["METER-UT1"]["observability"]
+    check(not meter["firmware"]["observable"] and not meter["serial"]["observable"]
+          and meter["vendor"]["evidence"] == ["oui"],
+          "Modbus meter firmware/serial should not be observable")
+    ws = hosts["WS20"]["observability"]["os"]
+    check(ws["observable"] and {"dhcp", "http", "smb"} <= set(ws["evidence"]),
+          f"WS20 OS evidence: {ws['evidence']}")
+    check(hosts["WS48"]["known_cves"] and "CVE-2017-0144" in
+          hosts["WS48"]["known_cves"], "WinXP host lost its MS17-010 CVE")
+    check(hosts["PLC-PK1"]["modules"] and hosts["PLC-PK1"]["embedded"]
+          and not hosts["PLC-PK1"]["edr"], "PLC-PK1 modules/embedded/edr")
+    # flows gain dport + transport
+    f = next(x for x in doc["flows"] if x["protocol"] == "enip-id")
+    check(f["dport"] == 44818 and f["transport"] == "tcp", "flow dport/transport")
+    check(next(x for x in doc["flows"] if x["protocol"] == "arp")["dport"]
+          is None, "ARP flow has a dport")
+    # externals: every public IP on the wire, CrowdStrike annotated
+    ext = {e["ip"]: e for e in doc["external"]}
+    host_ips = {h.ip for h in site.hosts}
+    wire = {ip for _, fr in site.build(1) for ip in (P.frame_ips(fr) or ())
+            if ip not in host_ips and ipaddress.ip_address(ip).is_global}
+    check(wire and wire == set(ext), "external list != public IPs on the wire")
+    check(all(e["kind"] == "edr-cloud" and e["vendor"] == "CrowdStrike"
+              and e["fqdns"] and e["talkers"] for e in ext.values()),
+          "CrowdStrike externals not annotated")
+    fq = {f for e in ext.values() for f in e["fqdns"]}
+    check(fq == set(enterprise.CROWDSTRIKE_FQDNS.values()),
+          f"external FQDNs incomplete: {fq}")
+    infra = doc["infrastructure"]
+    check(len(infra) == len(site.segments) and all(
+        i["kind"] == "hsrp-gateway" and i["mac"].startswith("00:00:0c:07:ac:")
+        for i in infra), "HSRP gateways missing from infrastructure")
+    # an env without EDR hosts has no externals
+    check(inventory.to_json(enterprise.get("ot-plant"))["external"],
+          "ot-plant: Falcon externals missing")
+
+
+def test_identity_wire_matches_inventory() -> None:
+    """ENIP List Identity and S7 SZL replies carry each device's own catalog
+    revision/serial (different PLCs differ) and agree with ``tgt inventory``;
+    decoded by tshark when present."""
+    import shutil
+    import subprocess
+    from tgt import devices, enterprise, inventory
+    site = enterprise.get("industrial-site")
+    inv = {h["ip"]: h for h in inventory.hosts(site)}
+    # meta path: each identity server's endpoint carries its own identity
+    revs, s7fw = set(), set()
+    for c, sv, proto in site.conversations:
+        h = site.host(sv)
+        meta = site._endpoints(site.host(c), h).meta
+        if proto == "enip-id":
+            check(meta["cip_revision"] == devices.cip_revision(h.firmware)
+                  and meta["cip_serial"] == int(h.serial, 16),
+                  f"{sv}: enip-id meta does not carry its identity")
+            revs.add(meta["cip_revision"])
+        elif proto == "s7-id":
+            check(meta["s7_serial"] == h.serial, f"{sv}: s7-id meta serial")
+            s7fw.add(meta["s7_firmware"])
+    check(len(revs) > 1, f"every ENIP device reports one revision: {revs}")
+    check(len(s7fw) > 1, f"every S7 CPU reports one firmware: {s7fw}")
+    if not shutil.which("tshark"):
+        _skipped.append("test_identity_wire_matches_inventory")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/site.pcap"
+        with PcapWriter(path) as w:
+            for k, f in site.build(1):
+                if k in ("enip-id", "s7-id"):
+                    w.write(f)
+        enip = subprocess.run(
+            ["tshark", "-r", path, "-Y", "enip.lir.name", "-T", "fields",
+             "-e", "ip.src", "-e", "enip.lir.revision", "-e", "enip.lir.serial",
+             "-e", "enip.lir.vendor"],
+            capture_output=True, text=True).stdout.splitlines()
+        s7 = subprocess.run(
+            ["tshark", "-r", path, "-Y",
+             "s7comm.szl.xy11.0001.ausbg || s7comm.szl.001c.0005.serialn",
+             "-T", "fields", "-e", "ip.src", "-e", "s7comm.szl.xy11.0001.ausbg",
+             "-e", "s7comm.szl.xy11.0001.ausbe",
+             "-e", "s7comm.szl.001c.0005.serialn"],
+            capture_output=True, text=True).stdout.splitlines()
+    seen_enip, seen_s7fw, seen_s7sn = set(), set(), set()
+    for ln in enip:
+        ip, rev, serial, vendor = ln.split("\t")
+        h = inv[ip]
+        major, minor = devices.cip_revision(h["firmware"])
+        check(int(rev) == (major << 8 | minor),
+              f"{h['name']}: wire revision {rev} != inventory {h['firmware']}")
+        check(int(serial, 16) == int(h["serial"], 16),
+              f"{h['name']}: wire serial {serial} != inventory {h['serial']}")
+        check(int(vendor, 16) == 1, f"{h['name']}: CIP vendor not Rockwell")
+        seen_enip.add(ip)
+    for ln in s7:
+        ip, ausbg, ausbe, serial = ln.split("\t")
+        h = inv[ip]
+        if ausbg:
+            ma, mi, pa = devices.s7_version(h["firmware"])
+            g, e = ausbg.split(",")[-1], ausbe.split(",")[-1]   # index 0x0007
+            check((int(g), int(e)) == (0x5600 | ma, mi << 8 | pa),
+                  f"{h['name']}: wire firmware != inventory {h['firmware']}")
+            seen_s7fw.add(ip)
+        if serial:
+            check(serial == h["serial"],
+                  f"{h['name']}: wire serial {serial} != inventory {h['serial']}")
+            seen_s7sn.add(ip)
+    want_enip = {site.host(sv).ip for _, sv, p in site.conversations
+                 if p == "enip-id"}
+    want_s7 = {site.host(sv).ip for _, sv, p in site.conversations
+               if p == "s7-id"}
+    check(seen_enip == want_enip, "tshark: not every ENIP device identified")
+    check(seen_s7fw == want_s7 == seen_s7sn,
+          "tshark: not every S7 CPU reported firmware + serial")
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

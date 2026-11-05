@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
-from . import protocols
+from . import devices, protocols
 from .packet import Endpoints, bytes_to_mac, mac_to_bytes, rewrite_l2
 
 # Vendor OUIs — an analyser also fingerprints assets by MAC prefix.
@@ -36,12 +36,12 @@ OUI_JCI = "00:10:8d"        # Johnson Controls (Metasys BMS)
 OUI_TRIDIUM = "00:01:f0"    # Tridium (Niagara JACE)
 OUI_SEL = "00:30:a7"        # Schweitzer Engineering Laboratories
 
-OUI_VENDORS: Dict[str, str] = {
-    OUI_WIN: "VMware", OUI_ROCKWELL: "Rockwell Automation",
-    OUI_SIEMENS: "Siemens", OUI_DELL: "Dell", OUI_SCHNEIDER: "Schneider Electric",
-    OUI_JCI: "Johnson Controls", OUI_TRIDIUM: "Tridium",
-    OUI_SEL: "Schweitzer Engineering Laboratories",
-}
+# OUI -> vendor and the embedded-device OUIs now come from the device catalog
+# (tgt.devices); these names stay for modules that import them.
+OUI_VENDORS: Dict[str, str] = devices.OUI_VENDORS
+
+# DNS domain every modeled host is named in (what SNI / LDAP carry)
+DOMAIN = "corp.local"
 
 
 @dataclass
@@ -103,10 +103,44 @@ class Host:
     os: str            # fingerprint key
     vendor: str = ""
     product: str = ""  # OT: model / order number
+    # Device-catalog identity (tgt.devices). Left empty, ``model`` resolves
+    # from ``product`` (embedded devices) or the OS fingerprint (general-
+    # purpose hosts), and firmware/serial are picked deterministically from
+    # the host name, so the same host always reports the same values.
+    model: str = ""
+    firmware: str = ""
+    serial: str = ""
+    modules: Tuple[devices.Module, ...] = ()
+    fqdn: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.model:
+            self.model = devices.resolve(self.product) or (
+                "" if self.vendor else devices.os_default(self.os))
+        dev = self.device
+        if dev is not None:
+            self.firmware = self.firmware or devices.pick_firmware(dev, self.name)
+            self.serial = self.serial or devices.make_serial(dev, self.name)
+            self.modules = self.modules or dev.modules
+        self.fqdn = self.fqdn or f"{self.name.lower()}.{DOMAIN}"
 
     @property
     def fp(self) -> OSFingerprint:
         return FINGERPRINTS[self.os]
+
+    @property
+    def device(self) -> Optional[devices.DeviceModel]:
+        """This host's catalog entry, or ``None`` if it has no model."""
+        return devices.find(self.model)
+
+    @property
+    def embedded(self) -> bool:
+        """An embedded OT device (PLC/RTU/relay/drive/meter/BMS firmware) —
+        by catalog model, else by its vendor MAC OUI."""
+        dev = self.device
+        if dev is not None:
+            return dev.embedded
+        return self.mac[:8].lower() in devices.EMBEDDED_OUIS
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +171,10 @@ CROWDSTRIKE_CLOUD_IPS = [
 
 # Falcon runs on modern Windows (Win7 SP1+ / Server 2012+) and Linux servers;
 # the EOL Win2000/XP hosts and embedded OT devices (PLC/RTU/relay/drive/meter
-# and BACnet/JACE firmware, identified by their vendor MAC OUI) cannot, so they
+# and BACnet/JACE firmware, identified by their tgt.devices model) cannot, so they
 # stay deliberately uncovered — a gap an analyser should flag.
 EDR_OS = {"win7", "win10", "win2012", "win2019", "linux"}
-_EMBEDDED_OUIS = {OUI_ROCKWELL, OUI_SIEMENS, OUI_SCHNEIDER, OUI_JCI,
-                  OUI_TRIDIUM, OUI_SEL}
+_EMBEDDED_OUIS = devices.EMBEDDED_OUIS     # compatibility alias
 
 
 def _cs_cloud_host(ip: str, fqdn: str) -> Host:
@@ -149,7 +182,7 @@ def _cs_cloud_host(ip: str, fqdn: str) -> Host:
     is cosmetic (``place`` rewrites it to the gateway as it egresses)."""
     o = [int(x) for x in ip.split(".")]
     return Host(f"CS-FALCON-{ip}", ip, "02:00:5c:%02x:%02x:%02x" % tuple(o[1:]),
-                "edr", "linux", "CrowdStrike", fqdn)
+                "edr", "linux", "CrowdStrike", fqdn, fqdn=fqdn)
 
 
 @dataclass(frozen=True)
@@ -177,6 +210,9 @@ SPAN_VIEWS = ("access", "core")
 
 # DNS suffix of every modeled host (matches the TLS SNI / LDAP names)
 DNS_DOMAIN = "corp.local"
+# Purdue level by zone for general-purpose hosts (OT-CELL splits L1/L2 by role)
+_ZONE_LEVEL = {"IT": "4", "DMZ": "3.5", "OT-SUPERVISORY": "3"}
+_FIELD_ROLES = {"plc", "drive", "meter", "relay", "rtu"}
 
 
 # A conversation: client drives `proto` toward server.
@@ -355,20 +391,26 @@ class Environment:
         return self._seg[host.name]
 
     def _endpoints(self, client: Host, server: Host) -> Endpoints:
+        dflt_cip = devices.get("rockwell-1756-l71").identity["cip"]
+        dflt_s7 = devices.get("siemens-cpu-315-2pndp").identity["s7"]
         meta = {
             "ua": client.fp.ua,
             "smb": client.fp.smb if client.fp.smb != "none" else "smb2",
             "dhcp_vendor": client.fp.dhcp_vendor,   # "" = no option 60
             "nbname": client.name,
             "host": server.name,
-            "sni": f"{server.name.lower()}.corp.local",
+            "sni": server.fqdn,
             "realm": "CORP.LOCAL",
             "dn": f"CN={client.name},DC=corp,DC=local",
-            "product": server.product or "1756-L71/B LOGIX5571",
+            "product": server.product or dflt_cip["product_name"],
             "device_type": 0x02 if server.role == "drive" else 0x0E,  # CIP
-            "order": server.product or "6ES7 315-2EH14-0AB0",
+            "order": server.product or dflt_s7["order"],
             "server": "Microsoft-IIS/10.0" if server.os.startswith("win") else "Apache",
         }
+        # the server's own identity: CIP vendor/product code/revision/serial,
+        # S7 firmware + serial — so each device reports its own values
+        meta.update(devices.identity_meta(server.device, server.firmware,
+                                          server.serial))
         # Built untagged, host to host; _place() puts each frame on its VLAN.
         return Endpoints(
             client_mac=client.mac, client_ip=client.ip,
@@ -446,10 +488,9 @@ class Environment:
 
     def edr_hosts(self) -> List[Host]:
         """Windows and Linux hosts that run a Falcon sensor. Excludes the EOL
-        XP/2000 Windows and embedded OT devices (by vendor MAC OUI), which
-        can't — so they stay uncovered."""
-        return [h for h in self.hosts if h.os in EDR_OS
-                and h.mac[:8].lower() not in _EMBEDDED_OUIS]
+        XP/2000 Windows and embedded OT devices (by catalog model, else
+        vendor MAC OUI), which can't — so they stay uncovered."""
+        return [h for h in self.hosts if h.os in EDR_OS and not h.embedded]
 
     def _edr_endpoints(self, win: Host, cloud: Host) -> Endpoints:
         return Endpoints(
@@ -466,11 +507,6 @@ class Environment:
         gateway (like any internet-bound flow). Beacons spread across the EU-1
         cloud IP pool; a representative host also exercises the upload / download
         / API FQDNs so all of them appear on the wire."""
-        fleet = self.edr_hosts()
-        if not fleet:
-            return []
-        ips, fq = CROWDSTRIKE_CLOUD_IPS, CROWDSTRIKE_FQDNS
-
         def flow(host: Host, ip: str, fqdn: str, n: int):
             cloud = _cs_cloud_host(ip, fqdn)
             ep = self._edr_endpoints(host, cloud)
@@ -478,17 +514,27 @@ class Environment:
             return [("edr", self.place(f, host, cloud, span, self.segment_or_none))
                     for f in frames]
 
+        return [flow(h, ip, fqdn, messages if bulk else 1)
+                for h, ip, fqdn, bulk in self.edr_plan()]
+
+    def edr_plan(self) -> List[Tuple[Host, str, str, bool]]:
+        """Who beacons where: (host, cloud IP, FQDN, bulk) per Falcon flow;
+        ``bulk`` flows carry ``messages`` exchanges, the rest one beacon."""
+        fleet = self.edr_hosts()
+        if not fleet:
+            return []
+        ips, fq = CROWDSTRIKE_CLOUD_IPS, CROWDSTRIKE_FQDNS
         # a low-and-slow beacon per host on the sensor channel, spread over the
         # cloud IP pool so the whole published egress set appears
-        streams = [flow(h, ips[i % len(ips)], fq["ts"], 1)
-                   for i, h in enumerate(fleet)]
+        plan = [(h, ips[i % len(ips)], fq["ts"], False)
+                for i, h in enumerate(fleet)]
         # one host also uploads telemetry, pulls content and hits the API
         anchor = next((h for h in fleet
                        if h.role in ("hist", "file", "dc", "scada")), fleet[0])
-        streams += [flow(anchor, ips[-1], fq["up"], messages),
-                    flow(anchor, ips[-2], fq["down"], messages),
-                    flow(anchor, ips[-3], fq["api"], 1)]
-        return streams
+        plan += [(anchor, ips[-1], fq["up"], True),
+                 (anchor, ips[-2], fq["down"], True),
+                 (anchor, ips[-3], fq["api"], False)]
+        return plan
 
     def build(self, messages: int, span: str = "access",
               edr: bool = True) -> List[Tuple[str, bytes]]:
@@ -530,6 +576,17 @@ class Environment:
         if self.edr_hosts():
             used.add("edr")
         return [k for k in protocols.PROFILES if k in used]
+
+    def purdue_level(self, host: Host) -> str:
+        """Purdue level ("0".."4", "3.5" = IT/OT DMZ): fixed by the catalog
+        model for embedded devices, else by where the host sits."""
+        dev = host.device
+        if dev is not None and dev.purdue_level:
+            return dev.purdue_level
+        zone = self.segment_of(host).zone
+        if zone == "OT-CELL":
+            return "1" if host.role in _FIELD_ROLES else "2"
+        return _ZONE_LEVEL.get(zone, "")
 
     def legacy_hosts(self) -> List[Host]:
         return [h for h in self.hosts if h.fp.legacy]
