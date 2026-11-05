@@ -5142,6 +5142,9 @@ def test_control_api_endpoints_and_injection() -> None:
             check(api.request(a, "POST", "/inject",
                               {"incident": "nosuch"})[0] == 404,
                   "api: unknown incident not 404")
+            # paused, the engine cannot start (or finish) i1, so the
+            # second request meets it deterministically on a loaded box
+            api.request(a, "POST", "/pause")
             code, r = api.request(a, "POST", "/inject",
                                   {"incident": "wannacry", "duration": 0.6,
                                    "ratio": 0.3})
@@ -5150,6 +5153,7 @@ def test_control_api_endpoints_and_injection() -> None:
             check(api.request(a, "POST", "/inject",
                               {"incident": "wannacry"})[0] == 409,
                   "api: concurrent injection of one incident not refused")
+            api.request(a, "POST", "/resume")
             check(api.request(a, "POST", "/rate", {"pps": 600})[0] == 200
                   and eng.cfg.rate == 600 and eng.limiter.pps == 600,
                   "api: /rate not applied")
