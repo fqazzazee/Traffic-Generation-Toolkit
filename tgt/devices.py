@@ -238,6 +238,7 @@ _add(DeviceModel(
      Module(1, "BMX DDI 1602", "16-pt DI"),
      Module(2, "BMX DDO 1602", "16-pt DQ")),
     identity={"modbus": {"vendor": "Schneider Electric",
+                         "vendor_url": "www.se.com",
                          "product_code": "BMX P34 2020",
                          "product_name": "BMX P34 2020"}},
     banners={"http": "Schneider-WEB/V2.1.4",
@@ -252,6 +253,7 @@ _add(DeviceModel(
     (Module(0, "BME P58 2040", "M580 CPU, EtherNet/IP + Modbus/TCP"),
      Module(2, "BME NOC 0301", "EtherNet/IP comms module")),
     identity={"modbus": {"vendor": "Schneider Electric",
+                         "vendor_url": "www.se.com",
                          "product_code": "BME P58 2040",
                          "product_name": "BME P58 2040"},
               "cip": {"vendor_id": 243, "device_type": 0x0E,
@@ -266,6 +268,7 @@ _add(DeviceModel(
     "meter", _SCHNEIDER, "1", "PowerLogic meter firmware",
     ("V2.3.3", "V2.7.4", "V3.0.2"), "##########",
     identity={"modbus": {"vendor": "Schneider Electric",
+                         "vendor_url": "www.se.com",
                          "product_code": "METSEPM5560",
                          "product_name": "PM5560"}},
     banners={"http": "", "snmp_sysdescr": "PM5560 {firmware}"},
@@ -278,7 +281,9 @@ _add(DeviceModel(
     "tridium-jace-8000", "Tridium", "Niagara JACE-8000 controller",
     "bms-supervisor", _TRIDIUM, "2", "QNX / Niagara 4",
     ("4.10.1.36", "4.12.1.16", "4.13.3.48"), "Qnx-TITAN-%%%%-%%%%-%%%%-%%%%",
-    identity={"bacnet": {"vendor_id": 36, "model_name": "JACE-8000"}},
+    identity={"bacnet": {"vendor_id": 36, "model_name": "JACE-8000",
+                         "app_version": "Niagara {firmware}",
+                         "segmentation": 0}},
     banners={"http": "Niagara Web Server",
              "snmp_sysdescr": "Niagara 4 JACE-8000 {firmware}"},
     aliases=("JACE-8000",)))
@@ -296,7 +301,7 @@ def _sel(model_id, product, dtype, level, fw, aliases, dnp3):
     _add(DeviceModel(
         model_id, "Schweitzer Engineering Laboratories", product, dtype, _SEL,
         level, "SEL firmware", fw, "##########",
-        identity={"dnp3": dnp3},
+        identity={"dnp3": {**dnp3, "product_name": aliases[0]}},
         banners={"http": "", "snmp_sysdescr": "{product} {firmware}"},
         aliases=aliases))
 
@@ -489,12 +494,47 @@ def banner(model: DeviceModel, key: str, host_name: str, firmware: str,
 
 
 def identity_meta(model: Optional[DeviceModel], firmware: str,
-                  serial: str) -> Dict[str, Any]:
+                  serial: str, host_name: str = "") -> Dict[str, Any]:
     """Endpoint ``meta`` keys the identity builders read for a device
-    (``protocols.enip_identity_flow`` / ``protocols.s7_identity_flow``)."""
+    (``protocols.enip_identity_flow`` / ``protocols.s7_identity_flow`` and
+    the ``tgt.protocols_ot`` Modbus / BACnet / DNP3 identity flows), plus
+    the SNMP system description from the model's banners."""
     if model is None:
         return {}
     meta: Dict[str, Any] = {}
+    mb = model.identity.get("modbus")
+    if mb:
+        meta.update({
+            "modbus_vendor": mb.get("vendor", model.vendor),
+            "modbus_product_code": mb.get("product_code", model.product),
+            "modbus_product_name": mb.get("product_name", model.product),
+            "modbus_model_name": mb.get("model_name", model.product),
+            "modbus_vendor_url": mb.get("vendor_url", ""),
+            "modbus_revision": firmware})
+    bn = model.identity.get("bacnet")
+    if bn:
+        meta.update({
+            "bacnet_vendor_id": bn["vendor_id"],
+            "bacnet_vendor": bn.get("vendor_name", model.vendor),
+            "bacnet_model": bn.get("model_name", model.product),
+            "bacnet_firmware": firmware,
+            "bacnet_app_version": bn.get("app_version", "{firmware}").format(
+                firmware=firmware),
+            "bacnet_segmentation": bn.get("segmentation", 3),
+            "bacnet_serial": serial})
+    dn = model.identity.get("dnp3")
+    if dn:
+        meta.update({"dnp3_vendor": model.vendor,
+                     "dnp3_product": dn.get("product_name", model.product),
+                     "dnp3_firmware": firmware, "dnp3_serial": serial})
+    iec = model.identity.get("iec104")
+    if iec and "common_address" in iec:
+        meta["common_address"] = iec["common_address"]
+    descr = banner(model, "snmp_sysdescr", host_name, firmware, serial)
+    if descr:
+        meta["snmp_sysdescr"] = descr
+        if model.banners.get("snmp_sysobjectid"):
+            meta["snmp_sysobjectid"] = model.banners["snmp_sysobjectid"]
     cip = model.identity.get("cip")
     if cip:
         meta["vendor_id"] = cip["vendor_id"]

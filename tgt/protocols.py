@@ -38,7 +38,14 @@ class TcpSession:
         self.s_seq = irs          # server next seq
         self.frames: List[bytes] = []
 
+    # The SYNs carry no MSS option, so each side may send RFC 879's default
+    # 536 bytes per segment; longer payloads go out as several segments.
+    mss = 536
+
     def _emit(self, from_client: bool, flags: int, payload: bytes = b"") -> None:
+        while len(payload) > self.mss:
+            self._emit(from_client, flags & ~P.PSH, payload[:self.mss])
+            payload = payload[self.mss:]
         if from_client:
             seq, ack = self.c_seq, self.s_seq
             sport, dport = self.sport, self.dport
@@ -1205,6 +1212,8 @@ def all_profiles() -> List[Profile]:
     return list(PROFILES.values())
 
 
+# OT identity + engineering-operation profiles (Modbus FC43, BACnet I-Am, …)
+from . import protocols_ot  # noqa: E402,F401
 # Industrial L2 / substation profiles (PROFINET, IEC 61850, PTP) register here.
 from . import protocols_ind  # noqa: E402,F401
 from . import protocols_infra  # noqa: E402,F401  (registers SNMP, LLDP, MQTT…)
