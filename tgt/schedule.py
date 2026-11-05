@@ -291,9 +291,13 @@ class Stream:
         """One builder call; a TCP session whose 4-tuple an open persistent
         connection holds is rebuilt (next ephemeral port)."""
         for _ in range(8):
-            protocols.begin_build(self.seed, self.builds, sport_stride=8)
-            self.builds += 1
-            frames = self.builder(self.ep, count)
+            # under the build lock: an injection pass may be building on
+            # its worker thread (tgt.control), and the build context is
+            # module state
+            with protocols.BUILD_LOCK:
+                protocols.begin_build(self.seed, self.builds, sport_stride=8)
+                self.builds += 1
+                frames = self.builder(self.ep, count)
             if sched is None or not sched.ports:
                 return frames
             tup = _tuple(frames, self.cmac)
@@ -458,6 +462,10 @@ class ArpStream(Stream):
         self.gratuitous = gratuitous
 
     def occur(self, t: float, sched=None):
+        with protocols.BUILD_LOCK:          # see Stream._build
+            return self._occur(t, sched)
+
+    def _occur(self, t: float, sched=None):
         self.occ += 1
         protocols.begin_build(self.seed, self.builds, sport_stride=8)
         self.builds += 1

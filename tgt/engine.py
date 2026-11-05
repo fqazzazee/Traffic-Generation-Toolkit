@@ -263,19 +263,6 @@ def _sprinkle(base: list, extras: List[list], randomize: bool = False,
     return merged
 
 
-def replay_offsets(timestamps: List[float],
-                   max_gap: float = 5.0) -> List[float]:
-    """Send time of each replayed frame relative to the first.
-
-    Gaps are clamped to ``[0, max_gap]`` so out-of-order timestamps or a long
-    idle stretch in the capture do not stall the replay.
-    """
-    out = [0.0]
-    for prev, cur in zip(timestamps, timestamps[1:]):
-        out.append(out[-1] + min(max(cur - prev, 0.0), max_gap))
-    return out
-
-
 class Engine:
     # manifest rewrite period (seconds of wall time)
     MANIFEST_INTERVAL = 10.0
@@ -296,6 +283,7 @@ class Engine:
         self.record = False         # keep a manifest Recorder even without a path
         self.recorder = None
         self.limiter: Optional[RateLimiter] = None
+        self.env_now = None         # timed: the phase's environment
 
     def log(self, msg: str) -> None:
         self._on_log(msg)
@@ -371,7 +359,6 @@ class Engine:
 
             limiter = RateLimiter(cfg.rate if pace else 0)
             self.limiter = limiter if pace else None
-            offsets = None      # realtime replay: send time of each frame
             builder = None
             if cfg.replay_path:
                 # streamed from disk (pcap or pcapng), rewritten on the fly;
@@ -406,18 +393,13 @@ class Engine:
                         from concurrent.futures import ThreadPoolExecutor
                         pool = ThreadPoolExecutor(1, "tgt-build")
                     nxt = pool.submit(builder.build, cycle + 1)
-                # realtime replay is scheduled against absolute target times
-                # from the cycle start, so per-packet overhead never accumulates
-                cycle_start = time.perf_counter()
                 for idx, (key, frame, source) in self.control.feed(
                         batch, self._stop):
                     if self._stop.is_set():
                         break
-                    if offsets is not None:
-                        self._sleep_until(cycle_start + offsets[idx])
-                    else:
-                        limiter.wait(self._stop)
-                    if self._stop.is_set():
+                    limiter.wait(self._stop)
+                    # a pause that began while this frame waited holds it
+                    if not self.control.gate(self._stop):
                         break
                     sent = True
                     if sender is not None:
@@ -450,8 +432,10 @@ class Engine:
                                       + self.stats.errors) >= cfg.count:
                         self._stop.set()
                         break
+                    # time spent paused does not count toward --duration
                     elapsed = (self.stats.packets * step if not pace
-                               else self.stats.elapsed)
+                               else self.stats.elapsed
+                               - self.control.paused_for())
                     if cfg.duration and elapsed >= cfg.duration:
                         self._stop.set()
                         break
@@ -463,6 +447,7 @@ class Engine:
         finally:
             if pool is not None:
                 pool.shutdown(wait=False)
+            self.control.close()
             if sender is not None:
                 sender.close()
             if pcap is not None:
@@ -506,6 +491,7 @@ class Engine:
             if self._stop.is_set():
                 break
             self.stats.cycles = i + 1
+            self.env_now = ph.env           # injections address onto it
             streams = campaign.phase_streams(ph, cfg)
             sched.day_profile = ph.day_profile or cfg.day_profile
             started, _ = sched.load(streams, t, ph.hosts, initial=(i == 0),
@@ -520,13 +506,16 @@ class Engine:
                 self.log(f"phase {ph.id} '{ph.name}': {len(started)} new "
                          f"streams, {len(ph.events)} change events")
             if recorder is not None:
-                recorder.begin_phase(ph, ts_of(t))
+                # paced wall clock: the real start (pauses and startup
+                # included), like end_phase
+                recorder.begin_phase(ph, ts_of(t) if synthetic or not pace
+                                     else time.time())
             cap = ph.rate if ph.rate is not None else cfg.rate
             limiter = RateLimiter(cap if pace and cap and cap > 0 else 0)
             self.limiter = limiter if pace else None     # /rate adjusts it
+            # a plain timed run's --duration is its one phase's duration
+            # (campaign.phases_for)
             t_end = t + ph.duration if ph.duration else float("inf")
-            if cfg.duration and not cfg.campaign:
-                t_end = min(t_end, cfg.duration)
             ft = t
             # the control API gates this stream (pause) and splices injected
             # incident frames in after the scheduled ones (tgt.control)
@@ -545,7 +534,8 @@ class Engine:
                                       + ft / speed)
                     if limiter.interval:
                         limiter.wait(self._stop)
-                    if self._stop.is_set():
+                    # a pause that began during the sleep holds this frame
+                    if not self.control.gate(self._stop):
                         break
                 for frame in copies:
                     sent = True

@@ -23,6 +23,12 @@ from .rewrite import Rewriter
 MAX_GAP = 5.0
 
 
+def gap(prev_ts: float, ts: float, max_gap: float = MAX_GAP) -> float:
+    """Capture time between two frames, clamped to ``[0, max_gap]`` so
+    out-of-order timestamps or a long idle stretch do not stall a replay."""
+    return min(max(ts - prev_ts, 0.0), max_gap)
+
+
 def rewriter_for(cfg) -> Optional[Rewriter]:
     """The run's Rewriter (None when nothing is remapped)."""
     return Rewriter.from_specs(
@@ -84,7 +90,7 @@ class ReplaySource:
                                               resolution=self.resolution):
             if self.realtime:
                 if prev_ts is not None:
-                    offset += min(max(ts - prev_ts, 0.0), MAX_GAP) / self.speed
+                    offset += gap(prev_ts, ts) / self.speed
                 prev_ts = ts
                 target = base + offset
                 if time.perf_counter() - target > 1.0:   # fell behind: resync
