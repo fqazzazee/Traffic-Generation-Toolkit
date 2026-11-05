@@ -1117,8 +1117,10 @@ def test_modbus_writes_are_a_minority() -> None:
         pdu = seg[(seg[12] >> 4) * 4:]
         if t[4] == 502 and len(pdu) >= 8:
             fcs.append(pdu[7])
-    check(fcs.count(0x06) == 2 and fcs.count(0x03) == 14,
-          f"modbus: expected 2 FC6 writes in 16 requests, got {fcs}")
+    check(fcs.count(0x06) == 2 and fcs.count(0x03) == 8
+          and {fcs.count(fc) for fc in (0x01, 0x02, 0x04)} == {2},
+          f"modbus: expected 2 FC6 writes, 8 FC3 and 2 each of FC1/2/4 in "
+          f"16 requests, got {fcs}")
     resp = [f for f in protocols.modbus_flow(Endpoints(), 5)]
     pay = [_l4(f)[5][20:] for f in resp]
     w = [p for p in pay if len(p) > 7 and p[7] == 0x06]
@@ -1204,6 +1206,14 @@ def test_tshark_dns_responses_matched() -> None:
         total = count("dns.flags.response == 1")
         check(total > 0 and count("dns.response_to") == total,
               "tshark: DNS responses not matched to their queries")
+
+# --- OT identity + engineering operations (tgt/protocols_ot.py, #44/#45) ---
+_DISSECTS_AS.update({
+    "modbus-id": "mbtcp", "modbus-write": "mbtcp", "bacnet-id": "bacapp",
+    "enip-list": "enip", "enip-io": "cipio", "enip-eng": "cip",
+    "s7-eng": "s7comm", "dnp3-id": "dnp3", "dnp3-time": "dnp3",
+    "iec104-time": "iec60870_asdu",
+})
 
 # --- IT / infrastructure protocols (tgt/protocols_infra.py, issue #46) ------
 _DISSECTS_AS.update({
@@ -1529,16 +1539,18 @@ def test_inventory_ground_truth_fields() -> None:
     hosts = {h["name"]: h for h in doc["hosts"]}
     ob = hosts["PLC-PK1"]["observability"]
     check(ob["firmware"] == {"value": pk1.firmware, "observable": True,
-                             "evidence": ["enip-id"]},
+                             "evidence": ["enip-id", "enip-list"]},
           f"PLC-PK1 firmware observability: {ob['firmware']}")
     check(ob["serial"]["observable"] and ob["vendor"]["observable"],
           "PLC-PK1 serial/vendor not observable")
     check(hosts["PLC-PR1"]["observability"]["serial"]["evidence"] == ["s7-id"],
           "S7 serial not observable via s7-id")
     meter = hosts["METER-UT1"]["observability"]
-    check(not meter["firmware"]["observable"] and not meter["serial"]["observable"]
-          and meter["vendor"]["evidence"] == ["oui"],
-          "Modbus meter firmware/serial should not be observable")
+    # Modbus device ID carries the revision but no serial number
+    check(meter["firmware"]["evidence"] == ["modbus-id"]
+          and not meter["serial"]["observable"]
+          and meter["vendor"]["evidence"] == ["modbus-id", "oui"],
+          f"Modbus meter observability: {meter}")
     ws = hosts["WS20"]["observability"]["os"]
     check(ws["observable"] and {"dhcp", "http", "smb"} <= set(ws["evidence"]),
           f"WS20 OS evidence: {ws['evidence']}")
@@ -3401,6 +3413,215 @@ def test_tshark_tls_ja3_and_certificates() -> None:
     warn = expert.split("Warns (")[1].split("Notes (")[0] if "Warns (" in expert else ""
     check(all("Connection reset" in ln for ln in warn.splitlines()[3:]
               if ln.strip()), "tshark TLS warnings besides deliberate RSTs")
+
+
+# -- OT device identity on the wire + engineering baseline (#44, #45) -------
+_IDENTITY_PROFILES = {"enip-id", "enip-list", "s7-id", "modbus-id",
+                      "bacnet-id", "dnp3-id", "snmp"}
+
+
+def test_every_embedded_device_identifies_itself() -> None:
+    """Every embedded device in the OT environments is the server of at
+    least one identity flow, and the identity meta it is built from comes
+    from its own catalog entry (so it matches ``tgt inventory``)."""
+    from tgt import enterprise
+    for key in ("industrial-site", "ot-plant", "enterprise-mixed"):
+        env = enterprise.get(key)
+        served = {sv for _, sv, p in env.conversations
+                  if p in _IDENTITY_PROFILES}
+        missing = [h.name for h in env.hosts if h.embedded
+                   and h.name not in served]
+        check(not missing, f"{key}: embedded hosts without identity: {missing}")
+    site = enterprise.get("industrial-site")
+    seen_dnp3 = set()
+    for c, sv, p in site.conversations:
+        h = site.host(sv)
+        m = site._endpoints(site.host(c), h).meta
+        if p == "modbus-id":
+            check(m["modbus_revision"] == h.firmware
+                  and m["modbus_vendor"] == h.device.vendor,
+                  f"{sv}: modbus-id meta != catalog")
+        elif p == "bacnet-id":
+            check(m["bacnet_firmware"] == h.firmware
+                  and m["bacnet_serial"] == h.serial
+                  and m["bacnet_instance"] % 1000 == int(h.ip.split(".")[3]),
+                  f"{sv}: bacnet-id meta != catalog")
+        elif p in ("dnp3", "dnp3-id", "dnp3-time"):
+            check(m["dnp3_outstation"] != m["dnp3_master"],
+                  f"{c}->{sv}: DNP3 master == outstation address")
+            seen_dnp3.add(m["dnp3_outstation"])
+    check(len(seen_dnp3) == 5, f"DNP3 outstations share addresses: {seen_dnp3}")
+
+
+def test_engineering_ops_from_engineering_hosts() -> None:
+    """S7/CIP engineering flows come only from engineering workstations,
+    Modbus writes from operator HMIs and time sync from the SCADA master —
+    always toward embedded devices — and ground truth labels them."""
+    from tgt import enterprise, inventory
+    from tgt.protocols_ot import ENGINEERING, OPERATIONS
+    roles = {"s7-eng": {"eng"}, "enip-eng": {"eng"}, "modbus-write": {"hmi"},
+             "dnp3-time": {"scada"}, "iec104-time": {"scada"}}
+    check(set(roles) == set(OPERATIONS), "OPERATIONS out of sync with test")
+    used = set()
+    for env in enterprise.all_environments():
+        for c, sv, p in env.conversations:
+            if p in OPERATIONS:
+                used.add(p)
+                check(env.host(c).role in roles[p] and env.host(sv).embedded,
+                      f"{env.key}: {p} from {c} ({env.host(c).role}) to {sv}")
+        for f in inventory.to_json(env)["flows"]:
+            if f["protocol"] in OPERATIONS:
+                want = "engineering" if f["protocol"] in ENGINEERING \
+                    else "operations"
+                check(f.get("activity") == want and f.get("note"),
+                      f"{env.key}: flow {f} not labelled {want}")
+            else:
+                check("activity" not in f, f"{env.key}: {f} labelled")
+    check(used == set(OPERATIONS), f"ops profiles unused: {set(OPERATIONS) - used}")
+    # one operation per build, whatever the message count
+    for k in OPERATIONS:
+        check(len(protocols.get(k).build(Endpoints(), 1)) ==
+              len(protocols.get(k).build(Endpoints(), 9)),
+              f"{k}: frame count grows with messages")
+
+
+def test_ot_identity_builders_wire_format() -> None:
+    """Byte-level checks of the new identity / operations builders."""
+    ep = Endpoints(meta={"bcast": "10.10.10.255", "bacnet_instance": 4242,
+                         "bacnet_vendor_id": 36})
+    f = protocols.get("bacnet-id").build(ep, 1)
+    check(f[0][:6] == b"\xff" * 6 and _l4(f[0])[2] == "10.10.10.255",
+          "bacnet-id: Who-Is not broadcast")
+    iam = _l4(f[1])[5][8:]
+    check(iam[4:8] == b"\x01\x00\x10\x00"
+          and struct.unpack("!I", iam[9:13])[0] == (8 << 22) | 4242
+          and iam.endswith(b"\x21\x24"), "bacnet-id: I-Am device/vendor wrong")
+    uni = protocols.get("enip-list").build(Endpoints(meta={"bcast": ""}), 1)
+    check(uni[0][:6] != b"\xff" * 6, "enip-list: bcast='' still broadcast")
+    io = [_l4(x) for x in protocols.get("enip-io").build(Endpoints(), 3)]
+    udp = [t for t in io if t[0] == P.IPPROTO_UDP]
+    check(len(udp) == 6 and all(t[3] == t[4] == 2222 for t in udp),
+          "enip-io: class-1 I/O not on UDP 2222")
+    check(all(struct.unpack("<HHH", t[5][8:14]) == (2, 0x8002, 8)
+              for t in udp), "enip-io: no sequenced address item")
+    s7 = b"".join(_l4(x)[5][20:] for x in protocols.get("s7-eng")
+                  .build(Endpoints(), 1))
+    for fn in (0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x28):
+        check(bytes([fn]) in s7, f"s7-eng: function 0x{fn:02x} missing")
+    check(b"_INSE" in s7 and b"_0A00010P" in s7, "s7-eng: DB10 not inserted")
+    ua = b"".join(_l4(x)[5][20:] for x in protocols.get("opcua")
+                  .build(Endpoints(meta={"host": "OPC1"}), 1))
+    check(b"SecurityPolicy#Basic256Sha256" in ua and b"urn:OPC1:UA:Server"
+          in ua and b"Anonymous" in ua, "opcua: endpoints/session identity")
+    seg = max(len(_l4(x)[5]) - 20 for x in protocols.get("opcua")
+              .build(Endpoints(meta={"host": "OPC1"}), 1))
+    check(seg <= 1460 + 40, f"opcua: {seg}-byte TCP segment")  # MSS + options
+
+
+def test_tshark_ot_identity_matches_inventory() -> None:
+    """Optional: tshark decodes each new identity protocol from a full
+    industrial-site cycle and the values agree with ``tgt inventory``."""
+    import shutil
+    import subprocess
+    from tgt import devices, enterprise, inventory
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_ot_identity_matches_inventory")
+        return
+    site = enterprise.get("industrial-site")
+    inv = {h["ip"]: h for h in inventory.hosts(site)}
+    from tgt import protocols_ot
+    keep = _IDENTITY_PROFILES | set(protocols_ot.OPERATIONS) | {"enip-io"}
+
+    def run(path, *args):
+        return subprocess.run(["tshark", "-r", path, *args],
+                              capture_output=True, text=True).stdout
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/site.pcap"
+        with PcapWriter(path) as w:
+            for k, fr in site.build(1):
+                if k in keep:
+                    w.write(fr)
+        expert = run(path, "-q", "-z", "expert,warn")
+        mb = run(path, "-Y", "modbus.object_str_value && tcp.srcport == 502",
+                 "-T", "fields", "-E", "aggregator=|", "-e", "ip.src",
+                 "-e", "modbus.object_id", "-e", "modbus.object_str_value")
+        dnp = run(path, "-Y", "dnp3.al.da.value", "-T", "fields", "-E",
+                  "aggregator=|", "-e", "ip.src", "-e", "dnp3.al.da.value")
+        bac = run(path, "-Y", "bacapp.confirmed_service == 14 && "
+                  "bacapp.type == 3", "-V", "-O", "bacapp")
+        cip = run(path, "-Y", "cip.id.serial_number || enip.lir.serial",
+                  "-T", "fields", "-e", "ip.src", "-e", "cip.id.major_rev",
+                  "-e", "cip.id.minor_rev", "-e", "cip.id.serial_number",
+                  "-e", "enip.lir.revision", "-e", "enip.lir.serial")
+        snmp = run(path, "-Y", "snmp.name == 1.3.6.1.2.1.1.1.0 && "
+                   "udp.srcport == 161", "-T", "fields", "-e", "ip.src",
+                   "-e", "snmp.value.octets")
+        io = run(path, "-Y", "cipio", "-T", "fields", "-e", "ip.src")
+        eng = run(path, "-Y", "s7comm.param.func == 0x1b || "
+                  "s7comm.param.func == 0x1d", "-T", "fields", "-e", "ip.src")
+    check("Errors (" not in expert and "Warns (" not in expert,
+          "tshark expert warnings in identity/operations traffic")
+    seen = set()
+    mb_objs: dict = {}
+    for ln in mb.splitlines():           # one row per FC 43 response
+        ip, ids, vals = ln.split("\t")
+        mb_objs.setdefault(ip, {}).update(zip(ids.split("|"),
+                                              vals.split("|")))
+    for ip, objs in mb_objs.items():     # basic + regular objects
+        h = inv[ip]
+        check(objs.get("2") == h["firmware"] and objs.get("0") ==
+              site.host(h["name"]).device.vendor
+              and objs.get("4", "?") in h["product"],
+              f"{h['name']}: Modbus device ID {objs} != inventory")
+        seen.add(ip)
+    for ln in dnp.splitlines():
+        ip, vals = ln.split("\t")
+        h, v = inv[ip], vals.split("|")
+        check(v[1] == h["product"] and v[2] == h["firmware"]
+              and v[3] == h["serial"] and v[4] == h["name"],
+              f"{h['name']}: DNP3 attributes {v} != inventory")
+        seen.add(ip)
+    ip = None
+    for ln in bac.splitlines():
+        if ln.startswith("Internet Protocol"):
+            ip = ln.split("Src: ")[1].split(",")[0]
+            seen.add(ip)
+        for prop, col in (("firmware-revision", "firmware"),
+                          ("serial-number", "serial")):
+            if ln.strip().startswith(prop + ":"):
+                got = ln.split("'")[1]
+                check(got == inv[ip][col],
+                      f"{inv[ip]['name']}: BACnet {prop} {got} != inventory")
+    for ln in cip.splitlines():
+        ip, ma, mi, sn, rev, lsn = ln.split("\t")
+        h = inv[ip]
+        major, minor = devices.cip_revision(h["firmware"])
+        if sn:
+            check((int(ma), int(mi)) == (major, minor)
+                  and int(sn, 16) == int(h["serial"], 16),
+                  f"{h['name']}: CIP Get_Attribute_All != inventory")
+        if lsn:
+            check(int(rev) == major << 8 | minor
+                  and int(lsn, 16) == int(h["serial"], 16),
+                  f"{h['name']}: List Identity != inventory")
+        seen.add(ip)
+    for ln in snmp.splitlines():
+        ip, descr = ln.split("\t")
+        text = bytes.fromhex(descr.split(",")[0]).decode()
+        check(inv[ip]["firmware"] in text,
+              f"{inv[ip]['name']}: sysDescr {text!r} lacks firmware")
+        seen.add(ip)
+    # every embedded device was decoded with its identity (S7 CPUs are
+    # covered by test_identity_wire_matches_inventory)
+    want = {h.ip for h in site.hosts if h.embedded
+            and h.device.identity.get("s7") is None}
+    check(want <= seen, "tshark: no decoded identity for "
+          f"{sorted(inv[i]['name'] for i in want - seen)}")
+    drives = {h.ip for h in site.hosts if h.role == "drive"}
+    check(drives <= set(io.split()), "tshark: drives without CIP I/O")
+    check({h.ip for h in site.hosts if h.name.startswith("PLC-PR")}
+          <= set(eng.split()), "tshark: S7 upload/download not seen")
 
 
 def main() -> int:

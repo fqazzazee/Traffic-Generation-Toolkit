@@ -19,6 +19,7 @@ import json
 from typing import Dict, List, Sequence, Set, TextIO
 
 from . import packet, protocols
+from .protocols_ot import ENGINEERING, OPERATIONS
 from .enterprise import (CROWDSTRIKE_CLOUD_IPS, OUI_VENDORS, Environment,
                          Host)
 
@@ -33,6 +34,11 @@ COLUMNS = ["name", "ip", "mac", "mac_vendor", "vendor", "product", "role",
 _FROM_SERVER = {
     "enip-id": ("vendor", "product", "model", "firmware", "serial", "os"),
     "s7-id": ("vendor", "product", "model", "firmware", "serial", "os"),
+    # device identity in the device's own protocol (tgt.protocols_ot)
+    "enip-list": ("vendor", "product", "model", "firmware", "serial", "os"),
+    "modbus-id": ("vendor", "product", "model", "firmware", "os"),
+    "bacnet-id": ("vendor", "product", "model", "firmware", "serial", "os"),
+    "dnp3-id": ("vendor", "product", "model", "firmware", "serial", "os"),
     "http": ("os",),             # Server: banner
     "https": ("fqdn",),          # the client's SNI names the server
     "ldap": ("fqdn",),           # rootDSE search names the DC
@@ -116,7 +122,8 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
         for f in _FROM_CLIENT.get(proto, ()):
             ev[client][f].add(proto)
         if server != client:
-            for f in _FROM_SERVER.get(proto, ()):
+            for f in _FROM_SERVER.get(proto, ()) or _snmp_fields(
+                    env.host(server), proto):
                 ev[server][f].add(proto)
         else:
             for f in _ANNOUNCES.get(proto, ()):
@@ -127,6 +134,20 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
         for h in env.hosts:
             emits(h.name, "arp")
     return ev
+
+
+def _snmp_fields(h: Host, proto: str) -> tuple:
+    """Fields an SNMP agent's sysDescr / sysObjectID reveal: those its
+    catalog banner carries (the environment fills them from the model)."""
+    dev = h.device
+    if proto not in ("snmp", "snmpv3") or dev is None:
+        return ()
+    tpl = dev.banners.get("snmp_sysdescr", "")
+    if not tpl:
+        return ()
+    return ("vendor", "product", "model", "os") + \
+        (("firmware",) if "{firmware}" in tpl else ()) + \
+        (("serial",) if "{serial}" in tpl else ())
 
 
 def _observability(h: Host, row: Dict, ev: Dict[str, Set[str]]) -> Dict:
@@ -191,9 +212,13 @@ def infrastructure(env: Environment) -> List[Dict]:
 
 def _flow(c: str, sv: str, p: str) -> Dict:
     prof = protocols.get(p)
-    return {"client": c, "server": sv, "protocol": p, "service": _service(p),
+    flow = {"client": c, "server": sv, "protocol": p, "service": _service(p),
             "dport": int(prof.port) if prof.port.isdigit() else None,
             "transport": prof.transport}
+    if p in OPERATIONS:            # benign engineering / operator activity
+        flow["activity"] = "engineering" if p in ENGINEERING else "operations"
+        flow["note"] = OPERATIONS[p]
+    return flow
 
 
 def to_json(env: Environment, sprinkle: Sequence[str] = ()) -> Dict:
