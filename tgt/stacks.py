@@ -75,6 +75,7 @@ OS_STACK: Dict[str, str] = {
     "win7": "win7", "winxp": "winxp", "win2000": "win2000", "linux": "linux",
     "rockwell": "rockwell", "siemens": "siemens", "schneider": "schneider",
     "bacnet": "embedded", "sel": "sel",
+    "rtos": "embedded", "linux-embedded": "linux",
 }
 
 # Profile-only runs (no environment): a Windows client, and for OT protocols

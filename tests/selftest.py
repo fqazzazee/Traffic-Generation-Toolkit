@@ -5741,6 +5741,44 @@ def test_w4c_injection_keeps_seeded_baseline() -> None:
     check(protocols.build_context() is ctx, "isolated_build leaked context")
 
 
+def test_w4c_os_fingerprint_aliases() -> None:
+    """One embedded-OS pair: rtos / linux-embedded; the older embedded /
+    embedded-linux keys still load (hosts, os: selectors) as aliases."""
+    from tgt import enterprise, envfile, stacks
+    check(not set(enterprise.OS_ALIASES) & set(enterprise.FINGERPRINTS),
+          "alias keys still in FINGERPRINTS")
+    h = enterprise.Host("X", "10.0.0.9", "00:11:22:33:44:55", "rtu",
+                        "embedded")
+    check(h.os == "rtos" and h.fp.label == "Embedded RTOS firmware",
+          f"embedded alias -> {h.os}")
+    check(stacks.for_os("rtos") == "embedded" and
+          stacks.for_os("linux-embedded") == "linux", "embedded OS stacks")
+    doc = {"key": "alias-t", "name": "t", "segments": [
+        {"name": "S", "vlan": 10, "subnet": "10.9.0.0/24", "zone": "OT-CELL",
+         "gateway": "10.9.0.1"}],
+        "hosts": [{"name": "A", "ip": "10.9.0.10", "role": "rtu",
+                   "os": "embedded"},
+                  {"name": "B", "ip": "10.9.0.11", "role": "hmi",
+                   "os": "embedded-linux"}],
+        "flows": [{"from": "os:embedded-linux", "to": "os:embedded",
+                   "proto": "modbus"}]}
+    import json
+    env = envfile.loads(json.dumps(doc), source="t")
+    check([x.os for x in env.hosts] == ["rtos", "linux-embedded"] and
+          env.conversations == [("B", "A", "modbus")],
+          f"alias env file: {[x.os for x in env.hosts]} "
+          f"{env.conversations}")
+    check('"embedded"' not in envfile.export(env), "export keeps alias")
+    for f in os.listdir(envfile.SITES_DIR):
+        txt = open(os.path.join(envfile.SITES_DIR, f)).read()
+        check('"os": "embedded"' not in txt and "embedded-linux" not in txt,
+              f"site {f} uses an alias OS key")
+    labels = {x.fp.label for e in _w4c_envs() for x in e.hosts}
+    check(not {"Embedded device firmware (RTOS)",
+               "Embedded Linux (vendor firmware)"} & labels,
+          "inventory still shows the old embedded OS labels")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
