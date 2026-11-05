@@ -4438,6 +4438,75 @@ def test_env_file_external_endpoints() -> None:
                 check(all(s != "GW-CLOUD" for _, s, p in e2.conversations
                           if p == "https"), "@SEG matched an external")
 
+
+# -- structured findings[] on every packaged site (#51) --
+def _finding_on_wire(env, batch, client, server, proto) -> bool:
+    """True when one build carries the flow: an IP flow by its (NAT-view)
+    addresses, client -> server, with a reply from the port the client
+    targeted (a one-way UDP flow needs only the request); a Layer-2 flow
+    by a frame the server sends or receives."""
+    c, s = env.nat_view(env.host(client), env.host(server))
+    if c.ip == s.ip:                    # self-flow (broadcast announces)
+        return any(k == proto and _l4(f) and _l4(f)[1] == c.ip
+                   for k, f in batch)
+    reqs, reps, l2 = [], [], False
+    for k, f in batch:
+        if k != proto:
+            continue
+        t = _l4(f)
+        if t is None:
+            l2 = l2 or s.mac in (P.bytes_to_mac(f[0:6]),
+                                 P.bytes_to_mac(f[6:12]))
+        elif (t[1], t[2]) == (c.ip, s.ip):
+            reqs.append(t)
+        elif (t[1], t[2]) == (s.ip, c.ip):
+            reps.append(t)
+    if l2:
+        return True
+    if not reqs:
+        return False
+    if reqs[0][0] not in (P.IPPROTO_TCP, P.IPPROTO_UDP):
+        return True
+    ports = {(t[3], t[4]) for t in reqs}
+    if not reps:
+        return reqs[0][0] == P.IPPROTO_UDP
+    return any((t[4], t[3]) in ports for t in reps)
+
+
+def test_every_site_has_wire_backed_findings() -> None:
+    """Every packaged site declares >= 3 structured findings whose hosts
+    exist, whose flows are env flows, which `tgt inventory -f json` lists,
+    and whose every flow is on the wire in one build."""
+    from tgt import envfile, inventory
+    names = sorted(f[:-5] for f in os.listdir(envfile.SITES_DIR)
+                   if f.endswith(".json"))
+    check(len(names) >= 7, f"packaged sites: {names}")
+    for key in names:
+        env = envfile.load(os.path.join(envfile.SITES_DIR, f"{key}.json"))
+        check(len(env.findings) >= 3,
+              f"{key}: only {len(env.findings)} findings")
+        known = {h.name for h in env.hosts} | {h.name for h in env.external}
+        conv = set(env.conversations)
+        for fd in env.findings:
+            check(fd.get("severity") in envfile.SEVERITIES and
+                  fd.get("category") and fd["flows"],
+                  f"{key}: finding {fd['id']} lacks severity/category/flows")
+            for h in fd["hosts"]:
+                check(h in known, f"{key}: finding {fd['id']}: no host {h}")
+            for fl in fd["flows"]:
+                check((fl["client"], fl["server"], fl["proto"]) in conv,
+                      f"{key}: finding {fd['id']}: {fl} not an env flow")
+        check([f["id"] for f in inventory.to_json(env).get("findings", [])]
+              == [f["id"] for f in env.findings],
+              f"{key}: inventory JSON lacks the findings")
+        protocols.begin_build(11, 0)
+        batch = env.build(1)
+        for fd in env.findings:
+            for fl in fd["flows"]:
+                check(_finding_on_wire(env, batch, fl["client"],
+                                       fl["server"], fl["proto"]),
+                      f"{key}: finding {fd['id']}: {fl} not on the wire")
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
