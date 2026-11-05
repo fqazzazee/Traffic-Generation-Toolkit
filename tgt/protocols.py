@@ -45,6 +45,8 @@ class TcpSession:
         else:
             seq, ack = self.s_seq, self.c_seq
             sport, dport = self.dport, self.sport
+        if flags == P.SYN:              # bare SYN: nothing to acknowledge yet
+            ack = 0
         seg = P.tcp(
             self.ep.client_ip if from_client else self.ep.server_ip,
             self.ep.server_ip if from_client else self.ep.client_ip,
@@ -174,11 +176,20 @@ def _cpf(*items: tuple[int, bytes]) -> bytes:
 # OT / ICS protocols
 # ===========================================================================
 def modbus_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """Modbus/TCP (502): Read Holding Registers + Write Single Register."""
+    """Modbus/TCP (502): Read Holding Registers polling, with an occasional
+    Write Single Register (FC 6, echoed back) setpoint update — one request in
+    eight, the fourth of each eight."""
     exchanges = []
     for i in range(count):
         tid = (i + 1) & 0xFFFF
         unit = 1
+        if i % 8 == 3:
+            # Write Single Register (FC 0x06): setpoint register 40101; the
+            # normal response echoes the request exactly
+            req = struct.pack("!HHHBBHH", tid, 0, 6, unit, 0x06, 100,
+                              (0x0200 + i) & 0xFFFF)
+            exchanges.append((req, req))
+            continue
         # Read Holding Registers (FC 0x03): start=0, qty=10
         req = struct.pack("!HHHBB HH", tid, 0, 6, unit, 0x03, 0, 10)
         # Response: 10 registers (20 bytes) of sample values
@@ -297,16 +308,27 @@ def iec104_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def bacnet_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """BACnet/IP (47808/UDP): BVLC + NPDU + APDU ReadProperty."""
+    """BACnet/IP (47808/UDP): BVLC + NPDU + APDU ReadProperty of an
+    analog-input's present-value, answered by a ComplexACK carrying the REAL."""
+    def bvll(npdu: bytes, apdu: bytes) -> bytes:   # Original-Unicast-NPDU
+        return struct.pack("!BBH", 0x81, 0x0A, 4 + len(npdu) + len(apdu)) + \
+            npdu + apdu
+
+    base = zlib.crc32(P.ip_to_bytes(ep.client_ip))
     frames = []
     for i in range(count):
-        # APDU: confirmed-request, ReadProperty (svc 12), object analog-input 1
-        apdu = struct.pack("!BBB", 0x00, 0x05, 0x0C) + \
-            b"\x0c\x00\x00\x00\x01\x19\x55"
-        npdu = struct.pack("!BB", 0x01, 0x00)
-        bvlc = struct.pack("!BBH", 0x81, 0x0A, 4 + len(npdu) + len(apdu))
-        payload = bvlc + npdu + apdu
-        frames.append(P.udp_frame(ep, True, 47808, 47808, payload, ident=i))
+        invoke = (base + i) & 0xFF
+        # context [0] object id analog-input:N, context [1] present-value (85)
+        obj = b"\x0c" + struct.pack("!I", (0 << 22) | (1 + i % 4)) + b"\x19\x55"
+        # Confirmed-Request, max-segs 0 / max-APDU 1476, invoke id, svc 12
+        req = struct.pack("!BBBB", 0x00, 0x05, invoke, 0x0C) + obj
+        # ComplexACK, same invoke id: [3] { REAL } property value
+        ack = struct.pack("!BBB", 0x30, invoke, 0x0C) + obj + b"\x3e\x44" + \
+            struct.pack("!f", 21.5 + 0.25 * i) + b"\x3f"
+        frames.append(P.udp_frame(ep, True, 47808, 47808,
+                                  bvll(b"\x01\x04", req), ident=i))  # expect reply
+        frames.append(P.udp_frame(ep, False, 47808, 47808,
+                                  bvll(b"\x01\x00", ack), ident=i))
     return frames
 
 
@@ -401,21 +423,35 @@ def icmp_flow(ep: Endpoints, count: int) -> List[bytes]:
     return frames
 
 
-def dns_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """DNS (53/UDP): A-record query + response."""
+def dns_flow(ep: Endpoints, count: int,
+             names: List[tuple[str, str]] | None = None) -> List[bytes]:
+    """DNS (53/UDP): A-record query + response, each from one client port.
+
+    ``names`` (or ``ep.meta['dns_names']``) is a list of ``(fqdn, ipv4)`` pairs
+    the client resolves in turn, so a monitor can learn hostname -> IP from the
+    answers (an environment passes its real inventory names). Without it the
+    client looks up ``plcN.ot.local`` names that resolve into its own /24.
+    """
     def qname(name: str) -> bytes:
         out = b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
         return out + b"\x00"
 
+    names = names or ep.meta.get("dns_names")
+    if not names:
+        net = ep.client_ip.rsplit(".", 1)[0]
+        names = [(f"plc{n}.ot.local", f"{net}.{100 + n}") for n in range(5)]
+    base = zlib.crc32(P.ip_to_bytes(ep.client_ip))
     frames = []
     for i in range(count):
-        tid = (i + 1) & 0xFFFF
-        q = qname(f"plc{i % 5}.ot.local") + struct.pack("!HH", 1, 1)
+        name, addr = names[i % len(names)]
+        tid = (base + i * 0x9E5) & 0xFFFF
+        sport = _sport()                           # one port per transaction
+        q = qname(name) + struct.pack("!HH", 1, 1)
         query = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0) + q
-        frames.append(P.udp_frame(ep, True, _sport(), 53, query, ident=i))
+        frames.append(P.udp_frame(ep, True, sport, 53, query, ident=i))
         ans = struct.pack("!HHHHHH", tid, 0x8180, 1, 1, 0, 0) + q + \
-            struct.pack("!HHHIH4s", 0xC00C, 1, 1, 60, 4, P.ip_to_bytes(ep.server_ip))
-        frames.append(P.udp_frame(ep, False, 53, _sport(), ans, ident=i))
+            struct.pack("!HHHIH4s", 0xC00C, 1, 1, 60, 4, P.ip_to_bytes(addr))
+        frames.append(P.udp_frame(ep, False, 53, sport, ans, ident=i))
     return frames
 
 
@@ -625,28 +661,72 @@ def edr_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def dhcp_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """DHCP (67/68): Discover + Offer with a fingerprint (option 55 + vendor 60).
+    """DHCP (67/68): a full DORA lease, then unicast renewals.
 
-    Option 55 (parameter request list) and option 60 (vendor class, e.g.
-    "MSFT 5.0") are exactly what device-fingerprinting engines use to identify
-    the OS — set via ``ep.meta['dhcp_vendor']``.
+    Discover/Request leave the client as 0.0.0.0:68 -> 255.255.255.255:67 (MAC
+    ff:ff:ff:ff:ff:ff) carrying option 12 (host name — a primary naming source
+    for passive monitors), 61 (client id), 50 (requested IP), 55 (parameter
+    request list) and 60 (vendor class, e.g. "MSFT 5.0", omitted when
+    ``ep.meta['dhcp_vendor']`` is empty) — the OS fingerprint. Offer/ACK assign
+    the client its address (yiaddr) with options 54/51/58/59/1/3/6. Optional
+    meta: ``nbname`` (host name), ``dhcp_router``, ``dhcp_mask``,
+    ``dhcp_dns``, ``dhcp_domain`` and ``dhcp_relay`` (giaddr of a relay agent).
     """
     vendor = ep.meta.get("dhcp_vendor", "MSFT 5.0").encode()
-    chaddr = P.mac_to_bytes(ep.client_mac) + bytes(10)
+    hostname = ep.meta.get("nbname", "WORKSTATION").encode()
+    router = ep.meta.get("dhcp_router",
+                         ep.client_ip.rsplit(".", 1)[0] + ".1")
+    mask = ep.meta.get("dhcp_mask", "255.255.255.0")
+    dns = ep.meta.get("dhcp_dns", ep.server_ip)
+    domain = ep.meta.get("dhcp_domain", "").encode()
+    giaddr = ep.meta.get("dhcp_relay", "0.0.0.0")
+    mac = P.mac_to_bytes(ep.client_mac)
+    you, sid = P.ip_to_bytes(ep.client_ip), P.ip_to_bytes(ep.server_ip)
+
+    def opt(code: int, data: bytes) -> bytes:
+        return bytes([code, len(data)]) + data
+
+    def msg(op: int, xid: int, opts: bytes, ciaddr: bytes = bytes(4),
+            yiaddr: bytes = bytes(4), relay: str = "0.0.0.0") -> bytes:
+        body = struct.pack("!BBBBIHH", op, 1, 6, 0, xid, 0, 0) + ciaddr + yiaddr + bytes(4) + \
+            P.ip_to_bytes(relay) + mac + bytes(10) + bytes(192) + \
+            struct.pack("!I", 0x63825363) + opts + b"\xff"   # magic cookie
+        return body.ljust(300, b"\x00")            # BOOTP minimum size
+
+    def broadcast(payload: bytes, ident: int) -> bytes:
+        seg = P.udp("0.0.0.0", "255.255.255.255", 68, 67, payload)
+        pkt = P.ipv4("0.0.0.0", "255.255.255.255", P.IPPROTO_UDP, seg,
+                     ttl=ep.ttl_client, ident=ident)
+        return P.ethernet("ff:ff:ff:ff:ff:ff", ep.client_mac, P.ETH_P_IP, pkt,
+                          vlan=ep.vlan)
+
+    cid, host = opt(61, b"\x01" + mac), opt(12, hostname)
+    fingerprint = (opt(60, vendor) if vendor else b"") + \
+        opt(55, b"\x01\x03\x06\x0f\x1f\x21\x2b\x2c")
+    lease = opt(54, sid) + opt(51, struct.pack("!I", 691200)) + \
+        opt(58, struct.pack("!I", 345600)) + opt(59, struct.pack("!I", 604800)) + \
+        opt(1, P.ip_to_bytes(mask)) + opt(3, P.ip_to_bytes(router)) + \
+        opt(6, P.ip_to_bytes(dns)) + (opt(15, domain) if domain else b"")
+    seed = zlib.crc32(mac)
     frames = []
     for i in range(count):
-        base = struct.pack("!BBBBIHH", 1, 1, 6, 0, 0x3903F326, 0, 0x8000) + \
-            bytes(4) * 4 + chaddr + bytes(64) + bytes(128) + \
-            struct.pack("!I", 0x63825363)          # magic cookie
-        # options: 53 (DHCPDISCOVER), 55 (param request list), 60 (vendor class)
-        opts = b"\x35\x01\x01" + \
-            b"\x37\x08\x01\x03\x06\x0f\x1f\x21\x2b\x2c" + \
-            b"\x3c" + bytes([len(vendor)]) + vendor + b"\xff"
-        disc = base + opts
-        frames.append(P.udp_frame(ep, True, 68, 67, disc, ident=i))
-        offer_opts = b"\x35\x01\x02\xff"           # DHCPOFFER
-        offer = base + offer_opts
-        frames.append(P.udp_frame(ep, False, 67, 68, offer, ident=i))
+        xid = (seed + i * 0x9E3779B1) & 0xFFFFFFFF
+        if i == 0:                                 # DORA: Discover/Offer/Request/ACK
+            disc = msg(1, xid, opt(53, b"\x01") + cid + opt(50, you) + host +
+                       fingerprint)
+            frames.append(broadcast(disc, 0))
+            frames.append(P.udp_frame(ep, False, 67, 68, msg(
+                2, xid, opt(53, b"\x02") + lease, yiaddr=you, relay=giaddr)))
+            req = msg(1, xid, opt(53, b"\x03") + cid + opt(50, you) +
+                      opt(54, sid) + host + fingerprint)
+            frames.append(broadcast(req, 1))
+        else:                                      # T1 renewal, unicast to server
+            req = msg(1, xid, opt(53, b"\x03") + cid + host + fingerprint,
+                      ciaddr=you)
+            frames.append(P.udp_frame(ep, True, 68, 67, req, ident=i + 1))
+        frames.append(P.udp_frame(ep, False, 67, 68, msg(
+            2, xid, opt(53, b"\x05") + lease, ciaddr=you if i else bytes(4),
+            yiaddr=you, relay=giaddr if i == 0 else "0.0.0.0"), ident=i))
     return frames
 
 
@@ -675,14 +755,41 @@ def netbios_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def ntp_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """NTP (123/UDP): client request + server response."""
+    """NTP (123/UDP): client polls (64 s apart) + a synchronised server's
+    replies with consistent timestamps (origin = the client's transmit time).
+
+    Times derive from a fixed epoch (2026-10-06 12:00 UTC) plus a per-client
+    offset so builds stay deterministic. The server is stratum 2 referencing a
+    public stratum-1 clock (``ep.meta['ntp_stratum']`` / ``['ntp_refid']``).
+    """
+    stratum = int(ep.meta.get("ntp_stratum", 2))
+    refid = P.ip_to_bytes(ep.meta.get("ntp_refid", "129.6.15.28"))  # NIST
+    t0 = _NTP_EPOCH + zlib.crc32(P.ip_to_bytes(ep.client_ip)) % 3600
+
+    def ts(sec: float) -> bytes:                   # 32.32 fixed-point
+        whole = int(sec)
+        return struct.pack("!II", whole & 0xFFFFFFFF,
+                           int((sec - whole) * 2 ** 32) & 0xFFFFFFFF)
+
     frames = []
     for i in range(count):
-        req = struct.pack("!B", 0x1B) + bytes(47)  # LI=0 VN=3 mode=3 (client)
-        frames.append(P.udp_frame(ep, True, _sport(), 123, req, ident=i))
-        resp = struct.pack("!B", 0x1C) + bytes(47)  # mode=4 (server)
-        frames.append(P.udp_frame(ep, False, 123, _sport(), resp, ident=i))
+        t1 = t0 + 64 * i + 0.137 * (i % 7)         # client transmit
+        t2 = t1 + 0.000412                         # server receive
+        t3 = t2 + 0.000031                         # server transmit
+        sport = _sport()                           # one port per transaction
+        # LI 0, VN 3, mode 3 (client); poll 2^6, precision 2^-20
+        req = struct.pack("!BBbb", 0x1B, 0, 6, -20) + bytes(12) + \
+            bytes(24) + ts(t1)
+        frames.append(P.udp_frame(ep, True, sport, 123, req, ident=i))
+        # LI 0, VN 3, mode 4 (server); root delay/dispersion in 16.16 seconds
+        resp = struct.pack("!BBbb", 0x1C, stratum, 6, -23) + \
+            struct.pack("!II", 0x0000034F, 0x00000A3D) + refid + \
+            ts(t1 - 312.5) + ts(t1) + ts(t2) + ts(t3)
+        frames.append(P.udp_frame(ep, False, 123, sport, resp, ident=i))
     return frames
+
+
+_NTP_EPOCH = 4000276800        # 2026-10-06 12:00:00 UTC in NTP-era seconds
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +874,7 @@ _reg("s7comm", "S7comm (Siemens)", "OT", "102", "tcp", s7comm_flow,
 _reg("iec104", "IEC 60870-5-104", "OT", "2404", "tcp", iec104_flow,
      "STARTDT, interrogation + M_ME_NC_1 floats, S-frame acks")
 _reg("bacnet", "BACnet/IP", "OT", "47808", "udp", bacnet_flow,
-     "BVLC/NPDU ReadProperty on analog-input objects")
+     "ReadProperty on analog-input objects + ComplexACK replies")
 _reg("opcua", "OPC UA", "OT", "4840", "tcp", opcua_flow,
      "Hello/Ack, OpenSecureChannel, ReadRequest/Response, Close")
 # OT asset identity / fingerprint
@@ -795,11 +902,11 @@ _reg("kerberos", "Kerberos", "IT", "88", "tcp", kerberos_flow,
 _reg("ldap", "LDAP / AD", "IT", "389", "tcp", ldap_flow,
      "bind + rootDSE search against Active Directory")
 _reg("dhcp", "DHCP", "IT", "67", "udp", dhcp_flow,
-     "Discover/Offer with option 55 + vendor-class fingerprint")
+     "DORA lease + renewals: host name, option 55 + vendor-class fingerprint")
 _reg("netbios", "NetBIOS-NS", "IT", "137", "udp", netbios_flow,
      "Name registration/announcement carrying host name + OS")
 _reg("ntp", "NTP", "IT", "123", "udp", ntp_flow,
-     "Time sync client/server exchange")
+     "Client polls + stratum-2 server replies with real timestamps")
 
 
 def get(key: str) -> Profile:

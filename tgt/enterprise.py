@@ -175,6 +175,9 @@ class Segment:
 
 SPAN_VIEWS = ("access", "core")
 
+# DNS suffix of every modeled host (matches the TLS SNI / LDAP names)
+DNS_DOMAIN = "corp.local"
+
 
 # A conversation: client drives `proto` toward server.
 Conversation = Tuple[str, str, str]   # (client_name, server_name, proto_key)
@@ -355,7 +358,7 @@ class Environment:
         meta = {
             "ua": client.fp.ua,
             "smb": client.fp.smb if client.fp.smb != "none" else "smb2",
-            "dhcp_vendor": client.fp.dhcp_vendor or "MSFT 5.0",
+            "dhcp_vendor": client.fp.dhcp_vendor,   # "" = no option 60
             "nbname": client.name,
             "host": server.name,
             "sni": f"{server.name.lower()}.corp.local",
@@ -395,6 +398,10 @@ class Environment:
         sseg, dseg = seg_of(src), seg_of(dst)
         if sseg is None and dseg is None:
             return [frame]
+        if frame[0:6] == b"\xff" * 6 and sseg is not None:
+            # L2 broadcast (e.g. DHCP Discover): stays in the sender's VLAN
+            return [rewrite_l2(frame, bytes_to_mac(frame[6:12]),
+                               bytes_to_mac(frame[0:6]), sseg.vlan)]
         if sseg is dseg:
             return [rewrite_l2(frame, bytes_to_mac(frame[6:12]),
                                bytes_to_mac(frame[0:6]), sseg.vlan)]
@@ -410,6 +417,28 @@ class Environment:
             out.append(rewrite_l2(frame, dseg.gateway_mac, dst.mac, dseg.vlan,
                                   ttl=frame[14 + 8] - 1))
         return out
+
+    def _proto_meta(self, proto: str, client: Host, server: Host) -> dict:
+        """Per-protocol endpoint meta that needs the inventory: DNS resolves
+        the real names of the hosts the client talks to, DHCP leases from the
+        client's own segment (relayed by its gateway when the server is
+        elsewhere)."""
+        if proto == "dns":
+            peers: List[Host] = []
+            for c, sv, _ in self.conversations:
+                h = self.host(sv)
+                if c == client.name and sv != c and h not in peers:
+                    peers.append(h)
+            return {"dns_names": [(f"{h.name.lower()}.{DNS_DOMAIN}", h.ip)
+                                  for h in peers or [server]]}
+        if proto == "dhcp":
+            seg = self.segment_of(client)
+            meta = {"dhcp_router": seg.gateway, "dhcp_domain": DNS_DOMAIN,
+                    "dhcp_mask": str(ipaddress.ip_network(seg.subnet).netmask)}
+            if self.segment_of(server) is not seg:
+                meta["dhcp_relay"] = seg.gateway
+            return meta
+        return {}
 
     def segment_or_none(self, host: Host):
         """Like :meth:`segment_of`, but ``None`` for a host not in this env."""
@@ -478,6 +507,7 @@ class Environment:
         for cname, sname, proto in self.conversations:
             client, server = self.host(cname), self.host(sname)
             ep = self._endpoints(client, server)
+            ep.meta.update(self._proto_meta(proto, client, server))
             frames = protocols.get(proto).build(ep, max(1, messages))
             streams.append([(proto, self._place(f, client, server, span))
                             for f in frames])

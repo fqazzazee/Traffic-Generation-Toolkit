@@ -107,10 +107,11 @@ def dga_dns(ep: Endpoints, count: int) -> List[bytes]:
         tid = (i + 1) & 0xFFFF
         q = qname(name) + struct.pack("!HH", 1, 1)
         query = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0) + q
-        frames.append(P.udp_frame(ep, True, _sport(), 53, query, ident=i))
+        sport = _sport()                             # one port per transaction
+        frames.append(P.udp_frame(ep, True, sport, 53, query, ident=i))
         # NXDOMAIN response (typical for DGA / sinkholed IOC)
         resp = struct.pack("!HHHHHH", tid, 0x8183, 1, 0, 0, 0) + q
-        frames.append(P.udp_frame(ep, False, 53, _sport(), resp, ident=i))
+        frames.append(P.udp_frame(ep, False, 53, sport, resp, ident=i))
     return frames
 
 
@@ -143,8 +144,8 @@ def log4shell(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def s7_control(ep: Endpoints, count: int) -> List[bytes]:
-    """S7comm (102) PLC control — STOP CPU + program download (Stuxnet-style
-    manipulation of a Siemens PLC, not just read/monitor)."""
+    """S7comm (102) PLC control — PLC STOP jobs naming the "P_PROGRAM" service
+    (Stuxnet-style manipulation of a Siemens PLC, not just read/monitor)."""
     exchanges = _s7_connect()                        # COTP + Setup Comm first
     for i in range(count):
         ref = i + 1
@@ -171,31 +172,40 @@ def iec104_command(ep: Endpoints, count: int) -> List[bytes]:
         return struct.pack("<BBBBH", type_id, 1, cot, 0, 1) + \
             ioa.to_bytes(3, "little") + element
 
+    def s_fr(nr):                                    # S-format acknowledgement
+        return struct.pack("<BBHH", 0x68, 4, 0x0001, nr << 1)
+
     exchanges = [(u(0x07), u(0x0B))]                 # STARTDT act / con
-    ns = 0
+    c_ns = s_ns = 0          # I-frames each side has sent (= the peer's N(R))
     for i in range(count):
         ioa = 0x1001 + i
-        # C_SC_NA_1 (45) single command, COT=6 activation, SCS=1 (close/trip)
-        cmd = i_fr(ns, 0, asdu(45, 6, ioa, b"\x01"))
-        # ... COT=7 activation confirmation back
-        con = i_fr(0, ns + 1, asdu(45, 7, ioa, b"\x01"))
+        # C_SC_NA_1 (45) single command, COT=6 activation, SCS=1 (close/trip);
+        # N(R) acknowledges every I-frame the outstation has sent so far
+        cmd = i_fr(c_ns, s_ns, asdu(45, 6, ioa, b"\x01"))
+        c_ns += 1
+        # ... COT=7 activation confirmation + COT=10 termination back, each
+        # acknowledging the command just received
+        con = i_fr(s_ns, c_ns, asdu(45, 7, ioa, b"\x01")) + \
+            i_fr(s_ns + 1, c_ns, asdu(45, 10, ioa, b"\x01"))
+        s_ns += 2
         exchanges.append((cmd, con))
-        ns += 1
+    exchanges.append((s_fr(s_ns), b""))              # ack the last replies
     return _tcp_flow(ep, _sport(), 2404, exchanges)
 
 
 def tristation(ep: Endpoints, count: int) -> List[bytes]:
     """TriStation (UDP 1502) to a Schneider Triconex safety controller
     (TRITON/TRISIS — manipulating a Safety Instrumented System)."""
+    sport = _sport()                     # the engineering tool's one socket
     frames = []
     for i in range(count):
         # TriStation command: function 0x05 (get CP status) / 0x0d (download)
         fn = 0x0D if i % 3 == 0 else 0x05
         req = struct.pack("<HHH", fn, i & 0xFFFF, 0) + b"TRISTATION" + \
             struct.pack("<H", i & 0xFFFF)
-        frames.append(P.udp_frame(ep, True, _sport(), 1502, req, ident=i))
+        frames.append(P.udp_frame(ep, True, sport, 1502, req, ident=i))
         resp = struct.pack("<HHH", fn | 0x8000, i & 0xFFFF, 0) + b"TRICONEX"
-        frames.append(P.udp_frame(ep, False, 1502, _sport(), resp, ident=i))
+        frames.append(P.udp_frame(ep, False, 1502, sport, resp, ident=i))
     return frames
 
 
@@ -214,10 +224,11 @@ def dns_tunnel(ep: Endpoints, count: int) -> List[bytes]:
         tid = (i + 1) & 0xFFFF
         q = qname(f"{label}.{base}") + struct.pack("!HH", 16, 1)   # TXT, IN
         query = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0) + q
-        frames.append(P.udp_frame(ep, True, _sport(), 53, query, ident=i))
+        sport = _sport()                             # one port per transaction
+        frames.append(P.udp_frame(ep, True, sport, 53, query, ident=i))
         resp = struct.pack("!HHHHHH", tid, 0x8180, 1, 1, 0, 0) + q + \
             struct.pack("!HHHIH", 0xC00C, 16, 1, 60, 5) + b"\x04data"
-        frames.append(P.udp_frame(ep, False, 53, _sport(), resp, ident=i))
+        frames.append(P.udp_frame(ep, False, 53, sport, resp, ident=i))
     return frames
 
 
@@ -302,7 +313,7 @@ ATTACKS: Dict[str, Tuple[AttackBuilder, str]] = {
     "dga-dns": (dga_dns, "IOC / DGA domain lookups"),
     "telnet-brute": (telnet_brute, "Telnet default-credential brute force"),
     "log4shell": (log4shell, "JNDI lookup in HTTP (CVE-2021-44228)"),
-    "s7-control": (s7_control, "S7comm PLC STOP + program download"),
+    "s7-control": (s7_control, "S7comm PLC STOP (P_PROGRAM) commands"),
     "iec104-command": (iec104_command, "IEC-104 breaker control commands"),
     "tristation": (tristation, "TriStation writes to a Triconex SIS"),
     "dns-tunnel": (dns_tunnel, "DNS tunneling / exfil over long TXT queries"),
@@ -605,7 +616,7 @@ _reg(Incident("log4shell", "Log4Shell", "IT", "2021",
 # ---- OT incidents ----------------------------------------------------------
 _reg(Incident("stuxnet", "Stuxnet", "OT", "2010",
     "Sabotage of Siemens S7 PLCs at Natanz: SMBv1 propagation and S7comm "
-    "PLC STOP + malicious program download from a compromised engineering WS.",
+    "PLC STOP commands from a compromised engineering WS.",
     [_h("STEP7-ENGWS", "172.16.2.50", "eng", "win7"),
      _h("WINCC-SCADA", "172.16.2.51", "scada", "winxp"),
      _h("PLC-S7-417", "172.16.2.21", "plc", "siemens", OUI_SIEMENS,
@@ -623,7 +634,7 @@ _reg(Incident("industroyer", "Industroyer / CrashOverride", "OT", "2016",
     [("SUBSTATION-HMI", "RTU-104", "port-scan",
       {"scan_ports": [2404, 102, 20000]}),
      ("SUBSTATION-HMI", "RTU-104", "iec104-command", {}),
-     ("INDUSTROYER-C2", "SUBSTATION-HMI", "c2-beacon", {
+     ("SUBSTATION-HMI", "INDUSTROYER-C2", "c2-beacon", {
         "domain": "195.16.88.6", "uri": "/xmlrpc"})]))
 
 _reg(Incident("triton", "TRITON / TRISIS", "OT", "2017",
