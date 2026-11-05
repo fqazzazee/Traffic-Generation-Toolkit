@@ -368,6 +368,69 @@ _os("canonical-ubuntu-linux", "Canonical", "Ubuntu Server 22.04 LTS",
      "snmp_sysdescr": "Linux {name} {firmware} #1 SMP x86_64",
      "snmp_sysobjectid": "1.3.6.1.4.1.8072.3.2.10"}, True)
 
+# ---------------------------------------------------------------------------
+# Vendor engineering-protocol devices (tgt/protocols_eng.py): Omron FINS,
+# Mitsubishi SLMP, HART-IP, GE SRTP. FINS model strings, SLMP model codes and
+# the HART manufacturer id (Rosemount = 38) are as the vendors document them;
+# firmware lists, serial formats and the gateway's expanded device type are
+# representative.
+# ---------------------------------------------------------------------------
+_OMRON = ("00:00:0a", "3c:f7:d1", "80:b5:c6")
+_MITSUBISHI = ("00:26:92", "10:4b:46", "38:e0:8e")
+_ROSEMOUNT = ("00:26:16", "00:22:e5")
+_GE_IP = ("00:09:91",)                   # GE Intelligent Platforms
+
+_add(DeviceModel(
+    "omron-nj501-1500", "Omron", "Sysmac NJ501-1500 machine automation "
+    "controller", "plc", _OMRON, "1", "Sysmac NJ firmware",
+    ("1.40", "1.46", "1.48", "1.60"), "#####?####",
+    (Module(0, "NJ501-1500", "NJ5 CPU unit, EtherNet/IP + EtherCAT"),
+     Module(1, "NJ-PA3001", "Power supply unit")),
+    identity={"fins": {"model": "NJ501-1500"},
+              "cip": {"vendor_id": 47, "device_type": 0x0E,
+                      "product_name": "NJ501-1500"}},
+    banners={"http": "", "snmp_sysdescr": "OMRON NJ501-1500 Ver.{firmware}"},
+    aliases=("NJ501-1500",)))
+_add(DeviceModel(
+    "mitsubishi-r04cpu", "Mitsubishi Electric", "MELSEC iQ-R R04CPU",
+    "plc", _MITSUBISHI, "1", "MELSEC iQ-R firmware",
+    ("28", "45", "61"), "##########-B",
+    (Module(0, "R04CPU", "iQ-R programmable controller CPU"),
+     Module(1, "RX40C7", "16-pt DC input"),
+     Module(2, "RY40NT5P", "16-pt transistor output")),
+    identity={"slmp": {"model": "R04CPU", "model_code": 0x4800}},
+    banners={"http": "", "snmp_sysdescr": "MELSEC iQ-R R04CPU"},
+    aliases=("R04CPU", "MELSEC iQ-R R04CPU")))
+_add(DeviceModel(
+    "mitsubishi-q03udvcpu", "Mitsubishi Electric", "MELSEC-Q Q03UDVCPU",
+    "plc", _MITSUBISHI, "1", "MELSEC-Q firmware",
+    ("19", "23", "27"), "##########-B",
+    (Module(0, "Q03UDVCPU", "Universal model high-speed QCPU"),
+     Module(1, "QX42", "64-pt DC input")),
+    identity={"slmp": {"model": "Q03UDVCPU", "model_code": 0x0366}},
+    banners={"http": "", "snmp_sysdescr": "MELSEC-Q Q03UDVCPU"},
+    aliases=("Q03UDVCPU", "MELSEC-Q Q03UDVCPU")))
+_add(DeviceModel(
+    "emerson-1410s-gateway", "Emerson", "Rosemount 1410S Smart Wireless "
+    "Gateway (HART-IP)", "rtu", _ROSEMOUNT, "1",
+    "Smart Wireless Gateway firmware", ("4.7.98", "4.7.106", "5.0.12"),
+    "#######",
+    identity={"hart": {"manufacturer_id": 0x0026, "device_type": 0x2690,
+                       "device_rev": 3, "sw_rev": 4, "hw_rev": 1}},
+    banners={"http": "", "snmp_sysdescr": "Smart Wireless Gateway {firmware}"},
+    aliases=("1410S Smart Wireless Gateway", "Smart Wireless Gateway 1410S")))
+_add(DeviceModel(
+    "ge-rx3i-cpe330", "GE Intelligent Platforms", "PACSystems RX3i CPE330",
+    "plc", _GE_IP, "1", "PACSystems firmware",
+    ("9.40", "10.30", "10.85"), "?##########",
+    (Module(0, "IC695PSD140", "RX3i power supply"),
+     Module(1, "IC695CPE330", "RX3i CPU, 1 GHz dual core"),
+     Module(3, "IC694MDL660", "32-pt 24 V DC input")),
+    identity={"srtp": {"cpu": "IC695CPE330", "r_registers": 32640}},
+    banners={"http": "", "snmp_sysdescr": "PACSystems RX3i IC695CPE330 "
+                                          "{firmware}"},
+    aliases=("IC695CPE330", "PACSystems RX3i CPE330")))
+
 # The OS-family model a general-purpose host gets from its fingerprint key.
 OS_DEFAULT_MODEL: Dict[str, str] = {
     "win2019": "microsoft-windows-server-2019",
@@ -512,4 +575,21 @@ def identity_meta(model: Optional[DeviceModel], firmware: str,
             meta["s7_firmware"] = s7_version(firmware)
         if serial:
             meta["s7_serial"] = serial
+    # vendor engineering protocols (tgt/protocols_eng.py)
+    fins = model.identity.get("fins")
+    if fins:
+        meta["fins_model"] = fins["model"]
+        if firmware:
+            meta["fins_version"] = firmware
+    slmp = model.identity.get("slmp")
+    if slmp:
+        meta["slmp_model"] = slmp["model"]
+        meta["slmp_model_code"] = slmp["model_code"]
+    hart = model.identity.get("hart")
+    if hart:
+        for k, v in hart.items():
+            meta[f"hart_{k}"] = v
+        digits = "".join(c for c in serial if c.isdigit())
+        if digits:
+            meta["hart_device_id"] = int(digits) % (1 << 24)
     return meta
