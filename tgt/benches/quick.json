@@ -1,0 +1,46 @@
+{
+  "name": "quick",
+  "description": "About 1 h simulated on the small OT plant: 20 min of normal traffic to learn, 15 min with three OT intrusions injected at fixed offsets, then 25 min of asset and conversation changes. Seconds with --clock synthetic, about 2 min on the wire with --speed 30.",
+  "env": "ot-plant",
+  "start_time": "2026-11-02T08:00:00Z",
+  "seed": 6500,
+  "stages": [
+    {"id": "learn", "kind": "baseline", "duration": "20m",
+     "description": "normal operation for the monitor to learn"},
+    {"id": "attack", "kind": "incidents", "duration": "15m",
+     "description": "ICS reconnaissance + C2, a PLC STOP from the engineering workstation, SMB lateral movement and unauthorized Modbus writes",
+     "inject": [
+       {"at": "2m", "incident": "havex", "duration": "3m"},
+       {"at": "6m", "incident": "stuxnet", "duration": "3m"},
+       {"at": "10m", "incident": "ekans", "duration": "3m"}
+     ]},
+    {"id": "change", "kind": "campaign",
+     "description": "a new PLC is commissioned, two new conversations (one cell to cell), an HMI goes offline",
+     "phases": [
+       {"name": "settle", "duration": "5m"},
+       {"name": "new-plc", "duration": "5m",
+        "description": "a CompactLogix joins the Rockwell cell and its HMI starts polling it",
+        "add_host": [{"name": "PLC-RW3", "ip": "172.16.1.23",
+                      "model": "rockwell-1769-l36erm"}],
+        "add_flow": [{"client": "HMI-RW", "server": "PLC-RW3",
+                      "proto": "enip"}]},
+       {"name": "new-conversations", "duration": "5m",
+        "description": "SCADA starts polling PLC-RW2; PLC-RW1 talks S7 to the Siemens cell",
+        "add_flow": [{"client": "SCADA01", "server": "PLC-RW2",
+                      "proto": "enip"},
+                     {"client": "PLC-RW1", "server": "PLC-S7-1",
+                      "proto": "s7comm"}]},
+       {"name": "hmi-offline", "duration": "5m",
+        "description": "the Windows 2000 HMI loses power",
+        "offline": ["HMI-2000"]},
+       {"name": "settle-2", "duration": "5m"}
+     ]}
+  ],
+  "thresholds": {
+    "discovery_recall": {"min": 0.9},
+    "field_accuracy": {"min": 0.8},
+    "change_detection_rate": {"min": 0.5},
+    "attack_detection_rate": {"min": 0.8},
+    "attack_median_ttd_s": {"max": 300}
+  }
+}

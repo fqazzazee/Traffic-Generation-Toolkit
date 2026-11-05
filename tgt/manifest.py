@@ -4,7 +4,8 @@
 ``tgt-manifest/1``): the seed and config that reproduce the run, the
 environment's inventory, when each asset first/last sent a frame, every flow
 seen (client, server, protocol), and one event per injected attack flow with a
-vendor-neutral category, so a scorer (``tgt score``) can match sensor alerts
+vendor-neutral category and its MITRE ATT&CK technique IDs (``techniques``,
+see :mod:`tgt.techniques`), so a scorer (``tgt score``) can match sensor alerts
 against it. The engine rewrites the file every ~10 s and on exit, atomically,
 so a killed or long run still leaves a valid manifest.
 """
@@ -92,6 +93,13 @@ class Recorder:
         self.cfg, self.seed, self.argv, self.clock = cfg, seed, list(argv), clock
         self.git = _git_sha()
         self.env = enterprise.get(cfg.env) if cfg.env else None
+        # replay --remap-env: the capture's hosts stand in for env hosts,
+        # whose inventory (and asset ids) is the ground truth
+        self.remap = None
+        if cfg.replay_path and getattr(cfg, "remap_env", None):
+            from .remapenv import plan_for
+            self.remap = plan_for(cfg)
+            self.env = self.remap.env
         self.addr_aid: Dict[str, str] = {}      # ip / mac -> asset id
         self.aid_ip: Dict[str, str] = {}
         # (key, addr a, addr b) -> (client aid, server aid, client ip, server ip)
@@ -106,6 +114,8 @@ class Recorder:
         if self.env is not None:
             from . import inventory
             self.inventory = inventory.to_json(self.env, self.sprinkle)
+            if self.remap is not None:
+                self.remap.annotate(self.inventory)
         self._index()
         self._cache: Dict[tuple, tuple] = {}
         self._pairs: Dict[tuple, str] = {}
@@ -308,6 +318,7 @@ class Recorder:
         return self.attack_proto.get(key) or key
 
     def to_dict(self, stats=None) -> Dict:
+        from . import techniques
         cfg = self.cfg
         flows = []
         for (c, s, key, source), (t0, t1, n) in self.flows.items():
@@ -335,7 +346,8 @@ class Recorder:
                 "hosts": [c] if c == s else [c, s],
                 "src": rec[2], "dst": rec[3], "protocol": self._proto(key),
                 "detail": f"{key}: {self.attack_desc.get(key, key)}",
-                "source": source, "attack": key, "packets": n})
+                "source": source, "attack": key, "packets": n,
+                "techniques": techniques.for_event(key, source)})
         for aid, (ip, incs) in self.new_assets.items():
             if aid in self.first_seen:
                 srcs = [i if ":" in i else f"sprinkle:{i}" for i in incs]
@@ -394,6 +406,8 @@ class Recorder:
             "injections": [self._injection_row(r) for r in
                            list(self.injections)],
         }
+        if self.remap is not None:
+            doc["remap"] = self.remap.to_json()
         if self.plan is not None:
             doc["campaign"] = {"name": self.plan.name,
                                "plan": self.plan.source,

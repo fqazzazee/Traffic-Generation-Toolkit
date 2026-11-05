@@ -264,8 +264,12 @@ def test_inventory_export() -> None:
         buf = io.StringIO()
         inventory.write_csv(env, buf)
         rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
-        check(len(rows) == len(env.hosts), f"inventory {env.key}: row count")
-        check(all(r["segment"] and r["vlan"] and r["zone"] for r in rows),
+        # one row per host, plus one per device behind a gateway (no IP,
+        # so no VLAN: "behind" names its gateway)
+        check(len(rows) == len(env.hosts) + len(env.field_devices),
+              f"inventory {env.key}: row count")
+        check(all(r["segment"] and (r["vlan"] or r["behind"]) and r["zone"]
+                  for r in rows),
               f"inventory {env.key}: host without segment/VLAN/zone")
         doc = json.loads(json.dumps(inventory.to_json(env)))
         check(len(doc["flows"]) == len(env.conversations),
@@ -325,18 +329,24 @@ def test_tshark_dissects_every_builder() -> None:
     # the site cycle gets its own capture: its ARP would otherwise flag the
     # default Endpoints() addresses as duplicates of real site hosts
     layers, expert = [], ""
+    # builders stock tshark needs extra options for get their own capture
+    # (_TSHARK_OWN, W5-C); _TSHARK_OPTS apply to every capture
+    own = [(k, [groups.pop(k)], _TSHARK_OWN[k]) for k in list(groups)
+           if k in _TSHARK_OWN]
     with tempfile.TemporaryDirectory() as d:
-        for name, chunk in (("all", list(groups.values())), ("site", [site])):
+        for name, chunk, extra in [("all", list(groups.values()), []),
+                                   ("site", [site], [])] + own:
             path = f"{d}/{name}.pcap"
             with PcapWriter(path) as w:
                 for frames in chunk:
                     for f in frames:
                         w.write(f)
+            opts = ["tshark"] + _TSHARK_OPTS + extra + ["-r", path]
             layers += subprocess.run(
-                ["tshark", "-r", path, "-T", "fields", "-e", "frame.protocols"],
+                opts + ["-T", "fields", "-e", "frame.protocols"],
                 capture_output=True, text=True).stdout.splitlines()
             expert += subprocess.run(
-                ["tshark", "-r", path, "-q", "-z", "expert,warn"],
+                opts + ["-q", "-z", "expert,warn"],
                 capture_output=True, text=True).stdout
     seen = {x for line in layers for x in line.split(":")}
     for key, layer in list(dissects.items()) + [("smb1", "smb")]:
@@ -893,7 +903,9 @@ def test_sprinkle_servers_serve_their_protocol() -> None:
     doc = inventory.to_json(plant, ["triton"])
     check(doc["sprinkle"]["triton"] == {
         "mapped": {"TRITON-ENGWS": "ENGWS01"},
-        "new_assets": ["SIS-TRICONEX"]}, "inventory JSON sprinkle mapping")
+        "new_assets": ["SIS-TRICONEX"],
+        "techniques": ["T0843", "T0846", "T0868", "T1046"]},
+        "inventory JSON sprinkle mapping")
 
 
 def serves_of(env, name: str) -> set:
@@ -1957,9 +1969,9 @@ def _score_fixture(mode: str, **kw):
     truth = S.load_truth(os.path.join(
         _SCORE_FIX, "manifest.json" if mode == "manifest"
         else "truth-inventory.json"))
-    rows, info = S.read_export(os.path.join(_SCORE_FIX, "export-ctd.csv"),
-                               S.load_json_spec("claroty-ctd"))
-    info.update(source="export-ctd.csv", map="claroty-ctd.json")
+    rows, info = S.read_export(os.path.join(_SCORE_FIX, "export-assets.csv"),
+                               S.load_json_spec("generic"))
+    info.update(source="export-assets.csv", map="generic.json")
     alerts = S.read_alerts(os.path.join(_SCORE_FIX, "alerts.csv"),
                            S.load_json_spec("alerts-generic"))
     return S.score(truth, rows, info, zeek=os.path.join(_SCORE_FIX, "zeek"),
@@ -2170,8 +2182,8 @@ def test_score_cli_reports() -> None:
         js, ht = os.path.join(d, "r.json"), os.path.join(d, "r.html")
         p = _cli(["score", "--manifest",
                   os.path.join(_SCORE_FIX, "manifest.json"), "--assets",
-                  os.path.join(_SCORE_FIX, "export-ctd.csv"), "--map",
-                  "claroty-ctd", "--zeek", os.path.join(_SCORE_FIX, "zeek"),
+                  os.path.join(_SCORE_FIX, "export-assets.csv"), "--map",
+                  "generic", "--zeek", os.path.join(_SCORE_FIX, "zeek"),
                   "--alerts", os.path.join(_SCORE_FIX, "alerts.csv"),
                   "--alert-map", "alerts-generic", "--json", js,
                   "--html", ht])
@@ -3250,8 +3262,12 @@ def test_tcp_ip_id_and_defaults() -> None:
     core = env.build(1, span="core")
     pairs = 0
     for (_, a), (_, b) in zip(core, core[1:]):
-        if P.frame_ips(a) and P.frame_ips(a) == P.frame_ips(b) and \
-                a[-20:] == b[-20:] and a[12:14] == b[12:14] == b"\x81\x00":
+        # a routed copy: both tagged, same addresses and the very same IP
+        # payload, TTL one lower (a shared tail alone can pair two distinct
+        # datagrams, whose IDs rightly differ)
+        if a[12:14] == b[12:14] == b"\x81\x00" and len(a) == len(b) and \
+                a[30:38] == b[30:38] and a[38:] == b[38:] and \
+                b[26] == a[26] - 1:
             pairs += 1
             check(a[22:24] == b[22:24], "routed copy changed the IP ID")
     check(pairs > 0, "no routed copies found in the core view")
@@ -6521,6 +6537,2038 @@ def test_review_sender_reopens_deleted_iface() -> None:
         "close": lambda self: None})()
     s.send(b"x" * 60)
     check(s.socks["b"] is not None, "sender: link-down socket dropped")
+
+# ---- W5-A: MITRE ATT&CK technique tags (#64) --------------------------------
+def test_w5a_attack_techniques_cover_attacks() -> None:
+    """Every built-in attack builder maps onto techniques that exist in
+    tgt/attack_ics.json; the table is well formed and fully used; incident
+    extras name real incidents/flows; label parsing and ID matching."""
+    import json
+    from tgt import incidents, plugins
+    from tgt import techniques as T
+    tab = T.load()
+    raw = json.load(open(T.TABLE_PATH, encoding="utf-8"))
+    check(set(tab) == {k for k in raw if not k.startswith("_")} and
+          len(tab) >= 20, "attack_ics.json: table not loaded")
+    tactics = {"initial-access", "execution", "persistence",
+               "privilege-escalation", "evasion", "defense-evasion",
+               "discovery", "lateral-movement", "collection",
+               "command-and-control", "inhibit-response-function",
+               "impair-process-control", "impact", "reconnaissance",
+               "credential-access", "exfiltration"}
+    for tid, v in tab.items():
+        ok = (v.get("name") and v.get("tactic") and
+              set(v["tactic"]) <= tactics and
+              v.get("matrix") in ("ics", "enterprise") and
+              T.parse_ids(tid) == [tid] and
+              (tid.startswith("T08")) == (v["matrix"] == "ics"))
+        check(bool(ok), f"attack_ics.json: bad entry {tid} {v}")
+    builtin = [k for k, (b, _) in incidents.ATTACKS.items()
+               if b.__module__ == "tgt.incidents"]
+    check(len(builtin) >= 14, "built-in attacks missing")
+    for k in builtin:
+        ids = T.for_attack(k)
+        check(bool(ids) and all(t in tab for t in ids) and
+              ids == sorted(set(ids)),
+              f"techniques: attack {k} -> {ids} (missing / not in table)")
+    probs = [p for p in T.validate()
+             if not p.startswith("attack ") or p.split()[1] in builtin]
+    check(not probs, f"techniques.validate: {probs}")
+    used = set()
+    for ik in incidents.INCIDENTS:
+        ids = T.for_incident(ik)
+        check(ids == sorted(set(ids)) and all(t in tab for t in ids),
+              f"techniques: incident {ik} -> {ids}")
+        used.update(ids)
+    check(set(tab) <= used, f"attack_ics.json lists techniques no incident "
+          f"shows: {sorted(set(tab) - used)}")
+    # spot checks the issue names
+    check("T0846" in T.for_attack("port-scan") and
+          "T0855" in T.for_attack("modbus-write") and
+          "T0855" in T.for_attack("iec104-command") and
+          "T0843" in T.for_attack("tristation") and
+          "T0886" in T.for_attack("smb-lateral") and
+          "T0869" in T.for_attack("c2-beacon"),
+          "techniques: issue examples not mapped")
+    check(T.for_flow("iec104-command", "industroyer") == ["T0806", "T0855"]
+          and T.for_flow("iec104-command") == ["T0855"] and
+          "T1568.002" in T.for_incident("sunburst") and
+          "T1568.002" not in T.for_incident("wannacry"),
+          "techniques: per-incident extras")
+    check(T.name("T0855") == "Unauthorized Command Message" and
+          T.name("T9999") == "" and T.for_attack("nope") == [] and
+          T.for_incident("nope") == [], "techniques: name / unknown keys")
+    check(T.incident_of("inject:wannacry#3") == "wannacry" and
+          T.incident_of("sprinkle:triton") == "triton" and
+          T.incident_of("incident:stuxnet") == "stuxnet" and
+          T.incident_of("baseline") is None and T.incident_of("") is None,
+          "techniques: source label parsing")
+    check(T.for_event("dga-dns", "inject:conficker#1") ==
+          ["T0869", "T1071.004", "T1568.002"], "techniques: for_event")
+    check(T.parse_ids("MITRE t0855; T1071.001,T0855 x") ==
+          ["T0855", "T1071.001"], "techniques: parse_ids")
+    check(T.shares(["T1071"], ["T1071.001"]) and
+          T.shares(["T1071.004"], ["T1071"]) and
+          not T.shares(["T1110.001"], ["T1110.003"]) and
+          not T.shares([], ["T0855"]) and T.shares(["T0855"], ["T0855"]),
+          "techniques: shares (parent / sub-technique)")
+    # plugins: techniques= on register_attack, validated and rolled back
+    try:
+        plugins.register_attack("w5a-x", lambda ep, n: [], "x",
+                                category="ot-write", techniques=["T9999"])
+        check(False, "plugins: unknown technique accepted")
+    except plugins.PluginError:
+        pass
+    plugins.unload_all()
+    plugins.register_attack("w5a-y", lambda ep, n: [], "y",
+                            category="ot-write", techniques=["T0855"])
+    check(T.for_attack("w5a-y") == ["T0855"], "plugins: attack techniques")
+    plugins.unload_all()
+    check("w5a-y" not in T.ATTACK_TECHNIQUES and
+          "w5a-y" not in incidents.ATTACKS,
+          "plugins: attack techniques not rolled back")
+
+
+def test_w5a_manifest_events_carry_techniques() -> None:
+    """Attack events of sprinkle, --incident and injection runs carry the
+    sorted technique IDs of their attack (+ incident extras); new-asset
+    events carry none; tgt inventory --sprinkle / tgt list show them."""
+    import contextlib
+    import io
+    from tgt import cli, enterprise, manifest
+    from tgt import techniques as T
+    from tgt.engine import build_batch as bb
+    cfg = RunConfig(env="it-org", sprinkle=["industroyer"], messages=2)
+    n = len(bb(cfg))
+    with tempfile.TemporaryDirectory() as d:
+        m = _manifest_run(d, "spr", RunConfig(
+            env="it-org", sprinkle=["industroyer"], messages=2, seed=3),
+            n + 50)
+        m2 = _manifest_run(d, "inc", RunConfig(
+            incident="triton", messages=2, seed=3), 60)
+    atk = [e for e in m["events"] if e.get("attack")]
+    check(atk and all(e["techniques"] == T.for_event(e["attack"],
+                                                      e["source"])
+                      and e["techniques"] for e in atk),
+          f"manifest: sprinkle events lack techniques "
+          f"{[(e['attack'], e.get('techniques')) for e in atk]}")
+    iec = [e for e in atk if e["attack"] == "iec104-command"]
+    check(iec and iec[0]["techniques"] == ["T0806", "T0855"],
+          f"manifest: industroyer extras {iec}")
+    check(all("techniques" not in e for e in m["events"]
+              if e["category"] == "new-asset"),
+          "manifest: new-asset event carries techniques")
+    atk2 = [e for e in m2["events"] if e.get("attack")]
+    check({e["attack"] for e in atk2} == {"tristation", "port-scan"} and
+          all(e["source"] == "incident:triton" and
+              e["techniques"] == T.for_attack(e["attack"]) for e in atk2),
+          f"manifest: --incident events {atk2}")
+    # an injection's events (control API / tgt ctl inject source label)
+    rec = manifest.Recorder(RunConfig(env="it-org"), 1, clock="synthetic")
+    rec.events[("a", "b", "dga-dns", "inject:sunburst#2")] = [
+        0.0, 1.0, 3, ("a", "b", "10.0.0.1", "10.0.0.2")]
+    ev = rec.to_dict()["events"][0]
+    check(ev["techniques"] == ["T0869", "T1071.004", "T1568.002"],
+          f"manifest: injection event techniques {ev}")
+    # tgt inventory --sprinkle (JSON inline, CSV on stderr) and tgt list
+    from tgt import inventory
+    doc = inventory.to_json(enterprise.get("it-org"), ["colonial"])
+    check(doc["sprinkle"]["colonial"]["techniques"] ==
+          T.for_incident("colonial"), "inventory JSON: sprinkle techniques")
+
+    class A:
+        env, env_file, format, output = "it-org", None, "csv", None
+        sprinkle = ["colonial"]
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        cli.cmd_inventory(A())
+    check("sprinkle colonial: ATT&CK T0869" in err.getvalue(),
+          f"inventory CSV: techniques note {err.getvalue()!r}")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_list(None)
+    txt = buf.getvalue()
+    check("techniques: " + ", ".join(T.for_incident("triton")) in txt and
+          "T0855     Unauthorized Command Message" in txt,
+          "tgt list: incident techniques / technique table missing")
+
+
+def _w5a_truth():
+    from tgt import score
+    hosts = [{"asset_id": "s:ENG", "name": "ENG", "ip": "10.0.0.1"},
+             {"asset_id": "s:PLC", "name": "PLC", "ip": "10.0.0.2"},
+             {"asset_id": "s:WS", "name": "WS", "ip": "10.0.0.3"}]
+
+    def ev(i, cat, atk, t0, src, dst, tech=None):
+        e = {"id": f"e{i}", "category": cat, "attack": atk,
+             "t_start": f"2026-11-05T14:{t0}Z",
+             "t_end": f"2026-11-05T14:{t0}Z", "src": src, "dst": dst,
+             "hosts": [], "source": "sprinkle:x", "detail": atk}
+        if tech is not None:
+            e["techniques"] = tech
+        return e
+    events = [
+        ev(1, "scan", "port-scan", "00:00", "10.0.0.1", "10.0.0.2",
+           ["T0846", "T1046"]),
+        ev(2, "ot-write", "modbus-write", "01:00", "10.0.0.1", "10.0.0.2",
+           ["T0836", "T0855"]),
+        ev(3, "ot-write", "modbus-write", "02:00", "10.0.0.3", "10.0.0.2",
+           ["T0836", "T0855"]),
+        ev(4, "c2", "https-c2", "03:00", "10.0.0.3", "198.51.100.9",
+           ["T0869", "T1071.001", "T1573"]),
+        # an old manifest without "techniques": derived from the attack
+        ev(5, "c2", "dga-dns", "04:00", "10.0.0.1", "10.0.0.3"),
+        {"id": "e6", "category": "new-asset", "t_start":
+         "2026-11-05T14:05:00Z", "t_end": "2026-11-05T14:05:00Z",
+         "hosts": ["10.0.0.9"], "src": "10.0.0.9", "dst": None,
+         "source": "sprinkle:x"}]
+    doc = {"schema": "tgt-manifest/1", "start": "2026-11-05T14:00:00Z",
+           "end": "2026-11-05T14:10:00Z", "inventory": {"hosts": hosts},
+           "first_seen": {}, "events": events}
+    return score.Truth(doc, "w5a")
+
+
+def test_w5a_score_by_technique_and_strict() -> None:
+    """tgt score: detections.by_technique counts (an event counts toward
+    each of its techniques), median TTD, tagged alerts via a technique
+    column and title regexes, --strict-technique, rendering."""
+    import json
+    from tgt import score
+    truth = _w5a_truth()
+    amap = {"format": "csv",
+            "columns": {"time": "time", "src": "src", "dst": "dst",
+                        "title": "title", "technique": "mitre"},
+            "categories": {"scan": "scan", "modbus write": "ot-write",
+                           "c2|beacon": "c2"},
+            "techniques": {"beacon": ["T1071.001"]}}
+    rows = ("time,src,dst,title,mitre\n"
+            # e1 scan, 10 s late, untagged
+            "2026-11-05T14:00:10Z,10.0.0.1,10.0.0.2,Port scan,\n"
+            # e2 modbus write, tagged with a shared technique
+            "2026-11-05T14:01:20Z,10.0.0.1,10.0.0.2,Modbus write,T0855\n"
+            # e3 modbus write, tagged with an unrelated technique
+            "2026-11-05T14:02:30Z,10.0.0.3,10.0.0.2,Modbus write,T0843\n"
+            # e4 c2: regex adds T1071.001 (shared)
+            "2026-11-05T14:03:40Z,10.0.0.3,198.51.100.9,TLS beacon,\n"
+            # e5 dga: column says T1071 (parent of T1071.004)
+            "2026-11-05T14:04:50Z,10.0.0.1,10.0.0.3,C2 lookup,T1071\n")
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "alerts.csv")
+        with open(p, "w") as f:
+            f.write(rows)
+        alerts = score.read_alerts(p, amap)
+        plain = score.read_alerts(p, dict(amap, techniques={},
+                                          columns=dict(amap["columns"],
+                                                       technique="nope")))
+    check([a["techniques"] for a in alerts] ==
+          [[], ["T0855"], ["T0843"], ["T1071.001"], ["T1071"]],
+          f"read_alerts techniques {[a['techniques'] for a in alerts]}")
+    check(all(a["techniques"] is None for a in plain),
+          "read_alerts: untagged map must give techniques None")
+    det = score.detections(truth, alerts, 300.0, 5.0)
+    bt = det["by_technique"]
+    want = {"T0836": (2, 2), "T0855": (2, 2), "T0846": (1, 1),
+            "T1046": (1, 1), "T0869": (2, 2), "T1071.001": (1, 1),
+            "T1573": (1, 1), "T1071.004": (1, 1)}
+    check({t: (v["events"], v["detected"]) for t, v in bt.items()} == want,
+          f"by_technique counts {bt}")
+    check(list(bt) == sorted(bt) and
+          set(bt["T0855"]) == {"name", "events", "detected", "rate",
+                               "median_ttd_s"} and
+          bt["T0855"]["name"] == "Unauthorized Command Message" and
+          bt["T0855"]["rate"] == 1.0 and
+          bt["T0855"]["median_ttd_s"] == 25.0 and
+          bt["T0846"]["median_ttd_s"] == 10.0,
+          f"by_technique shape {bt.get('T0855')}")
+    check(det["detected"] == 5 and det["strict_technique"] is False and
+          det["tagged_alerts"] == 4, f"detections {det['detected']}")
+    # strict: e3's alert (T0843) no longer matches; parent T1071 still does
+    sd = score.detections(truth, alerts, 300.0, 5.0, strict_technique=True)
+    sbt = sd["by_technique"]
+    check(sd["detected"] == 4 and sbt["T0855"]["detected"] == 1 and
+          sbt["T0855"]["rate"] == 0.5 and
+          sbt["T0855"]["median_ttd_s"] == 20.0 and
+          sbt["T1071.004"]["detected"] == 1 and
+          sbt["T0846"]["detected"] == 1 and sd["strict_technique"] and
+          len(sd["false_alerts"]) == 1,
+          f"strict technique: {sd['detected']} {sbt}")
+    nd = score.detections(truth, plain, 300.0, 5.0, strict_technique=True)
+    check(nd["detected"] == 5, "strict with an untagged map changed results")
+    # through score(): JSON-serialisable, summary + HTML tables; absent
+    # without alerts
+    res = score.score(truth, [], {"rows": 0, "columns": {}, "source": "x",
+                                  "map": "m", "protocol_ignore": [],
+                                  "normalize": lambda f, v: v},
+                      alerts=alerts, strict_technique=True)
+    check(res["detections"]["by_technique"]["T0855"]["detected"] == 1,
+          "score(): strict_technique not passed through")
+    json.dumps(res, default=str)
+    txt = score.summary(res)
+    check("techniques  ATT&CK coverage" in txt and "T0855" in txt and
+          "Unauthorized Command Message" in txt, f"summary: {txt}")
+    page = score.to_html(res)
+    check("Detections by ATT&amp;CK technique" in page and
+          "<td>T1071.004</td>" in page and "impair-process-control" in page,
+          "html: technique table missing")
+    res2 = score.score(truth, [], {"rows": 0, "columns": {}, "source": "x",
+                                   "map": "m", "protocol_ignore": [],
+                                   "normalize": lambda f, v: v})
+    check(res2["detections"] is None, "detections without alerts")
+    # the generic alert map's optional technique column and rules
+    gen = score.load_json_spec("alerts-generic")
+    check(gen["columns"].get("technique") and gen.get("techniques"),
+          "alerts-generic: optional technique fields missing")
+
+# ---- tgt bench: seeded evaluation suite + scorecard (#65) -----------------
+def test_bench_suite_validation() -> None:
+    from tgt import bench
+    suites = {os.path.basename(p): bench.load(p) for p in bench.packaged()}
+    check({"quick.json", "standard.json"} <= set(suites),
+          f"packaged suites {sorted(suites)}")
+    q = suites["quick.json"]
+    check(abs(q.duration - 3600) < 1 and q.env == "ot-plant"
+          and [s.kind for s in q.stages] == ["baseline", "incidents",
+                                             "campaign"],
+          f"quick suite shape {q.duration} {[s.kind for s in q.stages]}")
+    check(suites["standard.json"].duration >= 2 * 86400,
+          "standard suite is not multi-day")
+    for name, s in suites.items():
+        check(not s.check(), f"{name}: {s.check()}")
+        check([st.seed for st in s.stages] ==
+              [s.seed + i for i in range(len(s.stages))],
+              f"{name}: stage seeds")
+    # stages follow each other; injections become sprinkle phases
+    check([st.offset for st in q.stages] == [0.0, 1200.0, 2100.0],
+          f"quick offsets {[st.offset for st in q.stages]}")
+    s = bench.Suite({"env": "ot-plant", "seed": 7, "stages": [
+        {"id": "a", "kind": "incidents", "duration": "10m", "inject": [
+            {"at": "1m", "incident": "havex", "duration": "4m"},
+            {"at": "3m", "incident": ["ekans"], "duration": "4m"}]}]},
+        "t.json")
+    ph = [(p["name"], p["duration"], p.get("sprinkle"))
+          for p in s.stages[0].plan_doc["phases"]]
+    check(ph == [("quiet", 60.0, None),
+                 ("inject-havex", 120.0, ["havex"]),
+                 ("inject-ekans+havex", 120.0, ["ekans", "havex"]),
+                 ("inject-ekans", 120.0, ["ekans"]),
+                 ("quiet", 180.0, None)], f"inject phases {ph}")
+    check(s.fingerprint() == bench.Suite(dict(s.doc), "u.json").fingerprint()
+          and s.fingerprint() != bench.Suite(dict(s.doc, seed=8),
+                                             "t.json").fingerprint(),
+          "fingerprint follows suite + seeds")
+    good = {"id": "b", "kind": "baseline", "duration": "5m"}
+    for bad, msg in (
+            ({"env": "ot-plant", "stages": [good], "frob": 1}, "frob"),
+            ({"stages": [good]}, "env"),
+            ({"env": "ot-plant", "stages": []}, "stages"),
+            ({"env": "ot-plant", "stages": [dict(good, kind="soak")]},
+             "kind"),
+            ({"env": "ot-plant", "stages": [good, good]}, "duplicate"),
+            ({"env": "ot-plant", "stages": [dict(good, id="a b")]}, ".id"),
+            ({"env": "ot-plant", "stages": [dict(good, plan="x")]},
+             "not allowed"),
+            ({"env": "ot-plant", "stages": [{"id": "i", "kind": "incidents",
+                                             "duration": "5m", "inject": [
+                {"at": "4m", "incident": "havex", "duration": "2m"}]}]},
+             "end by"),
+            ({"env": "ot-plant", "stages": [{"id": "i", "kind": "incidents",
+                                             "duration": "5m", "inject": [
+                {"at": "1m", "incident": "nope", "duration": "2m"}]}]},
+             "nope"),
+            ({"env": "ot-plant", "stages": [{"id": "c", "kind": "campaign",
+                                             "plan": "baseline-then-change"}
+                                            ]}, "one environment"),
+            ({"env": "ot-plant", "stages": [{"id": "c", "kind": "campaign"}]},
+             "exactly one"),
+            ({"env": "ot-plant", "stages": [{"id": "c", "kind": "campaign",
+                                             "phases": [{"name": "x"}]}]},
+             "duration"),
+            ({"env": "ot-plant", "stages": [good],
+              "thresholds": {"vibes": {"min": 1}}}, "vibes"),
+            ({"env": "ot-plant", "stages": [good],
+              "thresholds": {"discovery_recall": {"least": 1}}}, "min")):
+        try:
+            bench.Suite(bad, "t.json")
+            check(False, f"bad suite accepted: {bad}")
+        except bench.BenchError as e:
+            check(msg in str(e), f"bad suite message {e!r} (want {msg!r})")
+    # an unknown environment is reported by check(), not a crash
+    probs = bench.Suite({"env": "nope", "stages": [good]}, "t.json").check()
+    check(probs and "nope" in probs[0], f"unknown env check {probs}")
+    p = _cli(["bench", "list", "--check"])
+    out, _ = p.communicate(timeout=120)
+    check(p.returncode == 0 and "quick" in out and "standard" in out
+          and "FAILED" not in out, f"bench list --check rc={p.returncode} "
+                                   f"{out[-300:]}")
+
+
+def test_bench_quick_bundle_scores_and_compares() -> None:
+    import csv
+    import json
+    from tgt import bench
+    with tempfile.TemporaryDirectory() as d:
+        b = os.path.join(d, "bundle")
+        p = _cli(["bench", "run", "quick", "--out", b])
+        out, _ = p.communicate(timeout=300)
+        check(p.returncode == 0, f"bench run quick rc={p.returncode} "
+                                 f"{out[-400:]}")
+        if p.returncode:
+            return
+        with open(os.path.join(b, "bench.json")) as f:
+            idx = json.load(f)
+        st = idx["stages"]
+        check(idx["schema"] == "tgt-bench/1" and idx["status"] == "complete"
+              and [s["id"] for s in st] == ["learn", "attack", "change"]
+              and all(s["status"] == "complete" for s in st)
+              and idx["tool"]["version"] and idx["fingerprint"],
+              f"bench index {idx['status']} {[s['status'] for s in st]}")
+        check(st[0]["start"] == "2026-11-02T08:00:00.000000Z"
+              and st[0]["end"] == st[1]["start"]
+              and st[1]["end"] == st[2]["start"]
+              and st[2]["end"] == "2026-11-02T09:00:00.000000Z"
+              and [s["seed"] for s in st] == [6500, 6501, 6502],
+              f"stage windows {[(s['start'], s['end']) for s in st]}")
+        for s in st:
+            check(os.path.getsize(os.path.join(b, s["pcap"])) > 1000
+                  and os.path.exists(os.path.join(b, s["plan"])),
+                  f"stage {s['id']}: pcap / plan missing")
+        with open(os.path.join(b, "manifest.json")) as f:
+            merged = json.load(f)
+        src = {e["source"].split(":")[0] for e in merged["events"]}
+        check(merged["schema"] == "tgt-manifest/1"
+              and len(merged["events"]) == sum(s["events"] for s in st)
+              and {"campaign", "sprinkle"} <= src
+              and all(e["id"].startswith(e["stage"] + "/")
+                      for e in merged["events"])
+              and "ot-plant:PLC-RW3" in merged["first_seen"],
+              f"merged manifest events {len(merged['events'])} {src}")
+        # a perfect monitor's exports score 100 % on every metric
+        pe = os.path.join(d, "perfect")
+        p = _cli(["bench", "score", b, "--self-test-export", pe])
+        p.communicate(timeout=60)
+        card_a, card_b = os.path.join(d, "a.json"), os.path.join(d, "b.json")
+        html = os.path.join(d, "a.html")
+        p = _cli(["bench", "score", b, "--assets",
+                  os.path.join(pe, "assets.csv"), "--map", "generic",
+                  "--alerts", os.path.join(pe, "alerts.csv"), "--alert-map",
+                  os.path.join(pe, "alert-map.json"), "--label", "perfect",
+                  "--out", card_a, "--html", html])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0 and "verdict: PASS" in out,
+              f"bench score rc={p.returncode} {out[-400:]}")
+        with open(card_a) as f:
+            ca = json.load(f)
+        m = ca["metrics"]
+        for k in ("discovery_recall", "discovery_precision",
+                  "field_accuracy", "protocol_recall",
+                  "change_detection_rate", "attack_detection_rate"):
+            check(m[k] == 1.0, f"perfect scorecard {k} = {m[k]}")
+        check(m["attack_median_ttd_s"] == 0 and m["false_alerts"] == 0
+              and ca["label"] == "perfect" and ca["verdict"] == "pass"
+              and ca["detections"]["change"]["events"] == 5
+              and ca["detections"]["attack"]["events"] >= 6
+              and [s["recall"] for s in ca["stages"]] == [1.0, 1.0, 1.0]
+              and all(c["pass"] for c in ca["thresholds"]),
+              f"perfect scorecard {m} {ca['verdict']}")
+        with open(html, encoding="utf-8") as f:
+            page = f.read()
+        check("prefers-color-scheme:dark" in page and "perfect" in page
+              and "http://" not in page and "https://" not in page
+              and "<script" not in page, "scorecard HTML not self-contained")
+        # a weaker monitor: misses assets and the cross-zone / PLC STOP
+        # alerts, raises one false alert
+        with open(os.path.join(pe, "assets.csv")) as f:
+            rows = list(csv.reader(f))
+        weak_assets = os.path.join(d, "weak-assets.csv")
+        with open(weak_assets, "w", newline="") as f:
+            csv.writer(f).writerows(rows[:-4])
+        with open(os.path.join(pe, "alerts.csv")) as f:
+            arows = list(csv.reader(f))
+        weak_alerts = os.path.join(d, "weak-alerts.csv")
+        with open(weak_alerts, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerows([r for r in arows if r[-1] not in
+                         ("cross-zone", "plc-mode-change")])
+            w.writerow(["2026-11-02T08:10:00Z", "172.16.0.11", "",
+                        "tgt scan", "scan"])
+        p = _cli(["bench", "score", b, "--assets", weak_assets, "--map",
+                  "generic", "--alerts", weak_alerts, "--alert-map",
+                  os.path.join(pe, "alert-map.json"), "--label", "weak",
+                  "--out", card_b])
+        out, _ = p.communicate(timeout=120)
+        with open(card_b) as f:
+            cb = json.load(f)
+        check(p.returncode == 0 and cb["verdict"] == "fail"
+              and cb["metrics"]["false_alerts"] == 1
+              and cb["metrics"]["discovery_recall"] < 1
+              and cb["detections"]["per_category"]["change:cross-zone"][
+                  "rate"] == 0, f"weak scorecard {cb['metrics']}")
+        cmp = bench.compare(ca, cb)
+        dm = {x["metric"]: x for x in cmp["metrics"]}
+        check(not cmp["warnings"]
+              and dm["discovery_recall"]["change"] == "worse"
+              and abs(dm["discovery_recall"]["delta"] -
+                      (cb["metrics"]["discovery_recall"] - 1.0)) < 1e-9
+              and dm["false_alerts"]["delta"] == 1
+              and dm["false_alerts"]["change"] == "worse"
+              and dm["field_accuracy"]["change"] == "same",
+              f"compare metrics {dm}")
+        cats = {x["key"]: x for x in cmp["per_category"]}
+        check(cats["attack:plc-mode-change"]["delta"] == -1.0
+              and cats["change:new-asset"]["change"] == "same",
+              f"compare per-category {cats}")
+        back = bench.compare(cb, ca)
+        check({x["metric"]: x["change"] for x in back["metrics"]}[
+            "discovery_recall"] == "better", "compare direction")
+        other = json.loads(json.dumps(cb))
+        other["bench"]["fingerprint"] = "0" * 16
+        check(any("not identical" in w
+                  for w in bench.compare(ca, other)["warnings"]),
+              "compare: no warning for a different bundle")
+        cmp_html = os.path.join(d, "cmp.html")
+        p = _cli(["bench", "compare", card_a, card_b, "--html", cmp_html])
+        out, _ = p.communicate(timeout=60)
+        check(p.returncode == 0 and "Discovery recall" in out
+              and os.path.getsize(cmp_html) > 1000,
+              f"bench compare rc={p.returncode} {out[-300:]}")
+
+
+def test_bench_seeded_and_per_technique() -> None:
+    import json
+    from tgt import bench, score
+    suite = {"name": "tiny", "env": "ot-plant", "seed": 9,
+             "start_time": "2026-11-02T08:00:00Z", "stages": [
+                 {"id": "learn", "kind": "baseline", "duration": "1m"},
+                 {"id": "hit", "kind": "incidents", "duration": "2m",
+                  "inject": [{"at": "30s", "incident": "stuxnet",
+                              "duration": "1m"}]}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "tiny.json")
+        with open(path, "w") as f:
+            json.dump(suite, f)
+        pcaps = []
+        for run in ("r1", "r2"):
+            p = _cli(["bench", "run", path, "--out", os.path.join(d, run)])
+            out, _ = p.communicate(timeout=120)
+            check(p.returncode == 0, f"tiny bench rc={p.returncode} "
+                                     f"{out[-300:]}")
+            pcaps.append([open(os.path.join(d, run, "stages", f"{s}.pcap"),
+                               "rb").read() for s in ("learn", "hit")])
+        check(pcaps[0] == pcaps[1], "seeded bench stages are not "
+                                    "byte-identical run to run")
+        p = _cli(["bench", "run", path, "--out", os.path.join(d, "r1")])
+        out, _ = p.communicate(timeout=60)
+        check(p.returncode == 2 and "--overwrite" in out,
+              f"bench run over a bundle: rc={p.returncode}")
+        # per-technique coverage: from the events' technique IDs ...
+        index, stages = bench.load_bundle(os.path.join(d, "r1"))
+        for _, m in stages:
+            for e in m["events"]:
+                e["techniques"] = (["T0816", "T0858"]
+                                   if e["category"] == "plc-mode-change"
+                                   else ["T0866"])
+        merged = bench.merge_manifests(stages, index)
+        truth = score.Truth(merged, "m")
+        rows: list = []
+        alerts = [{"row": i + 1, "time": score.parse_time(e["t_start"]),
+                   "title": "x", "raw_category": "", "category":
+                   e["category"], "src": e["src"] or "", "dst": ""}
+                  for i, e in enumerate(merged["events"])
+                  if e["category"] == "plc-mode-change"]
+        info = {"columns": {}, "rows": 0, "source": "-", "map": "-",
+                "protocol_ignore": []}
+        res = score.score(truth, rows, info, alerts=alerts)
+        res["detections"].pop("by_technique", None)
+        card = bench.scorecard(index, stages, res)
+        pt = card["detections"]["per_technique"]
+        check(pt and pt["T0816"]["rate"] == 1.0 and pt["T0866"]["rate"] == 0
+              and pt["T0858"]["events"] == pt["T0816"]["events"]
+              and card["metrics"]["technique_coverage"] == 2 / 3,
+              f"per-technique fallback {pt}")
+        # ... or the scorer's own by_technique when it has one
+        res["detections"]["by_technique"] = {
+            "T0846": {"name": "Remote System Discovery", "events": 4,
+                      "detected": 1, "rate": 0.25, "median_ttd_s": 3.0}}
+        card = bench.scorecard(index, stages, res)
+        check(card["detections"]["per_technique"]["T0846"]["detected"] == 1
+              and card["metrics"]["technique_coverage"] == 1.0,
+              "per-technique from by_technique")
+        check(card["verdict"] is None and card["metrics"][
+            "discovery_recall"] == 0.0, "no thresholds -> no verdict")
+
+# --- W5-E: CODESYS V3 (protocols_codesys) ----------------------------------
+# no stock Wireshark dissector: the carrier layer
+_DISSECTS_AS.update({"codesys": "tcp", "codesys-disc": "udp"})
+
+
+def _cds_payload(frame: bytes):
+    """(is TCP, sport, dport, payload) of a (tagged) IPv4 TCP/UDP frame."""
+    proto, _, _, sp, dp, l4 = _l4(frame)
+    if proto == P.IPPROTO_UDP:
+        return False, sp, dp, l4[8:]
+    return True, sp, dp, l4[(l4[12] >> 4) * 4:]
+
+
+def test_codesys_wire_format() -> None:
+    """CODESYS V3 framing: block driver magic / length, datagram header and
+    addresses, channel open / blocks / acks / keep-alive / close, services
+    header + tags, and the session's login -> session id -> monitoring
+    sequence, all parsed back by protocols_codesys.decode."""
+    import zlib
+    from tgt import devices
+    from tgt import protocols_codesys as C
+    # tag encoding: base-128 id/size, header padded with continuation bytes
+    check(C.tag(0x22, b"\x01\x00\x00\x00") ==
+          b"\x22\x84\x80\x00\x01\x00\x00\x00", "codesys: tag padding")
+    check(C.tag(0x10, b"ab", align=0x42) == b"\x10\x02ab" and
+          C.parse_tags(C.tag(0x81, C.tag(0x10, b"ab", align=0x42) +
+                             C.tag(0x11, bytes(200))))
+          == [(0x81, [(0x10, b"ab"), (0x11, bytes(200))])],
+          "codesys: tag round trip")
+    ep = Endpoints(meta={"codesys_user": "integrator"})
+    fr = protocols.get("codesys").build(ep, 5)
+    for f in fr:
+        verify_ip_l4(f, "codesys")
+    check(_l4(fr[0])[4] == 11740, "codesys: session not to TCP 11740")
+    pdus = []
+    for f in fr:
+        _, sp, dp, pl = _cds_payload(f)
+        if not pl:
+            continue
+        check(pl[:4] == b"\x00\x01\x17\xe8" and
+              struct.unpack("<I", pl[4:8])[0] == len(pl) <= 520,
+              "codesys: block driver magic / length")
+        d = C.decode(pl)
+        fc = dp == 11740
+        check(d["hop_count"] == 13 and d["hdr_words"] == 3 and
+              d["priority"] == 1, "codesys: datagram header")
+        me = struct.pack(">H", sp) + P.ip_to_bytes(_l4(f)[1])
+        peer = struct.pack(">H", dp) + P.ip_to_bytes(_l4(f)[2])
+        check(d["sender"] == me and d["receiver"] == peer,
+              "codesys: datagram addresses != TCP endpoints")
+        pdus.append((fc, d))
+    check(pdus[0][1]["ns_subcmd"] == C.NS_NAME_RESOLVE and
+          pdus[1][1]["ns_subcmd"] == C.NS_DEVICE_INFO and
+          pdus[1][1]["ns_msg_id"] == pdus[0][1]["ns_msg_id"],
+          "codesys: DeviceInfo identification missing")
+    check(pdus[2][1]["ch_type"] == C.CH_OPEN and
+          pdus[3][1]["ch_type"] == C.CH_OPEN_RSP and
+          pdus[3][1]["msg_id_ch"] == pdus[2][1]["msg_id_ch"],
+          "codesys: open channel exchange")
+    chan = pdus[3][1]["channel"]
+    check(pdus[-1][0] and pdus[-1][1]["ch_type"] == C.CH_CLOSE and
+          pdus[-1][1]["channel"] == chan, "codesys: no close channel")
+    last = {True: 0, False: 0}
+    for n, (fc, d) in enumerate(pdus[4:-1], 4):
+        check(d["channel"] == chan, "codesys: channel id differs")
+        if d["ch_type"] == C.CH_BLK:
+            check(d["blk_id"] == last[fc] + 1 and d["ack_id"] == last[not fc]
+                  and bool(d["flags"] & 0x80) == fc,
+                  "codesys: block numbering / request flag")
+            last[fc] = d["blk_id"]
+            nxt = pdus[n + 1]
+            check(nxt[0] != fc and nxt[1]["ch_type"] == C.CH_ACK and
+                  nxt[1]["blk_id"] == d["blk_id"], "codesys: block not acked")
+            check(d["size"] == len(d["data"]) and d["crc"] ==
+                  zlib.crc32(d["data"]) & 0xFFFFFFFF, "codesys: block CRC")
+    check(sum(d.get("ch_type") == C.CH_KEEPALIVE for _, d in pdus) == 1,
+          "codesys: keep-alive missing")
+    msgs = C.session_messages(fr)
+    calls = [(m["group"], m["sid"], m["reply"]) for _, m in msgs]
+    check(calls[:6] == [(1, 2, False), (1, 2, True), (2, 1, False),
+                        (2, 1, True), (2, 0x26, False), (2, 0x26, True)]
+          and calls.count((0x1B, 1, False)) == 5 and calls[-2:] ==
+          [(1, 3, False), (1, 3, True)], f"codesys: service sequence {calls}")
+    login, reply = msgs[0][1], msgs[1][1]
+    creds = dict(login["tags"])[0x81]
+    check(login["session"] == 0 and dict(creds)[0x10].rstrip(b"\x00") ==
+          b"integrator" and dict(login["tags"])[0x22] == b"\x01\x00\x00\x00",
+          "codesys: login tags")
+    rt = dict(dict(reply["tags"])[0x82])
+    session = struct.unpack("<I", rt[0x21])[0]
+    check(rt[0x20] == b"\x00\x00" and all(
+        m["session"] == session for _, m in msgs[2:]),
+        "codesys: session id not carried after login")
+    app_id = dict(dict(msgs[3][1]["tags"])[0x81])[0x11]
+    mon = [m for _, m in msgs if m["group"] == 0x1B]
+    check(all(dict(m["tags"])[0x01][:4] == app_id for m in mon
+              if not m["reply"]) and all(
+        len(dict(m["tags"])[0x40]) == 32 for m in mon if m["reply"]),
+        "codesys: Monitoring2 read app header / value list")
+    # a message too big for one PDU is split into acked blocks
+    big = C.service(C.SG_MON2, 1, 7, C.tag(0x02, bytes(range(256)) * 5))
+    bl = C.blocks(9, 1, 0, big, True, 492)
+    check(len(bl) == 3 and all(len(b) <= 492 for b in bl) and
+          bl[0][20:] + b"".join(b[12:] for b in bl[1:]) == big and
+          [struct.unpack("<I", b[4:8])[0] for b in bl] == [1, 2, 3] and
+          bl[1][1] == 0x80, "codesys: block segmentation")
+    # catalog identity on the UDP scan; broadcast request from 1740
+    m = devices.get("schneider-tm251mese")
+    meta = devices.identity_meta(m, "5.2.11.24", "12345678901234", "PLC-CNV")
+    meta["bcast"] = "10.10.10.255"
+    fr = protocols.get("codesys-disc").build(Endpoints(meta=meta), 1)
+    check(len(fr) == 2 and fr[0][:6] == b"\xff" * 6 and
+          _l4(fr[0])[2] == "10.10.10.255" and _l4(fr[0])[3:5] ==
+          (1740, 1740) and _l4(fr[1])[2] == "10.10.10.10",
+          "codesys-disc: request not broadcast 1740 / reply not unicast")
+    rq = C.decode(_cds_payload(fr[0])[3], tcp=False)
+    rp = C.decode(_cds_payload(fr[1])[3], tcp=False)
+    check(rq["service"] == 3 and rq["receiver"] == b"" and
+          rq["sender"] == b"\x00\x0a" and rp["service"] == 4 and
+          rp["receiver"] == b"\x00\x0a" and rp["sender"] == b"\x00\x14",
+          "codesys-disc: relative UDP addresses")
+    check((rp["node"], rp["device"], rp["vendor"], rp["firmware"],
+           rp["serial"]) == ("PLC-CNV", "TM251MESE", "Schneider Electric",
+                             "5.2.11.24", "12345678901234"),
+          f"codesys-disc: DeviceInfo identity {rp}")
+    # malformed input is rejected, seeded builds are reproducible
+    pl = _cds_payload(protocols.get("codesys").build(Endpoints(), 1)[3])[3]
+    for bad in (b"\x00\x01\x17\xe9" + pl[4:], pl + b"\x00"):
+        try:
+            C.decode(bad)
+            check(False, "codesys: decode accepted a corrupt PDU")
+        except ValueError:
+            pass
+    runs = []
+    for _ in range(2):
+        protocols.begin_build(11, 2)
+        runs.append(protocols.get("codesys").build(Endpoints(), 3))
+    check(runs[0] == runs[1], "codesys: seeded build not reproducible")
+
+
+def test_codesys_site_identity_and_timing() -> None:
+    """auto-assembly: an engineering laptop scans and logs into the CODESYS
+    controllers (WAGO, Modicon M251, Eaton XC300) on its own segment; the
+    DeviceInfo on the wire matches the inventory, which credits codesys
+    for vendor/model/firmware/serial; both profiles are daytime engineering
+    in the timed model."""
+    import re
+    from tgt import devices, envfile, inventory, timing
+    from tgt import protocols_codesys as C
+    for k in ("codesys", "codesys-disc"):
+        check(timing.spec(k)[4] == "eng", f"{k}: not a daytime eng period")
+    for mid in ("wago-750-8212", "schneider-tm251mese",
+                "schneider-tm241cec24t", "eaton-xc-303"):
+        m = devices.get(mid)
+        check("codesys" in m.identity and all(
+            devices.OUI_VENDORS.get(o) for o in m.ouis),
+            f"{mid}: no codesys identity / unknown OUI")
+    # loaded, not registered: the global env registry stays as it was
+    env = envfile.load(os.path.join(envfile.SITES_DIR, "auto-assembly.json"))
+    conv = [(c, s) for c, s, p in env.conversations if p.startswith("codesys")]
+    check(len(conv) == 14 and all(
+        env.host(c).role == "eng" and env.host(s).embedded and
+        env.segment_of(env.host(c)) is env.segment_of(env.host(s))
+        for c, s in conv), "auto-assembly: codesys conversations")
+    rows = {h["ip"]: h for h in inventory.to_json(env)["hosts"]}
+    seen = {}
+    for k, f in env.build(1):
+        if not k.startswith("codesys"):
+            continue
+        tcp, sp, dp, pl = _cds_payload(f)
+        if not pl:
+            continue
+        d = C.decode(pl, tcp)
+        if "device" in d:
+            seen[_l4(f)[1]] = d
+        if not tcp and sp == dp == 1740 and d["service"] == 3:
+            check(f[:6] == b"\xff" * 6 and _l4(f)[2] == "10.160.20.255",
+                  "auto-assembly: scan not a subnet broadcast")
+    names = {"PLC-OVN-01", "PLC-OVN-04", "PLC-CNV-02", "PLC-DRY-01"}
+    for ip, row in rows.items():
+        if row["name"] not in names:
+            continue
+        d = seen.get(ip)
+        check(d is not None, f"{row['name']}: no DeviceInfo on the wire")
+        if d is None:
+            continue
+        parts = [int(x) & 0xFF for x in
+                 re.findall(r"\d+", row["firmware"])][:4]
+        fw = ".".join(str(x) for x in parts + [0] * (4 - len(parts)))
+        ident = devices.get(row["model"]).identity["codesys"]
+        check(d["serial"] == row["serial"] and d["node"] == row["name"] and
+              d["firmware"] == fw and d["vendor"] == ident["vendor_name"]
+              and d["vendor"].split()[0] in row["vendor"] and
+              d["device"] == ident["device_name"],
+              f"{row['name']}: DeviceInfo {d} != inventory")
+        obs = row["observability"]
+        check(all("codesys" in obs[f]["evidence"] for f in
+                  ("vendor", "model", "firmware", "serial")),
+              f"{row['name']}: inventory does not credit codesys")
+
+
+def test_tshark_codesys_clean() -> None:
+    """Optional: the CODESYS builders and the auto-assembly site's CODESYS
+    traffic decode as clean TCP / UDP — no malformed packets, bad lengths
+    or other Warn/Error expert info."""
+    import shutil
+    import subprocess
+    from tgt import envfile
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_codesys_clean")
+        return
+    env = envfile.load(os.path.join(envfile.SITES_DIR, "auto-assembly.json"))
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/cds.pcap"
+        with PcapWriter(path) as w:
+            for key in ("codesys", "codesys-disc"):
+                for f in protocols.get(key).build(Endpoints(), 8):
+                    w.write(f)
+            for k, f in env.build(1):
+                if k.startswith("codesys"):
+                    w.write(f)
+        out = subprocess.run(["tshark", "-r", path, "-q", "-z", "expert"],
+                             capture_output=True, text=True).stdout
+        lens = subprocess.run(
+            ["tshark", "-r", path, "-T", "fields", "-e", "frame.protocols",
+             "-e", "udp.length", "-e", "ip.len", "-e", "frame.len"],
+            capture_output=True, text=True).stdout.splitlines()
+    check("Warns (" not in out and "Errors (" not in out,
+          f"tshark codesys expert: {out.strip()[:300]}")
+    check(lens and all(ln.split("\t")[0].endswith((":tcp", ":tcp:data",
+                                                   ":udp:data"))
+                       for ln in lens), "tshark: codesys frames mis-decoded")
+
+# -- W5-F: IPv6 rewrite + replay onto an environment by role ----------------
+
+def _w5f_a6(text: str) -> bytes:
+    import ipaddress
+    return ipaddress.IPv6Address(text).packed
+
+
+def _w5f_ip6(src: str, dst: str, chain: list, nh: int, upper: bytes,
+             hlim: int = 64, final: str = "", fix: bool = True) -> bytes:
+    """IPv6 packet: ``chain`` = [(ext header type, body after its next-
+    header byte)], then the upper layer ``nh`` (checksum filled in against
+    ``final`` or ``dst``)."""
+    s, d = _w5f_a6(src), _w5f_a6(dst)
+    ck = {6: 16, 17: 6, 58: 2}.get(nh)
+    if fix and ck is not None:
+        u = bytearray(upper)
+        u[ck:ck + 2] = b"\0\0"
+        pd = _w5f_a6(final) if final else d
+        c = P.checksum16(s + pd + struct.pack("!IxxxB", len(u), nh)
+                         + bytes(u))
+        struct.pack_into("!H", u, ck, c or 0xFFFF)
+        upper = bytes(u)
+    types = [t for t, _ in chain] + [nh]
+    exts = b"".join(bytes([types[i + 1]]) + body
+                    for i, (_, body) in enumerate(chain))
+    pl = exts + upper
+    return struct.pack("!IHBB", 0x60000000, len(pl), types[0], hlim) + s + d \
+        + pl
+
+
+def _w5f_v6_frames() -> list:
+    """An IPv6 sample: TCP (802.1Q-tagged), UDP, ICMPv6 echo behind
+    hop-by-hop + destination options, NDP NS/NA with link-layer options,
+    EUI-64 link-local echo, an SRH-routed TCP SYN, a fragmented UDP
+    datagram (first + non-first fragment)."""
+    A, B = "fd00:1::10", "fd00:1::20"
+    ma, mb = "02:00:00:00:00:0a", "00:1d:9c:00:00:0b"
+
+    def eth(dst, src, pkt, vlan=None):
+        return P.ethernet(dst, src, 0x86DD, pkt, vlan=vlan)
+
+    def tcp(sp, dp, seq, ack, flags, data=b""):
+        return struct.pack("!HHIIBBHHH", sp, dp, seq, ack, 5 << 4, flags,
+                           65535, 0, 0) + data
+
+    def udp(sp, dp, data):
+        return struct.pack("!HHHH", sp, dp, 8 + len(data), 0) + data
+    mb_q = b"\x00\x01\x00\x00\x00\x06\x01\x03\x00\x00\x00\x01"
+    out = [eth(mb, ma, _w5f_ip6(A, B, [], 6, tcp(40000, 502, 1, 0, 0x02)),
+               10),
+           eth(ma, mb, _w5f_ip6(B, A, [], 6, tcp(502, 40000, 9, 2, 0x12)),
+               10),
+           eth(mb, ma, _w5f_ip6(A, B, [], 6, tcp(40000, 502, 2, 10, 0x18,
+                                                 mb_q)), 10)]
+    q = (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+         b"\x04plc1\x04corp\x05local\x00\x00\x1c\x00\x01")
+    out.append(eth(mb, ma, _w5f_ip6(A, B, [], 17, udp(53000, 53, q))))
+    echo = struct.pack("!BBHHH", 128, 0, 0, 7, 1) + b"tgt-v6"
+    padn = b"\x00\x01\x04\x00\x00\x00\x00"          # len 0 + PadN(4)
+    out.append(eth(mb, ma, _w5f_ip6(A, B, [(0, padn), (60, padn)], 58,
+                                    echo)))
+    ns = (struct.pack("!BBHI", 135, 0, 0, 0) + _w5f_a6(B) + b"\x01\x01"
+          + P.mac_to_bytes(ma))
+    out.append(eth("33:33:ff:00:00:20", ma,
+                   _w5f_ip6(A, "ff02::1:ff00:20", [], 58, ns, hlim=255)))
+    na = (struct.pack("!BBHI", 136, 0, 0, 0x60000000) + _w5f_a6(B)
+          + b"\x02\x01" + P.mac_to_bytes(mb))
+    out.append(eth(ma, mb, _w5f_ip6(B, A, [], 58, na, hlim=255)))
+    out.append(eth(mb, ma, _w5f_ip6("fe80::ff:fe00:a",
+                                    "fe80::21d:9cff:fe00:b", [], 58, echo)))
+    # segment routing header (type 4): A -> fd00:1::99 (segment), final B
+    srh = (bytes([4, 4, 1, 1, 0, 0, 0]) + _w5f_a6(B)
+           + _w5f_a6("fd00:1::99"))
+    out.append(eth(mb, ma, _w5f_ip6(A, "fd00:1::99", [(43, srh)], 6,
+                                    tcp(40002, 502, 5, 0, 0x02), final=B)))
+    # a UDP datagram in two fragments
+    data = bytes(range(256)) * 2
+    u = bytearray(udp(40001, 47808, data))
+    c = P.checksum16(_w5f_a6(A) + _w5f_a6(B) + struct.pack(
+        "!IxxxB", len(u), 17) + bytes(u))
+    struct.pack_into("!H", u, 6, c)
+    for fo, part in ((1, bytes(u[:264])), ((264 // 8) << 3, bytes(u[264:]))):
+        pl = bytes([17, 0]) + struct.pack("!HI", fo, 0xABCD) + part
+        out.append(eth(mb, ma, struct.pack("!IHBB", 0x60000000, len(pl), 44,
+                                           64) + _w5f_a6(A) + _w5f_a6(B)
+                       + pl))
+    return out
+
+
+def _w5f_v6_check(frame: bytes) -> "bool | None":
+    """Own IPv6 upper-layer checksum check: True/False, None when the
+    packet carries no checkable checksum (fragment, unknown upper layer)."""
+    off = 14
+    while struct.unpack_from("!H", frame, off - 2)[0] in (0x8100, 0x88A8):
+        off += 4
+    if struct.unpack_from("!H", frame, off - 2)[0] != 0x86DD:
+        return None
+    plen = struct.unpack_from("!H", frame, off + 4)[0]
+    nh, p, final = frame[off + 6], off + 40, frame[off + 24:off + 40]
+    while nh in (0, 43, 44, 60):
+        if nh == 44:
+            return None
+        if nh == 43 and frame[p + 3]:
+            n = (frame[p + 1] * 8) // 16
+            final = (frame[p + 8:p + 24] if frame[p + 2] == 4 else
+                     frame[p + 8 + 16 * (n - 1):p + 8 + 16 * n])
+        nh, p = frame[p], p + (frame[p + 1] + 1) * 8
+    if nh not in (6, 17, 58):
+        return None
+    seg = frame[p:off + 40 + plen]
+    return P.checksum16(frame[off + 8:off + 24] + final + struct.pack(
+        "!IxxxB", len(seg), nh) + seg) == 0
+
+
+def test_w5f_rewrite_ipv6_checksums_and_extensions() -> None:
+    """--remap-ip / --remap-subnet / --remap-mac on IPv6: addresses (and NDP
+    targets, link-layer options, EUI-64 ids, SRH segments) rewritten, mixed
+    with IPv4 rules in one run; every upper-layer checksum still valid
+    (own check + tshark), fragments handled, VLAN tags kept, unparseable
+    frames left alone and counted."""
+    import ipaddress
+    from tgt.rewrite import Rewriter, RewriteError
+    frames = _w5f_v6_frames()
+    v4 = protocols.modbus_flow(Endpoints(client_ip="192.168.1.10",
+                                         server_ip="192.168.1.20"), 1)
+    rw = Rewriter.from_specs(
+        remap_ip=["fd00:1::20=fd10:9::99", "192.168.1.20=10.0.0.99"],
+        remap_subnet=["fd00:1::/64=fd20:2::/64",
+                      "192.168.1.0/24=10.100.10.0/24"],
+        remap_mac=["02:00:00:00:00:0a=00:0e:8c:12:34:56"])
+    check("1 IPv6 subnet" in rw.describe() and "1 IPv6" in rw.describe(),
+          f"rewrite describe: {rw.describe()}")
+    out = [rw.apply(f) for f in frames]
+    for i, (a, b) in enumerate(zip(frames, out)):
+        ok = _w5f_v6_check(b)
+        check(_w5f_v6_check(a) in (True, None) and ok in (True, None),
+              f"ipv6 rewrite {i}: bad upper-layer checksum")
+    for i, g in enumerate(v4):
+        verify_ip_l4(rw.apply(g), f"mixed v4 rewrite {i}")
+    broken = bytearray(out[2])
+    broken[-1] ^= 0x01
+    check(_w5f_v6_check(bytes(broken)) is False, "own v6 checksum check")
+
+    def addrs(f):
+        off = 18 if f[12:14] == b"\x81\x00" else 14
+        return (str(ipaddress.IPv6Address(f[off + 8:off + 24])),
+                str(ipaddress.IPv6Address(f[off + 24:off + 40])))
+    check(addrs(out[0]) == ("fd20:2::10", "fd10:9::99") and
+          out[0][12:16] == frames[0][12:16], f"tcp6: {addrs(out[0])}")
+    check(addrs(out[4]) == ("fd20:2::10", "fd10:9::99"), "hbh/dstopt echo")
+    check(_w5f_a6("fd10:9::99") in out[5][14 + 48:] and
+          P.mac_to_bytes("00:0e:8c:12:34:56") in out[5][14 + 40:],
+          "NDP NS target / source link-layer option not remapped")
+    check(_w5f_a6("fd10:9::99") in out[6][14 + 48:], "NDP NA target")
+    check(addrs(out[5])[1] == "ff02::1:ff00:99" and
+          out[5][0:6] == P.mac_to_bytes("33:33:ff:00:00:99"),
+          f"NS solicited-node group not following: {addrs(out[5])}")
+    check(addrs(out[7])[0] == "fe80::20e:8cff:fe12:3456",
+          f"EUI-64 link-local not following the MAC: {addrs(out[7])}")
+    check(_w5f_a6("fd10:9::99") in out[8][54:] and
+          _w5f_a6("fd20:2::99") in out[8][54:], "SRH segments not remapped")
+    # fragments: first keeps a valid checksum over the reassembly, the
+    # non-first one only has its addresses rewritten
+    check(addrs(out[10]) == ("fd20:2::10", "fd10:9::99") and
+          out[10][62:] == frames[10][62:], "non-first fragment payload")
+    whole = out[9][62:] + out[10][62:]
+    check(P.checksum16(out[9][22:54] + struct.pack("!IxxxB", len(whole), 17)
+                       + whole) == 0, "fragmented UDP checksum")
+    # unparseable: truncated extension chain -> untouched, counted
+    bad = frames[4][:14 + 40 + 4]
+    before = rw.unparsed
+    check(rw.apply(bad)[12:] == bad[12:] and rw.unparsed == before + 1,
+          "truncated IPv6 extension chain not left alone / counted")
+    # a non-pseudo-header upper layer (OSPF-free sample: proto 59 = none)
+    none = P.ethernet("00:1d:9c:00:00:0b", "02:00:00:00:00:0a", 0x86DD,
+                      _w5f_ip6("fd00:1::10", "fd00:1::20", [], 59, b""))
+    check(addrs(rw.apply(none)) == ("fd20:2::10", "fd10:9::99"),
+          "no-next-header packet not re-addressed")
+    for kw in ({"remap_ip": ["10.0.0.1=fd00::1"]},
+               {"remap_subnet": ["fd00::/64=fd01::/48"]},
+               {"remap_subnet": ["10.0.0.0/8=fd00::/8"]}):
+        try:
+            Rewriter.from_specs(**kw)
+            check(False, f"rewrite: {kw} accepted")
+        except RewriteError:
+            pass
+    if shutil_which("tshark"):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "v6.pcap")
+            with PcapWriter(path) as w:
+                for f in out:
+                    w.write(f)
+            bad = _expert_warns([("v6", f) for f in out])
+            rows = subprocess.run(
+                ["tshark", "-r", path, "-o", "tcp.check_checksum:TRUE",
+                 "-o", "udp.check_checksum:TRUE", "-T", "fields", "-e",
+                 "tcp.checksum.status", "-e", "udp.checksum.status", "-e",
+                 "icmpv6.checksum.status"], capture_output=True,
+                text=True).stdout.split("\n")
+        check(not bad, f"tshark expert on rewritten IPv6: {bad[:3]}")
+        stat = [x for ln in rows for x in ln.split("\t") if x.strip()]
+        check(len(stat) >= 9 and all(x == "1" for x in stat),
+              f"tshark IPv6 checksum status: {stat}")
+
+
+def _w5f_capture(d: str, env: str = "ot-plant") -> str:
+    path = os.path.join(d, f"{env}.pcap")
+    _run_engine(RunConfig(env=env, rate=0, loop=False, seed=7,
+                          pcap_path=path), timeout=60)
+    return path
+
+
+def test_w5f_remap_env_roles_and_determinism() -> None:
+    """--remap-env: the capture's hosts land on environment hosts of a
+    compatible role (PLCs on PLCs serving the same protocol, vendor kept,
+    switches on switches), the same seed maps the same way, frames carry
+    the env addresses + segment VLANs with valid checksums, unmappable
+    hosts keep their identity, and the manifest's ground truth is the
+    replayed env hosts."""
+    import json
+    from tgt import enterprise, pcapread, remapenv, score
+    from tgt.rewrite import RewriteError
+    with tempfile.TemporaryDirectory() as d:
+        src = _w5f_capture(d)
+        env = enterprise.get("industrial-site")
+        a = remapenv.RemapPlan(src, env, "access", seed=0)
+        b = remapenv.RemapPlan(src, env, "access", seed=0)
+        key = [(p.key, h.name) for p, h, _, _ in a.mapped]
+        check(key == [(p.key, h.name) for p, h, _, _ in b.mapped] and
+              json.dumps(a.to_json()) == json.dumps(b.to_json()),
+              "remap-env: same seed, different mapping")
+        check(len(a.mapped) >= 12, f"remap-env: only {len(a.mapped)} mapped")
+        ehosts = {e.host.name: e for e in remapenv._env_hosts(env)}
+        names = [h.name for _, h, _, _ in a.mapped]
+        check(len(set(names)) == len(names), "two hosts on one env host")
+        for p, h, seg, _ in a.mapped:
+            check(remapenv.score(p, ehosts[h.name]) is not None,
+                  f"remap-env: {p.key} ({p.role}) on incompatible {h.name}")
+            check(seg is env.segment_of(h), f"{h.name}: wrong segment")
+            if p.role == "plc":
+                ports = ehosts[h.name].serves | ehosts[h.name].can
+                check(h.role in ("plc", "rtu", "relay", "drive", "meter") and
+                      any(x in ports for x in p.serves),
+                      f"PLC {p.key} -> {h.name} ({h.role})")
+                check(p.vendor == remapenv._oui_vendor(h.mac),
+                      f"PLC {p.key} {p.vendor} -> {h.name} {h.mac}")
+            if p.role == "switch":
+                check(h.role == "switch", f"switch {p.key} -> {h.role}")
+        roles = {p.key: p.role for p in a.profiles}
+        check(roles.get("172.16.2.21") == "plc" and
+              roles.get("172.16.0.2") == "switch" and
+              roles.get("172.16.0.40") == "nms",
+              f"classifier: {roles}")
+        # placement: env addresses + VLANs, checksums valid
+        rw = a.rewriter()
+        orig = {P.ip_to_bytes(p.ip) for p, _, _, _ in a.mapped if p.ip}
+        new = {h.ip for _, h, _, _ in a.mapped}
+        vlans = {seg.vlan for seg in env.segments}
+        n_in = n_out = 0
+        out = []
+        for _, f in pcapread.iter_frames(src):
+            n_in += 1
+            for g in rw.apply_all(f):
+                n_out += 1
+                out.append(("replay", g))
+                ips = P.frame_ips(g)
+                if ips is not None:
+                    check(not ({P.ip_to_bytes(x) for x in ips} & orig),
+                          f"original address left in {ips}")
+                    verify_ip_l4(g, "remap-env frame")
+                if ips is not None and set(ips) & new:
+                    vid = (struct.unpack("!H", g[14:16])[0] & 0x0FFF
+                           if g[12:14] == b"\x81\x00" else None)
+                    check(vid in vlans, f"{ips}: VLAN {vid} not an env "
+                                        "segment's")
+        check(n_in == n_out, f"access span: {n_in} in, {n_out} out")
+        bad = _expert_warns(out)
+        check(not bad, f"tshark expert on remap-env replay: {bad[:3]}")
+        # core span adds the routed copies (TTL - 1)
+        core = remapenv.RemapPlan(src, env, "core", seed=0).rewriter()
+        n_core = sum(len(core.apply_all(f))
+                     for _, f in pcapread.iter_frames(src))
+        check(n_core > n_in, "core span: no routed copies")
+        # unmappable: OT hosts onto an IT-only environment keep identity
+        it = remapenv.RemapPlan(src, enterprise.get("it-org"), "access")
+        kept = {p.key for p, _ in it.unmapped}
+        check({"172.16.1.21", "172.16.2.21"} <= kept and all(
+            why for _, why in it.unmapped), f"it-org kept: {kept}")
+        f = next(f for _, f in pcapread.iter_frames(src)
+                 if (P.frame_ips(f) or ("",))[0] == "172.16.2.21")
+        check("172.16.2.21" in (P.frame_ips(it.rewriter().apply_all(f)[0])
+                                or ()), "unmapped PLC was re-addressed")
+        # the run: manifest ground truth = the env hosts the replay showed
+        man, rep = os.path.join(d, "m.json"), os.path.join(d, "r.json")
+        cfg = RunConfig(replay_path=src, remap_env="industrial-site",
+                        rate=0, loop=False, pcap_path=os.path.join(
+                            d, "o.pcap"), manifest_path=man)
+        _run_engine(cfg, timeout=60)
+        with open(man) as fh:
+            doc = json.load(fh)
+        ids = {f"industrial-site:{h.name}" for _, h, _, _ in a.mapped}
+        check(ids <= set(doc.get("first_seen", {})) and
+              doc.get("remap", {}).get("env") == "industrial-site" and
+              len(doc["remap"]["hosts"]) == len(a.mapped),
+              "manifest: remap-env ground truth missing")
+        pop = {x["id"] for x in score.Truth(doc, man).population()}
+        check(pop == ids, f"score population != mapped hosts: "
+                          f"{sorted(pop ^ ids)[:4]}")
+        rows = [r for r in doc["inventory"]["hosts"] if "replay" in r]
+        check(len(rows) == len(ids) and all(
+            not r["observability"]["firmware"]["observable"] for r in rows),
+            "manifest: replayed hosts not annotated")
+        remapenv.plan_for(cfg).write_report(rep)
+        with open(rep) as fh:
+            check(json.load(fh)["schema"] == remapenv.SCHEMA, "report")
+        # IPv6-only hosts are listed, not mapped
+        v6 = os.path.join(d, "v6.pcap")
+        with PcapWriter(v6) as w:
+            for g in _w5f_v6_frames():
+                w.write(g)
+        p6 = remapenv.RemapPlan(v6, env)
+        check(not p6.mapped and p6.unmapped and all(
+            "IPv6-only" in why for _, why in p6.unmapped),
+            f"IPv6-only: {[(p.key, w) for p, w in p6.unmapped]}")
+        try:
+            remapenv.RemapPlan(src, env, "mirror")
+            check(False, "remap-env: bad span accepted")
+        except RewriteError:
+            pass
+
+
+def test_w5f_remap_env_cli_checks() -> None:
+    """tgt run --remap-env: bad combinations are refused (exit 2) before
+    anything is sent; service args carry it."""
+    import contextlib
+    import io
+    from tgt import cli, service
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "x.pcap")
+        with PcapWriter(src) as w:
+            for f in protocols.modbus_flow(Endpoints(), 1):
+                w.write(f)
+        base = ["run", "--replay", src, "--pcap", os.path.join(d, "o.pcap"),
+                "--once"]
+        for extra in (["--remap-env", "no-such-env"],
+                      ["--remap-env", "ot-plant", "--remap-ip",
+                       "1.1.1.1=2.2.2.2"],
+                      ["--remap-env", "ot-plant", "--vlan", "5"],
+                      ["--remap-report", os.path.join(d, "r.json")]):
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(base + extra)
+            check(rc == 2, f"tgt run {extra}: exit {rc}, want 2")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main(["run", "--remap-env", "ot-plant", "--pcap",
+                           os.path.join(d, "o.pcap"), "--once"])
+        check(rc == 2, "--remap-env without --replay accepted")
+    args = service.build_run_args(None, [], 10, 5, replay="/x.pcap",
+                                  remap_env="ot-plant", span="core")
+    check("--remap-env ot-plant --span core" in args,
+          f"service args: {args}")
+
+# ---------------------------------------------------------------------------
+# W5-D (#67): serial-to-Ethernet gateways and IIoT
+# ---------------------------------------------------------------------------
+# no stock Wireshark dissector on these ports (RTU-over-TCP / DNP3 serial /
+# RealCOM decode with decode-as, see test_w5d_tshark_gateways_decode_as)
+_DISSECTS_AS.update({
+    "modbus-rtu-tcp": "tcp", "dnp3-serial": "tcp", "realcom": "tcp",
+    "realcom-cmd": "tcp", "moxa-discovery": "udp", "bacnet-sc": "tls",
+    "lorawan-udp": "udp",
+})
+_W5D_DECODE_AS = {"modbus-rtu-tcp": ("tcp.port==4001,mbrtu", "mbrtu"),
+                  "dnp3-serial": ("tcp.port==4001,dnp3", "dnp3"),
+                  "realcom": ("tcp.port==950,mbrtu", "mbrtu")}
+
+
+def _w5d_site():
+    from tgt import envfile
+    return envfile.load(os.path.join(envfile.SITES_DIR, "iiot-retrofit.json"))
+
+
+def test_w5d_modbus_rtu_over_tcp_framing() -> None:
+    """RTU-over-TCP: every payload is slave id + PDU + CRC-16/Modbus (low
+    byte first) with no MBAP header, the slaves behind the port are polled
+    in turn, and the device server's port N maps to TCP 4000 + N."""
+    from tgt import protocols_iiot as iiot
+    check(iiot.crc16_modbus(b"123456789") == 0x4B37,
+          "CRC-16/MODBUS check value")
+    check(iiot.rtu_frame(1, b"\x03\x00\x00\x00\x0a") ==
+          bytes.fromhex("01030000000ac5cd"), "RTU frame / CRC byte order")
+    ep = Endpoints(meta={"serial_addresses": [3, 4, 7],
+                         "serial_tcp_port": 4002})
+    protocols.begin_build(5, 0)
+    frames = protocols.get("modbus-rtu-tcp").build(ep, 30)
+    reqs = _payloads(frames, to_port=4002)
+    rsps = _payloads(frames, from_port=4002)
+    check(len(reqs) == len(rsps) == 30, f"rtu: {len(reqs)}/{len(rsps)}")
+    for pl in reqs + rsps:
+        check(iiot.crc16_modbus(pl[:-2]) == struct.unpack("<H", pl[-2:])[0],
+              f"rtu: bad CRC in {pl.hex()}")
+        check(pl[1] & 0x7F in (1, 2, 3, 4, 6), f"rtu: function {pl[1]}")
+    check([p[0] for p in reqs[:6]] == [3, 4, 7, 3, 4, 7],
+          "rtu: slaves not polled in turn")
+    check(all(a[0] == b[0] for a, b in zip(reqs, rsps)),
+          "rtu: reply from another slave")
+    check(any(p[1] == 0x06 for p in reqs) and any(p[1] == 0x83 for p in rsps),
+          "rtu: no FC 6 write / exception reply")
+    check(iiot.ports("modbus-rtu-tcp", 3) == {"serial_tcp_port": 4003} and
+          iiot.ports("realcom", 2) == {"realcom_data_port": 951,
+                                       "realcom_cmd_port": 967},
+          "device-server port numbering")
+
+
+def test_w5d_dnp3_serial_realcom_and_search() -> None:
+    """DNP3 serial frames to each outstation on the line in turn; RealCOM
+    data (950) carries the serial bytes and the command channel (966)
+    PORT_INIT then POLLING/ALIVE pairs; the Moxa search is the 8-byte
+    broadcast request and 24-byte unicast replies."""
+    ep = Endpoints(meta={"serial_addresses": [11, 12], "dnp3_master": 100})
+    protocols.begin_build(5, 0)
+    frames = protocols.get("dnp3-serial").build(ep, 6)
+    reqs = _payloads(frames, to_port=4001)
+    check(len(reqs) == 6 and all(p[:2] == b"\x05\x64" for p in reqs),
+          "dnp3-serial: no DNP3 link frames on 4001")
+    check([struct.unpack("<H", p[4:6])[0] for p in reqs[:4]] ==
+          [11, 12, 11, 12] and
+          {struct.unpack("<H", p[6:8])[0] for p in reqs} == {100},
+          "dnp3-serial: outstations not polled in turn")
+    rc = protocols.get("realcom").build(
+        Endpoints(meta={"serial_protocol": "dnp3", "realcom_data_port": 951}),
+        3)
+    check(all(p[:2] == b"\x05\x64" for p in _payloads(rc, to_port=951)),
+          "realcom: DNP3 bytes not carried on the data channel")
+    cmd = protocols.get("realcom-cmd").build(Endpoints(), 4)
+    up, down = _payloads(cmd, to_port=966), _payloads(cmd, from_port=966)
+    check(up[0][:2] == b"\x2c\x08" and up[0][2] == 6 and
+          down[0][0] == 0x2C, "realcom-cmd: no PORT_INIT (9600 8N1)")
+    polls, alive = down[1:], up[1:]
+    check(len(polls) == len(alive) == 4 and
+          all(p[0] == 0x27 and a[0] == 0x28 and p[2] == a[2]
+              for p, a in zip(polls, alive)),
+          "realcom-cmd: POLLING / ALIVE pairs do not match")
+    ep = Endpoints(meta={"moxa_product_id": 0x5650})
+    search = protocols.get("moxa-discovery").build(ep, 2)
+    req, rep = search[0], search[1]
+    check(req[:6] == b"\xff" * 6 and _udp_tcp_payload(req) ==
+          bytes.fromhex("0100000800000000") and _l4(req)[4] == 4800,
+          "moxa search request")
+    body = _udp_tcp_payload(rep)
+    check(len(body) == 24 and body[:4] == b"\x81\x00\x00\x18" and
+          P.mac_to_bytes(ep.server_mac) in body and _l4(rep)[3] == 4800
+          and _l4(rep)[2] == ep.client_ip, "moxa search reply")
+
+
+def test_w5d_bacnet_sc_tls13_heartbeats() -> None:
+    """BACnet/SC: a TLS 1.3-only ClientHello (ALPN http/1.1, SNI = hub), a
+    TLS 1.3 ServerHello, then only application_data records — including the
+    small heartbeat-sized ones — closed by Disconnect + close_notify."""
+    ep = Endpoints(meta={"sni": "sc-hub01.corp.local"})
+    protocols.begin_build(5, 0)
+    frames = protocols.get("bacnet-sc").build(ep, 6)
+    up, down = _payloads(frames, to_port=443), _payloads(frames, from_port=443)
+    hello = up[0]
+    check(hello[0] == 0x16 and hello[5] == 0x01, "bsc: no ClientHello")
+    check(b"sc-hub01.corp.local" in hello and b"\x08http/1.1" in hello,
+          "bsc: SNI / ALPN missing")
+    check(b"\x00\x2b\x00\x03\x02\x03\x04" in hello,
+          "bsc: supported_versions is not TLS 1.3 only")
+    check(down[0][0] == 0x16 and b"\x00\x2b\x00\x02\x03\x04" in down[0],
+          "bsc: server did not pick TLS 1.3")
+
+    def records(stream):
+        out, i = [], 0
+        while i + 5 <= len(stream):
+            n = struct.unpack("!H", stream[i + 3:i + 5])[0]
+            out.append((stream[i], n))
+            i += 5 + n
+        return out
+    cli, hub = records(b"".join(up)), records(b"".join(down))
+    later = cli[1:] + hub[1:]
+    check(cli[0][0] == hub[0][0] == 22 and later and
+          all(t == 23 for t, _ in later),
+          f"bsc: non-application_data record after the hellos: {later[:4]}")
+    # Heartbeat-Request: 4-byte BVLC-SC in a masked WebSocket frame (10 B)
+    # + inner type + 16-byte tag = 27; the hub's unmasked ACK 6 + 17 = 23.
+    # 6 messages: 4 heartbeats + 2 encapsulated NPDUs, then Disconnect
+    check(sum(n == 27 for _, n in cli) == 5 and
+          sum(n == 23 for _, n in hub) == 5,
+          f"bsc: heartbeat-sized records {[n for _, n in cli]}")
+
+
+def test_w5d_lorawan_semtech_udp() -> None:
+    """Semtech UDP forwarder: version 2 headers, PUSH_DATA / PULL_DATA /
+    TX_ACK from the gateway (EUI = MAC with FFFE) each acknowledged by the
+    server with the same token, rxpk JSON whose base64 PHYPayload carries
+    the configured DevAddrs with FCnts advancing per device across cycles,
+    and PULL_RESP txpk downlinks (ACK bit) answering confirmed uplinks."""
+    import base64
+    import json
+    from tgt import protocols_iiot as iiot
+    devs = [0x26011B01, 0x26011B02]
+    ep = Endpoints(client_mac="70:76:ff:01:02:03",
+                   meta={"lora_devices": devs})
+    fcnts = {d: [] for d in devs}
+    seen_ids = set()
+    for cycle in (0, 1):
+        protocols.begin_build(5, cycle)
+        frames = protocols.get("lorawan-udp").build(ep, 8)
+        pending = {}
+        for f in frames:
+            t = _l4(f)
+            pl = _udp_tcp_payload(f)
+            check(pl[0] == 2, "lorawan: protocol version != 2")
+            tok, ident = struct.unpack("!H", pl[1:3])[0], pl[3]
+            seen_ids.add(ident)
+            check(tok & 0xFF > 0x10, "lorawan: token low byte <= 0x10")
+            from_gw = t[4] == 1700
+            check(from_gw == (ident in (0, 2, 5)), f"lorawan: {ident} "
+                  "sent by the wrong side")
+            if ident in (0, 2, 5):
+                check(pl[4:12] == bytes.fromhex("7076fffffe010203"),
+                      "lorawan: gateway EUI")
+            if ident in (0, 2, 3):
+                pending[tok] = ident
+            elif ident in (1, 4, 5):
+                want = {1: 0, 4: 2, 5: 3}[ident]
+                check(pending.pop(tok, None) == want,
+                      f"lorawan: ack {ident} without its request")
+            if ident == 0:
+                doc = json.loads(pl[12:])
+                for pk in doc.get("rxpk", []):
+                    phy = base64.b64decode(pk["data"])
+                    check(pk["size"] == len(phy) and pk["modu"] == "LORA",
+                          "lorawan: rxpk size / modulation")
+                    mhdr, addr, _, fcnt = struct.unpack("<BIBH", phy[:8])
+                    check(mhdr in (0x40, 0x80) and addr in devs,
+                          f"lorawan: PHYPayload {phy.hex()}")
+                    fcnts[addr].append(fcnt)
+            if ident == 3:
+                txpk = json.loads(pl[4:])["txpk"]
+                phy = base64.b64decode(txpk["data"])
+                check(phy[0] == 0x60 and phy[5] & 0x20 and txpk["ipol"],
+                      "lorawan: downlink is not an ACK")
+        check(not pending, f"lorawan: unacknowledged {pending}")
+    check(seen_ids == {0, 1, 2, 3, 4, 5}, f"lorawan: identifiers {seen_ids}")
+    for d, f in fcnts.items():
+        check(f == list(range(len(f))) and len(f) == 8,
+              f"lorawan: {d:08X} FCnt {f}")
+    check(iiot.gateway_eui("00:08:00:4a:5b:6c").hex() == "000800fffe4a5b6c",
+          "gateway EUI derivation")
+
+
+def test_w5d_iiot_site_field_devices_behind_gateways() -> None:
+    """iiot-retrofit: the devices behind gateways are inventory assets with
+    'behind' set and no IP/MAC, the gateway flows poll exactly their
+    addresses (and run on the right serial port's TCP port), and a scorer
+    leaves them out of the discovery population (inventory and manifest
+    truth); the env file round-trips and rejects bad field devices."""
+    import copy
+    import io
+    import json
+    from tgt import envfile, inventory, score
+    env = _w5d_site()
+    fd = {d["name"]: d for d in env.field_devices}
+    check(len(fd) == 21, f"iiot-retrofit: {len(fd)} field devices")
+    doc = inventory.to_json(env)
+    rows = {h["name"]: h for h in doc["hosts"]}
+    for name, d in fd.items():
+        r = rows.get(name)
+        check(r is not None and r["behind"] == d["behind"] and not r["ip"]
+              and not r["mac"] and r["model"] == d["model"] and
+              not any(o["observable"] for o in r["observability"].values()),
+              f"inventory row for {name}: {r}")
+    buf = io.StringIO()
+    inventory.write_csv(env, buf)
+    check(sum(1 for ln in buf.getvalue().splitlines()
+              if ln.startswith("PM-MAIN-")) == 6, "CSV lacks field devices")
+    flows = {(f["client"], f["server"], f["protocol"]): f
+             for f in doc["flows"]}
+    check(flows[("SCADA01", "NPORT-MCC1", "dnp3-serial")]["dport"] == 4003
+          and flows[("SCADA01", "NPORT-MCC1", "modbus-rtu-tcp")]["dport"]
+          == 4001, "gateway flow ports")
+    truth = score.Truth(doc, env.key)
+    pop = {a["name"] for a in truth.population()}
+    check(not pop & set(fd) and {"NPORT-MCC1", "LORA-GW01"} <= pop,
+          "field devices counted in the discovery population")
+
+    def ep(c, s, p):
+        return env.conv_endpoints(env.host(c), env.host(s), p)
+    check(ep("HIST01", "MGATE-PWR1", "modbus").meta["modbus_units"] ==
+          [1, 2, 3, 4, 5, 6], "MGate units")
+    m = ep("SCADA01", "NPORT-MCC1", "dnp3-serial").meta
+    check(m["serial_addresses"] == [11, 12] and m["serial_tcp_port"] == 4003,
+          f"dnp3-serial meta {m}")
+    protocols.begin_build(3, 0)
+    batch = env.build(4)
+    lora = {d["address"] for d in fd.values()
+            if d["behind"] == "LORA-GW01"}
+    import base64
+    heard = set()
+    for k, f in batch:
+        if k == "lorawan-udp" and _l4(f)[4] == 1700 and \
+                _l4(f)[5][8 + 3] == 0:
+            for pk in json.loads(_l4(f)[5][8 + 12:]).get("rxpk", []):
+                heard.add(struct.unpack("<I", base64.b64decode(
+                    pk["data"])[1:5])[0])
+    check(heard and heard <= lora | {d["address"] for d in fd.values()
+                                     if d["behind"] == "LORA-GW02"},
+          f"LoRa uplinks from unknown DevAddrs {heard}")
+    mb = [_l4(f)[5] for k, f in batch if k == "modbus" and _l4(f)[4] == 502]
+    units = {pl[(pl[12] >> 4) * 4 + 6] for pl in mb
+             if len(pl) > (pl[12] >> 4) * 4 + 7}
+    check(units == {1, 2, 3, 4}, f"MGate polls units {units}")
+    # env export round trip, validation
+    d = envfile.to_dict(env)
+    env2 = envfile.from_dict(json.loads(json.dumps(d)))
+    check(env2.field_devices == env.field_devices, "field_devices export")
+    bad = [({"via": "http"}, "via"), ({"address": 300}, "address"),
+           ({"behind": "NOPE"}, "behind"), ({"port": 2}, "port"),
+           ({"protocol": "dnp3"}, "protocol")]
+    for patch, what in bad:
+        d2 = copy.deepcopy(d)
+        d2["field_devices"].append(dict(
+            {"name": "X1", "behind": "NPORT-MCC1", "via": "modbus-rtu-tcp",
+             "address": 9}, **patch))
+        try:
+            envfile.from_dict(d2)
+            _failures.append(f"field_devices: bad {what} accepted")
+        except envfile.EnvFileError as e:
+            check(what in str(e), f"field_devices {what}: {e}")
+    d2 = copy.deepcopy(d)
+    d2["field_devices"].append({"name": "X1", "behind": "NPORT-MCC1",
+                                "address": 2})
+    try:
+        envfile.from_dict(d2)
+        _failures.append("field_devices: duplicate slave address accepted")
+    except envfile.EnvFileError:
+        pass
+
+
+def test_w5d_timed_serial_turnaround_and_manifest() -> None:
+    """Timed run of iiot-retrofit: a serial gateway answers a poll only
+    after the line round trip (tens of ms, not the sub-ms of a switched
+    Ethernet device); the field devices never show up in first_seen and the
+    manifest truth leaves them out of the population."""
+    from tgt import envfile, score
+    envfile.load_user_envs(warn=lambda m: None, force=True)
+    names = {d["name"] for d in _w5d_site().field_devices}
+    with tempfile.TemporaryDirectory() as d:
+        recs, m = _timed_run(d, "iiot", env="iiot-retrofit", duration=120.0)
+    rows = _tcp_rows(recs, 4001)
+    lat = []
+    for a, b in zip(rows, rows[1:]):
+        if a[4] == 4001 and a[8] > 0 and b[3] == 4001 and b[8] > 0:
+            lat.append(b[0] - a[0])
+    check(len(lat) > 10 and min(lat) > 0.02,
+          f"rtu turnaround {sorted(lat)[:3]} ({len(lat)} polls)")
+    fs = set(m.get("first_seen") or {})
+    check(fs and not {k.split(":", 1)[-1] for k in fs} & names,
+          "field devices in first_seen")
+    truth = score.Truth(m, "iiot-retrofit")
+    check(not {a["name"] for a in truth.population()} & names,
+          "manifest population includes field devices")
+
+
+def test_w5d_tshark_gateways_decode_as() -> None:
+    """Optional: with Wireshark's decode-as, RTU-over-TCP and the RealCOM
+    data channel dissect as Modbus RTU with good CRCs and DNP3 serial as
+    DNP3; a full iiot-retrofit cycle has no expert warnings."""
+    import shutil
+    import subprocess
+    if not shutil.which("tshark"):
+        _skipped.append("test_w5d_tshark_gateways_decode_as")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        for key, (rule, layer) in _W5D_DECODE_AS.items():
+            path = f"{d}/{key}.pcap"
+            protocols.begin_build(2, 0)
+            with PcapWriter(path) as w:
+                for f in protocols.get(key).build(
+                        Endpoints(meta={"serial_addresses": [1, 2]}), 8):
+                    w.write(f)
+            args = ["tshark", "-r", path, "-d", rule, "-o",
+                    "mbrtu.crc_verification:TRUE"]
+            out = subprocess.run(args + ["-T", "fields", "-e",
+                                         "frame.protocols"],
+                                 capture_output=True, text=True).stdout
+            check(sum(layer in ln.split(":") for ln in out.splitlines()) == 16,
+                  f"tshark: {key} not decoded as {layer}")
+            exp = subprocess.run(args + ["-q", "-z", "expert,warn"],
+                                 capture_output=True, text=True).stdout
+            check("Warnings" not in exp and "Errors" not in exp,
+                  f"tshark: {key}: {exp.strip()[:200]}")
+        path = f"{d}/site.pcap"
+        protocols.begin_build(2, 0)
+        with PcapWriter(path) as w:
+            for _, f in _w5d_site().build(3):
+                w.write(f)
+        args = ["tshark", "-r", path, "-d", "tcp.port==4001,mbrtu", "-d",
+                "tcp.port==4003,dnp3", "-d", "tcp.port==950,mbrtu", "-o",
+                "mbrtu.crc_verification:TRUE"]
+        out = subprocess.run(args + ["-T", "fields", "-e", "frame.protocols"],
+                             capture_output=True, text=True).stdout
+        layers = {x for ln in out.splitlines() for x in ln.split(":")}
+        check({"mbrtu", "dnp3", "mbtcp", "tls", "snmp"} <= layers,
+              f"tshark: site layers {sorted(layers)}")
+        exp = subprocess.run(args + ["-q", "-z", "expert,warn"],
+                             capture_output=True, text=True).stdout
+        check("Warnings" not in exp and "Errors" not in exp,
+              f"tshark: iiot-retrofit: {exp.strip()[:300]}")
+
+# ---------------------------------------------------------------------------
+# W5-C: secure OT protocol variants and their observability (#66)
+# ---------------------------------------------------------------------------
+_DISSECTS_AS.update({
+    "enip-tls": "tls", "enip-dtls": "dtls", "s7plus-tls": "cotp",
+    "opcua-sign-encrypt": "opcua", "iec104-tls": "tls", "dnp3-tls": "tls",
+    "modbus-sec": "tls",
+})
+# Stock tshark has no dissector for the Modbus/TCP Security role extension
+# (OID 1.3.6.1.4.1.50316.802.1) in a client certificate; mapped to its
+# UTF8String syntax it decodes, else BER flags "Dissector for OID not
+# implemented" (an Undecoded warning about Wireshark, not the frame).
+_TSHARK_OPTS = ["-o", 'uat:oid:"1.3.6.1.4.1.50316.802.1","modbus-role",'
+                '"UTF8String"']
+# TLS records in COTP data TPDUs (S7-1500 secure PG/HMI communication) trip
+# stock tshark's SES-over-COTP heuristic, which then reports the TLS bytes
+# as malformed session PDUs; such a capture is read without it.
+_TSHARK_OWN = {"s7plus-tls": ["--disable-heuristic", "ses_cotp"]}
+_W5C_EP = {"sni": "plc-a.corp.local", "tls_client_cn": "hmi-a.corp.local",
+           "tls_client": "chrome", "mbsec_role": "Engineer",
+           "host": "PLC-A", "nbname": "HMI-A"}
+
+
+def _tls_records(data: bytes) -> list:
+    """(content type, version, body) of each TLS record in a byte stream."""
+    out, i = [], 0
+    while i + 5 <= len(data):
+        ct, ver, n = struct.unpack_from("!BHH", data, i)
+        out.append((ct, ver, data[i + 5:i + 5 + n]))
+        i += 5 + n
+    check(i == len(data), "TLS stream does not end on a record boundary")
+    return out
+
+
+def _tls_hs_types(records) -> list:
+    """Handshake message types readable in clear (whole records only)."""
+    out = []
+    for ct, _, body in records:
+        if ct != 22:
+            continue
+        j, got = 0, []
+        while j + 4 <= len(body):
+            got.append(body[j])
+            j += 4 + int.from_bytes(body[j + 1:j + 4], "big")
+        if j == len(body):
+            out += got
+    return out
+
+
+def _ch_exts(body: bytes, dtls: bool = False) -> list:
+    """Extension types of a ClientHello handshake message."""
+    i = 4 + (8 if dtls else 0) + 2 + 32
+    i += 1 + body[i]                                   # session id
+    if dtls:
+        i += 1 + body[i]                               # cookie
+    i += 2 + struct.unpack_from("!H", body, i)[0]      # cipher suites
+    i += 1 + body[i]                                   # compression
+    end = i + 2 + struct.unpack_from("!H", body, i)[0]
+    i += 2
+    out = []
+    while i < end:
+        t, n = struct.unpack_from("!HH", body, i)
+        out.append(t)
+        i += 4 + n
+    return out
+
+
+def _cotp_data(msg: bytes) -> bytes:
+    """Concatenated COTP DT user data of the TPKTs in one message."""
+    out, i = b"", 0
+    while i < len(msg):
+        n = struct.unpack_from("!H", msg, i + 2)[0]
+        tp = msg[i + 4:i + n]
+        check(msg[i] == 3 and tp[1] == 0xF0 and n <= 4 + 1024,
+              "s7plus-tls: not a COTP DT TPDU within the 1024 TPDU size")
+        out += tp[3:]
+        i += n
+    return out
+
+
+def test_w5c_secure_tls_handshakes() -> None:
+    """TLS variants on their ports: mutual-auth TLS 1.2 (no SNI / ALPN),
+    certificates naming both hosts, the Modbus role in the client
+    certificate, one record per plaintext message sized plaintext + suite
+    overhead, close_notify both ways; S7 secure communication: CR/CC and
+    InitSsl in clear, TLS 1.3 in COTP with only the hellos readable."""
+    from tgt import protocols_sec as S
+    from tgt import tls
+    ep = Endpoints(meta=dict(_W5C_EP))
+    for key, port in (("enip-tls", 2221), ("iec104-tls", 19998),
+                      ("dnp3-tls", 19999), ("modbus-sec", 802)):
+        protocols.begin_build(3, 0)
+        frames = protocols.get(key).build(ep, 5)
+        ports = {_l4(f)[4] for f in frames if _l4(f)[1] == ep.client_ip}
+        check(ports == {port}, f"{key}: client -> ports {ports}")
+        msgs = S._messages(frames, ep)
+        c = b"".join(d for _, frm, d in msgs if frm)
+        s = b"".join(d for _, frm, d in msgs if not frm)
+        crec, srec = _tls_records(c), _tls_records(s)
+        exts = _ch_exts(crec[0][2])
+        check(0 not in exts and 16 not in exts,
+              f"{key}: ClientHello carries SNI / ALPN ({exts})")
+        check({2, 11, 13, 14} <= set(_tls_hs_types(srec)) and
+              {11, 15, 16} <= set(_tls_hs_types(crec)),
+              f"{key}: no mutual-auth TLS 1.2 handshake "
+              f"{_tls_hs_types(crec)} / {_tls_hs_types(srec)}")
+        check(srec[0][2][4:6] == b"\x03\x03" and
+              b"plc-a.corp.local" in s and b"hmi-a.corp.local" in c,
+              f"{key}: TLS 1.2 certificates do not name the hosts")
+        protocols.begin_build(3, 0)
+        plain = S._messages(protocols.get(S.PLAIN_OF[key]).build(ep, 5), ep)
+        for side, recs in ((True, crec), (False, srec)):
+            app = [len(b) for ct, _, b in recs if ct == 23]
+            want = [len(d) for _, frm, d in plain if frm == side]
+            check(len(app) == len(want) and
+                  all(24 <= a - w <= 64 for a, w in zip(app, want)),
+                  f"{key}: app records {app} vs plaintext {want}")
+            check(sum(ct == 21 for ct, _, _ in recs) == 1,
+                  f"{key}: close_notify missing")
+        if key == "modbus-sec":       # AES-128-GCM: nonce + tag exactly
+            app = [len(b) for ct, _, b in crec if ct == 23]
+            want = [len(d) for _, frm, d in plain if frm]
+            check(app == [w + 24 for w in want],
+                  f"modbus-sec: GCM record sizes {app} vs {want}")
+            check(tls._oid(S.MODBUS_ROLE_OID) + b"\x04\x0a\x0c\x08Engineer"
+                  in c, "modbus-sec: client certificate lacks the role")
+    # S7-1500: TLS 1.3 inside COTP after a cleartext InitSsl
+    protocols.begin_build(3, 0)
+    msgs = S._messages(protocols.get("s7plus-tls").build(ep, 4), ep)
+    cm = [d for _, frm, d in msgs if frm]
+    sm = [d for _, frm, d in msgs if not frm]
+    check(cm[0][5] == 0xE0 and sm[0][5] == 0xD0 and
+          cm[1][7:9] == b"\x72\x01" and cm[1][11:16] == b"\x31\x00\x00\x05"
+          b"\xb3", "s7plus-tls: COTP CR/CC + InitSsl not in clear")
+    crec = _tls_records(b"".join(_cotp_data(m) for m in cm[2:]))
+    srec = _tls_records(b"".join(_cotp_data(m) for m in sm[2:]))
+    check(crec[0][0] == 22 and 43 in _ch_exts(crec[0][2]) and
+          b"\x00\x2b\x00\x02\x03\x04" in srec[0][2],
+          "s7plus-tls: not a TLS 1.3 handshake")
+    check(_tls_hs_types(srec) == [2] and b"plc-a.corp.local" not in
+          b"".join(sm), "s7plus-tls: the certificate is readable")
+    check(all([ct for ct, _, _ in _tls_records(_cotp_data(m))][-1:] == [23]
+              for m in cm[3:]) and
+          sum(ct == 23 for ct, _, _ in crec) == len(cm) - 3,
+          "s7plus-tls: one record per S7CommPlus PDU")
+    # every variant: seeded builds reproduce, others differ
+    for key in S.PLAIN_OF:
+        out = []
+        for seed in (9, 9, 10):
+            protocols.begin_build(seed, 2)
+            out.append(protocols.get(key).build(ep, 3))
+        check(out[0] == out[1] and out[0] != out[2],
+              f"{key}: seeded build not reproducible")
+
+
+def test_w5c_opcua_sign_encrypt_and_dtls_wire() -> None:
+    """OPC UA SignAndEncrypt: OPN with the Basic256Sha256 policy, the
+    sender certificate and the SHA-1 thumbprint of the receiver's, RSA
+    block-sized bodies, symmetric chunks in AES blocks. CIP Security I/O:
+    DTLS 1.2 cookie exchange on 2221/udp, epoch-1 records whose sequence
+    numbers rise within a build and continue in the next."""
+    import hashlib
+    from tgt import protocols_sec as S
+    ep = Endpoints(meta=dict(_W5C_EP))
+    protocols.begin_build(4, 0)
+    msgs = S._messages(protocols.get("opcua-sign-encrypt").build(ep, 4), ep)
+    scert, ccert = S.opcua_certificates(ep)
+    protocols.begin_build(4, 0)
+    plain = S._messages(protocols.get("opcua").build(ep, 4), ep)
+    check([d[:3] for _, _, d in msgs] == [d[:3] for _, _, d in plain],
+          "opcua-sign-encrypt: chunk sequence differs from plaintext")
+    opn = 0
+    for _, frm, d in msgs:
+        check(struct.unpack_from("<I", d, 4)[0] == len(d),
+              "opcua-sign-encrypt: chunk size field")
+        if d[:3] == b"OPN":
+            opn += 1
+            i = 12
+            fields = []
+            for _ in range(3):
+                n = struct.unpack_from("<i", d, i)[0]
+                fields.append(d[i + 4:i + 4 + n])
+                i += 4 + n
+            pol, cert, thumb = fields
+            check(pol == S.B256SHA256 and
+                  cert == (ccert if frm else scert) and
+                  thumb == hashlib.sha1(scert if frm else ccert).digest()
+                  and (len(d) - i) % 256 == 0,
+                  "opcua-sign-encrypt: asymmetric security header")
+        elif d[:3] in (b"MSG", b"CLO"):
+            check((len(d) - 16) % 16 == 0 and len(d) >= 16 + 48,
+                  "opcua-sign-encrypt: symmetric chunk not AES-blocked")
+    check(opn == 2 and b"urn:HMI-A:UA:Client" in ccert and
+          b"plc-a.corp.local" in scert,
+          "opcua-sign-encrypt: OPN / application certificates")
+    seqs = []
+    for cyc in (0, 1):
+        protocols.begin_build(4, cyc)
+        frames = protocols.get("enip-dtls").build(ep, 4)
+        udp = [(_l4(f)[1] == ep.client_ip, _l4(f)) for f in frames
+               if _l4(f)[0] == P.IPPROTO_UDP]
+        check({(t[3], t[4]) for _, t in udp} == {(2221, 2221)},
+              "enip-dtls: DTLS not on 2221/udp")
+        tcp = {_l4(f)[4] for f in frames if _l4(f)[0] == P.IPPROTO_TCP
+               and _l4(f)[1] == ep.client_ip}
+        check(tcp == {2221}, f"enip-dtls: Forward_Open on {tcp}")
+        dg = [(frm, t[5][8:]) for frm, t in udp]
+        ch1, hvr, ch2 = dg[0][1], dg[1][1], dg[2][1]
+        check(ch1[:3] == b"\x16\xfe\xff" and ch1[13] == 1 and
+              hvr[13] == 3 and hvr[25:27] == b"\xfe\xff" and
+              ch2[13] == 1, "enip-dtls: ClientHello / HelloVerifyRequest")
+        cookie = hvr[28:28 + hvr[27]]
+        check(len(cookie) == 20 and 2 + 32 + 1 + 1 + 20 <= len(ch2) and
+              ch2[13 + 12 + 35:13 + 12 + 36 + 20] == b"\x14" + cookie,
+              "enip-dtls: second ClientHello does not echo the cookie")
+        app = [(frm, struct.unpack("!H", p[3:5])[0],
+                int.from_bytes(p[5:11], "big"))
+               for frm, p in dg if p[0] == 23]
+        check(len(app) == 8 and {e for _, e, _ in app} == {1},
+              f"enip-dtls: {len(app)} epoch-1 I/O records")
+        for side in (True, False):
+            s = [q for frm, _, q in app if frm == side]
+            check(s == sorted(s) and len(set(s)) == len(s),
+                  "enip-dtls: record sequence numbers do not rise")
+        seqs.append(max(q for _, _, q in app))
+        seqs.append(min(q for _, _, q in app))
+    check(seqs[3] > seqs[0], f"enip-dtls: sequence restarts per build {seqs}")
+
+
+def test_w5c_secure_persistent_cuts() -> None:
+    """Under the timed scheduler a secure session keeps its plaintext
+    shape: the PERSISTENT cuts leave as many polls as the plaintext cut,
+    every poll is application data only, the IEC 104 GI refresh is the
+    encrypted GI, and a long run opens one connection and one handshake
+    whose polls are plaintext-sized records."""
+    from tgt import protocols_sec as S
+    from tgt import schedule, timing
+    ep = Endpoints()
+    cm = P.mac_to_bytes(ep.client_mac)
+
+    def data(f: bytes) -> bytes:
+        frm, flags, plen, off, l4, tcp = schedule.view(f, cm)
+        start = l4 + ((f[l4 + 12] >> 4) * 4 if tcp else 8)
+        return f[start:start + plen]
+
+    for key, plain in S.PLAIN_OF.items():
+        ss, st, _ = timing.PERSISTENT[key]
+        ps, pt, _ = timing.PERSISTENT[plain]
+        check(timing.spec(key)[:3] == timing.spec(plain)[:3],
+              f"{key}: period differs from {plain}")
+        protocols.begin_build(2, 0)
+        g = schedule.exchanges(protocols.get(key).build(ep, 5), cm)
+        protocols.begin_build(2, 0)
+        pg = schedule.exchanges(protocols.get(plain).build(ep, 5), cm)
+        # a lone client message closing the plaintext polls (an IEC 104
+        # S-frame) shares the teardown exchange with the close_notify
+        lone = not any(schedule.view(f, cm)[2] > 0 and
+                       not schedule.view(f, cm)[0] for f in pg[-pt - 1])
+        diff = (len(pg) - ps - pt) - (len(g) - ss - st)
+        check(diff == 0 or (lone and diff == 1),
+              f"{key}: {len(g) - ss - st} polls vs {len(pg) - ps - pt}")
+        for grp in g[ss:len(g) - st]:
+            for f in grp:
+                d = data(f)
+                if not d:
+                    continue
+                ok = (d[:3] == b"MSG" if key == "opcua-sign-encrypt" else
+                      d[0] == 3 and d[7] == 0x17 if key == "s7plus-tls" else
+                      d[0] == 0x17)
+                check(ok, f"{key}: a poll is not application data")
+    gi = timing.REFRESH["iec104-tls"][1]
+    protocols.begin_build(2, 0)
+    g = schedule.exchanges(protocols.get("iec104-tls").build(ep, 5), cm)
+    protocols.begin_build(2, 0)
+    pg = schedule.exchanges(protocols.get("iec104").build(ep, 5), cm)
+    req = [len(data(f)) for f in g[gi] if schedule.view(f, cm)[0]
+           and data(f)]
+    preq = [len(data(f)) for f in pg[timing.REFRESH["iec104"][1]]
+            if schedule.view(f, cm)[0] and data(f)]
+    check(req == [n + 29 for n in preq],
+          f"iec104-tls: refresh exchange {req} is not the GI {preq}")
+    st = schedule.profile_streams(["modbus-sec"], ep)
+    st[0].period = 1.0
+    sch = schedule.Scheduler(5)
+    sch.load(st, 0.0, initial=True)
+    frames = [c[0] for _, _, _, c, _, _ in sch.run(600.0)]
+    syn = [f for f in frames if schedule.view(f, cm)[1] == 0x02]
+    hello = [f for f in frames if schedule.view(f, cm)[0] and
+             data(f)[:1] == b"\x16" and data(f)[5:6] == b"\x01"]
+    polls = {len(data(f)) for f in frames if schedule.view(f, cm)[0]
+             and data(f)[:1] == b"\x17"}
+    n = sum(1 for f in frames if schedule.view(f, cm)[0]
+            and data(f)[:1] == b"\x17")
+    check(len(syn) == 1 and len(hello) == 1 and n > 500 and
+          polls == {12 + 29},
+          f"modbus-sec timed: {len(syn)} SYN, {len(hello)} hellos, {n} "
+          f"polls sized {polls}")
+
+
+def _w5c_doc() -> dict:
+    return {"key": "t-sec", "segments": [
+        {"name": "C", "vlan": 10, "subnet": "10.9.0.0/24",
+         "zone": "OT-CELL"}],
+        "hosts": [
+            {"name": "HMI-1", "ip": "10.9.0.10", "role": "hmi",
+             "os": "win10"},
+            {"name": "ENG-1", "ip": "10.9.0.11", "role": "eng",
+             "os": "win10"},
+            {"name": "PLC-L8", "ip": "10.9.0.20",
+             "model": "rockwell-1756-l83e", "firmware": "33.011"},
+            {"name": "PLC-L8B", "ip": "10.9.0.23",
+             "model": "rockwell-1756-l83e", "firmware": "34.011"},
+            {"name": "PLC-S7", "ip": "10.9.0.21",
+             "model": "siemens-cpu-1516-3pndp", "firmware": "V3.1.1"},
+            {"name": "PLC-S7R", "ip": "10.9.0.24",
+             "model": "siemens-cpu-1515r-2pn"},
+            {"name": "RTU-1", "ip": "10.9.0.22", "role": "rtu",
+             "os": "linux", "meta": {"secure": True}}] +
+        [{"name": f"SW{i}", "ip": f"10.9.0.{30 + i}", "role": "ws",
+          "os": "win10"} for i in range(4)],
+        "flows": [
+            {"from": "HMI-1", "to": "PLC-L8", "proto": "enip",
+             "secure": True},
+            {"client": "ENG-1", "server": "PLC-L8", "proto": "enip"},
+            {"client": "PLC-L8", "server": "PLC-L8B", "proto": "enip-io",
+             "secure": True},
+            {"client": "HMI-1", "server": "PLC-S7", "proto": "s7plus",
+             "secure": True},
+            {"client": "HMI-1", "server": "PLC-S7", "proto": "opcua",
+             "secure": True},
+            {"client": "ENG-1", "server": "PLC-S7R", "proto": "s7plus-tls"},
+            {"client": "HMI-1", "server": "RTU-1", "proto": "modbus"},
+            {"client": "HMI-1", "server": "RTU-1", "proto": "dnp3",
+             "secure": False},
+            {"client": "HMI-1", "server": "RTU-1", "proto": "iec104"},
+            {"client": "HMI-1", "server": "RTU-1", "proto": "ntp"}]}
+
+
+def test_w5c_env_file_secure_opt_in() -> None:
+    """Env files select the secure variant per flow ("secure": true) or per
+    server (meta "secure": true, a flow's "secure": false wins), the
+    catalog rejects devices that cannot (model or firmware), export
+    round-trips, and the flows build with checksums intact."""
+    import copy
+    from tgt import envfile
+    env = envfile.from_dict(_w5c_doc(), "s.json")
+    want = {("HMI-1", "PLC-L8", "enip-tls"), ("ENG-1", "PLC-L8", "enip"),
+            ("PLC-L8", "PLC-L8B", "enip-dtls"),
+            ("HMI-1", "PLC-S7", "s7plus-tls"),
+            ("HMI-1", "PLC-S7", "opcua-sign-encrypt"),
+            ("ENG-1", "PLC-S7R", "s7plus-tls"),
+            ("HMI-1", "RTU-1", "modbus-sec"), ("HMI-1", "RTU-1", "dnp3"),
+            ("HMI-1", "RTU-1", "iec104-tls"), ("HMI-1", "RTU-1", "ntp")}
+    check(set(env.conversations) == want,
+          f"secure opt-in: {set(env.conversations) ^ want}")
+    again = envfile.from_dict(envfile.to_dict(env), "x.json")
+    check(again.conversations == env.conversations,
+          "secure opt-in: export does not round-trip")
+    batch = env.build(1)
+    for _, f in batch:
+        verify_ip_l4(f, "t-sec")
+    mb = b"".join(f for k, f in batch if k == "modbus-sec")
+    check(b"hmi-1.corp.local" in mb and b"Operator" in mb and
+          b"rtu-1.corp.local" in mb,
+          "modbus-sec: client / server certificate names, HMI role")
+    bad = [
+        ("flows", 0, {"from": "HMI-1", "to": "PLC-L8", "proto": "https",
+                      "secure": True}, "no secure variant"),
+        ("hosts", 4, {"name": "PLC-S7", "ip": "10.9.0.21",
+                      "model": "siemens-cpu-1516-3pndp",
+                      "firmware": "V2.8.3"}, "does not support"),
+        ("hosts", 2, {"name": "PLC-L8", "ip": "10.9.0.20",
+                      "model": "rockwell-1756-l71"}, "does not support"),
+        ("flows", 0, {"client": "HMI-1", "server": "PLC-L8",
+                      "proto": "enip", "secure": "yes"}, "secure"),
+    ]
+    for where, i, val, msg in bad:
+        doc = copy.deepcopy(_w5c_doc())
+        doc[where][i] = val
+        try:
+            envfile.from_dict(doc, "bad.json")
+            check(False, f"secure opt-in accepted {val}")
+        except envfile.EnvFileError as e:
+            check(msg in str(e), f"secure opt-in error {e}")
+
+
+def test_w5c_inventory_observability_and_score() -> None:
+    """Encrypted payloads hide what the plaintext protocol would carry:
+    certificates still name the hosts on TLS / DTLS 1.2 and OPC UA, not on
+    TLS 1.3; flows state their encryption; a perfect export still scores
+    100 %."""
+    from tgt import envfile, inventory, score
+    env = envfile.from_dict(_w5c_doc(), "s.json")
+    doc = inventory.to_json(env)
+    rows = {h["name"]: h for h in doc["hosts"]}
+
+    def ev(host, field):
+        return rows[host]["observability"][field]["evidence"]
+
+    check(ev("PLC-S7R", "fqdn") == [] and ev("PLC-S7", "fqdn") ==
+          ["opcua-sign-encrypt"],
+          "TLS 1.3 certificate counted as observable")
+    check(ev("PLC-L8", "fqdn") == ["enip-dtls", "enip-tls"] and
+          ev("HMI-1", "fqdn") == ["enip-tls", "iec104-tls", "modbus-sec",
+                                  "opcua-sign-encrypt"],
+          f"TLS 1.2 certificates: {ev('PLC-L8', 'fqdn')} "
+          f"{ev('HMI-1', 'fqdn')}")
+    for h in ("PLC-L8", "PLC-S7", "PLC-S7R"):
+        check(not rows[h]["observability"]["firmware"]["observable"],
+              f"{h}: firmware observable through an encrypted session")
+    enc = {(f["client"], f["server"], f["protocol"]): f.get("encryption")
+           for f in doc["flows"]}
+    check(enc[("HMI-1", "PLC-S7", "s7plus-tls")] == "tls1.3" and
+          enc[("PLC-L8", "PLC-L8B", "enip-dtls")] == "dtls1.2" and
+          enc[("ENG-1", "PLC-L8", "enip")] is None,
+          "inventory flows: encryption")
+    check({e["protocol"]: e["certificates"]
+           for e in rows["PLC-S7"]["encrypted"]} ==
+          {"s7plus-tls": "encrypted", "opcua-sign-encrypt": "clear"},
+          "inventory host: encrypted protocols")
+    mapping = score.load_json_spec("generic", "map")
+    with tempfile.TemporaryDirectory() as d:
+        truth = score.Truth(doc, env.key)
+        path = os.path.join(d, "x.csv")
+        score.write_perfect_export(truth, path)
+        rows_, info = score.read_export(path, mapping)
+        res = score.score(truth, rows_, info)
+    acc = [res["fields"][f]["observable"]["accuracy"] for f in score.FIELDS]
+    check(res["discovery"]["recall"] == 1.0 and
+          all(a in (None, 1.0) for a in acc) and
+          res["protocols"]["precision"] == 1.0 and
+          res["protocols"]["recall"] == 1.0,
+          f"secure env self-score: {res['discovery']} {acc}")
+    check(score.norm_protocol("enip-tls 2221/tcp") == "cip-security" ==
+          score.norm_protocol("CIP Security") and
+          score.norm_protocol("s7plus-tls") == "s7comm",
+          "score: secure protocol aliases")
+
+
+def test_w5c_pharma_mixes_secure_and_plaintext() -> None:
+    """pharma-batch: HMIs on CIP Security, controller-to-controller DTLS
+    I/O and OPC UA SignAndEncrypt next to plaintext CIP / OPC UA / class-1
+    I/O; the controllers' identity stays observable through cleartext List
+    Identity, the HMIs' names only through their client certificates."""
+    from tgt import enterprise, envfile, inventory
+    envfile.load_user_envs(warn=lambda m: None, force=True)
+    env = enterprise.ENVIRONMENTS.get("pharma-batch")
+    check(env is not None, "pharma-batch not loaded")
+    if env is None:
+        return
+    protos = {p for _, _, p in env.conversations}
+    check({"enip-tls", "enip-dtls", "opcua-sign-encrypt", "enip", "opcua",
+           "enip-io"} <= protos, f"pharma-batch protocols {protos}")
+    rows = {h["name"]: h for h in inventory.to_json(env)["hosts"]}
+    ob = rows["PLC-GRAN-01"]["observability"]
+    check(ob["firmware"]["evidence"] == ["enip-id"] and
+          rows["OPS-HMI01"]["observability"]["fqdn"]["evidence"] ==
+          ["enip-tls"], "pharma-batch observability")
+    batch = env.build(1)
+    to = {(_l4(f)[0], _l4(f)[4]) for k, f in batch
+          if k in ("enip-tls", "enip-dtls") and _l4(f)}
+    check((P.IPPROTO_TCP, 2221) in to and (P.IPPROTO_UDP, 2221) in to,
+          f"pharma-batch: secure CIP not on 2221 ({to})")
+
+
+def test_w5c_tshark_secure_variants() -> None:
+    """Optional: every secure builder decodes with no tshark warning or
+    error — TLS 1.2 mutual handshakes, DTLS with HelloVerifyRequest, OPC UA
+    asymmetric headers, the Modbus role as a UTF8String — and the S7
+    TLS 1.3 stream, lifted out of its COTP TPDUs, decodes as TLS 1.3."""
+    import subprocess
+    from tgt import protocols_sec as S
+    if not shutil_which("tshark"):
+        _skipped.append("test_w5c_tshark_secure_variants")
+        return
+    ep = Endpoints(meta=dict(_W5C_EP))
+    fields = {"enip-tls": ("tls.handshake.type", {"1", "2", "11", "13",
+                                                  "14", "15", "16"}),
+              "modbus-sec": ("x509sat.UTF8String", {"Engineer"}),
+              "enip-dtls": ("dtls.handshake.type", {"1", "3", "13", "15"}),
+              "opcua-sign-encrypt": ("opcua.security.spu",
+                                     {S.B256SHA256.decode()})}
+
+    def run(path, extra, *args):
+        return subprocess.run(["tshark"] + _TSHARK_OPTS + extra +
+                              ["-r", path] + list(args),
+                              capture_output=True, text=True).stdout
+
+    with tempfile.TemporaryDirectory() as d:
+        for key in S.PLAIN_OF:
+            protocols.begin_build(6, 0)
+            frames = protocols.get(key).build(ep, 4)
+            path = os.path.join(d, key + ".pcap")
+            with PcapWriter(path) as w:
+                for f in frames:
+                    w.write(f)
+            extra = _TSHARK_OWN.get(key, [])
+            ex = run(path, extra, "-q", "-z", "expert,warn")
+            bad = [ln.strip() for ln in ex.splitlines()
+                   if ln.strip()[:1].isdigit()]
+            check("Errors (" not in ex and not bad,
+                  f"tshark {key}: {bad[:3]}")
+            if key in fields:
+                fld, want = fields[key]
+                got = {v for ln in run(path, extra, "-T", "fields", "-e",
+                                       fld).split()
+                       for v in ln.split(",")}
+                check(want <= got, f"tshark {key}: {fld} {got}")
+            if key != "s7plus-tls":
+                continue
+            msgs = S._messages(frames, ep)
+            pairs = S._pairs([(frm, _cotp_data(m))
+                              for _, frm, m in msgs[4:]])
+            lifted = protocols._tcp_flow(ep, 40000, 443,
+                                         [tuple(p) for p in pairs])
+            path = os.path.join(d, "s7tls.pcap")
+            with PcapWriter(path) as w:
+                for f in lifted:
+                    w.write(f)
+            ex = run(path, [], "-q", "-z", "expert,warn")
+            vers = run(path, [], "-T", "fields", "-e",
+                       "tls.handshake.extensions.supported_version", "-e",
+                       "x509sat.uTF8String")
+            check("Errors (" not in ex and "0x0304" in vers and
+                  "corp.local" not in vers,
+                  f"s7plus-tls: lifted TLS stream {vers.split()[:4]}")
 
 
 def test_review_injection_worker_ends_with_run() -> None:

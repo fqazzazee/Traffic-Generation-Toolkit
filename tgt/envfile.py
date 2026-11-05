@@ -62,6 +62,15 @@ that matches nothing is an error. Optional ``period`` (seconds, or "500ms",
 "1s", "2m", or "1s±5%") and ``jitter`` ("5%" or a fraction) set the flow's
 recurrence under the timed scheduler (``--schedule timed``; the defaults
 come from :data:`tgt.timing.PERIODS`); the cycle builder ignores them.
+Optional ``secure`` (true / false) selects the protocol's secure variant
+(``modbus`` -> ``modbus-sec``, ``enip`` -> ``enip-tls``, ``enip-io`` ->
+``enip-dtls``, ``s7plus`` -> ``s7plus-tls``, ``opcua`` ->
+``opcua-sign-encrypt``, ``iec104`` -> ``iec104-tls``, ``dnp3`` ->
+``dnp3-tls``; see :mod:`tgt.protocols_sec`). A server host whose ``meta``
+holds ``"secure": true`` gets the secure variant on every flow that has one,
+unless the flow says ``"secure": false``. A device the catalog knows not to
+support the variant (model, or firmware below the release that added it —
+:data:`tgt.devices.SECURE`) is an error.
 
 **segments[]** optional keys — ``gateway_mac`` (the gateway's MAC when it
 is not the HSRP virtual MAC), ``wan_rtt_ms`` (round-trip time of the WAN
@@ -87,6 +96,23 @@ public ``ip``, ``role``, ``os``, ``vendor``, ``product``, ``fqdn``,
 name, role or ``zone:external``, never by a name glob or ``@SEGMENT``);
 their traffic egresses through the internal host's gateway, DNS answers their
 ``fqdn`` and ``tgt inventory`` lists them under ``external``, not as assets.
+
+**field_devices[]** — devices with no IP of their own behind a gateway host:
+serial slaves on a device server's line, LoRaWAN sensors heard by a LoRa
+gateway. ``{"name", "behind": HOST, "via"?: PROTO, "port"?: 1-32,
+"address"?: N, "protocol"?, "model"?, "vendor"?, "product"?, "role"?,
+"firmware"?, "serial"?, "count"?, "start"?}``. ``via`` is the protocol the
+gateway is reached with — ``modbus-rtu-tcp`` (default; raw TCP 4000+port),
+``dnp3-serial`` (raw TCP 4000+port), ``realcom`` (Moxa RealCOM 950/966 +
+port-1, ``protocol`` ``modbus-rtu`` or ``dnp3``), ``modbus`` (a Modbus TCP ->
+RTU gateway: unit id = slave address) or ``lorawan-udp`` (the gateway is the
+flow's client; ``address`` is the DevAddr, a number or hex string). Devices
+of one gateway reached the same way share one serial ``port`` (an RS-485
+drop) and need distinct addresses; ``count`` numbers the name template and
+the addresses up from ``address``. The flows to (LoRa: from) the gateway
+poll them; ``tgt inventory`` lists them as assets with ``behind`` set and no
+IP/MAC, which a passive monitor cannot discover as IP assets (``tgt score``
+leaves them out of the discovery population, like hosts hidden by NAT).
 
 **options** — ``arp`` (default true: start-of-cycle ARP for gateway and
 peers), ``flat`` (one VLAN for every segment), ``dual_homed`` (list of
@@ -114,7 +140,10 @@ ZONES = ("IT", "DMZ", "OT-SUPERVISORY", "OT-CELL")
 CATEGORIES = ("IT", "OT", "mixed")
 _TOP_KEYS = {"key", "name", "category", "description", "options", "segments",
              "hosts", "flows", "findings",
-             "external"}
+             "external", "field_devices"}
+_FIELD_KEYS = {"name", "behind", "via", "port", "address", "protocol",
+               "model", "vendor", "product", "role", "firmware", "serial",
+               "count", "start"}
 _SEG_KEYS = {"name", "vlan", "subnet", "zone", "gateway", "gateway_mac", "nat",
              "wan_rtt_ms"}
 _NAT_KEYS = {"outside_ip", "outside_mac", "local"}
@@ -125,7 +154,7 @@ _HOST_KEYS = {"name", "ip", "role", "os", "model", "vendor", "product", "mac",
               "firmware", "serial", "fqdn", "count", "start", "ip_start",
               "meta", "client_meta"}
 _FLOW_KEYS = {"client", "server", "from", "to", "proto", "mode", "period",
-              "jitter"}
+              "jitter", "secure"}
 _OPTION_KEYS = {"arp", "flat", "dual_homed", "snmp_community",
                 "default_snmp_community", "day_profile", "utc_offset"}
 _DUAL_KEYS = {"host", "ip", "mac", "flows"}
@@ -327,14 +356,18 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
 
     conv: List[Conversation] = []
     timing: Dict[Conversation, Dict[str, Any]] = {}
+    by_name = {h.name: h for h in list(hosts) + list(external)}
     for i, raw in enumerate(cx.list(doc.get("flows", []), "flows")):
         path = f"flows[{i}]"
         pairs, t = _flows(cx, raw, path, hosts, seg_of, segments, external)
+        pairs = _secure(cx, raw, path, pairs, by_name, host_meta)
         conv += pairs
         if t:
             for c in pairs:
                 timing[c] = dict(t)
 
+    fdevs = _field_devices(cx, doc.get("field_devices", []), where,
+                           {h.name for h in hosts})
     options = _options(cx, doc.get("options", {}), "options", where, segments)
     findings = [_finding(cx, f, f"findings[{i}]", where, conv)
                 for i, f in enumerate(cx.list(doc.get("findings", []),
@@ -346,7 +379,8 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
     try:
         env = Environment(key, name, category, desc, hosts, conv, segments,
                           options, host_meta, timing,
-                          findings=findings, external=external)
+                          findings=findings, external=external,
+                          field_devices=fdevs)
     except ValueError as e:
         raise EnvFileError(f"{source}: {e}") from None
     env.source = source             # type: ignore[attr-defined]
@@ -429,6 +463,85 @@ def _finding(cx: _Ctx, raw: Any, path: str, where: Dict[str, str],
                              "proto": f["proto"]})
     if not out["hosts"] and not out["flows"]:
         raise cx.err(path, "a finding needs 'hosts' and/or 'flows'")
+    return out
+
+
+def _field_devices(cx: _Ctx, raw: Any, where: Dict[str, str],
+                   internal: set) -> List[Dict[str, Any]]:
+    """``field_devices[]``: devices without an IP behind a gateway host,
+    normalised (``count`` expanded, catalog identity filled in)."""
+    from . import protocols_iiot as iiot
+    out: List[Dict[str, Any]] = []
+    seen: Dict[tuple, str] = {}
+    port_of: Dict[tuple, int] = {}
+    for i, d in enumerate(cx.list(raw, "field_devices")):
+        path = f"field_devices[{i}]"
+        d = cx.obj(d, path, _FIELD_KEYS, ("name", "behind"))
+        gw = cx.str(d["behind"], f"{path}.behind")
+        if gw not in internal:
+            raise cx.err(f"{path}.behind", f"no host named {gw!r}")
+        via = d.get("via", "modbus-rtu-tcp")
+        if via not in iiot.VIA:
+            raise cx.err(f"{path}.via", f"{via!r} is not one of "
+                         f"{', '.join(iiot.VIA)}")
+        proto = d.get("protocol", iiot.VIA[via])
+        if proto not in iiot.FIELD_PROTOCOLS or (
+                via != "realcom" and proto != iiot.VIA[via]) or (
+                via == "realcom" and proto == "lorawan"):
+            raise cx.err(f"{path}.protocol", f"{proto!r} cannot be reached "
+                         f"via {via}")
+        port = cx.int(d.get("port", 1), f"{path}.port", 1, 32)
+        if port_of.setdefault((gw, via), port) != port:
+            raise cx.err(f"{path}.port", f"{gw}'s {via} devices share one "
+                         f"serial line (port {port_of[(gw, via)]})")
+        lo, hi = iiot.ADDRESS_RANGE[proto]
+        addr = d.get("address", 1)
+        if isinstance(addr, str):           # a DevAddr in hex
+            try:
+                addr = int(addr, 16)
+            except ValueError:
+                raise cx.err(f"{path}.address", f"not a hex address: "
+                             f"{addr!r}") from None
+        addr = cx.int(addr, f"{path}.address", lo, hi)
+        model = d.get("model", "")
+        dev = None
+        if model:
+            dev = devices.find(cx.str(model, f"{path}.model"))
+            if dev is None:
+                raise cx.err(f"{path}.model", f"unknown device model "
+                             f"{model!r} (see tgt/devices.py CATALOG)")
+        role = d.get("role") or (dev and _ROLE_OF_TYPE.get(dev.device_type)) \
+            or (dev.device_type if dev else "field-device")
+        count = cx.int(d.get("count", 1), f"{path}.count", 1, 247)
+        start = cx.int(d.get("start", 1), f"{path}.start", 0, 1 << 20)
+        tpl = cx.str(d["name"], f"{path}.name")
+        for k in range(count):
+            try:
+                name = tpl.format(n=start + k) if count > 1 else tpl
+            except (KeyError, IndexError, ValueError) as e:
+                raise cx.err(f"{path}.name", f"bad name template {tpl!r}: "
+                             f"{e!r}") from None
+            if name in where or any(x["name"] == name for x in out):
+                raise cx.err(f"{path}.name", f"duplicate name {name!r}")
+            a = addr + k
+            if a > hi:
+                raise cx.err(f"{path}.count", f"address {a} past {hi}")
+            if (gw, via, a) in seen:
+                raise cx.err(f"{path}.address", f"{gw} {via} address {a} "
+                             f"already used by {seen[(gw, via, a)]}")
+            seen[(gw, via, a)] = name
+            fd = {"name": name, "behind": gw, "via": via, "port": port,
+                  "address": a, "protocol": proto, "model": model,
+                  "vendor": d.get("vendor", dev.vendor if dev else ""),
+                  "product": d.get("product", dev.product if dev else ""),
+                  "role": cx.str(role, f"{path}.role"),
+                  "firmware": d.get("firmware", devices.pick_firmware(
+                      dev, name) if dev else ""),
+                  "serial": d.get("serial", devices.make_serial(
+                      dev, name) if dev else "")}
+            for key in ("vendor", "product", "firmware", "serial"):
+                cx.str(fd[key], f"{path}.{key}", allow_empty=True)
+            out.append(fd)
     return out
 
 
@@ -627,7 +740,40 @@ def _flows(cx: _Ctx, raw: Any, path: str, hosts: List[Host],
     return pairs, timing
 
 
-_DUR = re.compile(r"\s*([0-9]*\.?[0-9]+)\s*(ms|s|m|h)?\s*$")
+def _secure(cx: _Ctx, raw: Dict[str, Any], path: str,
+            pairs: List[Conversation], by_name: Dict[str, Host],
+            host_meta: Dict[str, Dict[str, Dict[str, Any]]]
+            ) -> List[Conversation]:
+    """A flow's conversations with the secure variant selected — by the
+    flow's ``secure``, else by the server's meta ``"secure": true`` — and
+    every secure conversation checked against the device catalog."""
+    from .protocols_sec import PLAIN_OF, SECURE_OF
+    flag = raw.get("secure")
+    if flag is not None:
+        flag = cx.bool(flag, f"{path}.secure")
+    out: List[Conversation] = []
+    for c, s, proto in pairs:
+        want = flag
+        if want is None:
+            want = (host_meta.get(s, {}).get("server", {}).get("secure")
+                    is True and proto in SECURE_OF)
+        if want and proto not in PLAIN_OF:
+            if proto not in SECURE_OF:
+                known = ", ".join(sorted(SECURE_OF))
+                raise cx.err(f"{path}.secure", f"{proto!r} has no secure "
+                             f"variant (one of {known})")
+            proto = SECURE_OF[proto]
+        if proto in PLAIN_OF:
+            h = by_name[s]
+            if devices.secure_support(h.device, h.firmware, proto) is False:
+                raise cx.err(f"{path}.secure" if want else f"{path}.proto",
+                             f"{s} ({h.model}, firmware {h.firmware}) does "
+                             f"not support {proto}")
+        out.append((c, s, proto))
+    return out
+
+
+_DUR =re.compile(r"\s*([0-9]*\.?[0-9]+)\s*(ms|s|m|h)?\s*$")
 _PCT = re.compile(r"\s*([0-9]*\.?[0-9]+)\s*%\s*$")
 
 
@@ -776,13 +922,19 @@ def to_dict(env: Environment) -> Dict[str, Any]:
     if env.external:
         doc["external"] = [_host_dict(env, h) for h in env.external]
     flows = []
+    from .protocols_sec import SECURE_OF
     for c in conv:
         f: Dict[str, Any] = {"client": c[0], "server": c[1], "proto": c[2]}
+        if c[2] in SECURE_OF and env.host_meta.get(c[1], {}).get(
+                "server", {}).get("secure") is True:
+            f["secure"] = False         # kept plaintext on a secure host
         f.update(env.timing.get(c, {}))
         flows.append(f)
     doc["flows"] = flows
     if env.findings:
         doc["findings"] = copy.deepcopy(env.findings)
+    if env.field_devices:
+        doc["field_devices"] = copy.deepcopy(env.field_devices)
     return doc
 
 

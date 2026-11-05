@@ -9,6 +9,7 @@
     tgt env export ENV       write an environment as an env file (JSON)
     tgt campaign PLAN        phased run: baseline, then changes (timed)
     tgt ctl ...              control a running "tgt run --api" (status, inject…)
+    tgt bench ...            seeded evaluation suite -> bundle -> scorecard
 """
 from __future__ import annotations
 
@@ -66,7 +67,7 @@ def cmd_list(args) -> int:
         if e.legacy_hosts():
             leg = ", ".join(f"{h.name} ({h.fp.label})" for h in e.legacy_hosts())
             print(f"    at-risk: {leg}")
-    from . import incidents
+    from . import incidents, techniques
     print("\nIncidents (famous attacks — detection-test traffic; use with "
           "--incident):")
     incs = incidents.all_incidents()
@@ -78,6 +79,17 @@ def cmd_list(args) -> int:
         protos, extra = ", ".join(inc.protocols()), ", ".join(inc.attack_only())
         print(f"    protocols: {protos}{' + ' if protos and extra else ''}{extra}")
         print(f"    signals: {'; '.join(inc.indicators())}")
+        tids = techniques.for_incident(inc.key)
+        if tids:
+            print(f"    techniques: {', '.join(tids)}")
+    used = sorted({t for inc in incs for t in techniques.for_incident(inc.key)})
+    if used:
+        print("\nATT&CK techniques the incidents show (ICS T08xx, "
+              "Enterprise T1xxx; tgt/attack_ics.json):")
+        for line in _columns([(t, techniques.name(t),
+                               f"[{', '.join(techniques.tactics(t))}]")
+                              for t in used], (9, 48)):
+            print(f"  {line}")
     from . import plugins
     if plugins.LOADED or plugins.ERRORS:
         print("\nPlugins (TGT_PLUGIN_PATH, ~/.config/tgt/plugins):")
@@ -164,7 +176,7 @@ def cmd_iface(args) -> int:
             peer = args.peer or f"{args.name}-mon"
             print(f"\nveth ready. Generate on '{args.name}', capture on '{peer}':")
             print(f"  tgt run --iface {args.name} --profile modbus")
-            print(f"  # point your sensor (Zeek/Suricata/tcpdump, or Claroty CTD) at: {peer}")
+            print(f"  # point your sensor (Zeek/Suricata/tcpdump or your monitor) at: {peer}")
         return 0 if res.ok else 1
     if args.iface_cmd == "delete":
         res = net.delete_interface(args.name, use_sudo=not args.no_sudo)
@@ -213,9 +225,21 @@ def cmd_run(args) -> int:
         print(f"unknown environment: {env}. Try 'tgt list'.", file=sys.stderr)
         return 2
     span = getattr(args, "span", "access")
-    if span != "access" and not env:
-        print("--span core needs --env (segments come from the modeled "
-              "environment).", file=sys.stderr)
+    remap_env = getattr(args, "remap_env", None)
+    if remap_env and remap_env not in enterprise.ENVIRONMENTS:
+        print(f"unknown environment for --remap-env: {remap_env}. Try "
+              "'tgt list'.", file=sys.stderr)
+        return 2
+    if (remap_env or getattr(args, "remap_report", None)) and not replay:
+        print("--remap-env/--remap-report map a --replay capture onto an "
+              "environment.", file=sys.stderr)
+        return 2
+    if getattr(args, "remap_report", None) and not remap_env:
+        print("--remap-report needs --remap-env.", file=sys.stderr)
+        return 2
+    if span != "access" and not (env or remap_env):
+        print("--span core needs --env or --remap-env (segments come from "
+              "the modeled environment).", file=sys.stderr)
         return 2
     if incident and incident not in incidents.INCIDENTS:
         print(f"unknown incident: {incident}. Try 'tgt list'.", file=sys.stderr)
@@ -292,6 +316,8 @@ def cmd_run(args) -> int:
         replay_tsresol=tsresol,
         remap_ip=remaps[0], remap_subnet=remaps[1], remap_mac=remaps[2],
         replay_vlan=args.vlan if replay else None,
+        remap_env=remap_env if replay else None,
+        remap_seed=getattr(args, "seed", None) if remap_env else None,
     )
     if cfg.speed <= 0:
         print("--speed must be > 0.", file=sys.stderr)
@@ -305,10 +331,26 @@ def cmd_run(args) -> int:
         from .replay import rewriter_for
         from .rewrite import RewriteError
         try:
-            rewriter_for(cfg)
+            rw = rewriter_for(cfg)
         except RewriteError as e:
             print(str(e), file=sys.stderr)
             return 2
+        except (OSError, pcapread.PcapError) as e:
+            print(f"cannot profile {replay}: {e}", file=sys.stderr)
+            return 2
+        plan = getattr(rw, "plan", None)
+        if plan is not None:
+            print(plan.describe())
+            for line in plan.table():
+                print(f"  {line}")
+            if getattr(args, "remap_report", None):
+                try:
+                    plan.write_report(args.remap_report)
+                except OSError as e:
+                    print(f"cannot write {args.remap_report}: {e}",
+                          file=sys.stderr)
+                    return 2
+                print(f"  mapping -> {args.remap_report}")
     return _run_engine(cfg, args)
 
 
@@ -637,12 +679,23 @@ def cmd_inventory(args) -> int:
               file=sys.stderr)
     else:
         write(env, sys.stdout, sprinkle)
+    if sprinkle and args.format != "json":     # JSON carries them inline
+        from . import techniques
+        for k in sprinkle:
+            print(f"sprinkle {k}: ATT&CK "
+                  f"{', '.join(techniques.for_incident(k)) or '(none)'}",
+                  file=sys.stderr)
     return 0
 
 
 def cmd_score(args) -> int:
     from . import score
     return score.run(args)
+
+
+def cmd_bench(args) -> int:
+    from . import bench
+    return bench.main(args)
 
 
 def cmd_tui(args) -> int:
@@ -656,8 +709,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tgt",
         description="Traffic Generation Toolkit — craft OT/ICS + IT test "
                     "traffic onto a virtual interface for SPAN-ingestion "
-                    "testing with Zeek, Suricata, Security Onion, Malcolm, "
-                    "Claroty CTD, Nozomi, etc.")
+                    "testing with Zeek, Suricata, Security Onion, Malcolm or "
+                    "any passive OT/IT monitor.")
     p.add_argument("--version", action="version", version=f"tgt {VERSION}")
     sub = p.add_subparsers(dest="command")
 
@@ -692,6 +745,10 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_arguments(sub.add_parser(
         "score", help="score a monitor's asset/alert export against TGT "
                       "ground truth (manifest or inventory JSON)"))
+    from . import bench
+    bench.add_arguments(sub.add_parser(
+        "bench", help="play a fixed, seeded evaluation suite and score a "
+                      "monitor on it (list, run, score, compare)"))
 
     pi = sub.add_parser("iface", help="manage virtual interfaces")
     isub = pi.add_subparsers(dest="iface_cmd", required=True)
@@ -748,13 +805,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="override the pcapng timestamp resolution: us, ns, "
                         "ms or ticks per second")
     r.add_argument("--remap-ip", action="append", metavar="OLD=NEW[,..]",
-                   help="replay: rewrite IPv4 addresses (IP + ARP, "
-                        "checksums recomputed); repeatable")
+                   help="replay: rewrite IPv4/IPv6 addresses (IP, ARP, "
+                        "NDP; checksums recomputed); repeatable")
     r.add_argument("--remap-subnet", action="append", metavar="A/N=B/N[,..]",
-                   help="replay: move a subnet, keeping host bits "
-                        "(e.g. 192.168.1.0/24=10.100.10.0/24)")
+                   help="replay: move an IPv4/IPv6 subnet, keeping host "
+                        "bits (e.g. 192.168.1.0/24=10.100.10.0/24)")
     r.add_argument("--remap-mac", action="append", metavar="OLD=NEW[,..]",
-                   help="replay: rewrite MAC addresses (Ethernet + ARP)")
+                   help="replay: rewrite MAC addresses (Ethernet, ARP, NDP "
+                        "options, EUI-64 IPv6 interface ids)")
+    r.add_argument("--remap-env", metavar="ENV",
+                   help="replay: map the capture's internal hosts onto "
+                        "environment ENV by role (IP, MAC and segment "
+                        "VLAN; --span picks the capture point, --seed the "
+                        "tie-breaks); recorded in the manifest")
+    r.add_argument("--remap-report", metavar="FILE",
+                   help="with --remap-env: write the host mapping as JSON")
     r.add_argument("--iface", "-i",
                    help="interface(s) to send on (needs root); a,b,c sends "
                         "the same frames to each (fan-out)")
@@ -919,6 +984,7 @@ def main(argv=None) -> int:
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,
         "inventory": cmd_inventory,
         "score": cmd_score, "campaign": cmd_campaign, "ctl": cmd_ctl,
+        "bench": cmd_bench,
     }[args.command](args)
 
 

@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tgt-toolkit"
 dynamic = ["version"]   # single source: tgt/__init__.py __version__
-description = "Traffic Generation Toolkit — OT/ICS + IT test traffic onto a virtual interface for SPAN-ingestion testing (e.g. Claroty CTD)"
+description = "Traffic Generation Toolkit — OT/ICS + IT test traffic onto a virtual interface for SPAN-ingestion and passive-monitor evaluation"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [{ name = "TGT" }]
-keywords = ["ics", "ot", "modbus", "dnp3", "s7comm", "span", "claroty", "traffic-generator", "scada"]
+keywords = ["ics", "ot", "modbus", "dnp3", "s7comm", "span", "passive-monitoring", "traffic-generator", "scada"]
 classifiers = [
   "Environment :: Console :: Curses",
   "Operating System :: POSIX :: Linux",
@@ -30,8 +30,8 @@ Homepage = "https://example.local/tgt"
 packages = ["tgt"]
 
 [tool.setuptools.package-data]
-tgt = ["scoremaps/*.json", "envs/*.json", "envs/*.toml", "envs/sites/*.json",
-       "campaigns/*.json", "campaigns/*.toml",
+tgt = ["attack_ics.json", "scoremaps/*.json", "envs/*.json", "envs/*.toml", "envs/sites/*.json",
+       "campaigns/*.json", "campaigns/*.toml", "benches/*.json",
        "envs/sites/*.toml"]
 
 [tool.setuptools.dynamic]

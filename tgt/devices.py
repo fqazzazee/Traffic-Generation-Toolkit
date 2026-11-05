@@ -679,6 +679,15 @@ def identity_meta(model: Optional[DeviceModel], firmware: str,
         digits = "".join(c for c in serial if c.isdigit())
         if digits:
             meta["hart_device_id"] = int(digits) % (1 << 24)
+    cds = model.identity.get("codesys")
+    if cds:                     # CODESYS V3 name-service DeviceInfo
+        meta.update({"codesys_device": cds.get("device_name", model.product),
+                     "codesys_vendor": cds.get("vendor_name", model.vendor),
+                     "codesys_target_type": cds.get("target_type", 0x1006),
+                     "codesys_target_id": cds.get("target_id", 0x0001),
+                     "codesys_firmware": firmware, "codesys_serial": serial})
+        if host_name:
+            meta["codesys_node"] = host_name
     # IEC 61850 MMS Identify (vendorName / modelName / revision) and the SEL
     # ASCII ID command (tgt/protocols_util.py)
     mms = model.identity.get("mms")
@@ -1065,7 +1074,11 @@ _add(DeviceModel(
     identity={"modbus": {"vendor": "WAGO GmbH & Co. KG",
                          "vendor_url": "www.wago.com",
                          "product_code": "750-8212",
-                         "product_name": "PFC200 CS 2ETH RS"}},
+                         "product_name": "PFC200 CS 2ETH RS"},
+              # e!RUNTIME / CODESYS V3 DeviceInfo (tgt/protocols_codesys.py)
+              "codesys": {"device_name": "WAGO 750-8212 PFC200 G2 2ETH RS",
+                          "vendor_name": "WAGO", "target_type": 0x1006,
+                          "target_id": 0x8212}},
     banners={"http": "lighttpd", "snmp_sysdescr": "WAGO 750-8212 PFC200 CS "
              "2ETH RS FW {firmware}",
              "snmp_sysobjectid": "1.3.6.1.4.1.13576"},
@@ -1220,3 +1233,195 @@ def _site_reindex() -> None:
 
 
 _site_reindex()
+
+
+# ---------------------------------------------------------------------------
+# CODESYS V3 controllers (tgt/protocols_codesys.py). The ``codesys``
+# identity is what the runtime's name-service DeviceInfo reply carries:
+# device and vendor name strings plus target type / id. OUIs are as
+# Wireshark's manuf lists them (Schneider M2xx: Telemecanique 00:80:f4;
+# Eaton XC300: Eaton Industries GmbH, ex Moeller, 00:80:99). Device-name
+# strings, target types / ids, firmware lists and serial formats are
+# representative.
+# ---------------------------------------------------------------------------
+_EATON_IND = ("00:80:99",)
+_M2XX = ("00:80:f4",)
+
+_add(DeviceModel(
+    "schneider-tm251mese", "Schneider Electric", "Modicon M251 TM251MESE "
+    "logic controller", "plc", _M2XX, "1", "Modicon M251 firmware "
+    "(CODESYS V3 runtime)", ("5.1.9.34", "5.2.11.24", "5.3.6.2"),
+    "##############",
+    (Module(0, "TM251MESE", "M251 logic controller, 2 Ethernet ports"),
+     Module(1, "TM3DI16", "TM3 16-ch digital input"),
+     Module(2, "TM3DQ16T", "TM3 16-ch transistor output")),
+    identity={"codesys": {"device_name": "TM251MESE",
+                          "vendor_name": "Schneider Electric",
+                          "target_type": 0x1003, "target_id": 0x0251}},
+    banners={"http": ""}, aliases=("TM251MESE",), stack="embedded"))
+_add(DeviceModel(
+    "schneider-tm241cec24t", "Schneider Electric", "Modicon M241 "
+    "TM241CEC24T logic controller", "plc", _M2XX, "1",
+    "Modicon M241 firmware (CODESYS V3 runtime)",
+    ("5.1.9.34", "5.2.11.24"), "##############",
+    (Module(0, "TM241CEC24T", "M241 logic controller, Ethernet + CANopen"),),
+    identity={"codesys": {"device_name": "TM241CEC24T/U",
+                          "vendor_name": "Schneider Electric",
+                          "target_type": 0x1003, "target_id": 0x0241}},
+    banners={"http": ""}, aliases=("TM241CEC24T",), stack="embedded"))
+_add(DeviceModel(
+    "eaton-xc-303", "Eaton", "XC300 modular PLC XC-303-C32-002", "plc",
+    _EATON_IND, "1", "XC300 firmware (Linux, CODESYS V3 runtime)",
+    ("1.03.024", "1.04.008", "1.05.012"), "#########",
+    (Module(0, "XC-303-C32-002", "XC300 CPU, 2 Ethernet, OPC UA"),
+     Module(1, "XN300-16DI", "XN300 16-ch digital input")),
+    identity={"codesys": {"device_name": "XC-303-C32-002",
+                          "vendor_name": "Eaton",
+                          "target_type": 0x1006, "target_id": 0x0303}},
+    banners={"http": ""}, aliases=("XC-303-C32-002",), stack="linux"))
+
+
+# ===========================================================================
+# Serial-to-Ethernet gateways and IIoT (tgt/protocols_iiot.py, site
+# iiot-retrofit): Moxa / Lantronix device servers and a Modbus gateway, LoRa
+# gateways, a BACnet/SC hub, and the field devices that sit behind them
+# (serial slaves and LoRaWAN sensors: no IP of their own — their OUI is the
+# vendor's, the prefix of a LoRaWAN sensor's DevEUI). OUIs are from
+# Wireshark's manuf database; product names are the vendors'; firmware lists,
+# serial formats, sysDescr strings, sysObjectIDs and Moxa search product ids
+# are representative. ``moxa`` identity: ``product_id`` the device-search
+# reply carries.
+# ===========================================================================
+_LANTRONIX = ("00:80:a3", "00:c0:f2")
+_KERLINK = ("70:76:ff",)
+_MULTITECH = ("00:08:00",)
+_CONTEMPORARY = ("00:50:db",)
+_MILESIGHT = ("24:e1:24", "c0:ba:1f")
+_DRAGINO = ("a8:40:41",)
+_ABB_DRIVES = ("00:1c:01",)
+
+
+def _gw(model_id, vendor, product, dtype, ouis, level, os_family, fw, serial,
+        identity=None, banners=None, stack="embedded", aliases=()):
+    _add(DeviceModel(model_id, vendor, product, dtype, ouis, level, os_family,
+                     fw, serial, identity=identity or {},
+                     banners=dict({"http": ""}, **(banners or {})),
+                     aliases=aliases, stack=stack))
+
+
+# -- serial device servers / gateways ---------------------------------------
+_gw("moxa-nport-5150", "Moxa", "NPort 5150 1-port RS-232/422/485 serial "
+    "device server", "serial-gateway", _MOXA, "1", "Moxa NPort firmware",
+    ("V3.9", "V3.10", "V3.11"), "TAGBB#######",
+    {"moxa": {"product_id": 0x5150}},
+    {"snmp_sysdescr": "NPort 5150", "snmp_sysobjectid": "1.3.6.1.4.1.8691.2.7"},
+    aliases=("NPort 5150",))
+_gw("moxa-nport-5650-16", "Moxa", "NPort 5650-16 16-port rackmount RS-232/"
+    "422/485 serial device server", "serial-gateway", _MOXA, "1",
+    "Moxa NPort firmware", ("V3.9", "V3.11", "V3.12"), "TAHCB#######",
+    {"moxa": {"product_id": 0x5650}},
+    {"snmp_sysdescr": "NPort 5650-16",
+     "snmp_sysobjectid": "1.3.6.1.4.1.8691.2.8"},
+    aliases=("NPort 5650-16",))
+_gw("moxa-mgate-mb3170", "Moxa", "MGate MB3170 1-port Modbus TCP to RTU/ASCII "
+    "gateway", "protocol-gateway", _MOXA, "1", "Moxa MGate firmware",
+    ("V4.2", "V4.3", "V4.4"), "TAIDB#######",
+    {"moxa": {"product_id": 0x3170}},
+    {"snmp_sysdescr": "MGate MB3170",
+     "snmp_sysobjectid": "1.3.6.1.4.1.8691.21.1"},
+    aliases=("MGate MB3170",))
+_gw("lantronix-uds1100", "Lantronix", "UDS1100 1-port serial device server",
+    "serial-gateway", _LANTRONIX, "1", "Lantronix device server firmware",
+    ("6.10.0.1", "6.11.0.4", "6.11.0.7"), "########",
+    aliases=("UDS1100",))
+# -- LoRaWAN gateways (Semtech UDP packet forwarder) --------------------------
+_gw("kerlink-wirnet-istation", "Kerlink", "Wirnet iStation LoRaWAN gateway",
+    "lora-gateway", _KERLINK, "2", "KerOS (Linux)",
+    ("5.9.1", "5.10.4", "6.1.2"), "########",
+    banners={"snmp_sysdescr": "Linux {name} KerOS {firmware} armv7l"},
+    stack="linux", aliases=("Wirnet iStation",))
+_gw("multitech-conduit-mtcdt", "Multitech", "MultiTech Conduit MTCDT "
+    "LoRaWAN gateway", "lora-gateway", _MULTITECH, "2", "mPower (Linux)",
+    ("5.3.8", "6.0.2", "6.3.0"), "########",
+    banners={"snmp_sysdescr": "MultiTech Conduit mPower {firmware}"},
+    stack="linux", aliases=("Conduit MTCDT",))
+# -- BACnet/SC hub -----------------------------------------------------------
+_gw("contemporary-basrouter-sc", "Contemporary Controls",
+    "BASrouterSC BACnet/SC router and hub", "bacnet-sc-hub", _CONTEMPORARY,
+    "2", "BASrouterSC firmware (Linux)", ("1.0.6", "1.1.2", "1.2.0"),
+    "BRSC######", stack="linux", aliases=("BASrouterSC",))
+# -- field devices behind gateways (no IP of their own) ----------------------
+_gw("schneider-pm5330", "Schneider Electric", "PowerLogic PM5330 power meter "
+    "(RS-485 Modbus RTU)", "meter", _SCHNEIDER, "0", "PM5000 firmware",
+    ("2.2.1", "2.3.4", "3.0.2"), "#########",
+    {"modbus": _modbus_id("Schneider Electric", "METSEPM5330",
+                          "PM5330", "www.se.com")},
+    aliases=("PM5330",))
+_gw("abb-acs580", "ABB", "ACS580 general-purpose drive (embedded fieldbus, "
+    "Modbus RTU)", "drive", _ABB_DRIVES, "0", "ACS580 primary control "
+    "firmware", ("2.15.0.1", "2.16.0.4", "2.19.0.2"), "#########",
+    {"modbus": _modbus_id("ABB", "ACS580-01", "ACS580", "new.abb.com")},
+    aliases=("ACS580",))
+_gw("milesight-em300-th", "Milesight", "EM300-TH LoRaWAN temperature and "
+    "humidity sensor", "sensor", _MILESIGHT, "0", "Milesight EM300 firmware",
+    ("1.2", "1.3", "1.5"), "6136?#########", aliases=("EM300-TH",))
+_gw("dragino-lht65n", "Dragino", "LHT65N LoRaWAN temperature and humidity "
+    "sensor", "sensor", _DRAGINO, "0", "Dragino LHT65N firmware",
+    ("1.2.3", "1.2.5", "1.3.0"), "A84041########", aliases=("LHT65N",))
+
+_site_reindex()
+
+
+# ---------------------------------------------------------------------------
+# Secure protocol variants (tgt/protocols_sec.py)
+# ---------------------------------------------------------------------------
+# model id -> {secure protocol: minimum firmware, as _numbers() reads it;
+# () = every release}. A model listed with {} is known NOT to speak any (a
+# ControlLogix 5570 needs a 1756-EN4TR module for CIP Security; S7-300 has
+# no TLS). Models not listed are unknown: an environment may opt them in.
+SECURE: Dict[str, Dict[str, Tuple[int, ...]]] = {
+    # CIP Security on the controller's embedded Ethernet port: ControlLogix
+    # 5580 and CompactLogix 5380 from firmware v32
+    "rockwell-1756-l83e": {"enip-tls": (32,), "enip-dtls": (32,)},
+    "rockwell-5069-l320er": {"enip-tls": (32,), "enip-dtls": (32,)},
+    "rockwell-1756-l71": {},
+    "rockwell-1769-l36erm": {},
+    # S7-1500: secure PG/HMI communication (TLS 1.3) from V2.9 (TIA Portal
+    # V17); the CPU's OPC UA server offers Basic256Sha256 from V2.0
+    "siemens-cpu-1516-3pndp": {"s7plus-tls": (2, 9),
+                               "opcua-sign-encrypt": (2, 0)},
+    "siemens-cpu-1515r-2pn": {"s7plus-tls": (2, 9),
+                              "opcua-sign-encrypt": (2, 0)},
+    "siemens-cpu-315-2pndp": {},
+    "siemens-cpu-317-2pndp": {},
+    "siemens-im151-8-pndp": {},
+    # IEC 60870-5-104 secured per IEC 62351-3 (SICAM A8000), DNP3 over TLS
+    # (SEL RTAC)
+    "siemens-sicam-cp-8050": {"iec104-tls": ()},
+    "sel-3530": {"dnp3-tls": ()},
+    # embedded OPC UA servers with SignAndEncrypt endpoints
+    "phoenix-axc-f-2152": {"opcua-sign-encrypt": ()},
+    "beckhoff-cx5140": {"opcua-sign-encrypt": ()},
+}
+
+
+def secure_support(model: Optional[DeviceModel], firmware: str,
+                   proto: str) -> Optional[bool]:
+    """Whether a device of ``model`` running ``firmware`` speaks the secure
+    variant ``proto``: True / False from :data:`SECURE`, ``None`` when the
+    catalog does not know (no model, or a model not listed)."""
+    if model is None or model.model_id not in SECURE:
+        return None
+    floor = SECURE[model.model_id].get(proto)
+    if floor is None:
+        return False
+    return not floor or _numbers(firmware) >= list(floor)
+
+
+def secure_protocols(model: Optional[DeviceModel],
+                     firmware: str) -> List[str]:
+    """The secure variants a device of ``model`` at ``firmware`` supports."""
+    if model is None:
+        return []
+    return sorted(p for p in SECURE.get(model.model_id, {})
+                  if secure_support(model, firmware, p))

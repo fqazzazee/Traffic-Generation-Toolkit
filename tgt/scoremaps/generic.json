@@ -1,20 +1,19 @@
 {
-  "_comment": "Generic asset-export map for tgt score. Each column entry may be one header name or a list of candidates (first present wins, case-insensitive). Also reads 'tgt inventory -f csv' output. Copy and edit for your product.",
+  "_comment": "Generic asset-export map for tgt score. Each column entry may be one header name or a list of candidates (first present wins, case-insensitive); the candidates cover the header names common asset inventories export. Also reads 'tgt inventory -f csv' output. Protocol lists split on ';', ',' or '|'. If your export uses other headers, copy this file, edit the candidate lists and pass it with --map PATH.",
   "format": "csv",
   "columns": {
-    "ip": ["ip", "ip_address", "ip address", "ips", "address", "ipv4"],
-    "mac": ["mac", "mac_address", "mac address", "macs"],
-    "vlan": ["vlan", "vlan_id", "vlans"],
-    "name": ["name", "hostname", "host", "asset", "asset name"],
+    "ip": ["ip", "ip_address", "ip address", "ips", "address", "ipv4", "ip addresses"],
+    "mac": ["mac", "mac_address", "mac address", "macs", "mac addresses"],
+    "vlan": ["vlan", "vlan_id", "vlans", "vlan id"],
+    "name": ["name", "hostname", "host", "asset", "asset name", "host name", "label"],
     "vendor": ["vendor", "manufacturer", "vendor_name"],
-    "model": ["model", "product", "product_name", "model_name"],
-    "firmware": ["firmware", "firmware_version", "fw", "version"],
+    "model": ["model", "product", "product_name", "model_name", "product code", "product name"],
+    "firmware": ["firmware", "firmware_version", "fw", "version", "fw version"],
     "serial": ["serial", "serial_number", "serial number"],
-    "os": ["os", "operating_system", "operating system", "os_name"],
+    "os": ["os", "operating_system", "operating system", "os_name", "os version"],
     "protocols": ["protocols", "protocol", "services"],
-    "first_seen": ["first_seen", "first seen", "created", "created_at"]
+    "first_seen": ["first_seen", "first seen", "created", "created_at", "discovered", "first_activity_time", "first activity"]
   },
-  "split": {"protocols": ";"},
   "normalize": {
     "vendor": {
       "Rockwell Automation": "Rockwell",

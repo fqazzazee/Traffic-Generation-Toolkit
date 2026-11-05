@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased (roadmap v3)
+
+### Evaluating a monitor
+- **`tgt bench`**: packaged seeded suites (`quick`, `standard`) of a learning baseline, an
+  attack window and a change campaign. `run` writes a bundle; `score` turns a monitor's
+  exports into one vendor-neutral scorecard with pass/fail thresholds; `compare` diffs two
+  scorecards. #65
+- **MITRE ATT&CK for ICS**: attack events in the manifest carry the technique IDs visible
+  on the wire. `tgt score` reports coverage per technique; alert maps can tag techniques,
+  and `--strict-technique` requires a shared one. #64
+
+### Protocols and networks
+- **Secured OT**: CIP Security (EtherNet/IP over TLS, class-1 I/O over DTLS), S7comm-plus
+  over TLS, OPC UA SignAndEncrypt, IEC 104 and DNP3 over TLS, and Modbus/TCP Security.
+  Env files opt in per flow or host. The inventory marks identity hidden by encryption as
+  not observable. `pharma-batch` mixes secure and plaintext CIP. #66
+- **Serial gateways and IIoT**: Modbus RTU over TCP, DNP3 serial through terminal servers,
+  Moxa RealCOM and device search, BACnet/SC, and the LoRaWAN Semtech UDP forwarder.
+  `field_devices[]` models devices behind gateways, which are known assets but not
+  discoverable as IP assets. New site: `iiot-retrofit`. #67
+- **CODESYS V3** runtime and discovery, plus CODESYS controllers (WAGO, Modicon M241/M251,
+  Eaton XC300) on `auto-assembly`. #49
+
+### Changed
+- **Product-neutral.** The `claroty-ctd` and `nozomi` template score maps are removed. Their
+  column names are folded into `generic`, which now matches the headers common asset
+  exports use, and protocol lists split on `;`, `,` or `|`. Docs, help text and packaging
+  no longer name commercial monitors. If you used `--map claroty-ctd` or `--map nozomi`,
+  use `--map generic`, or a copy of it with your export's headers.
+
+### Replay
+- IPv6 in `--remap-ip` / `--remap-subnet`: extension headers, fragments, NDP and EUI-64.
+  `--remap-env ENV` maps a capture's hosts onto an environment by role and vendor, and
+  records the mapping in the manifest. #60
+
 ## 2.0.0 — 2026-11-05
 
 TGT 2.0 shifts from a traffic generator to a toolkit for evaluating a passive monitor. It

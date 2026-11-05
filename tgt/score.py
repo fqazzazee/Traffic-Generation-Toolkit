@@ -10,7 +10,9 @@ Inputs:
 * optionally Zeek logs (``--zeek DIR``: baseline-flow coverage from
   ``conn.log``) and the monitor's alerts (``--alerts`` + ``--alert-map``: each
   alert title is mapped by regex onto TGT's generic event categories and
-  matched against the manifest's ``events``).
+  matched against the manifest's ``events``; detections are also broken
+  down per MITRE ATT&CK technique from the events' ``techniques``, and an
+  alert map may tag alerts with technique IDs, see :func:`read_alerts`).
 
 Output: a terminal summary, ``--json`` (everything) and ``--html`` (a
 single self-contained page). Standard library only.
@@ -170,7 +172,19 @@ _PROTO_ALIASES = {
     "sparkplug": ["sparkplug", "sparkplug b", "sparkplugb"],
     "rdp": ["rdp", "ms-rdp", "ms-wbt-server"],
     "ssh": ["ssh"],
+    # secure OT variants (tgt.protocols_sec)
+    "cip-security": ["cip-security", "cip security", "enip-tls", "enip-dtls",
+                     "ethernet/ip over tls", "ethernet/ip over dtls",
+                     "enip/tls", "enip/dtls", "ethernet-ip-sec"],
+    "iec104-tls": ["iec104-tls", "iec-104-sec", "iec 104 tls",
+                   "iec 62351-3", "iec104s", "secure iec 104"],
+    "dnp3-tls": ["dnp3-tls", "dnp-sec", "dnp3 tls", "dnp3 over tls",
+                 "secure dnp3", "dnp3s"],
+    "modbus-sec": ["modbus-sec", "mbap-s", "modbus/tcp security",
+                   "modbus tcp security", "modbus-tls", "secure modbus"],
 }
+_PROTO_ALIASES["s7comm"] += ["s7plus-tls", "s7comm-plus tls"]
+_PROTO_ALIASES["opcua"] += ["opcua-sign-encrypt", "opc ua secure"]
 _PROTO_BY_KEY = {_key(a): canon for canon, al in _PROTO_ALIASES.items()
                  for a in al}
 
@@ -570,8 +584,10 @@ def _truth_asset(h: Dict, new: bool = False) -> Dict[str, Any]:
         "ip": ip, "mac": norm_mac(h.get("mac") or ""),
         "vlan": _vlan(h.get("vlan")), "role": h.get("role", ""),
         "fields": fields, "protocols": protos, "new": new,
-        # a host behind NAT (not on this capture) never reaches the monitor
-        "emitted": not h.get("nat_hidden"), "first_seen": None,
+        # a host behind NAT (not on this capture) never reaches the monitor,
+        # nor does a serial / LoRaWAN device behind a gateway (no IP / MAC)
+        "emitted": not (h.get("nat_hidden") or h.get("behind")),
+        "first_seen": None,
     }
 
 
@@ -905,6 +921,15 @@ def baseline(truth: Truth, zeek: str) -> Dict[str, Any]:
 # detections
 
 def read_alerts(path: str, amap: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Alert rows -> records. Optional ATT&CK tagging: ``columns.technique``
+    names a column holding technique IDs (any text; ``T0855``,
+    ``T1071.001`` ... are picked out), and ``techniques`` maps title /
+    category regexes to an ID or a list of IDs (every matching rule adds its
+    IDs). An alert's ``techniques`` is None when the map tags nothing (no
+    such rules and no such column in the file), else a sorted list, empty
+    for a row with no IDs (``--strict-technique`` only constrains alerts
+    that carry IDs)."""
+    from . import techniques as tech
     rows = read_table(path, amap.get("format", "auto"),
                       amap.get("json_path", ""), amap.get("delimiter"))
     cols = amap.get("columns") or {}
@@ -916,6 +941,20 @@ def read_alerts(path: str, amap: Dict[str, Any]) -> List[Dict[str, Any]]:
             rules.append((re.compile(pat, re.I), cat))
         except re.error as e:
             raise ScoreError(f"alert-map: bad regex {pat!r}: {e}")
+    trules = []
+    for pat, ids in (amap.get("techniques") or {}).items():
+        try:
+            rx = re.compile(pat, re.I)
+        except re.error as e:
+            raise ScoreError(f"alert-map: bad technique regex {pat!r}: {e}")
+        got = tech.parse_ids(" ".join(ids) if isinstance(ids, list)
+                             else str(ids))
+        if not got:
+            raise ScoreError(f"alert-map: technique rule {pat!r} names no "
+                             f"technique ID (like T0855): {ids!r}")
+        trules.append((rx, got))
+    tcol = cols.get("technique")
+    tagged = bool(trules) or bool(tcol and _has_column(rows, tcol))
     out = []
     for i, r in enumerate(rows):
         get = _getter(r)
@@ -932,15 +971,43 @@ def read_alerts(path: str, amap: Dict[str, Any]) -> List[Dict[str, Any]]:
             t = parse_time(get(cols.get("time")), off, tfmt)
         except ValueError:
             t = None
+        tids = None
+        if tagged:
+            tids = tech.parse_ids(_text(get(tcol))) if tcol else []
+            for rx, ids in trules:
+                if rx.search(title) or (raw_cat and rx.search(raw_cat)):
+                    tids += [x for x in ids if x not in tids]
+            tids = sorted(tids)
         out.append({"row": i + 1, "time": t, "title": title,
                     "raw_category": raw_cat, "category": cat,
                     "src": _text(get(cols.get("src"))),
-                    "dst": _text(get(cols.get("dst")))})
+                    "dst": _text(get(cols.get("dst"))),
+                    "techniques": tids})
     return out
 
 
+def _event_techniques(ev: Dict[str, Any]) -> List[str]:
+    """An event's technique IDs: the manifest's ``techniques``, or (older
+    manifests) derived from its attack key and source label."""
+    if "techniques" in ev:
+        return sorted(ev.get("techniques") or [])
+    if ev.get("attack"):
+        from . import techniques as tech
+        return tech.for_event(ev["attack"], ev.get("source", ""))
+    return []
+
+
 def detections(truth: Truth, alerts: List[Dict], tolerance: float,
-               skew: float) -> Dict[str, Any]:
+               skew: float, strict_technique: bool = False) -> Dict[str, Any]:
+    """Match alerts to manifest events: same generic category, inside
+    [start - skew, end + tolerance], sharing a host when both name hosts.
+    With ``strict_technique``, an alert that carries technique IDs (see
+    :func:`read_alerts`) must also share one with a technique-tagged event
+    (a parent ID matches its sub-techniques); alerts without IDs match on
+    category as before. Detections are summarised
+    overall, ``per_category`` and ``by_technique`` (an event with several
+    techniques counts toward each)."""
+    from . import techniques as tech
     ip_of: Dict[str, str] = {}
     for a in truth.assets:
         if a["ip"]:
@@ -961,9 +1028,11 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
         al["ips"] = ips(al["src"], al["dst"])
     used = set()
     per_cat: Dict[str, Dict[str, Any]] = {}
+    per_tech: Dict[str, Dict[str, Any]] = {}
     results = []
     for ev in sorted(truth.events, key=lambda e: str(e.get("t_start", ""))):
         cat = ev.get("category", "")
+        etech = _event_techniques(ev)
         t0, t1 = parse_time(ev.get("t_start")), parse_time(ev.get("t_end"))
         t1 = t1 or t0
         hosts = ips(ev.get("hosts") or [], ev.get("src"), ev.get("dst"))
@@ -977,6 +1046,10 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
                     continue
                 if hosts and al["ips"] and not hosts & al["ips"]:
                     continue
+                if strict_technique and etech and \
+                        al.get("techniques") and \
+                        not tech.shares(al["techniques"], etech):
+                    continue
                 if best is None or al["time"] < best["time"]:
                     best = al
                 used.add(al["row"])
@@ -988,13 +1061,18 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
                         "detected": best is not None,
                         "alert_row": best["row"] if best else None,
                         "alert_title": best["title"] if best else None,
-                        "ttd_s": ttd})
-        pc = per_cat.setdefault(cat, {"events": 0, "detected": 0, "_t": []})
-        pc["events"] += 1
-        if best:
-            pc["detected"] += 1
-            pc["_t"].append(ttd)
-    for pc in per_cat.values():
+                        "ttd_s": ttd, "techniques": etech})
+        pcs = [per_cat.setdefault(cat, {"events": 0, "detected": 0,
+                                        "_t": []})]
+        pcs += [per_tech.setdefault(t, {"name": tech.name(t), "events": 0,
+                                        "detected": 0, "_t": []})
+                for t in etech]
+        for pc in pcs:
+            pc["events"] += 1
+            if best:
+                pc["detected"] += 1
+                pc["_t"].append(ttd)
+    for pc in list(per_cat.values()) + list(per_tech.values()):
         pc["rate"] = _ratio(pc["detected"], pc["events"])
         pc["median_ttd_s"] = _median(pc.pop("_t"))
     unmapped: Dict[str, int] = defaultdict(int)
@@ -1012,6 +1090,9 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
         "mapped_alerts": sum(1 for a in alerts if a["category"]),
         "matched_alerts": len(used),
         "per_category": dict(sorted(per_cat.items())),
+        "by_technique": dict(sorted(per_tech.items())),
+        "strict_technique": bool(strict_technique),
+        "tagged_alerts": sum(1 for a in alerts if a.get("techniques")),
         "missed": [r for r in results if not r["detected"]],
         "events_detail": results,
         "false_alerts": [{"row": a["row"], "time": _iso(a["time"]),
@@ -1030,7 +1111,8 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
 def score(truth: Truth, rows: List[Dict], export_info: Dict[str, Any],
           zeek: Optional[str] = None, alerts: Optional[List[Dict]] = None,
           tolerance: float = 300.0, skew: float = 5.0,
-          fuzzy: float = 0.85) -> Dict[str, Any]:
+          fuzzy: float = 0.85,
+          strict_technique: bool = False) -> Dict[str, Any]:
     primary = match_assets(truth, rows, fuzzy)
     pop = truth.population()
     found = [a for a in pop if a["id"] in primary]
@@ -1170,7 +1252,8 @@ def score(truth: Truth, rows: List[Dict], export_info: Dict[str, Any],
     }
     if alerts is not None:
         if truth.events or truth.mode == "manifest":
-            res["detections"] = detections(truth, alerts, tolerance, skew)
+            res["detections"] = detections(truth, alerts, tolerance, skew,
+                                           strict_technique)
         else:
             res["detections"] = {"note": "detections need a run manifest "
                                          "with events (--manifest)",
@@ -1241,6 +1324,18 @@ def summary(res: Dict[str, Any]) -> str:
                      f"{_secs(det['median_ttd_s'])}; "
                      f"{len(det['false_alerts'])} false, "
                      f"{det['unmapped_alerts']} unmapped alerts")
+        bt = det.get("by_technique") or {}
+        if bt:
+            lines.append("techniques  ATT&CK coverage" + (
+                " (strict: tagged alerts must share the technique)"
+                if det.get("strict_technique") else ""))
+            w = max(len(t) for t in bt)
+            nw = min(max(len(v["name"]) for v in bt.values()), 44)
+            for t, v in bt.items():
+                lines.append(
+                    f"  {t:<{w}}  {v['name'][:nw]:<{nw}}  "
+                    f"{v['detected']:>3}/{v['events']:<3} "
+                    f"{_pct(v['rate']):>6}  ttd {_secs(v['median_ttd_s'])}")
     if d["missed"]:
         more = len(d["missed"]) - 8
         lines.append("missed      " + ", ".join(d["missed"][:8]) +
@@ -1333,6 +1428,11 @@ def to_html(res: Dict[str, Any]) -> str:
     if det and "note" not in det:
         tiles.append(("Detection rate", _pct(det["rate"]),
                       f"{det['detected']} of {det['events']} events"))
+        bt = det.get("by_technique") or {}
+        if bt:
+            hit = sum(1 for v in bt.values() if v["detected"])
+            tiles.append(("ATT&CK techniques", f"{hit}/{len(bt)}",
+                          "with a detection"))
     body = [f"<h1>TGT score — {_h(t['env'] or 'run')}</h1>",
             f"<p class=sub>Ground truth: {_h(t['mode'])} <code>"
             f"{_h(t['source'])}</code> · export <code>"
@@ -1400,10 +1500,31 @@ def to_html(res: Dict[str, Any]) -> str:
             [(c, v["events"], v["detected"], _pct(v["rate"]),
               _secs(v["median_ttd_s"])) for c, v in
              det["per_category"].items()], numeric=(1, 2, 3, 4)))
+        if det.get("by_technique") is not None:
+            from . import techniques as tech
+            body.append("<h2>Detections by ATT&amp;CK technique</h2>"
+                        "<p class=sub>An event tagged with several techniques "
+                        "counts toward each" + (
+                            "; strict: an alert tagged with techniques must "
+                            "share one with the event" if
+                            det.get("strict_technique") else "") + ".</p>")
+            body.append(_table(
+                ("Technique", "Name", "Tactic", "Events", "Detected", "Rate",
+                 "Median TTD"),
+                [(t, v["name"], ", ".join(tech.tactics(t)), v["events"],
+                  v["detected"],
+                  (_pct(v["rate"]), "found" if v["detected"] == v["events"]
+                   else "missed" if not v["detected"] else "partial"),
+                  _secs(v["median_ttd_s"]))
+                 for t, v in det["by_technique"].items()],
+                numeric=(3, 4, 6)))
         body.append("<h2>Missed events</h2>")
-        body.append(_table(("Event", "Category", "Start", "Hosts", "Detail"),
+        body.append(_table(("Event", "Category", "Start", "Hosts",
+                            "Techniques", "Detail"),
                            [(e["id"], e["category"], e["t_start"],
-                             ", ".join(e["hosts"]), e["detail"])
+                             ", ".join(e["hosts"]),
+                             ", ".join(e.get("techniques") or []),
+                             e["detail"])
                             for e in det["missed"]]))
         body.append("<h2>False and unmapped alerts</h2>")
         body.append(_table(("Row", "Time", "Title", "Category", "Src", "Dst"),
@@ -1485,7 +1606,7 @@ def add_arguments(p) -> None:
                    help="the monitor's asset export (CSV/JSON/Zeek log)")
     p.add_argument("--map", metavar="MAP",
                    help="column map: a path or a bundled name (generic, "
-                        "zeek-known-hosts, claroty-ctd, nozomi)")
+                        "zeek-known-hosts)")
     p.add_argument("--zeek", metavar="DIR",
                    help="Zeek log dir (or conn.log): baseline-flow coverage")
     p.add_argument("--alerts", metavar="FILE",
@@ -1498,6 +1619,9 @@ def add_arguments(p) -> None:
     p.add_argument("--skew", type=float, default=5.0, metavar="SEC",
                    help="alert may precede the event start by this much "
                         "(clock skew, default 5)")
+    p.add_argument("--strict-technique", action="store_true",
+                   help="an alert the alert map tags with ATT&CK technique "
+                        "IDs only detects an event sharing one of them")
     p.add_argument("--fuzzy", type=float, default=0.85, metavar="RATIO",
                    help="name-similarity threshold for name matching")
     p.add_argument("--json", metavar="FILE", help="write full results here")
@@ -1528,7 +1652,9 @@ def run(args) -> int:
                                  load_json_spec(args.alert_map, "alert map"))
         res = score(truth, rows, info, zeek=args.zeek, alerts=alerts,
                     tolerance=args.tolerance, skew=args.skew,
-                    fuzzy=args.fuzzy)
+                    fuzzy=args.fuzzy,
+                    strict_technique=getattr(args, "strict_technique",
+                                             False))
     except ScoreError as e:
         print(f"tgt score: {e}", file=sys.stderr)
         return 2

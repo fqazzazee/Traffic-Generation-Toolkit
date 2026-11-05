@@ -1,7 +1,7 @@
 # SPAN Configuration
 
-GUI-first walkthroughs for feeding TGT's simulated traffic to an analyser VM (Claroty
-CTD, Zeek, Suricata, Security Onion, …) as a SPAN/mirror feed, per hypervisor. Each doc
+GUI-first walkthroughs for feeding TGT's simulated traffic to an analyser VM
+(Zeek, Suricata, Security Onion, …) as a SPAN/mirror feed, per hypervisor. Each doc
 references the vendor's official documentation, includes community-sourced tips, and
 only reaches for CLI/scripting where the GUI has no equivalent.
 

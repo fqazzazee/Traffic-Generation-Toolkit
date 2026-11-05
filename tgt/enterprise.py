@@ -6,7 +6,7 @@ realistic mix of conversations between them: DNS/Kerberos/LDAP to the DC, SMB to
 the file server, HTTP/HTTPS browsing, DHCP/NetBIOS fingerprint chatter, and — on
 the OT side — Rockwell EtherNet/IP and Siemens S7comm PLC polling with vendor
 identity. Legacy hosts (Windows 2000/XP/7) advertise SMBv1 and old User-Agents so
-an analyser (Zeek, Suricata, Claroty CTD, …) can inventory assets and flag the risky ones.
+an analyser (Zeek, Suricata, an OT monitor, …) can inventory assets and flag the risky ones.
 
 Hosts sit in segments (:class:`Segment`) — one VLAN + subnet + security zone each, routed
 by a core L3 switch. Same-segment flows are switched (peer MACs); cross-segment
@@ -276,6 +276,9 @@ DNS_DOMAIN = "corp.local"
 # Purdue level by zone for general-purpose hosts (OT-CELL splits L1/L2 by role)
 _ZONE_LEVEL = {"IT": "4", "DMZ": "3.5", "OT-SUPERVISORY": "3"}
 _FIELD_ROLES = {"plc", "drive", "meter", "relay", "rtu"}
+# Modbus/TCP Security role a client's certificate carries, by host role
+_MBSEC_ROLE = {"eng": "Engineer", "hist": "Monitor", "scada": "Operator",
+               "hmi": "Operator", "nms": "Monitor"}
 
 
 def _ot_addressing(client: "Host", server: "Host") -> dict:
@@ -531,6 +534,15 @@ class Environment:
     a vendor's remote-service portal): conversations may name them, their
     frames egress via the internal host's gateway like EDR beacons, and the
     inventory lists them as external, not as assets.
+
+    ``field_devices`` lists devices with no IP of their own that sit behind
+    a gateway host — serial slaves on a device server's RS-485 drop, LoRaWAN
+    sensors heard by a LoRa gateway (``{"name", "behind": HOST, "via":
+    PROTO, "port", "address", "protocol", "model", "vendor", "product",
+    "role", "firmware", "serial"}``, see :mod:`tgt.protocols_iiot`). The
+    gateway's flows over ``via`` poll them; the inventory lists them as
+    known assets ``behind`` the gateway that are not observable as IP
+    assets.
     """
     key: str
     name: str
@@ -544,6 +556,7 @@ class Environment:
     timing: Dict[Conversation, Dict[str, Any]] = field(default_factory=dict)
     findings: List[Dict[str, Any]] = field(default_factory=list)
     external: List[Host] = field(default_factory=list)
+    field_devices: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # what was declared, before options rewrite it (env export uses this)
@@ -860,7 +873,7 @@ class Environment:
             return {"dns_names": [(h.fqdn if h.name in self._ext else
                                    f"{h.name.lower()}.{DNS_DOMAIN}", h.ip)
                                   for h in peers or [server]]}
-        if proto in ("bacnet-id", "enip-list"):
+        if proto in ("bacnet-id", "enip-list", "codesys-disc"):
             # discovery broadcast to the client's subnet when the device
             # shares it; a routed device is browsed by unicast
             seg = self.segment_of(client)
@@ -894,6 +907,16 @@ class Environment:
             own.update(self.host_meta.get(client.name, {}).get("server", {}))
             return {f"client_{k}": v for k, v in own.items()
                     if k.startswith(proto + "_")}
+        from . import protocols_iiot
+        if proto in protocols_iiot.GATEWAY_PROTOCOLS:
+            # serial slaves / LoRaWAN sensors behind a gateway, Moxa search
+            return protocols_iiot.gateway_meta(self, proto, client, server)
+        from .protocols_sec import PLAIN_OF
+        if proto in PLAIN_OF:
+            # mutual TLS: the client's certificate names the client; a
+            # Modbus/TCP Security client's states its role
+            return {"tls_client_cn": client.fqdn,
+                    "mbsec_role": _MBSEC_ROLE.get(client.role, "Operator")}
         return {}
 
     def _agent_meta(self, proto: str, agent: Host) -> dict:

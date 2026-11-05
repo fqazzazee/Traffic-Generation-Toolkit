@@ -1,12 +1,13 @@
 {
-  "_comment": "Example alert map: which columns hold the alert time, source/destination (IP or asset name), title and vendor category, and regexes (case-insensitive, searched in the title, then the vendor category; first match wins) that map vendor alert names onto TGT's generic event categories. Edit the regexes to your product's alert names.",
+  "_comment": "Example alert map: which columns hold the alert time, source/destination (IP or asset name), title and vendor category, and regexes (case-insensitive, searched in the title, then the vendor category; first match wins) that map vendor alert names onto TGT's generic event categories. Edit the regexes to your product's alert names. Optional MITRE ATT&CK tagging: columns.technique names a column holding technique IDs (T0855, T1071.001 ...), and 'techniques' maps title/category regexes to technique IDs (every matching rule adds its IDs). With tgt score --strict-technique an alert carrying IDs only detects an event sharing one of them; alerts without IDs match on category alone.",
   "format": "csv",
   "columns": {
     "time": ["time", "timestamp", "Time", "Date", "Detected", "created_at"],
     "src": ["src", "source", "src_ip", "Source", "Source IP", "ip_src"],
     "dst": ["dst", "destination", "dst_ip", "Destination", "Destination IP", "ip_dst"],
     "title": ["title", "Title", "name", "Alert", "Description", "type_name"],
-    "category": ["category", "Category", "type", "Type"]
+    "category": ["category", "Category", "type", "Type"],
+    "technique": ["technique", "techniques", "Technique", "mitre_technique", "MITRE Technique", "attack_technique"]
   },
   "categories": {
     "new (asset|device|node)|asset (was )?(discovered|added)": "new-asset",
@@ -28,5 +29,13 @@
     "legacy os|obsolete|end[- ]of[- ]life|windows (xp|2003|7)": "legacy-os",
     "default (credential|password)": "default-credentials",
     "clear ?text (credential|password)|plaintext password": "cleartext-credentials"
+  },
+  "techniques": {
+    "port scan|sweep|reconnaissance": "T0846",
+    "(program|logic) download": "T0843",
+    "(mode|state) change|plc (stop|run)|controller (stop|start)": "T0858",
+    "(write|set ?point|force) (command|request|value)|modbus write|ot write|unauthori[sz]ed command": "T0855",
+    "c2|command and control|beacon": "T0869",
+    "default (credential|password)": "T0812"
   }
 }

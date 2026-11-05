@@ -174,7 +174,8 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                    remap_ip: Optional[List[str]] = None,
                    remap_subnet: Optional[List[str]] = None,
                    remap_mac: Optional[List[str]] = None,
-                   vlan: Optional[int] = None) -> str:
+                   vlan: Optional[int] = None,
+                   remap_env: Optional[str] = None) -> str:
     """Serialize a selection into a `tgt run` argument string for the service.
 
     The result is shell-quoted (``shlex.split`` gives the argv back), so
@@ -184,9 +185,10 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
     ``min_period``) selects the time model, in which ``rate`` is only a cap.
     ``clock="synthetic"`` stamps from ``start_time``; ``api`` serves the
     control API (``tgt ctl``) at [HOST:]PORT. The replay options
-    (``replay_speed``, ``replay_loop``, ``remap_*``, ``vlan`` = retag) only
-    apply with ``replay``. The send interface(s) are not part of the string:
-    they go in TGT_IFACE (see :func:`write_config`).
+    (``replay_speed``, ``replay_loop``, ``remap_*``, ``vlan`` = retag,
+    ``remap_env`` with ``span``) only apply with ``replay``. The send
+    interface(s) are not part of the string: they go in TGT_IFACE (see
+    :func:`write_config`).
     """
     parts: List[str] = []
     if replay:
@@ -205,6 +207,10 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                     parts += [flag, spec]
         if vlan is not None:
             parts += ["--vlan", str(int(vlan))]
+        if remap_env:
+            parts += ["--remap-env", remap_env]
+            if span and span != "access":
+                parts += ["--span", span]
     elif incident:
         parts += ["--incident", incident]
     elif env:

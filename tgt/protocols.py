@@ -3,7 +3,7 @@
 Each *flow builder* takes :class:`~tgt.packet.Endpoints` and a message ``count``
 and returns a list of complete Ethernet frames (``bytes``).  OT/ICS protocols
 are crafted at the byte level so the well-known signatures that DPI engines such
-a DPI monitor (Zeek, Suricata, Claroty CTD, …) classifies on are explicit.
+a DPI monitor (Zeek, Suricata, an OT monitor, …) classifies on are explicit.
 
 TCP protocols emit a coherent session (SYN / SYN-ACK / ACK, PSH data both ways,
 FIN teardown) via :class:`TcpSession` so stream-reassembling sensors see a real
@@ -368,12 +368,16 @@ def modbus_flow(ep: Endpoints, count: int) -> List[bytes]:
     occasional Write Single Register (FC 6, echoed back) setpoint update — one
     request in eight, the fourth of each eight — and, once in sixteen, a read
     past the end of the register map answered by exception 0x83/0x02
-    (Illegal Data Address)."""
+    (Illegal Data Address). Behind a Modbus TCP -> RTU gateway the unit id
+    addresses each serial slave in ``ep.meta['modbus_units']`` in turn."""
     exchanges = []
     cb, dev = _cycle_base(count), f"mb:{ep.server_ip}"
+    units = [int(u) for u in ep.meta.get("modbus_units") or (1,)]
     for i in range(count):
         tid = (cb + i + 1) & 0xFFFF
-        unit = 1
+        unit = units[(cb + i) % len(units)]
+        if len(units) > 1:
+            dev = f"mb:{ep.server_ip}:{unit}"
         if i % 8 == 3:
             # Write Single Register (FC 0x06): setpoint register 40101; the
             # normal response echoes the request exactly
@@ -1490,3 +1494,6 @@ from . import protocols_infra  # noqa: E402,F401  (registers SNMP, LLDP, MQTT…
 from . import protocols_eng  # noqa: E402,F401  (registers FTP, SSH, RDP, FINS…)
 from . import protocols_util  # noqa: E402,F401  (registers SEL ASCII engineering)
 from . import protocols_site  # noqa: E402,F401  (registers MRP, DLR, DICOM, HL7…)
+from . import protocols_codesys  # noqa: E402,F401  (registers CODESYS V3)
+from . import protocols_iiot  # noqa: E402,F401  (registers RTU-over-TCP, LoRaWAN…)
+from . import protocols_sec  # noqa: E402,F401  (CIP Security, TLS/DTLS, UA)

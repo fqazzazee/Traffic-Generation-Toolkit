@@ -71,6 +71,10 @@ PERIODS: Dict[str, Tuple[float, float, float, int, str]] = {
     "s7-eng": (1200.0, 3600.0, 0.50, 1, "eng"),
     "enip-eng": (1200.0, 3600.0, 0.50, 1, "eng"),
     "pn-dcp-set": (3600.0, 7200.0, 0.50, 1, "eng"),
+    # CODESYS online session (login, project info, 6 monitoring reads) and
+    # the gateway's network scan: daytime engineering activity
+    "codesys": (1800.0, 5400.0, 0.50, 6, "eng"),
+    "codesys-disc": (1800.0, 7200.0, 0.50, 1, "eng"),
     "modbus-write": (300.0, 1800.0, 0.50, 1, "operator"),
     "dnp3-time": (3600.0, 3600.0, 0.02, 1, "infra"),
     "iec104-time": (3600.0, 3600.0, 0.02, 1, "infra"),
@@ -105,6 +109,23 @@ PERIODS: Dict[str, Tuple[float, float, float, int, str]] = {
     "arp": (30.0, 120.0, 0.20, 1, "infra"),   # per host: cache timeout
     "edr": (30.0, 60.0, 0.20, 1, "infra"),    # Falcon heartbeat
     "edr-bulk": (600.0, 1800.0, 0.30, 1, "infra"),  # telemetry upload / pulls
+    # serial-to-Ethernet gateways and IIoT (tgt/protocols_iiot.py): a serial
+    # master polls slower than an Ethernet one (each poll waits on the line)
+    "modbus-rtu-tcp": (1.0, 5.0, 0.05, 1, "ot"),
+    "dnp3-serial": (2.0, 10.0, 0.05, 1, "ot"),
+    "realcom": (1.0, 5.0, 0.05, 1, "ot"),
+    "realcom-cmd": (10.0, 30.0, 0.05, 1, "infra"),   # POLLING / ALIVE
+    "moxa-discovery": (1800.0, 7200.0, 0.50, 1, "eng"),
+    "bacnet-sc": (30.0, 300.0, 0.02, 1, "ot"),    # heartbeat <= 300 s timeout
+    "lorawan-udp": (10.0, 60.0, 0.30, 1, "ot"),   # PULL_DATA 10 s + uplinks
+    # secure OT variants (tgt/protocols_sec.py) poll like their plaintext
+    "enip-tls": (0.5, 2.0, 0.03, 1, "ot"),
+    "enip-dtls": (0.02, 0.1, 0.01, 1, "ot"),  # class-1 RPI over DTLS
+    "s7plus-tls": (0.5, 2.0, 0.03, 1, "ot"),
+    "opcua-sign-encrypt": (1.0, 1.0, 0.02, 1, "ot"),
+    "iec104-tls": (2.0, 10.0, 0.30, 1, "ot"),
+    "dnp3-tls": (2.0, 10.0, 0.05, 1, "ot"),
+    "modbus-sec": (0.5, 2.0, 0.03, 1, "ot"),
 }
 DEFAULT_PERIOD = (60.0, 300.0, 0.30, 1, "infra")
 
@@ -149,6 +170,21 @@ PERSISTENT: Dict[str, Tuple[int, int, Tuple[float, float]]] = {
     "enip-io": (3, 3, (0.0, 0.0)),
     "edr": (3, 1, (21600.0, 86400.0)),
     "dhcp": (2, 0, (0.0, 0.0)),      # DORA once, then a renewal per period
+    "modbus-rtu-tcp": (1, 1, (43200.0, 172800.0)),
+    "dnp3-serial": (1, 1, (0.0, 0.0)),
+    "realcom": (1, 1, (0.0, 0.0)),
+    "realcom-cmd": (2, 1, (0.0, 0.0)),   # PORT_INIT, then keep-alives
+    "bacnet-sc": (4, 2, (0.0, 0.0)),     # TLS, upgrade, Connect / Disconnect
+    # secure variants: the plaintext cut plus the TLS handshake (hello,
+    # Finished) in setup and the close_notify exchange in teardown (S7: the
+    # InitSsl exchange too; CIP I/O: the DTLS handshake's three flights)
+    "modbus-sec": (3, 2, (43200.0, 172800.0)),
+    "enip-tls": (4, 2, (43200.0, 172800.0)),
+    "s7plus-tls": (7, 3, (43200.0, 172800.0)),
+    "opcua-sign-encrypt": (6, 3, (43200.0, 172800.0)),
+    "dnp3-tls": (3, 2, (0.0, 0.0)),
+    "iec104-tls": (5, 2, (0.0, 0.0)),
+    "enip-dtls": (8, 3, (0.0, 0.0)),
 }
 # Polls built per builder call (a chunk) for a persistent session.
 CHUNK = 256
@@ -159,6 +195,7 @@ CHUNK = 256
 # IEC 104 master's station (general) interrogation, C_IC_NA_1, every 15 min.
 REFRESH: Dict[str, Tuple[float, int]] = {
     "iec104": (900.0, 2),
+    "iec104-tls": (900.0, 4),        # the same GI, as TLS records
 }
 
 # ---------------------------------------------------------------------------
@@ -177,6 +214,12 @@ RTT: Dict[str, Tuple[float, float]] = {
 PROCESSING: Dict[str, Tuple[float, float]] = {
     "embedded": (0.001, 0.008),
     "host": (0.0001, 0.0015),
+    # a protocol key overrides both: a serial gateway answers only once the
+    # request has crossed the line (9600 baud: ~1 ms a byte), the slave has
+    # turned it around and its reply has come back
+    "modbus-rtu-tcp": (0.03, 0.12),
+    "dnp3-serial": (0.05, 0.25),
+    "realcom": (0.03, 0.12),
 }
 # a client's turn-around between receiving a reply and its next segment
 THINK = (0.00005, 0.0005)

@@ -19,7 +19,7 @@ jobs:
     # setup-python has no 3.9 build for ubuntu-latest (26.04); keep the
     # oldest supported Python covered on 24.04
     runs-on: ${{ matrix.python == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -33,13 +33,21 @@ jobs:
           allow-prereleases: true
 
       # tshark lets the dissection / expert-info groups run instead of skip.
+      # Non-fatal: a stalled mirror must not fail CI. Without tshark the
+      # selftest skips its dissection groups (the other jobs still run them)
+      # and says so.
       - name: Install tshark
-        timeout-minutes: 6
+        timeout-minutes: 10
+        continue-on-error: true
         run: |
           echo "wireshark-common wireshark-common/install-setuid boolean false" \
-            | sudo debconf-set-selections
+            | timeout 60 sudo debconf-set-selections
           # 26.04's sudo ignores -E, so pass the frontend explicitly
           apt="sudo env DEBIAN_FRONTEND=noninteractive"
+          # the runner image may still hold the apt lock from its own boot-time
+          # update, and mirrors stall now and then: wait for the lock (bounded),
+          # retry downloads, and keep apt's output visible
+          opts="-o DPkg::Lock::Timeout=100 -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
           # Ubuntu 24.04 ships tshark 4.2, whose GOOSE/MMS dissectors trip an
           # internal assertion; the wireshark-dev stable PPA has a current
           # one. 26.04 ships 4.6 already, and adding the PPA there has hung
@@ -49,8 +57,13 @@ jobs:
             timeout 120 $apt add-apt-repository -y ppa:wireshark-dev/stable \
               || echo "::warning::wireshark PPA unavailable; using distro tshark"
           fi
-          $apt apt-get update -qq
-          $apt apt-get install -y -qq --no-install-recommends tshark
+          for i in 1 2 3; do
+            timeout 120 $apt apt-get $opts update -q && break
+            echo "::warning::apt-get update attempt $i failed or timed out"
+            [ "$i" = 3 ] && exit 1
+            sleep 10
+          done
+          timeout 180 $apt apt-get $opts install -y -q --no-install-recommends tshark
           tshark --version | head -n 1
 
       - name: Self-test (from the repo root, no PYTHONPATH)
@@ -68,7 +81,11 @@ jobs:
           tgt run -p modbus --count 10 --rate 0 --pcap ci.pcap
           # stdin: Ubuntu 26.04 runners confine tshark's own file opens
           # ("You don't have permission to read the file")
-          tshark -r - -q -z io,stat,0 < ci.pcap
+          if command -v tshark >/dev/null; then
+            tshark -r - -q -z io,stat,0 < ci.pcap
+          else
+            echo "::warning::tshark not installed on this runner; dissection checks skipped"
+          fi
 
   shellcheck:
     runs-on: ubuntu-latest
