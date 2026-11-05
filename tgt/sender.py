@@ -140,6 +140,9 @@ class RawSender:
 class RateLimiter:
     """Simple pacing to approximate a target packets-per-second."""
 
+    # catch-up allowed after falling behind, in seconds of sends
+    MAX_BACKLOG = 0.1
+
     def __init__(self, pps: float):
         self.pps = pps
         self.interval = 1.0 / pps if pps and pps > 0 else 0.0
@@ -164,6 +167,7 @@ class RateLimiter:
                 stop.wait(delay)
             else:
                 time.sleep(delay)
-        elif delay < -1.0:
-            # fell badly behind (e.g. slow terminal) — resync
+        elif delay < -self.MAX_BACKLOG:
+            # fell behind (a stall, a slow rebuild): resync instead of
+            # bursting the whole backlog onto the wire
             self._next = now

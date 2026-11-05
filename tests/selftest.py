@@ -5471,6 +5471,40 @@ def test_plugins_example_registers_everything() -> None:
     check("acme-plant" not in out, "plugins: TGT_NO_PLUGINS ignored")
 
 
+# -- rolling send rate (#62) --
+def test_rolling_pps_shows_stalls() -> None:
+    """Stats.rolling: the recent rate drops to 0 in a stall while the
+    lifetime average barely moves; RateLimiter resyncs instead of
+    bursting the backlog."""
+    import time
+    from tgt.engine import Stats
+    from tgt.sender import RateLimiter
+    s = Stats()
+    t0 = time.perf_counter()
+    s.started = t0 - 100.0
+    s.packets, s.bytes = 10000, 1000000
+    check(abs(s.rolling(now=t0)[0] - 100.0) < 1.0,
+          "rolling: first sample should be the lifetime average")
+    s.packets += 500
+    s.bytes += 50000
+    pps, mbps = s.rolling(now=t0 + 1.0)
+    check(abs(pps - 500.0) < 1e-6 and abs(mbps - 0.4) < 1e-6,
+          f"rolling: 500 frames in 1 s gave {pps} pps {mbps} Mb/s")
+    pps, _ = s.rolling(now=t0 + 10.0)              # nothing sent for 9 s
+    check(pps == 0.0 and s.pps > 50, f"rolling: stall shows {pps} pps")
+    for i in range(1, 11):                         # back to 100 pps
+        s.packets += 50
+        pps, _ = s.rolling(now=t0 + 10.0 + 0.5 * i)
+    check(abs(pps - 100.0) < 1e-6, f"rolling: recovery gave {pps} pps")
+    lim = RateLimiter(100)
+    lim._next -= 1.0                               # a 1 s stall
+    start, n = time.perf_counter(), 0
+    while time.perf_counter() - start < 0.1:
+        lim.wait()
+        n += 1
+    check(n <= 25, f"rate limiter burst {n} frames in 100 ms at 100 pps")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
