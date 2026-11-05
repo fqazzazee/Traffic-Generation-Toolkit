@@ -2167,6 +2167,174 @@ def test_score_cli_reports() -> None:
         check(bad.returncode == 2 and "tgt score:" in out,
               f"tgt score bad input rc={bad.returncode}")
 
+# ---- per-cycle variation, --seed, run manifest (#24, #54) -------------------
+def _syns(batch) -> list:
+    """(src ip, dst ip, sport, dport, seq) of every bare TCP SYN in a batch."""
+    out = []
+    for item in batch:
+        f = item[1]
+        off = 18 if f[12:14] == b"\x81\x00" else 14
+        if f[off - 2:off] != b"\x08\x00" or f[off + 9] != P.IPPROTO_TCP:
+            continue
+        t = off + (f[off] & 0x0F) * 4
+        if f[t + 13] == P.SYN:
+            sp, dp, seq = struct.unpack("!HHI", f[t:t + 8])
+            out.append((f[off + 12:off + 16], f[off + 16:off + 20], sp, dp, seq))
+    return out
+
+
+def test_seeded_cycles_are_deterministic() -> None:
+    from tgt.engine import CycleBuilder
+    cfg = RunConfig(env="ot-plant", sprinkle=["triton"], messages=3, seed=7)
+    a, b = CycleBuilder(cfg, 7), CycleBuilder(cfg, 7)
+    for c in (0, 2, 1):                       # order of builds must not matter
+        check(a.build(c) == b.build(c), f"seed 7 cycle {c} not reproducible")
+    check(CycleBuilder(cfg, 8).build(2) != a.build(2),
+          "different seeds built identical cycles")
+    check(build_batch(cfg) == build_batch(cfg),
+          "build_batch with cfg.seed not deterministic")
+
+
+def test_cycles_vary_ports_isns_and_values() -> None:
+    from tgt.engine import CycleBuilder
+    cb = CycleBuilder(RunConfig(env="ot-plant", messages=3), 11)
+    one, two = cb.build(1), cb.build(2)
+    s1, s2 = _syns(one), _syns(two)
+    check(len(s1) == len(s2) > 0, "cycles differ in shape")
+    check(not {x[2] for x in s1} & {x[2] for x in s2},
+          "cycles 1 and 2 reuse source ports")
+    check(not {x[4] for x in s1} & {x[4] for x in s2},
+          "cycles 1 and 2 reuse TCP ISNs")
+    check(len({x[4] for x in s1}) == len(s1), "ISNs repeat within a cycle")
+    # the SYN|ACK ISN is random too (not the old fixed 5000)
+    check(all(seq not in (1000, 5000) for *_, seq in s1), "fixed ISN left")
+    # app-level counters continue across cycles: Modbus TIDs differ
+    def tids(batch):
+        out = set()
+        for k, f, _ in batch:
+            if k == "modbus" and len(f) > 70:
+                off = 18 if f[12:14] == b"\x81\x00" else 14
+                t = off + 20 + (f[off + 32] >> 4) * 4
+                out.add(struct.unpack("!H", f[t:t + 2])[0])
+        return out
+    t1, t2 = tids(one), tids(two)
+    check(t1 and t2 and not t1 & t2, f"modbus TIDs repeat across cycles {t1}")
+
+
+def test_no_tcp_4tuple_reuse_across_cycles() -> None:
+    from tgt.engine import CycleBuilder
+    cb = CycleBuilder(RunConfig(env="industrial-site", sprinkle=["wannacry"],
+                                messages=2), 3)
+    tuples = []
+    for c in range(3):
+        tuples += [x[:4] for x in _syns(cb.build(c))]
+    check(len(tuples) == len(set(tuples)),
+          f"{len(tuples) - len(set(tuples))} TCP 4-tuples reused in 3 cycles")
+
+
+def _manifest_run(d: str, name: str, cfg: RunConfig, count: int) -> dict:
+    import json
+    from tgt.engine import Engine
+    cfg.pcap_path = os.path.join(d, name + ".pcap")
+    cfg.manifest_path = os.path.join(d, name + ".json")
+    cfg.rate, cfg.count = 1000.0, count
+    cfg.clock, cfg.start_time = "synthetic", "2026-11-05T14:00:00Z"
+    eng = Engine(cfg, argv=["run", "--test"])
+    eng.start()
+    eng.join(60)
+    with open(cfg.manifest_path) as fh:
+        return json.load(fh)
+
+
+def test_run_manifest_contract() -> None:
+    from tgt import enterprise, incidents, manifest
+    from tgt.engine import build_batch as bb
+    env = enterprise.get("it-org")
+    n = len(bb(RunConfig(env="it-org", sprinkle=["wannacry"], messages=2)))
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(env="it-org", sprinkle=["wannacry"], messages=2,
+                        seed=5)
+        m = _manifest_run(d, "a", cfg, 2 * n)
+        want = {"schema", "tool", "seed", "argv", "config", "env", "span",
+                "iface", "pcap", "start", "end", "clock", "packets", "bytes",
+                "errors", "cycles", "inventory", "first_seen", "last_seen",
+                "flows_seen", "phases", "events"}
+        check(want <= set(m), f"manifest missing {want - set(m)}")
+        check(m["schema"] == "tgt-manifest/1" and m["seed"] == 5
+              and m["clock"] == "synthetic" and m["cycles"] == 2
+              and m["packets"] == 2 * n and m["argv"] == ["run", "--test"],
+              "manifest header fields wrong")
+        check(m["start"] == "2026-11-05T14:00:00.000000Z", m["start"])
+        check(m["inventory"] and m["inventory"]["env"] == "it-org",
+              "manifest inventory missing")
+        ids = {f"it-org:{h.name}" for h in env.hosts}
+        seen = set(m["first_seen"])
+        check(seen & ids and len(seen & ids) >= len(ids) - 2,
+              f"first_seen misses hosts: {sorted(ids - seen)}")
+        check(all(m["first_seen"][k] <= m["last_seen"][k] for k in seen),
+              "first_seen after last_seen")
+        f0 = m["flows_seen"][0]
+        check({"client", "server", "protocol", "first", "last", "packets"}
+              <= set(f0), "flows_seen row keys")
+        check(any(f["protocol"] == "smb" and f["source"] == "baseline"
+                  for f in m["flows_seen"]), "no baseline SMB flow")
+        # every sprinkled attack flow is one event, on the mapped hosts
+        mp = incidents.get("wannacry").map_onto(env)
+        inc = incidents.get("wannacry")
+        evs = [e for e in m["events"] if e["source"] == "sprinkle:wannacry"
+               and e["category"] != "new-asset"]
+        check(len(evs) == len(inc.flows), f"{len(evs)} wannacry events")
+        for (a, v, atk, _), e in zip(inc.flows, evs):
+            ah, vh = mp.get(a) or inc.host(a), mp.get(v) or inc.host(v)
+            check(e["category"] == manifest.ATTACK_CATEGORY[atk]
+                  and e["hosts"] == [f"it-org:{ah.name}", f"it-org:{vh.name}"]
+                  and e["src"] == ah.ip and e["dst"] == vh.ip
+                  and e["t_start"] <= e["t_end"],
+                  f"event for {atk} {a}->{v} wrong: {e}")
+        check(m["events"][0]["id"] == "e1", "event ids")
+        # a second run with the same seed: identical pcap and ground truth
+        m2 = _manifest_run(d, "b", RunConfig(env="it-org", messages=2,
+                           sprinkle=["wannacry"], seed=5), 2 * n)
+        with open(os.path.join(d, "a.pcap"), "rb") as x, \
+                open(os.path.join(d, "b.pcap"), "rb") as y:
+            check(x.read() == y.read(), "same seed: pcaps differ")
+        check(m2["events"] == m["events"]
+              and m2["flows_seen"] == m["flows_seen"],
+              "same seed: manifests differ")
+
+
+def test_attack_categories_cover_every_attack() -> None:
+    from tgt import incidents, manifest
+    allowed = {"new-asset", "asset-offline", "ip-change", "firmware-change",
+               "new-conversation", "cross-zone", "new-protocol", "ot-write",
+               "plc-mode-change", "plc-program", "scan", "c2",
+               "exploit-attempt", "lateral-movement", "remote-access",
+               "legacy-os", "default-credentials", "cleartext-credentials"}
+    missing = set(incidents.ATTACKS) - set(manifest.ATTACK_CATEGORY)
+    check(not missing, f"manifest.ATTACK_CATEGORY lacks {sorted(missing)}")
+    check(set(manifest.ATTACK_CATEGORY.values()) <= allowed,
+          "non-generic manifest category")
+
+
+def test_seed_flags_and_default_seed() -> None:
+    from tgt import cli
+    from tgt.engine import Engine
+    ns = cli.build_parser().parse_args(
+        ["run", "--seed", "9", "--manifest", "m.json", "--clock",
+         "synthetic", "--start-time", "2026-11-05T14:00:00Z"])
+    check(ns.seed == 9 and ns.manifest == "m.json" and ns.clock == "synthetic",
+          "run --seed/--manifest/--clock not parsed")
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(profiles=["modbus"], messages=1, loop=False, rate=0,
+                        pcap_path=os.path.join(d, "x.pcap"))
+        logs: list = []
+        eng = Engine(cfg, on_log=logs.append)
+        eng.start()
+        eng.join(20)
+        check(eng.stats.seed is not None
+              and any(f"seed {eng.stats.seed}" in m for m in logs),
+              "unseeded run did not pick + log a seed")
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

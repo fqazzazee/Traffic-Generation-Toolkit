@@ -22,7 +22,7 @@ from . import packet as P
 from .enterprise import (FINGERPRINTS, OUI_DELL, OUI_SCHNEIDER, OUI_SIEMENS,
                          OUI_VENDORS, OUI_WIN, Host)
 from .packet import Endpoints
-from .protocols import _s7, _s7_connect, _sport, _tcp_flow
+from .protocols import _rand32, _s7, _s7_connect, _sport, _tcp_flow
 
 AttackBuilder = Callable[[Endpoints, int], List[bytes]]
 
@@ -37,13 +37,13 @@ def port_scan(ep: Endpoints, count: int) -> List[bytes]:
     frames = []
     for i in range(max(count, 1)):
         for k, dport in enumerate(ports):
-            sport = _sport()
+            sport, isn = _sport(), _rand32()
             syn = P.tcp(ep.client_ip, ep.server_ip, sport, dport,
-                        1000 + i, 0, P.SYN)
+                        isn, 0, P.SYN)
             frames.append(P.ip_frame(ep, True, P.IPPROTO_TCP, syn))
             # closed → RST/ACK back
             rst = P.tcp(ep.server_ip, ep.client_ip, dport, sport,
-                        0, 1001 + i, P.RST | P.ACK)
+                        0, isn + 1, P.RST | P.ACK)
             frames.append(P.ip_frame(ep, False, P.IPPROTO_TCP, rst))
     return frames
 
