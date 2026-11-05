@@ -2796,8 +2796,14 @@ def test_env_file_directories_cli_and_tui() -> None:
                 del os.environ["TGT_ENV_PATH"]
             else:
                 os.environ["TGT_ENV_PATH"] = old
+        sites = sorted(os.path.splitext(f)[0]
+                       for f in os.listdir(envfile.SITES_DIR)
+                       if f.endswith(".json")) \
+            if os.path.isdir(envfile.SITES_DIR) else []
         try:
-            check(got == ["example-site"], f"user envs loaded: {got}")
+            # packaged sites (tgt/envs/sites/<key>.json) load first
+            check(got == sites + ["example-site"],
+                  f"user envs loaded: {got}")
             check(len(warnings) == 2 and any("bad.json" in w for w in warnings)
                   and any("'it-org'" in w for w in warnings),
                   f"env dir warnings: {warnings}")
@@ -2809,7 +2815,8 @@ def test_env_file_directories_cli_and_tui() -> None:
             keys = [c[1] for _, c, _, _ in tui._preset_items(ui) if c[0] == "e"]
             check("example-site" in keys, "TUI preset list misses a file env")
         finally:
-            enterprise.ENVIRONMENTS.pop("example-site", None)
+            for k in got:            # leave the registry as the built-ins
+                enterprise.ENVIRONMENTS.pop(k, None)
         # CLI: list / run / inventory / env export through a subprocess
         penv = dict(os.environ, PYTHONPATH=_REPO, TGT_ENV_PATH=envdir)
 
@@ -2857,7 +2864,9 @@ def test_arp_for_gateway_and_peers_every_host() -> None:
         while n_arp < len(batch) and batch[n_arp][0] == "arp":
             n_arp += 1
         arps = [f for k, f in batch if k == "arp"]
-        check(len(arps) > 0 and n_arp >= 2 * len(env.hosts),
+        # hosts behind NAT (not local) are not on this capture
+        seen_hosts = [h for h in env.hosts if not env.hidden(h)]
+        check(len(arps) > 0 and n_arp >= 2 * len(seen_hosts),
               f"{env.key}: ARP does not open the cycle")
         req, rep, grat = set(), set(), set()
         for f in arps:
@@ -2871,12 +2880,13 @@ def test_arp_for_gateway_and_peers_every_host() -> None:
                 (grat if spa == tpa else req).add((spa, tpa, vlan))
             elif op == 2:
                 rep.add((spa, tpa, sha, vlan))
-        for h in env.hosts:
+        for h in seen_hosts:
             seg = env.segment_of(h)
             ip, gw = P.ip_to_bytes(h.ip), P.ip_to_bytes(seg.gateway)
             check((ip, gw, seg.vlan) in req,
                   f"{env.key}: {h.name} never ARPs for its gateway")
-            check((gw, ip, P.mac_to_bytes(seg.gateway_mac), seg.vlan) in rep,
+            check((gw, ip, P.mac_to_bytes(env.gateway_mac(seg)), seg.vlan)
+                  in rep,
                   f"{env.key}: gateway never answers {h.name}")
         check(grat, f"{env.key}: no gratuitous ARP")
     plant = enterprise.get("ot-plant")
@@ -3460,12 +3470,15 @@ def test_engineering_ops_from_engineering_hosts() -> None:
     from tgt import enterprise, inventory
     from tgt.protocols_ot import ENGINEERING, OPERATIONS
     roles = {"s7-eng": {"eng"}, "enip-eng": {"eng"}, "modbus-write": {"hmi"},
-             "dnp3-time": {"scada"}, "iec104-time": {"scada"}}
+             "dnp3-time": {"scada"}, "iec104-time": {"scada"},
+             "sel-telnet": {"eng"}}
     check(set(roles) == set(OPERATIONS), "OPERATIONS out of sync with test")
     used = set()
-    for env in enterprise.all_environments():
+    for env in enterprise.all_environments() + _utility_sites():
+        planted = {(f["client"], f["server"], f["proto"])
+                   for x in env.findings for f in x["flows"]}
         for c, sv, p in env.conversations:
-            if p in OPERATIONS:
+            if p in OPERATIONS and (c, sv, p) not in planted:
                 used.add(p)
                 check(env.host(c).role in roles[p] and env.host(sv).embedded,
                       f"{env.key}: {p} from {c} ({env.host(c).role}) to {sv}")
@@ -3622,6 +3635,513 @@ def test_tshark_ot_identity_matches_inventory() -> None:
     check(drives <= set(io.split()), "tshark: drives without CIP I/O")
     check({h.ip for h in site.hosts if h.name.startswith("PLC-PR")}
           <= set(eng.split()), "tshark: S7 upload/download not seen")
+
+
+# -- utility & energy sites (tgt/envs/sites, #51) + remote sites / NAT (#52) --
+_DISSECTS_AS.update({"sel-telnet": "telnet"})
+
+UTILITY_SITES = ("water-utility", "electric-substation", "oil-gas-pipeline")
+# identity on the wire: the W2-C set plus IEC 61850 MMS Identify, the SEL
+# ASCII ID command and a panel HMI's VNC desktop name
+_UTIL_ID_PROFILES = _IDENTITY_PROFILES | {"mms", "sel-telnet", "vnc"}
+_UTIL_CACHE: dict = {}
+
+
+def _utility_sites() -> list:
+    """The packaged utility sites, loaded straight from their files (so the
+    registry stays as the built-ins whatever the test order)."""
+    from tgt import envfile
+    if not _UTIL_CACHE:
+        for k in UTILITY_SITES:
+            _UTIL_CACHE[k] = envfile.load(
+                os.path.join(envfile.SITES_DIR, f"{k}.json"))
+    return [_UTIL_CACHE[k] for k in UTILITY_SITES]
+
+
+def _tcp_payload(frame: bytes) -> bytes:
+    t = _l4(frame)
+    if t is None or t[0] != P.IPPROTO_TCP:
+        return b""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    total = struct.unpack("!H", frame[off + 2:off + 4])[0]
+    ihl = (frame[off] & 0x0F) * 4
+    seg = frame[off + ihl:off + total]
+    return seg[(seg[12] >> 4) * 4:]
+
+
+def _vid(frame: bytes):
+    return (struct.unpack("!H", frame[14:16])[0] & 0x0FFF
+            if frame[12:14] == b"\x81\x00" else None)
+
+
+def _expert_warns(batch) -> list:
+    """tshark Warn/Error summary lines of a batch (empty without tshark)."""
+    import subprocess
+    if not shutil_which("tshark"):
+        return []
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/x.pcap"
+        with PcapWriter(path) as w:
+            for _, f in batch:
+                w.write(f)
+        out = subprocess.run(["tshark", "-r", path, "-q", "-z",
+                              "expert,warn"], capture_output=True,
+                             text=True).stdout
+    bad, on = [], False
+    for ln in out.splitlines():
+        if ln.startswith(("Warns", "Errors")):
+            on = True
+        elif ln.startswith(("Notes", "Chats")):
+            on = False
+        elif on and ln.strip()[:1].isdigit():
+            bad.append(ln.split(None, 3)[-1].strip())
+    return bad
+
+
+def test_utility_sites_load_build_and_catalog() -> None:
+    """The packaged water / substation / pipeline sites load, round-trip
+    through env export, build in both SPAN views with valid checksums and
+    no tshark warnings beyond browser RSTs, give every host a catalog model
+    (planted unknown devices excepted), every flow a period, and show up in
+    the registry once the site directory is loaded."""
+    from tgt import envfile
+    for env in _utility_sites():
+        check(bool(env.findings), f"{env.key}: no planted findings")
+        check(any(s.options.get("wan_rtt_ms") for s in env.segments),
+              f"{env.key}: no WAN latency hint")
+        for h in env.hosts:
+            dev = h.device
+            check(dev is not None, f"{env.key}: {h.name} has no catalog model")
+            if dev is None:
+                continue
+            if h.embedded or _looks_embedded(h):
+                check(dev.embedded, f"{env.key}: {h.name} not embedded")
+                check(h.mac[:8] in dev.ouis,
+                      f"{env.key}: {h.name} MAC OUI not one of {h.model}'s")
+            check(h.firmware in dev.firmware,
+                  f"{env.key}: {h.name} firmware {h.firmware!r} not offered")
+            check(bool(env.purdue_level(h)),
+                  f"{env.key}: {h.name} has no Purdue level")
+        check(all(env.timing.get(c, {}).get("period")
+                  for c in env.conversations),
+              f"{env.key}: flows without a period for the time model")
+        again = envfile.from_dict(envfile.to_dict(env))
+        check(again.conversations == env.conversations
+              and again.findings == env.findings
+              and [s.options for s in again.segments] ==
+              [s.options for s in env.segments]
+              and again.timing == env.timing,
+              f"{env.key}: env export/load not lossless")
+        for span in ("access", "core"):
+            protocols.begin_build(11, 0)
+            batch = env.build(2, span)
+            check(len(batch) > 500, f"{env.key}/{span}: tiny build")
+            for k, f in batch:
+                verify_ip_l4(f, f"{env.key}/{span}/{k}")
+            if span == "access":
+                bad = [w for w in _expert_warns(batch)
+                       if "Connection reset (RST)" not in w]
+                check(not bad, f"{env.key}: tshark warnings {bad[:3]}")
+    keys = set(envfile.load_user_envs(warn=lambda m: None, force=True))
+    try:
+        from tgt import enterprise
+        check(set(UTILITY_SITES) <= keys and all(
+            envfile.source_of(enterprise.get(k)) for k in UTILITY_SITES),
+            f"packaged sites not registered: {sorted(keys)}")
+    finally:
+        from tgt import enterprise
+        for k in keys:
+            enterprise.ENVIRONMENTS.pop(k, None)
+
+
+def test_utility_sites_identity_on_wire() -> None:
+    """Every embedded device is the server of an identity flow, and what
+    tshark decodes from it (Modbus device ID, DNP3 attributes, MMS Identify,
+    SNMP sysDescr, SEL ID, CIP List Identity, VNC desktop) matches
+    ``tgt inventory`` — through the NAT'd address for remote-site devices."""
+    import shutil
+    import subprocess
+    from tgt import inventory
+    sites = _utility_sites()
+    for env in sites:
+        served = {sv for _, sv, p in env.conversations
+                  if p in _UTIL_ID_PROFILES}
+        missing = [h.name for h in env.hosts if h.embedded
+                   and h.name not in served]
+        check(not missing, f"{env.key}: embedded hosts without identity: "
+              f"{missing}")
+    if not shutil.which("tshark"):
+        _skipped.append("test_utility_sites_identity_on_wire")
+        return
+
+    def run(path, *args):
+        return subprocess.run(["tshark", "-r", path, *args],
+                              capture_output=True, text=True).stdout
+
+    for env in sites:
+        rows = {r["name"]: r for r in inventory.to_json(env)["hosts"]}
+        at: dict = {}                     # wire IP -> host names
+        for h in env.hosts:
+            at.setdefault(h.ip, []).append(h.name)
+            if env.nat_address(h):
+                at.setdefault(env.nat_address(h), []).append(h.name)
+        seen: dict = {}                   # host -> wire IP it was seen at
+
+        def match(ip, ok, what):
+            hit = [n for n in at.get(ip, []) if ok(env.host(n))]
+            check(bool(hit), f"{env.key}: {what} from {ip} matches no host "
+                  f"of {at.get(ip)}")
+            for n in hit:
+                seen[n] = ip
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/site.pcap"
+            protocols.begin_build(3, 0)
+            with PcapWriter(path) as w:
+                for k, fr in env.build(1):
+                    if k in _UTIL_ID_PROFILES:
+                        w.write(fr)
+            mb = run(path, "-Y", "modbus.object_str_value && tcp.srcport == "
+                     "502", "-T", "fields", "-E", "aggregator=|", "-e",
+                     "ip.src", "-e", "tcp.stream", "-e", "modbus.object_id",
+                     "-e", "modbus.object_str_value")
+            dnp = run(path, "-Y", "dnp3.al.da.value", "-T", "fields", "-E",
+                      "aggregator=|", "-e", "ip.src", "-e",
+                      "dnp3.al.da.value")
+            mms = run(path, "-Y", "mms.vendorName", "-T", "fields", "-e",
+                      "ip.src", "-e", "mms.vendorName", "-e",
+                      "mms.modelName", "-e", "mms.revision")
+            snmp = run(path, "-Y", "snmp.name == 1.3.6.1.2.1.1.1.0 && "
+                       "udp.srcport == 161", "-T", "fields", "-e", "ip.src",
+                       "-e", "snmp.value.octets")
+            sel = run(path, "-Y", "telnet.data contains \"SERIALNO=\" && "
+                      "tcp.srcport == 23", "-T", "fields", "-e", "ip.src",
+                      "-e", "telnet.data")
+            cip = run(path, "-Y", "enip.lir.serial", "-T", "fields", "-e",
+                      "ip.src", "-e", "enip.lir.revision", "-e",
+                      "enip.lir.serial")
+            vnc = run(path, "-Y", "vnc.desktop_name", "-T", "fields", "-e",
+                      "ip.src", "-e", "vnc.desktop_name")
+        objs: dict = {}
+        for ln in mb.splitlines():
+            ip, stream, ids, vals = ln.split("\t")
+            objs.setdefault((ip, stream), {}).update(
+                zip(ids.split("|"), vals.split("|")))
+        for (ip, _), o in objs.items():
+            match(ip, lambda h, o=o: h.device and o.get("2") == h.firmware
+                  and o.get("0") == h.device.identity["modbus"].get(
+                      "vendor", h.device.vendor), f"Modbus ID {o}")
+        for ln in dnp.splitlines():
+            ip, vals = ln.split("\t")
+            v = vals.split("|")
+            match(ip, lambda h, v=v: v[1] == rows[h.name]["product"]
+                  and v[2] == h.firmware and v[3] == h.serial
+                  and v[4] == h.name, f"DNP3 attributes {v}")
+        for ln in mms.splitlines():
+            ip, vendor, model, rev = ln.split("\t")
+            match(ip, lambda h, x=(vendor, model, rev): h.device and
+                  "mms" in h.device.identity and x == (
+                      h.device.identity["mms"]["vendor"],
+                      h.device.identity["mms"]["model"], h.firmware),
+                  f"MMS Identify {vendor}/{model}/{rev}")
+        for ln in snmp.splitlines():
+            ip, descr = ln.split("\t")
+            text = bytes.fromhex(descr.split(",")[0]).decode()
+            match(ip, lambda h, t=text: bool(h.firmware) and h.firmware in t,
+                  f"sysDescr {text!r}")
+        for ln in sel.splitlines():
+            ip, data = ln.split("\t")
+            match(ip, lambda h, t=data: f"-{h.firmware}-" in t
+                  and f"SERIALNO={h.serial}" in t, "SEL ID")
+        for ln in cip.splitlines():
+            ip, rev, serial = ln.split("\t")
+            match(ip, lambda h, r=rev, s=serial: h.device is not None and
+                  "cip" in h.device.identity and
+                  int(s, 16) == int(h.serial, 16) and
+                  int(r) == _cip_rev(h.firmware), "CIP List Identity")
+        for ln in vnc.splitlines():
+            ip, desk = ln.split("\t")
+            match(ip, lambda h, x=desk: h.embedded and h.name in x,
+                  f"VNC desktop {desk!r}")
+        want = {h.name for h in env.hosts if h.embedded}
+        check(want <= set(seen), f"{env.key}: tshark decoded no identity "
+              f"for {sorted(want - set(seen))}")
+        for n, ip in seen.items():          # the wire address is the truth's
+            r = rows[n]
+            check(ip in (r["ip"], r.get("nat_ip")),
+                  f"{env.key}: {n} seen at {ip}, inventory {r['ip']} / "
+                  f"{r.get('nat_ip')}")
+            if r.get("nat_hidden"):
+                check(ip == r["nat_ip"], f"{env.key}: hidden {n} at {ip}")
+
+
+def _cip_rev(firmware: str) -> int:
+    from tgt import devices
+    major, minor = devices.cip_revision(firmware)
+    return major << 8 | minor
+
+
+def _flow_frames(env, batch, client, server, proto) -> list:
+    """Frames of one modeled flow, found by its (NAT-translated) addresses —
+    by MAC for Layer-2 protocols."""
+    c, s = env.nat_view(env.host(client), env.host(server))
+    out = []
+    for k, f in batch:
+        if k != proto:
+            continue
+        ips = P.frame_ips(f)
+        if ips and set(ips) == {c.ip, s.ip}:
+            out.append(f)
+        elif not ips and P.bytes_to_mac(f[6:12]) in (c.mac, s.mac):
+            out.append(f)
+    return out
+
+
+def test_utility_sites_planted_findings() -> None:
+    """Every planted finding's flows are on the wire (as the capture point
+    sees them), with the evidence a monitor keys on."""
+    from tgt import inventory
+    sites = {e.key: e for e in _utility_sites()}
+    batches = {}
+    for key, env in sites.items():
+        protocols.begin_build(5, 0)
+        batches[key] = b = env.build(2)
+        inv = inventory.to_json(env)
+        check([f["id"] for f in inv.get("findings", [])] ==
+              [f["id"] for f in env.findings],
+              f"{key}: inventory JSON lacks the findings")
+        for fd in env.findings:
+            for fl in fd["flows"]:
+                check(bool(_flow_frames(env, b, fl["client"], fl["server"],
+                                        fl["proto"])),
+                      f"{key}: finding {fd['id']}: {fl} not on the wire")
+    # water: unauthenticated VNC, Telnet creds, public community, legacy HMI
+    w, b = sites["water-utility"], batches["water-utility"]
+    vnc = _flow_frames(w, b, "OPS-WS2", "LS04-HMI", "vnc")
+    check(any(_tcp_payload(f) == b"\x01\x01" and _l4(f)[1] == "10.250.0.14"
+              for f in vnc), "water: LS04 VNC does not offer security None")
+    tel = b"".join(_tcp_payload(f) for f in
+                   _flow_frames(w, b, "ENG01", "LS07-MODEM", "telnet"))
+    check(b"moxa\r\n" in tel and b"admin\r\n" in tel,
+          "water: Telnet login to LS07 not in cleartext")
+    for n in range(1, 9):
+        snmp = _flow_frames(w, b, "OT-NMS", f"LS0{n}-MODEM", "snmp")
+        check(any(b"public" in _l4(f)[5] for f in snmp),
+              f"water: LS0{n} modem not polled with 'public'")
+    check(not any(b"public" in _l4(f)[5] for f in
+                  _flow_frames(w, b, "OT-NMS", "SW-PLANT", "snmp")),
+          "water: plant switch also answers 'public'")
+    check(w.host("HMI-FILTER").fp.legacy, "water: HMI-FILTER not legacy")
+    check(not any(P.frame_ips(f) and any(ip.startswith("192.168.")
+                                         for ip in P.frame_ips(f))
+                  for _, f in b), "water: a station LAN address leaked")
+    # substation: rogue GOOSE publisher, rogue PTP GM, corporate engineering
+    s, b = sites["electric-substation"], batches["electric-substation"]
+    ts = s.host("TESTSET-01").mac
+    check(any(k == "goose" and P.bytes_to_mac(f[6:12]) == ts for k, f in b),
+          "substation: no GOOSE from the test set")
+    appids = {struct.unpack("!H", f[18:20])[0] for k, f in b if k == "goose"}
+    check(len(appids) == 6, f"substation: GOOSE APPIDs {sorted(appids)}")
+    rogue = s.host("PTP-ROGUE").mac
+    check(any(k == "ptp-l2" and P.bytes_to_mac(f[6:12]) == rogue
+              and f[18] & 0x0F == 0x0B for k, f in b),
+          "substation: rogue grandmaster sends no Announce")
+    sess = b"".join(_tcp_payload(f) for f in _flow_frames(
+        s, b, "CORP-ENG-LT", "L1-SEL451", "sel-telnet"))
+    check(b"ACC\r\n" in sess and b"OTTER" in sess and b"SET 1" in sess,
+          "substation: corporate SEL session lacks login / settings change")
+    check(s.rtt_ms(s.host("CORP-ENG-LT"), s.host("L1-SEL451")) == 34,
+          "substation: WAN latency hint not applied")
+    # pipeline: vendor access, metering write, flat MS5, EOL HMI
+    o, b = sites["oil-gas-pipeline"], batches["oil-gas-pipeline"]
+    check(any(_l4(f)[4] == 3389 and _l4(f)[2] == "10.200.0.11" for f in
+              _flow_frames(o, b, "VENDOR-JUMP", "CS1-HMI", "rdp")),
+          "pipeline: vendor RDP not to CS1's VSAT address")
+    check(any(_l4(f)[4] == 22 and _l4(f)[2] == "10.200.0.12" for f in
+              _flow_frames(o, b, "VENDOR-JUMP", "CS2-TURB", "ssh")),
+          "pipeline: vendor SSH not to CS2's VSAT address")
+    fcs = {_tcp_payload(f)[7] for f in _flow_frames(
+        o, b, "MEAS-WS01", "MS4-FC", "modbus-write")
+        if _l4(f)[4] == 502 and len(_tcp_payload(f)) > 7}
+    check(fcs & {5, 6, 15, 16}, f"pipeline: metering write FCs {fcs}")
+    ms5 = [f for _, f in b if _vid(f) == 215]
+    check(any(P.frame_ips(f) == ("192.168.15.50", "192.168.15.23")
+              for f in ms5) and any(f[12:14] == b"\x81\x00" and
+                                    f[16:18] == b"\x08\x06" for f in ms5),
+          "pipeline: MS5 flat LAN (office PC -> flow computer, ARP) unseen")
+    check(not any(_vid(f) in (211, 212, 213, 214) for _, f in b),
+          "pipeline: a hidden station VLAN is on the wire")
+    check(o.host("CS2-HMI").fp.legacy, "pipeline: CS2-HMI not legacy")
+
+
+_NAT_ENV = {
+    "key": "nat-test", "name": "NAT test", "category": "OT",
+    "segments": [
+        {"name": "HQ", "vlan": 10, "subnet": "10.1.0.0/24",
+         "zone": "OT-SUPERVISORY"},
+        {"name": "WAN", "vlan": 20, "subnet": "10.2.0.0/24", "zone": "OT-CELL",
+         "wan_rtt_ms": 100},
+        {"name": "SITE", "vlan": 30, "subnet": "192.168.50.0/24",
+         "zone": "OT-CELL", "wan_rtt_ms": 120,
+         "nat": {"outside_ip": "10.2.0.5"}},
+        {"name": "SITE2", "vlan": 40, "subnet": "192.168.60.0/24",
+         "zone": "OT-CELL", "gateway_mac": "00:a0:d5:00:00:99",
+         "nat": {"outside_ip": "203.0.113.9", "local": True}},
+    ],
+    "hosts": [
+        {"name": "SCADA", "ip": "10.1.0.10", "role": "scada", "os": "win2019"},
+        {"name": "MODEM", "ip": "10.2.0.5", "role": "router",
+         "os": "embedded-linux", "model": "sierra-airlink-rv50x"},
+        {"name": "RTU", "ip": "192.168.50.21",
+         "model": "schneider-scadapack-474"},
+        {"name": "HMI", "ip": "192.168.50.30", "role": "hmi", "os": "win10"},
+        {"name": "RTU2", "ip": "192.168.60.21",
+         "model": "schneider-scadapack-474"},
+    ],
+    "flows": [
+        {"client": "SCADA", "server": "RTU", "proto": "dnp3"},
+        {"client": "SCADA", "server": "MODEM", "proto": "snmp"},
+        {"client": "HMI", "server": "RTU", "proto": "modbus"},
+        {"client": "SCADA", "server": "RTU2", "proto": "modbus"},
+    ],
+    "findings": [{"id": "x", "title": "t", "hosts": ["HMI"],
+                  "flows": [{"client": "HMI", "server": "RTU",
+                             "proto": "modbus"}]}],
+}
+
+
+def test_nat_remote_sites() -> None:
+    """Segment ``nat`` (#52): remote-site hosts appear as the router's
+    outside IP/MAC on the HQ capture (checksums recomputed, TTL -1 on the
+    way out), site-internal frames vanish unless ``local``, a carrier
+    outside address rides the HQ gateway, and inventory / manifest / env
+    export carry the translation; plus the schema errors."""
+    import copy
+    import json
+    from tgt import envfile, inventory
+    env = envfile.from_dict(copy.deepcopy(_NAT_ENV))
+    h = {n: env.host(n) for n in ("SCADA", "MODEM", "RTU", "HMI", "RTU2")}
+    check(env.nat_address(h["RTU"]) == "10.2.0.5" and env.hidden(h["RTU"])
+          and not env.hidden(h["RTU2"]) and not env.nat_address(h["MODEM"]),
+          "nat_address / hidden wrong")
+    v = env.nat_view(h["SCADA"], h["RTU"])
+    check(v[0] is h["SCADA"] and (v[1].ip, v[1].mac) ==
+          ("10.2.0.5", h["MODEM"].mac), f"nat_view: {v[1]}")
+    check(env.nat_view(h["HMI"], h["RTU"]) == (h["HMI"], h["RTU"]),
+          "nat_view translated a site-internal flow")
+    check(env.rtt_ms(h["SCADA"], h["RTU"]) == 120
+          and env.rtt_ms(h["SCADA"], h["MODEM"]) == 100
+          and env.rtt_ms(h["HMI"], h["RTU"]) == 0, "rtt_ms wrong")
+    for span in ("access", "core"):
+        protocols.begin_build(1, 0)
+        b = env.build(2, span)
+        for k, f in b:
+            verify_ip_l4(f, f"nat/{span}/{k}")
+        ips = [P.frame_ips(f) for _, f in b if P.frame_ips(f)]
+        check(not any(ip.startswith("192.168.50.") for p in ips for ip in p),
+              f"nat/{span}: a hidden site address leaked")
+        check(not any(k == "modbus" and P.frame_ips(f) and "10.2.0.5" in
+                      P.frame_ips(f) for k, f in b),
+              f"nat/{span}: the site-internal Modbus flow is on the wire")
+        check(not any(_vid(f) == 30 for _, f in b),
+              f"nat/{span}: hidden site VLAN on the wire (ARP?)")
+        up = [f for k, f in b if k == "dnp3" and _vid(f) == 20
+              and P.frame_ips(f) == ("10.2.0.5", "10.1.0.10")]
+        down = [f for k, f in b if k == "dnp3"
+                and P.frame_ips(f) == ("10.1.0.10", "10.2.0.5")]
+        check(bool(up) and bool(down), f"nat/{span}: DNP3 not translated")
+        off = 18
+        check(all(f[off + 8] == 63 and P.bytes_to_mac(f[6:12]) ==
+                  h["MODEM"].mac and _vid(f) == 20 for f in up),
+              f"nat/{span}: outbound frames not from the modem, TTL 63")
+        check(any(_vid(f) == 10 for f in down) and (span == "access") ==
+              (not any(_vid(f) == 20 and P.frame_ips(f) ==
+                       ("10.1.0.10", "10.2.0.5") for _, f in b)),
+              f"nat/{span}: inbound placement / core copy wrong")
+        rtu2 = [f for k, f in b if k == "modbus" and P.frame_ips(f) ==
+                ("203.0.113.9", "10.1.0.10")]
+        gw = env.segment_of(h["SCADA"]).gateway_mac
+        check(bool(rtu2) and all(_vid(f) == 10 and P.bytes_to_mac(f[6:12])
+                                 == gw for f in rtu2),
+              f"nat/{span}: carrier-address site not via the HQ gateway")
+        check(any(_vid(f) == 40 and f[16:18] == b"\x08\x06" for _, f in b),
+              f"nat/{span}: local site's ARP missing")
+    # inventory, manifest, export
+    inv = inventory.to_json(env)
+    rows = {r["name"]: r for r in inv["hosts"]}
+    check(rows["RTU"].get("nat_ip") == "10.2.0.5" and rows["RTU"]["nat_hidden"]
+          and rows["RTU2"]["nat_hidden"] is False and "nat_ip" not in
+          rows["SCADA"], "inventory nat_ip / nat_hidden")
+    check(not rows["RTU"]["observability"]["vendor"]["evidence"] or
+          "oui" not in rows["RTU"]["observability"]["vendor"]["evidence"],
+          "inventory: hidden host credited with its MAC OUI")
+    segs = {s["name"]: s for s in inv["segments"]}
+    check(segs["SITE"].get("nat") == {"outside_ip": "10.2.0.5"}
+          and segs["WAN"].get("wan_rtt_ms") == 100
+          and segs["SITE2"]["gateway_mac"] == "00:a0:d5:00:00:99"
+          and segs["SITE"]["gateway_mac"] == h["MODEM"].mac,
+          "inventory segments lack nat / wan_rtt_ms / gateway_mac")
+    infra = {i["segment"]: i for i in inv["infrastructure"]}
+    check("SITE" not in infra and infra["SITE2"]["kind"] == "gateway"
+          and infra["HQ"]["kind"] == "hsrp-gateway",
+          f"inventory infrastructure for NAT sites: {infra}")
+    check(inv["findings"][0]["id"] == "x", "inventory findings")
+    check(json.loads(json.dumps(envfile.to_dict(env)))["segments"][2]["nat"]
+          == {"outside_ip": "10.2.0.5"}, "env export drops nat")
+    envfile.register(env)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            protocols.begin_build(1, 0)
+            n = len(env.build(1))
+            m = _manifest_run(d, "nat", RunConfig(env="nat-test", seed=2),
+                              n)
+        flows = {(f["client"], f["server"], f["protocol"])
+                 for f in m["flows_seen"]}
+        check(("nat-test:SCADA", "nat-test:RTU", "dnp3") in flows,
+              f"manifest: translated DNP3 flow not attributed: {flows}")
+    finally:
+        from tgt import enterprise
+        enterprise.ENVIRONMENTS.pop("nat-test", None)
+    # schema errors
+    for mut, want in (
+            (lambda d: d["segments"][2]["nat"].update(
+                outside_ip="192.168.50.9"), "inside the NAT'd subnet"),
+            (lambda d: d["segments"][2]["nat"].update(port=1), "unknown key"),
+            (lambda d: d["segments"][1].update(wan_rtt_ms=-5), "wan_rtt_ms"),
+            (lambda d: d["segments"][3].update(gateway_mac="xx"),
+             "gateway_mac"),
+            (lambda d: d["segments"][3]["nat"].update(outside_ip="10.2.0.0"),
+             None),
+            (lambda d: d["findings"][0]["flows"][0].update(proto="dnp3"),
+             "not one of the flows"),
+            (lambda d: d["findings"].append(dict(d["findings"][0])),
+             "duplicate finding id"),
+            (lambda d: d["findings"][0].update(severity="urgent"),
+             "severity")):
+        doc = copy.deepcopy(_NAT_ENV)
+        mut(doc)
+        try:
+            envfile.from_dict(doc, "nat.json")
+            check(want is None, f"env file accepted: {want}")
+        except envfile.EnvFileError as e:
+            check(want is not None and want in str(e) and "nat.json" in str(e),
+                  f"unexpected env-file error: {e}")
+    # a NAT outside address inside another NAT segment is refused
+    doc = copy.deepcopy(_NAT_ENV)
+    doc["segments"][3]["nat"]["outside_ip"] = "192.168.50.99"
+    try:
+        envfile.from_dict(doc, "nat.json")
+        check(False, "outside_ip inside another NAT segment accepted")
+    except envfile.EnvFileError as e:
+        check("inside NAT segment" in str(e), f"wrong error: {e}")
+    # packet.rewrite_ips keeps UDP/TCP checksums valid and Ethernet padding
+    ep = Endpoints(client_ip="192.168.1.5", server_ip="10.0.0.1")
+    for f in protocols.get("modbus").build(ep, 1) + \
+            protocols.get("snmp").build(ep, 1):
+        g = P.rewrite_ips(f + b"\x00" * 4, src_ip="198.51.100.7",
+                          ttl_delta=-1)
+        verify_ip_l4(g[:-4], "rewrite_ips")
+        check(g.endswith(b"\x00" * 4) and P.frame_ips(g)[0] ==
+              "198.51.100.7" and g[22] == f[22] - 1, "rewrite_ips fields")
 
 
 def main() -> int:
