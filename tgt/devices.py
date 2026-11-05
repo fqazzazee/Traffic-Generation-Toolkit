@@ -679,6 +679,15 @@ def identity_meta(model: Optional[DeviceModel], firmware: str,
         digits = "".join(c for c in serial if c.isdigit())
         if digits:
             meta["hart_device_id"] = int(digits) % (1 << 24)
+    cds = model.identity.get("codesys")
+    if cds:                     # CODESYS V3 name-service DeviceInfo
+        meta.update({"codesys_device": cds.get("device_name", model.product),
+                     "codesys_vendor": cds.get("vendor_name", model.vendor),
+                     "codesys_target_type": cds.get("target_type", 0x1006),
+                     "codesys_target_id": cds.get("target_id", 0x0001),
+                     "codesys_firmware": firmware, "codesys_serial": serial})
+        if host_name:
+            meta["codesys_node"] = host_name
     # IEC 61850 MMS Identify (vendorName / modelName / revision) and the SEL
     # ASCII ID command (tgt/protocols_util.py)
     mms = model.identity.get("mms")
@@ -1065,7 +1074,11 @@ _add(DeviceModel(
     identity={"modbus": {"vendor": "WAGO GmbH & Co. KG",
                          "vendor_url": "www.wago.com",
                          "product_code": "750-8212",
-                         "product_name": "PFC200 CS 2ETH RS"}},
+                         "product_name": "PFC200 CS 2ETH RS"},
+              # e!RUNTIME / CODESYS V3 DeviceInfo (tgt/protocols_codesys.py)
+              "codesys": {"device_name": "WAGO 750-8212 PFC200 G2 2ETH RS",
+                          "vendor_name": "WAGO", "target_type": 0x1006,
+                          "target_id": 0x8212}},
     banners={"http": "lighttpd", "snmp_sysdescr": "WAGO 750-8212 PFC200 CS "
              "2ETH RS FW {firmware}",
              "snmp_sysobjectid": "1.3.6.1.4.1.13576"},
@@ -1219,4 +1232,51 @@ def _site_reindex() -> None:
                               for o in m.ouis)
 
 
+_site_reindex()
+
+
+# ---------------------------------------------------------------------------
+# CODESYS V3 controllers (tgt/protocols_codesys.py). The ``codesys``
+# identity is what the runtime's name-service DeviceInfo reply carries:
+# device and vendor name strings plus target type / id. OUIs are as
+# Wireshark's manuf lists them (Schneider M2xx: Telemecanique 00:80:f4;
+# Eaton XC300: Eaton Industries GmbH, ex Moeller, 00:80:99). Device-name
+# strings, target types / ids, firmware lists and serial formats are
+# representative.
+# ---------------------------------------------------------------------------
+_EATON_IND = ("00:80:99",)
+_M2XX = ("00:80:f4",)
+
+_add(DeviceModel(
+    "schneider-tm251mese", "Schneider Electric", "Modicon M251 TM251MESE "
+    "logic controller", "plc", _M2XX, "1", "Modicon M251 firmware "
+    "(CODESYS V3 runtime)", ("5.1.9.34", "5.2.11.24", "5.3.6.2"),
+    "##############",
+    (Module(0, "TM251MESE", "M251 logic controller, 2 Ethernet ports"),
+     Module(1, "TM3DI16", "TM3 16-ch digital input"),
+     Module(2, "TM3DQ16T", "TM3 16-ch transistor output")),
+    identity={"codesys": {"device_name": "TM251MESE",
+                          "vendor_name": "Schneider Electric",
+                          "target_type": 0x1003, "target_id": 0x0251}},
+    banners={"http": ""}, aliases=("TM251MESE",), stack="embedded"))
+_add(DeviceModel(
+    "schneider-tm241cec24t", "Schneider Electric", "Modicon M241 "
+    "TM241CEC24T logic controller", "plc", _M2XX, "1",
+    "Modicon M241 firmware (CODESYS V3 runtime)",
+    ("5.1.9.34", "5.2.11.24"), "##############",
+    (Module(0, "TM241CEC24T", "M241 logic controller, Ethernet + CANopen"),),
+    identity={"codesys": {"device_name": "TM241CEC24T/U",
+                          "vendor_name": "Schneider Electric",
+                          "target_type": 0x1003, "target_id": 0x0241}},
+    banners={"http": ""}, aliases=("TM241CEC24T",), stack="embedded"))
+_add(DeviceModel(
+    "eaton-xc-303", "Eaton", "XC300 modular PLC XC-303-C32-002", "plc",
+    _EATON_IND, "1", "XC300 firmware (Linux, CODESYS V3 runtime)",
+    ("1.03.024", "1.04.008", "1.05.012"), "#########",
+    (Module(0, "XC-303-C32-002", "XC300 CPU, 2 Ethernet, OPC UA"),
+     Module(1, "XN300-16DI", "XN300 16-ch digital input")),
+    identity={"codesys": {"device_name": "XC-303-C32-002",
+                          "vendor_name": "Eaton",
+                          "target_type": 0x1006, "target_id": 0x0303}},
+    banners={"http": ""}, aliases=("XC-303-C32-002",), stack="linux"))
 _site_reindex()

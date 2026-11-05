@@ -87,7 +87,7 @@ for _fam, _keys in (
                             "cdp syslog mdns ssdp llmnr nbns"),
         ("Remote access", "ssh rdp vnc telnet"),
         ("Vendor engineering", "s7-eng enip-eng s7plus fins slmp hart-ip srtp "
-                               "ftp tftp http-fw")):
+                               "codesys codesys-disc ftp tftp http-fw")):
     for _k in _keys.split():
         _FAMILY_OF[_k] = _fam
 

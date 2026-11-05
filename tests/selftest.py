@@ -7082,6 +7082,239 @@ def test_bench_seeded_and_per_technique() -> None:
         check(card["verdict"] is None and card["metrics"][
             "discovery_recall"] == 0.0, "no thresholds -> no verdict")
 
+# --- W5-E: CODESYS V3 (protocols_codesys) ----------------------------------
+# no stock Wireshark dissector: the carrier layer
+_DISSECTS_AS.update({"codesys": "tcp", "codesys-disc": "udp"})
+
+
+def _cds_payload(frame: bytes):
+    """(is TCP, sport, dport, payload) of a (tagged) IPv4 TCP/UDP frame."""
+    proto, _, _, sp, dp, l4 = _l4(frame)
+    if proto == P.IPPROTO_UDP:
+        return False, sp, dp, l4[8:]
+    return True, sp, dp, l4[(l4[12] >> 4) * 4:]
+
+
+def test_codesys_wire_format() -> None:
+    """CODESYS V3 framing: block driver magic / length, datagram header and
+    addresses, channel open / blocks / acks / keep-alive / close, services
+    header + tags, and the session's login -> session id -> monitoring
+    sequence, all parsed back by protocols_codesys.decode."""
+    import zlib
+    from tgt import devices
+    from tgt import protocols_codesys as C
+    # tag encoding: base-128 id/size, header padded with continuation bytes
+    check(C.tag(0x22, b"\x01\x00\x00\x00") ==
+          b"\x22\x84\x80\x00\x01\x00\x00\x00", "codesys: tag padding")
+    check(C.tag(0x10, b"ab", align=0x42) == b"\x10\x02ab" and
+          C.parse_tags(C.tag(0x81, C.tag(0x10, b"ab", align=0x42) +
+                             C.tag(0x11, bytes(200))))
+          == [(0x81, [(0x10, b"ab"), (0x11, bytes(200))])],
+          "codesys: tag round trip")
+    ep = Endpoints(meta={"codesys_user": "integrator"})
+    fr = protocols.get("codesys").build(ep, 5)
+    for f in fr:
+        verify_ip_l4(f, "codesys")
+    check(_l4(fr[0])[4] == 11740, "codesys: session not to TCP 11740")
+    pdus = []
+    for f in fr:
+        _, sp, dp, pl = _cds_payload(f)
+        if not pl:
+            continue
+        check(pl[:4] == b"\x00\x01\x17\xe8" and
+              struct.unpack("<I", pl[4:8])[0] == len(pl) <= 520,
+              "codesys: block driver magic / length")
+        d = C.decode(pl)
+        fc = dp == 11740
+        check(d["hop_count"] == 13 and d["hdr_words"] == 3 and
+              d["priority"] == 1, "codesys: datagram header")
+        me = struct.pack(">H", sp) + P.ip_to_bytes(_l4(f)[1])
+        peer = struct.pack(">H", dp) + P.ip_to_bytes(_l4(f)[2])
+        check(d["sender"] == me and d["receiver"] == peer,
+              "codesys: datagram addresses != TCP endpoints")
+        pdus.append((fc, d))
+    check(pdus[0][1]["ns_subcmd"] == C.NS_NAME_RESOLVE and
+          pdus[1][1]["ns_subcmd"] == C.NS_DEVICE_INFO and
+          pdus[1][1]["ns_msg_id"] == pdus[0][1]["ns_msg_id"],
+          "codesys: DeviceInfo identification missing")
+    check(pdus[2][1]["ch_type"] == C.CH_OPEN and
+          pdus[3][1]["ch_type"] == C.CH_OPEN_RSP and
+          pdus[3][1]["msg_id_ch"] == pdus[2][1]["msg_id_ch"],
+          "codesys: open channel exchange")
+    chan = pdus[3][1]["channel"]
+    check(pdus[-1][0] and pdus[-1][1]["ch_type"] == C.CH_CLOSE and
+          pdus[-1][1]["channel"] == chan, "codesys: no close channel")
+    last = {True: 0, False: 0}
+    for n, (fc, d) in enumerate(pdus[4:-1], 4):
+        check(d["channel"] == chan, "codesys: channel id differs")
+        if d["ch_type"] == C.CH_BLK:
+            check(d["blk_id"] == last[fc] + 1 and d["ack_id"] == last[not fc]
+                  and bool(d["flags"] & 0x80) == fc,
+                  "codesys: block numbering / request flag")
+            last[fc] = d["blk_id"]
+            nxt = pdus[n + 1]
+            check(nxt[0] != fc and nxt[1]["ch_type"] == C.CH_ACK and
+                  nxt[1]["blk_id"] == d["blk_id"], "codesys: block not acked")
+            check(d["size"] == len(d["data"]) and d["crc"] ==
+                  zlib.crc32(d["data"]) & 0xFFFFFFFF, "codesys: block CRC")
+    check(sum(d.get("ch_type") == C.CH_KEEPALIVE for _, d in pdus) == 1,
+          "codesys: keep-alive missing")
+    msgs = C.session_messages(fr)
+    calls = [(m["group"], m["sid"], m["reply"]) for _, m in msgs]
+    check(calls[:6] == [(1, 2, False), (1, 2, True), (2, 1, False),
+                        (2, 1, True), (2, 0x26, False), (2, 0x26, True)]
+          and calls.count((0x1B, 1, False)) == 5 and calls[-2:] ==
+          [(1, 3, False), (1, 3, True)], f"codesys: service sequence {calls}")
+    login, reply = msgs[0][1], msgs[1][1]
+    creds = dict(login["tags"])[0x81]
+    check(login["session"] == 0 and dict(creds)[0x10].rstrip(b"\x00") ==
+          b"integrator" and dict(login["tags"])[0x22] == b"\x01\x00\x00\x00",
+          "codesys: login tags")
+    rt = dict(dict(reply["tags"])[0x82])
+    session = struct.unpack("<I", rt[0x21])[0]
+    check(rt[0x20] == b"\x00\x00" and all(
+        m["session"] == session for _, m in msgs[2:]),
+        "codesys: session id not carried after login")
+    app_id = dict(dict(msgs[3][1]["tags"])[0x81])[0x11]
+    mon = [m for _, m in msgs if m["group"] == 0x1B]
+    check(all(dict(m["tags"])[0x01][:4] == app_id for m in mon
+              if not m["reply"]) and all(
+        len(dict(m["tags"])[0x40]) == 32 for m in mon if m["reply"]),
+        "codesys: Monitoring2 read app header / value list")
+    # a message too big for one PDU is split into acked blocks
+    big = C.service(C.SG_MON2, 1, 7, C.tag(0x02, bytes(range(256)) * 5))
+    bl = C.blocks(9, 1, 0, big, True, 492)
+    check(len(bl) == 3 and all(len(b) <= 492 for b in bl) and
+          bl[0][20:] + b"".join(b[12:] for b in bl[1:]) == big and
+          [struct.unpack("<I", b[4:8])[0] for b in bl] == [1, 2, 3] and
+          bl[1][1] == 0x80, "codesys: block segmentation")
+    # catalog identity on the UDP scan; broadcast request from 1740
+    m = devices.get("schneider-tm251mese")
+    meta = devices.identity_meta(m, "5.2.11.24", "12345678901234", "PLC-CNV")
+    meta["bcast"] = "10.10.10.255"
+    fr = protocols.get("codesys-disc").build(Endpoints(meta=meta), 1)
+    check(len(fr) == 2 and fr[0][:6] == b"\xff" * 6 and
+          _l4(fr[0])[2] == "10.10.10.255" and _l4(fr[0])[3:5] ==
+          (1740, 1740) and _l4(fr[1])[2] == "10.10.10.10",
+          "codesys-disc: request not broadcast 1740 / reply not unicast")
+    rq = C.decode(_cds_payload(fr[0])[3], tcp=False)
+    rp = C.decode(_cds_payload(fr[1])[3], tcp=False)
+    check(rq["service"] == 3 and rq["receiver"] == b"" and
+          rq["sender"] == b"\x00\x0a" and rp["service"] == 4 and
+          rp["receiver"] == b"\x00\x0a" and rp["sender"] == b"\x00\x14",
+          "codesys-disc: relative UDP addresses")
+    check((rp["node"], rp["device"], rp["vendor"], rp["firmware"],
+           rp["serial"]) == ("PLC-CNV", "TM251MESE", "Schneider Electric",
+                             "5.2.11.24", "12345678901234"),
+          f"codesys-disc: DeviceInfo identity {rp}")
+    # malformed input is rejected, seeded builds are reproducible
+    pl = _cds_payload(protocols.get("codesys").build(Endpoints(), 1)[3])[3]
+    for bad in (b"\x00\x01\x17\xe9" + pl[4:], pl + b"\x00"):
+        try:
+            C.decode(bad)
+            check(False, "codesys: decode accepted a corrupt PDU")
+        except ValueError:
+            pass
+    runs = []
+    for _ in range(2):
+        protocols.begin_build(11, 2)
+        runs.append(protocols.get("codesys").build(Endpoints(), 3))
+    check(runs[0] == runs[1], "codesys: seeded build not reproducible")
+
+
+def test_codesys_site_identity_and_timing() -> None:
+    """auto-assembly: an engineering laptop scans and logs into the CODESYS
+    controllers (WAGO, Modicon M251, Eaton XC300) on its own segment; the
+    DeviceInfo on the wire matches the inventory, which credits codesys
+    for vendor/model/firmware/serial; both profiles are daytime engineering
+    in the timed model."""
+    import re
+    from tgt import devices, envfile, inventory, timing
+    from tgt import protocols_codesys as C
+    for k in ("codesys", "codesys-disc"):
+        check(timing.spec(k)[4] == "eng", f"{k}: not a daytime eng period")
+    for mid in ("wago-750-8212", "schneider-tm251mese",
+                "schneider-tm241cec24t", "eaton-xc-303"):
+        m = devices.get(mid)
+        check("codesys" in m.identity and all(
+            devices.OUI_VENDORS.get(o) for o in m.ouis),
+            f"{mid}: no codesys identity / unknown OUI")
+    # loaded, not registered: the global env registry stays as it was
+    env = envfile.load(os.path.join(envfile.SITES_DIR, "auto-assembly.json"))
+    conv = [(c, s) for c, s, p in env.conversations if p.startswith("codesys")]
+    check(len(conv) == 14 and all(
+        env.host(c).role == "eng" and env.host(s).embedded and
+        env.segment_of(env.host(c)) is env.segment_of(env.host(s))
+        for c, s in conv), "auto-assembly: codesys conversations")
+    rows = {h["ip"]: h for h in inventory.to_json(env)["hosts"]}
+    seen = {}
+    for k, f in env.build(1):
+        if not k.startswith("codesys"):
+            continue
+        tcp, sp, dp, pl = _cds_payload(f)
+        if not pl:
+            continue
+        d = C.decode(pl, tcp)
+        if "device" in d:
+            seen[_l4(f)[1]] = d
+        if not tcp and sp == dp == 1740 and d["service"] == 3:
+            check(f[:6] == b"\xff" * 6 and _l4(f)[2] == "10.160.20.255",
+                  "auto-assembly: scan not a subnet broadcast")
+    names = {"PLC-OVN-01", "PLC-OVN-04", "PLC-CNV-02", "PLC-DRY-01"}
+    for ip, row in rows.items():
+        if row["name"] not in names:
+            continue
+        d = seen.get(ip)
+        check(d is not None, f"{row['name']}: no DeviceInfo on the wire")
+        if d is None:
+            continue
+        parts = [int(x) & 0xFF for x in
+                 re.findall(r"\d+", row["firmware"])][:4]
+        fw = ".".join(str(x) for x in parts + [0] * (4 - len(parts)))
+        ident = devices.get(row["model"]).identity["codesys"]
+        check(d["serial"] == row["serial"] and d["node"] == row["name"] and
+              d["firmware"] == fw and d["vendor"] == ident["vendor_name"]
+              and d["vendor"].split()[0] in row["vendor"] and
+              d["device"] == ident["device_name"],
+              f"{row['name']}: DeviceInfo {d} != inventory")
+        obs = row["observability"]
+        check(all("codesys" in obs[f]["evidence"] for f in
+                  ("vendor", "model", "firmware", "serial")),
+              f"{row['name']}: inventory does not credit codesys")
+
+
+def test_tshark_codesys_clean() -> None:
+    """Optional: the CODESYS builders and the auto-assembly site's CODESYS
+    traffic decode as clean TCP / UDP — no malformed packets, bad lengths
+    or other Warn/Error expert info."""
+    import shutil
+    import subprocess
+    from tgt import envfile
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_codesys_clean")
+        return
+    env = envfile.load(os.path.join(envfile.SITES_DIR, "auto-assembly.json"))
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/cds.pcap"
+        with PcapWriter(path) as w:
+            for key in ("codesys", "codesys-disc"):
+                for f in protocols.get(key).build(Endpoints(), 8):
+                    w.write(f)
+            for k, f in env.build(1):
+                if k.startswith("codesys"):
+                    w.write(f)
+        out = subprocess.run(["tshark", "-r", path, "-q", "-z", "expert"],
+                             capture_output=True, text=True).stdout
+        lens = subprocess.run(
+            ["tshark", "-r", path, "-T", "fields", "-e", "frame.protocols",
+             "-e", "udp.length", "-e", "ip.len", "-e", "frame.len"],
+            capture_output=True, text=True).stdout.splitlines()
+    check("Warns (" not in out and "Errors (" not in out,
+          f"tshark codesys expert: {out.strip()[:300]}")
+    check(lens and all(ln.split("\t")[0].endswith((":tcp", ":tcp:data",
+                                                   ":udp:data"))
+                       for ln in lens), "tshark: codesys frames mis-decoded")
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

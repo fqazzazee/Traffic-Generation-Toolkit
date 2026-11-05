@@ -45,6 +45,11 @@ _FROM_SERVER = {
     # IEC 61850 MMS Identify; SEL ASCII ID (FID firmware string + serial)
     "mms": ("vendor", "product", "model", "firmware", "os"),
     "sel-telnet": ("vendor", "product", "model", "firmware", "serial", "os"),
+    # CODESYS V3 name-service DeviceInfo (scan reply, and inside the online
+    # session): vendor + device name, firmware bytes, serial number
+    "codesys": ("vendor", "product", "model", "firmware", "serial", "os"),
+    "codesys-disc": ("vendor", "product", "model", "firmware", "serial",
+                     "os"),
 }
 _FROM_CLIENT = {
     # DICOM C-STORE data set: Manufacturer, Model Name, Device Serial

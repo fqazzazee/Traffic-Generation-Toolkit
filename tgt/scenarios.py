@@ -76,9 +76,11 @@ SCENARIOS = {
         "upload — the file-transfer events a monitor should flag."),
     "multi-vendor-ot": Scenario(
         "multi-vendor-ot", "Multi-Vendor OT",
-        ["s7plus", "fins", "slmp", "hart-ip", "srtp", "enip", "modbus"],
+        ["s7plus", "fins", "slmp", "hart-ip", "srtp", "codesys", "enip",
+         "modbus"],
         "Engineering / HMI traffic across vendors: Siemens S7CommPlus, Omron "
-        "FINS, Mitsubishi SLMP, HART-IP, GE SRTP, EtherNet/IP and Modbus — "
+        "FINS, Mitsubishi SLMP, HART-IP, GE SRTP, CODESYS V3, EtherNet/IP "
+        "and Modbus — "
         "vendor coverage for protocol classification and asset identity."),
 }
 
