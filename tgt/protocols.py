@@ -11,6 +11,8 @@ conversation rather than orphaned segments.
 """
 from __future__ import annotations
 
+import math
+import random
 import struct
 import zlib
 from dataclasses import replace
@@ -30,12 +32,14 @@ class TcpSession:
     """Tracks sequence/ack numbers for a single TCP conversation."""
 
     def __init__(self, ep: Endpoints, sport: int, dport: int,
-                 iss: int = 1000, irs: int = 5000):
+                 iss: int | None = None, irs: int | None = None):
         self.ep = ep
         self.sport = sport
         self.dport = dport
-        self.c_seq = iss          # client next seq
-        self.s_seq = irs          # server next seq
+        # random ISN per direction (RFC 6528), drawn from the build context
+        # so a seeded run reproduces them
+        self.c_seq = _rand32() if iss is None else iss   # client next seq
+        self.s_seq = _rand32() if irs is None else irs   # server next seq
         self.frames: List[bytes] = []
 
     def _emit(self, from_client: bool, flags: int, payload: bytes = b"") -> None:
@@ -93,14 +97,80 @@ def _tcp_flow(ep: Endpoints, sport: int, dport: int,
 
 # A client ephemeral source port that increments per session for realism.
 _next_sport = 40000
+SPORT_LO, SPORT_HI = 40000, 60000
 
 
 def _sport() -> int:
     global _next_sport
     _next_sport += 1
-    if _next_sport > 60000:
-        _next_sport = 40000
+    if _next_sport > SPORT_HI:
+        _next_sport = SPORT_LO
+    _bctx.sports_used += 1
     return _next_sport
+
+
+# ---------------------------------------------------------------------------
+# Build context: per-cycle variation, reproducible under a run seed
+# ---------------------------------------------------------------------------
+class BuildContext:
+    """What one build (one engine cycle) varies: a seeded RNG for TCP ISNs,
+    session handles and the like, the cycle index that app-level counters
+    continue from, and a salt for process-value drift. Builders consult the
+    module-level context (see :func:`begin_build`) so their signatures stay
+    ``(endpoints, count)``. Without a seed every build differs."""
+
+    def __init__(self, seed: int | None = None, cycle: int = 0):
+        self.seed = seed
+        self.cycle = cycle
+        self.rng = (random.Random(f"tgt:{seed}:{cycle}") if seed is not None
+                    else random.Random())
+        self.salt = seed if seed is not None else random.getrandbits(48)
+        self.sports_used = 0
+
+
+_bctx = BuildContext()
+
+
+def begin_build(seed: int | None, cycle: int = 0,
+                sport_stride: int = 0) -> BuildContext:
+    """Start a build: fresh context for ``(seed, cycle)`` and the ephemeral
+    source-port allocator reset to where that cycle's ports begin — a
+    seed-derived offset plus ``cycle * sport_stride`` — so ports keep
+    advancing across cycles (no 4-tuple reuse while the range lasts) and two
+    builds of the same seed + cycle are identical."""
+    global _bctx, _next_sport
+    _bctx = BuildContext(seed, cycle)
+    span = SPORT_HI - SPORT_LO + 1
+    off = (zlib.crc32(f"tgt:{_bctx.salt}".encode()) + cycle * sport_stride)
+    _next_sport = SPORT_LO + (off - 1) % span     # _sport() pre-increments
+    return _bctx
+
+
+def build_context() -> BuildContext:
+    return _bctx
+
+
+def _rand32() -> int:
+    return _bctx.rng.getrandbits(32)
+
+
+def _cycle_base(count: int) -> int:
+    """Offset for per-flow counters (transaction ids, sequence numbers,
+    sample indexes) so they continue across cycles instead of restarting."""
+    return _bctx.cycle * max(1, count)
+
+
+def _knot(key: str, k: int) -> float:
+    return zlib.crc32(f"{_bctx.salt}:{key}:{k}".encode()) / 0x7FFFFFFF - 1.0
+
+
+def _drift(key: str, t: int, period: int = 24) -> float:
+    """Smooth pseudo-random drift in [-1, 1] of process value ``key`` at
+    sample ``t`` (value noise: cosine-interpolated seeded knots), so a polled
+    value wanders plausibly over a run yet is a pure function of the seed."""
+    k, f = divmod(t, period)
+    a, b = _knot(key, k), _knot(key, k + 1)
+    return a + (b - a) * (1 - math.cos(math.pi * f / period)) / 2
 
 
 # ---------------------------------------------------------------------------
@@ -180,21 +250,24 @@ def modbus_flow(ep: Endpoints, count: int) -> List[bytes]:
     Write Single Register (FC 6, echoed back) setpoint update — one request in
     eight, the fourth of each eight."""
     exchanges = []
+    cb, dev = _cycle_base(count), f"mb:{ep.server_ip}"
     for i in range(count):
-        tid = (i + 1) & 0xFFFF
+        tid = (cb + i + 1) & 0xFFFF
         unit = 1
         if i % 8 == 3:
             # Write Single Register (FC 0x06): setpoint register 40101; the
             # normal response echoes the request exactly
             req = struct.pack("!HHHBBHH", tid, 0, 6, unit, 0x06, 100,
-                              (0x0200 + i) & 0xFFFF)
+                              int(0x0200 + 32 * _drift(dev + ":sp", cb + i)))
             exchanges.append((req, req))
             continue
         # Read Holding Registers (FC 0x03): start=0, qty=10
         req = struct.pack("!HHHBB HH", tid, 0, 6, unit, 0x03, 0, 10)
-        # Response: 10 registers (20 bytes) of sample values
-        regvals = b"".join(struct.pack("!H", (0x1000 + i + r) & 0xFFFF)
-                           for r in range(10))
+        # Response: 10 registers (20 bytes) of drifting process values
+        regvals = b"".join(
+            struct.pack("!H", int(0x1000 + 0x80 * r +
+                                  0x40 * _drift(f"{dev}:{r}", cb + i)))
+            for r in range(10))
         resp = struct.pack("!HHHBBB", tid, 0, 3 + len(regvals), unit,
                            0x03, len(regvals)) + regvals
         exchanges.append((req, resp))
@@ -222,12 +295,14 @@ def dnp3_flow(ep: Endpoints, count: int) -> List[bytes]:
         return out
 
     exchanges = []
+    cb = _cycle_base(count)
     for i in range(count):
-        tp = 0xC0 | (i & 0x3F)                     # transport: FIN | FIR | seq
-        ac = 0xC0 | (i & 0x0F)                     # application: FIR | FIN | seq
+        tp = 0xC0 | ((cb + i) & 0x3F)              # transport: FIN | FIR | seq
+        ac = 0xC0 | ((cb + i) & 0x0F)              # application: FIR | FIN | seq
         read = bytes([tp, ac, 0x01]) + b"\x3c\x01\x06"   # READ g60v1, all
-        points = b"".join(struct.pack("<Bh", 0x01, 100 * i + p)
-                          for p in range(4))      # flags ONLINE + int16
+        points = b"".join(struct.pack("<Bh", 0x01, int(
+            1000 * (p + 1) + 200 * _drift(f"dnp3:{ep.server_ip}:{p}", cb + i)))
+            for p in range(4))                     # flags ONLINE + int16
         resp = bytes([tp, ac, 0x81, 0x00, 0x00]) + \
             b"\x1e\x02\x00\x00\x03" + points       # g30v2, start-stop 0..3
         exchanges.append((link(0xC4, 1, 10, read), link(0x44, 10, 1, resp)))
@@ -237,7 +312,8 @@ def dnp3_flow(ep: Endpoints, count: int) -> List[bytes]:
 def enip_flow(ep: Endpoints, count: int) -> List[bytes]:
     """EtherNet/IP (44818): RegisterSession, unconnected CIP Get_Attribute_Single
     polls (Identity status) in SendRRData, then UnRegisterSession."""
-    session = 0x12340000 | (zlib.crc32(P.ip_to_bytes(ep.client_ip)) & 0xFFFF)
+    session = _rand32() | 1                        # target-assigned per session
+    cb = _cycle_base(count)
     exchanges = [(_enip(0x0065, 0, struct.pack("<HH", 1, 0)),
                   _enip(0x0065, session, struct.pack("<HH", 1, 0)))]
 
@@ -249,7 +325,7 @@ def enip_flow(ep: Endpoints, count: int) -> List[bytes]:
         # Get_Attribute_Single, path class 0x01 / instance 1 / attribute 5
         req = bytes([0x0E, 0x03, 0x20, 0x01, 0x24, 0x01, 0x30, 0x05])
         rsp = bytes([0x8E, 0x00, 0x00, 0x00]) + struct.pack("<H", 0x0060)
-        exchanges.append((rr(req, i + 1), rr(rsp, i + 1)))
+        exchanges.append((rr(req, cb + i + 1), rr(rsp, cb + i + 1)))
     exchanges.append((_enip(0x0066, session, b""), b""))   # UnRegisterSession
     return _tcp_flow(ep, _sport(), 44818, exchanges)
 
@@ -258,13 +334,15 @@ def s7comm_flow(ep: Endpoints, count: int) -> List[bytes]:
     """S7comm (102): COTP connect, Setup Communication, then Read Var jobs on
     DB1 answered by Ack_Data with the bytes read."""
     exchanges = _s7_connect()
+    cb = _cycle_base(count)
     for i in range(count):
-        ref = i + 1
+        ref = cb + i + 1
         addr = (i * 10) << 3                       # byte offset, in bits
         item = b"\x12\x0a\x10\x02" + struct.pack("!HHB", 10, 1, 0x84) + \
             addr.to_bytes(3, "big")                # S7ANY: 10 BYTE of DB1
         job = _s7(1, ref, b"\x04\x01" + item)
-        values = bytes((i + v) & 0xFF for v in range(10))
+        values = bytes(int(128 + 100 * _drift(f"s7:{ep.server_ip}:{i}:{v}",
+                                              cb + i)) for v in range(10))
         ack = _s7(3, ref, b"\x04\x01",
                   b"\xff\x04" + struct.pack("!H", len(values) * 8) + values)
         exchanges.append((job, ack))
@@ -288,8 +366,11 @@ def iec104_flow(ep: Endpoints, count: int) -> List[bytes]:
         return struct.pack("<BBBBH", type_id, 1, cot, 0, 1) + \
             ioa.to_bytes(3, "little") + element
 
+    cb = _cycle_base(count)
+
     def value(i: int) -> bytes:                    # short float + QDS
-        return struct.pack("<fB", 49.95 + 0.01 * i, 0x00)
+        hz = 50.0 + 0.05 * _drift(f"104:{ep.server_ip}:{i % 4}", cb + i)
+        return struct.pack("<fB", hz, 0x00)
 
     gi = b"\x14"                                   # QOI 20: station
     exchanges = [(u(0x07), u(0x0B))]               # STARTDT act / con
@@ -315,16 +396,18 @@ def bacnet_flow(ep: Endpoints, count: int) -> List[bytes]:
             npdu + apdu
 
     base = zlib.crc32(P.ip_to_bytes(ep.client_ip))
+    cb = _cycle_base(count)
     frames = []
     for i in range(count):
-        invoke = (base + i) & 0xFF
+        invoke = (base + cb + i) & 0xFF
         # context [0] object id analog-input:N, context [1] present-value (85)
         obj = b"\x0c" + struct.pack("!I", (0 << 22) | (1 + i % 4)) + b"\x19\x55"
         # Confirmed-Request, max-segs 0 / max-APDU 1476, invoke id, svc 12
         req = struct.pack("!BBBB", 0x00, 0x05, invoke, 0x0C) + obj
         # ComplexACK, same invoke id: [3] { REAL } property value
         ack = struct.pack("!BBB", 0x30, invoke, 0x0C) + obj + b"\x3e\x44" + \
-            struct.pack("!f", 21.5 + 0.25 * i) + b"\x3f"
+            struct.pack("!f", 21.5 + 1.5 * _drift(
+                f"bac:{ep.server_ip}:{1 + i % 4}", cb + i)) + b"\x3f"
         frames.append(P.udp_frame(ep, True, 47808, 47808,
                                   bvll(b"\x01\x04", req), ident=i))  # expect reply
         frames.append(P.udp_frame(ep, False, 47808, 47808,
@@ -412,11 +495,12 @@ _PING_DATA = b"abcdefghijklmnopqrstuvwabcdefghi"   # Windows ping.exe
 
 def icmp_flow(ep: Endpoints, count: int) -> List[bytes]:
     """ICMP echo request/reply (ping sweep style)."""
-    frames = []
+    frames, cb = [], _cycle_base(count)
     for i in range(count):
-        req = P.icmp_echo(0x1234, i, _PING_DATA)
+        req = P.icmp_echo(0x1234, cb + i, _PING_DATA)
         frames.append(P.ip_frame(ep, True, P.IPPROTO_ICMP, req, ident=i))
-        rep = struct.pack("!BBHHH", 0, 0, 0, 0x1234, i) + _PING_DATA
+        rep = struct.pack("!BBHHH", 0, 0, 0, 0x1234, (cb + i) & 0xFFFF) + \
+            _PING_DATA
         chk = P.checksum16(rep)
         rep = rep[:2] + struct.pack("!H", chk) + rep[4:]
         frames.append(P.ip_frame(ep, False, P.IPPROTO_ICMP, rep, ident=i))
@@ -441,10 +525,11 @@ def dns_flow(ep: Endpoints, count: int,
         net = ep.client_ip.rsplit(".", 1)[0]
         names = [(f"plc{n}.ot.local", f"{net}.{100 + n}") for n in range(5)]
     base = zlib.crc32(P.ip_to_bytes(ep.client_ip))
+    cb = _cycle_base(count)
     frames = []
     for i in range(count):
         name, addr = names[i % len(names)]
-        tid = (base + i * 0x9E5) & 0xFFFF
+        tid = (base + (cb + i) * 0x9E5) & 0xFFFF
         sport = _sport()                           # one port per transaction
         q = qname(name) + struct.pack("!HH", 1, 1)
         query = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0) + q
@@ -771,9 +856,9 @@ def ntp_flow(ep: Endpoints, count: int) -> List[bytes]:
         return struct.pack("!II", whole & 0xFFFFFFFF,
                            int((sec - whole) * 2 ** 32) & 0xFFFFFFFF)
 
-    frames = []
+    frames, cb = [], _cycle_base(count)
     for i in range(count):
-        t1 = t0 + 64 * i + 0.137 * (i % 7)         # client transmit
+        t1 = t0 + 64 * (cb + i) + 0.137 * (i % 7)  # client transmit
         t2 = t1 + 0.000412                         # server receive
         t3 = t2 + 0.000031                         # server transmit
         sport = _sport()                           # one port per transaction
