@@ -7,6 +7,7 @@ fall back to pcap-only output, which needs nothing at all.
 from __future__ import annotations
 
 import socket
+import threading
 import time
 from typing import Optional
 
@@ -53,14 +54,19 @@ class RateLimiter:
         self.interval = 1.0 / pps if pps and pps > 0 else 0.0
         self._next = time.perf_counter()
 
-    def wait(self) -> None:
+    def wait(self, stop: Optional[threading.Event] = None) -> None:
+        """Block until the next send slot; with ``stop``, long waits (slow
+        rates) return early once the event is set."""
         if self.interval <= 0:
             return
         self._next += self.interval
         now = time.perf_counter()
         delay = self._next - now
         if delay > 0:
-            time.sleep(delay)
+            if stop is not None and delay > 0.05:
+                stop.wait(delay)
+            else:
+                time.sleep(delay)
         elif delay < -1.0:
             # fell badly behind (e.g. slow terminal) — resync
             self._next = now
