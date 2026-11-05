@@ -539,7 +539,10 @@ class Engine:
                 if self._stop.is_set():
                     break
                 if pace:
-                    self._sleep_until(wall0 + ft / speed)
+                    # a pause shifts the schedule instead of bursting the
+                    # backlog on resume (tgt.control.RunControl.paused_total)
+                    self._sleep_until(wall0 + self.control.paused_total
+                                      + ft / speed)
                     if limiter.interval:
                         limiter.wait(self._stop)
                     if self._stop.is_set():
@@ -585,7 +588,8 @@ class Engine:
                 recorder.end_phase(ts_of(t) if synthetic or not pace
                                    else time.time())
             if pace:
-                self._sleep_until(wall0 + t / speed)
+                self._sleep_until(wall0 + self.control.paused_total
+                                  + t / speed)
         self.stats.cycles = max(self.stats.cycles, 1)
 
     def _write_manifest(self, recorder) -> None:
