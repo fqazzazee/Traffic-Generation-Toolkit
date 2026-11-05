@@ -1,0 +1,25 @@
+{
+  "_comment": "TEMPLATE for a Nozomi Networks Guardian asset export (CSV from the Assets view, or JSON from the query API with json_path 'result' and format 'json'). Field names vary by Guardian version: check your export header and edit the candidate lists.",
+  "format": "csv",
+  "columns": {
+    "ip": ["ip", "ips", "IP", "Ip"],
+    "mac": ["mac_address", "mac", "MAC address", "Mac address"],
+    "vlan": ["vlan_id", "vlan", "VLAN id", "Vlan id"],
+    "name": ["name", "Name", "label"],
+    "vendor": ["vendor", "Vendor"],
+    "model": ["product_name", "Product name", "model", "Model"],
+    "firmware": ["firmware_version", "Firmware version", "firmware"],
+    "serial": ["serial_number", "Serial number", "serial"],
+    "os": ["os", "OS", "operating_system"],
+    "protocols": ["protocols", "Protocols", "roles"],
+    "first_seen": ["created_at", "first_activity_time", "First activity", "Created at"]
+  },
+  "split": {"protocols": ","},
+  "normalize": {
+    "vendor": {
+      "Rockwell Automation": "Rockwell",
+      "Allen-Bradley": "Rockwell",
+      "Schweitzer Engineering Laboratories": "SEL"
+    }
+  }
+}

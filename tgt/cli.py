@@ -300,6 +300,11 @@ def cmd_inventory(args) -> int:
     return 0
 
 
+def cmd_score(args) -> int:
+    from . import score
+    return score.run(args)
+
+
 def cmd_tui(args) -> int:
     from . import tui
     return tui.run()
@@ -332,6 +337,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also list the hosts these sprinkled incidents add "
                          "as new assets (no compatible inventory host); "
                          "comma-separated, repeatable")
+
+    from . import score
+    score.add_arguments(sub.add_parser(
+        "score", help="score a monitor's asset/alert export against TGT "
+                      "ground truth (manifest or inventory JSON)"))
 
     pi = sub.add_parser("iface", help="manage virtual interfaces")
     isub = pi.add_subparsers(dest="iface_cmd", required=True)
@@ -407,6 +417,7 @@ def main(argv=None) -> int:
     return {
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,
         "inventory": cmd_inventory,
+        "score": cmd_score,
     }[args.command](args)
 
 

@@ -1,0 +1,33 @@
+{
+  "_comment": "TEMPLATE for a Claroty CTD asset CSV export. Column names differ between CTD versions and export views: open your export, check the header row and edit the candidate lists below. Nothing here is guaranteed to match your version exactly.",
+  "format": "csv",
+  "columns": {
+    "ip": ["IP", "IPs", "IP Address", "IP Addresses", "IPv4"],
+    "mac": ["MAC", "MACs", "MAC Address", "MAC Addresses"],
+    "vlan": ["VLAN", "VLANs", "Vlan", "VLAN ID"],
+    "name": ["Name", "Asset Name", "Hostname", "Host Name"],
+    "vendor": ["Vendor", "Vendor Name", "Manufacturer"],
+    "model": ["Model", "Product", "Product Code", "Model Name"],
+    "firmware": ["Firmware", "Firmware Version", "FW Version"],
+    "serial": ["Serial", "Serial Number"],
+    "os": ["OS", "Operating System", "OS Name", "OS Version"],
+    "protocols": ["Protocols", "Protocol"],
+    "first_seen": ["First Seen", "First seen", "Created", "Discovered"]
+  },
+  "split": {"protocols": ","},
+  "utc_offset": "+00:00",
+  "normalize": {
+    "vendor": {
+      "Rockwell Automation": "Rockwell",
+      "Allen-Bradley": "Rockwell",
+      "Allen Bradley": "Rockwell",
+      "Schweitzer Engineering Laboratories": "SEL",
+      "Johnson Controls International": "Johnson Controls"
+    },
+    "protocols": {
+      "CIP": "enip",
+      "S7Comm Plus": "s7comm",
+      "IEC 60870-5-104": "iec104"
+    }
+  }
+}
