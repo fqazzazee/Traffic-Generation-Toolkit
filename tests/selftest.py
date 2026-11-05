@@ -1969,9 +1969,9 @@ def _score_fixture(mode: str, **kw):
     truth = S.load_truth(os.path.join(
         _SCORE_FIX, "manifest.json" if mode == "manifest"
         else "truth-inventory.json"))
-    rows, info = S.read_export(os.path.join(_SCORE_FIX, "export-ctd.csv"),
-                               S.load_json_spec("claroty-ctd"))
-    info.update(source="export-ctd.csv", map="claroty-ctd.json")
+    rows, info = S.read_export(os.path.join(_SCORE_FIX, "export-assets.csv"),
+                               S.load_json_spec("generic"))
+    info.update(source="export-assets.csv", map="generic.json")
     alerts = S.read_alerts(os.path.join(_SCORE_FIX, "alerts.csv"),
                            S.load_json_spec("alerts-generic"))
     return S.score(truth, rows, info, zeek=os.path.join(_SCORE_FIX, "zeek"),
@@ -2182,8 +2182,8 @@ def test_score_cli_reports() -> None:
         js, ht = os.path.join(d, "r.json"), os.path.join(d, "r.html")
         p = _cli(["score", "--manifest",
                   os.path.join(_SCORE_FIX, "manifest.json"), "--assets",
-                  os.path.join(_SCORE_FIX, "export-ctd.csv"), "--map",
-                  "claroty-ctd", "--zeek", os.path.join(_SCORE_FIX, "zeek"),
+                  os.path.join(_SCORE_FIX, "export-assets.csv"), "--map",
+                  "generic", "--zeek", os.path.join(_SCORE_FIX, "zeek"),
                   "--alerts", os.path.join(_SCORE_FIX, "alerts.csv"),
                   "--alert-map", "alerts-generic", "--json", js,
                   "--html", ht])

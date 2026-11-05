@@ -3,7 +3,7 @@
 Each *flow builder* takes :class:`~tgt.packet.Endpoints` and a message ``count``
 and returns a list of complete Ethernet frames (``bytes``).  OT/ICS protocols
 are crafted at the byte level so the well-known signatures that DPI engines such
-a DPI monitor (Zeek, Suricata, Claroty CTD, …) classifies on are explicit.
+a DPI monitor (Zeek, Suricata, an OT monitor, …) classifies on are explicit.
 
 TCP protocols emit a coherent session (SYN / SYN-ACK / ACK, PSH data both ways,
 FIN teardown) via :class:`TcpSession` so stream-reassembling sensors see a real

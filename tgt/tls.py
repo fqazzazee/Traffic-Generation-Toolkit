@@ -3,7 +3,7 @@
 A sensor fingerprints TLS clients by their ClientHello (JA3 / JA4: version,
 cipher suites, extensions, groups, point formats, signature algorithms, ALPN)
 and inventories servers by the certificate they present (Zeek ``x509.log``,
-CTD). Each :class:`ClientTemplate` reproduces one real client family — Windows
+passive monitors). Each :class:`ClientTemplate` reproduces one real client family — Windows
 SChannel (10 / 7 / XP / 2000), Chrome and Firefox on the desktop, OpenSSL/curl
 on Linux, the CrowdStrike Falcon sensor — so hosts of different OSes carry
 different JA3/JA4 hashes while each family stays stable.

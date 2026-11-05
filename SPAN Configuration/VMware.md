@@ -1,6 +1,6 @@
 # VMware vSphere — SPAN / mirror feed setup
 
-Goal: get every frame TGT sends visible to an analyser VM (Claroty CTD, Zeek,
+Goal: get every frame TGT sends visible to an analyser VM (Zeek,
 Suricata, Security Onion, …) on ESXi/vSphere. vSphere has a real, native, GUI-driven
 port-mirroring feature — but only on a **vSphere Distributed Switch (vDS)**, which
 requires vCenter and an **Enterprise Plus** license (a vDS is also included free if
@@ -31,12 +31,12 @@ Mirroring Source/Destination or ERSPAN over plain Distributed Port Mirroring.
    Port Mirroring → New.**
 2. Choose a **session type** (exact descriptions per VMware's own docs):
    - **Distributed Port Mirroring** — "Mirror packets from a number of distributed
-     ports to other distributed ports **on the same host**." Use this for TGT → CTD
+     ports to other distributed ports **on the same host**." Use this for TGT → analyser
      when both VMs are pinned to the same ESXi host. **Important, confirmed gotcha:**
      this session type only works while source and destination stay on the same
      host — VMware's own troubleshooting KB documents it breaking the moment either
      VM vMotions to a different host, with the fix being to switch to Encapsulated
-     Remote Mirroring (L3) Source instead. If DRS could ever move TGT or CTD, don't
+     Remote Mirroring (L3) Source instead. If DRS could ever move TGT or the analyser, don't
      use this session type for anything you need to keep working.
    - **Remote Mirroring Source** — "Mirror packets from a number of distributed ports
      to specific uplink ports on the corresponding host." Sends mirrored traffic out
@@ -54,8 +54,8 @@ Mirroring Source/Destination or ERSPAN over plain Distributed Port Mirroring.
      upstream on physical switch gear instead.
 3. Set **source**: the TGT VM's vNIC port (or the whole port group), direction
    ingress/egress/both.
-4. Set **destination**: the CTD VM's vNIC port (Distributed Port Mirroring), or a VLAN
-   ID (Remote Mirroring Source), or the CTD VM's IP address (Encapsulated Remote
+4. Set **destination**: the analyser VM's vNIC port (Distributed Port Mirroring), or a VLAN
+   ID (Remote Mirroring Source), or the analyser VM's IP address (Encapsulated Remote
    Mirroring/ERSPAN).
 5. Enable the session (sessions are created disabled by default) and save.
 
@@ -65,7 +65,7 @@ the destination port, it isn't relying on flooding.
 ## Option B — Standard vSwitch, no vDS license: promiscuous-mode fallback (still GUI)
 
 If you don't have Enterprise Plus/vDS, there's a widely used, still entirely
-GUI-driven trick often called the "poor man's SPAN": put TGT and CTD on the same
+GUI-driven trick often called the "poor man's SPAN": put TGT and the analyser on the same
 port group and flip that port group's security policy to promiscuous.
 
 1. **Host → Configure → Networking → Virtual switches** (or **Host Client** if
@@ -80,7 +80,7 @@ port group and flip that port group's security policy to promiscuous.
    group to the promiscuous port(s), regardless of destination MAC, functioning as a
    hub for that segment.
 
-This works per-host; if TGT and CTD land on different ESXi hosts with no vDS tying
+This works per-host; if TGT and the analyser land on different ESXi hosts with no vDS tying
 them together, you need identical port group names/VLANs on each host **and** the
 physical switch trunking that VLAN between hosts — same requirement documented for
 Nutanix multi-host in `Nutanix.md`.
@@ -116,7 +116,7 @@ Source** above, the matching Cisco-side config is a standard `monitor session`:
 monitor session 1 source interface Gi1/0/1
 monitor session 1 destination remote vlan 900
 
-! ERSPAN, routed to the CTD VM's IP directly
+! ERSPAN, routed to the analyser VM's IP directly
 monitor session 1 source interface Gi1/0/1 both
 monitor session 1 destination ip address 10.10.10.50
 ```
@@ -143,8 +143,8 @@ field experience:
 ```bash
 tcpdump -i <monitor-nic> -n
 ```
-on the CTD/analyser VM, confirm TGT's traffic (or the decapsulated ERSPAN stream)
-arrives before pointing CTD's detection engine at the interface.
+on the analyser VM, confirm TGT's traffic (or the decapsulated ERSPAN stream)
+arrives before pointing the analyser's detection engine at the interface.
 
 ## Sources
 

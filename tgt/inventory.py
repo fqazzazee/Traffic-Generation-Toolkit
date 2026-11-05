@@ -3,7 +3,7 @@
 What a sensor *should* discover when fed ``tgt run --env KEY``: every host with
 its addressing, vendor/product, OS fingerprint, segment/VLAN/zone, risk notes,
 and the services it serves and uses. Diff it against the analyser's asset list
-(Claroty CTD, Nozomi, Zeek ``known_hosts``, …) to measure discovery coverage.
+(an asset-inventory export, Zeek ``known_hosts``, …) to measure discovery coverage.
 
 CSV holds one row per host; JSON adds the segments, the expected flows (the
 communication baseline), per-field observability (can a passive monitor learn

@@ -23,6 +23,13 @@
 - **CODESYS V3** runtime and discovery, plus CODESYS controllers (WAGO, Modicon M241/M251,
   Eaton XC300) on `auto-assembly`. #49
 
+### Changed
+- **Product-neutral.** The `claroty-ctd` and `nozomi` template score maps are removed. Their
+  column names are folded into `generic`, which now matches the headers common asset
+  exports use, and protocol lists split on `;`, `,` or `|`. Docs, help text and packaging
+  no longer name commercial monitors. If you used `--map claroty-ctd` or `--map nozomi`,
+  use `--map generic`, or a copy of it with your export's headers.
+
 ### Replay
 - IPv6 in `--remap-ip` / `--remap-subnet`: extension headers, fragments, NDP and EUI-64.
   `--remap-env ENV` maps a capture's hosts onto an environment by role and vendor, and

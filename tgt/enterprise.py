@@ -6,7 +6,7 @@ realistic mix of conversations between them: DNS/Kerberos/LDAP to the DC, SMB to
 the file server, HTTP/HTTPS browsing, DHCP/NetBIOS fingerprint chatter, and — on
 the OT side — Rockwell EtherNet/IP and Siemens S7comm PLC polling with vendor
 identity. Legacy hosts (Windows 2000/XP/7) advertise SMBv1 and old User-Agents so
-an analyser (Zeek, Suricata, Claroty CTD, …) can inventory assets and flag the risky ones.
+an analyser (Zeek, Suricata, an OT monitor, …) can inventory assets and flag the risky ones.
 
 Hosts sit in segments (:class:`Segment`) — one VLAN + subnet + security zone each, routed
 by a core L3 switch. Same-segment flows are switched (peer MACs); cross-segment

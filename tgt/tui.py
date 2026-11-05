@@ -2192,7 +2192,7 @@ IFACE_FIELDS = [
           "send interface appears here.",
           show=lambda ui: ui.link_kind() == "veth"),
     Field("Sensor label", lambda ui: ui.sensor_label, _act_sensor,
-          "Name shown in the SENSOR box (e.g. Claroty CTD, Zeek, Suricata).",
+          "Name shown in the SENSOR box (e.g. Zeek, Suricata, your monitor).",
           keys="Enter edit"),
     Field("Create veth pair", lambda ui: ("press Enter", C_DIM), _act_create,
           "Create <name> and <name>-mon (needs iproute2 and sudo)."),

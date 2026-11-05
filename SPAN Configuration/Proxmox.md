@@ -1,6 +1,6 @@
 # Proxmox VE — SPAN / mirror feed setup
 
-Goal: get every frame TGT sends visible to an analyser VM (Claroty CTD, Zeek,
+Goal: get every frame TGT sends visible to an analyser VM (Zeek,
 Suricata, Security Onion, Malcolm, …) on Proxmox VE. Proxmox has **no built-in
 port-mirroring GUI feature** — not for the default Linux bridge, and not for the
 optional Open vSwitch bridge type either (the GUI lets you *create* an OVS bridge, but
@@ -122,7 +122,7 @@ monitor session 1 destination ip address 10.10.10.50     ! ERSPAN
 For SPAN/RSPAN, dedicate a physical NIC on the Proxmox host to a bridge with that
 uplink attached and put the analyser's tap on it (promiscuous mode in-guest, as above).
 For ERSPAN, no special bridge/VLAN is needed at all — it's just routed GRE traffic to
-the analyser VM's ordinary IP; confirm your analyser (Claroty CTD, etc.) supports
+the analyser VM's ordinary IP; confirm your analyser supports
 ERSPAN ingestion natively before committing to this as the design.
 
 ## Community tips

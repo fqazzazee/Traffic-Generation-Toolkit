@@ -1606,7 +1606,7 @@ def add_arguments(p) -> None:
                    help="the monitor's asset export (CSV/JSON/Zeek log)")
     p.add_argument("--map", metavar="MAP",
                    help="column map: a path or a bundled name (generic, "
-                        "zeek-known-hosts, claroty-ctd, nozomi)")
+                        "zeek-known-hosts)")
     p.add_argument("--zeek", metavar="DIR",
                    help="Zeek log dir (or conn.log): baseline-flow coverage")
     p.add_argument("--alerts", metavar="FILE",

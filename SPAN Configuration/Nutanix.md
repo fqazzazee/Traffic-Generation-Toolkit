@@ -1,6 +1,6 @@
 # Nutanix AHV — SPAN / mirror feed setup
 
-Goal: get every frame TGT sends visible to an analyser VM (Claroty CTD, Zeek,
+Goal: get every frame TGT sends visible to an analyser VM (Zeek,
 Suricata, Security Onion, …) on Nutanix AHV, using supported tools wherever possible.
 
 **Correction from an earlier draft of this doc:** Nutanix *does* now ship a native,
@@ -43,7 +43,7 @@ support login, and content moves between releases — the links below are the do
    titles, this lives in the same part of Prism Central as Flow Network
    Security/Virtual Networking — check your version's nav, it has moved across
    releases) and **create a session**: select the TGT VM's NIC as the mirror source
-   and the analyser (CTD) VM's NIC as the destination.
+   and the analyser VM's NIC as the destination.
 2. Sessions appear to be created and then separately **enabled** — the docs have a
    distinct "Enabling a Traffic Mirroring Session" page, the same create-then-enable
    pattern VMware's vDS uses (see `VMware.md`). Don't assume a newly created session
@@ -135,7 +135,7 @@ the physical switch and land the feed on a normal Nutanix subnet or a passthroug
 - **ERSPAN:** have the physical switch GRE-encapsulate the mirrored traffic and route
   it to the analyser VM's IP over an ordinary Subnet — no passthrough, no special
   trunking required, since it's just routed IP traffic. Confirm your analyser's
-  (e.g. Claroty CTD's) supported ingestion methods before committing to this. See
+  supported ingestion methods before committing to this. See
   `VMware.md` and `Proxmox.md` for the switch-side `monitor session` commands — the
   switch-side config is identical regardless of which hypervisor the destination VM
   runs on.

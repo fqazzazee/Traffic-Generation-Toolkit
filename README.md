@@ -6,8 +6,7 @@
 network monitor can capture and classify it just like a physical SPAN / mirror feed.**
 
 Works with any sensor — **Wireshark, Zeek, Suricata, Security Onion, Malcolm**
-(all free/open-source), or a commercial OT platform like **Claroty CTD, Nozomi or
-Dragos**. Runs on a workstation, in **WSL**, or in a **Podman / Docker** container.
+(all free/open-source), or any commercial OT / IT monitoring platform. Runs on a workstation, in **WSL**, or in a **Podman / Docker** container.
 
 `zero dependencies` · `pure Python stdlib` · `TUI + CLI` · `runs as a service`
 
@@ -554,8 +553,8 @@ frame count. Import the pcap into a monitor that accepts offline captures, or `t
 ## Evaluating a monitor
 
 The workflow TGT is built around: **know what's on the wire, let the monitor learn a
-baseline, change things or attack, then grade what it reported.** Claroty CTD, Nozomi,
-Dragos, Zeek or any other passive monitor fits; only the export step differs.
+baseline, change things or attack, then grade what it reported.** Any passive monitor
+fits — open source or commercial; only the export step differs.
 
 **1. Pick an environment** like the one the product will face — a built-in, a [packaged
 site](#packaged-sites) or [your own](#your-own-environments) — and wire up a veth or a
@@ -570,8 +569,8 @@ tgt inventory -e water-utility -o truth.csv          # spreadsheet view
 ```
 
 **3. Run a baseline with a manifest.** Use the timed scheduler so polling looks real, and
-let it run through the monitor's learning period (CTD's training mode, Nozomi's learning
-phase) before you change anything. The manifest records the seed, the inventory, when each
+let it run through the monitor's learning (training / baselining) period before you change
+anything. The manifest records the seed, the inventory, when each
 asset first and last sent a frame, every flow seen, and every attack event; it is rewritten
 every ~10 s and on exit, so a long or killed run still leaves a valid file.
 
@@ -622,25 +621,25 @@ source/destination, title); for Zeek, `known_hosts.log` and the log directory.
 fields but not time or detections):
 
 ```bash
-tgt score --manifest baseline.json --assets ctd-assets.csv --map claroty-ctd \
-          --alerts ctd-alerts.csv --alert-map alerts-generic --html report.html --json report.json
+tgt score --manifest baseline.json --assets assets.csv --map generic \
+          --alerts alerts.csv --alert-map alerts-generic --html report.html --json report.json
 tgt score --truth truth.json --assets known_hosts.log --map zeek-known-hosts --zeek /opt/zeek/logs/current
 ```
 
 | map | for |
 |---|---|
-| `generic` | any CSV with common column names (also reads `tgt inventory` CSV) — copy and edit for your product |
+| `generic` | an asset export in CSV (or JSON with `json_path`) whose headers are common names — `IP` / `IP Address`, `MAC`, `VLAN`, `Name` / `Hostname`, `Vendor`, `Model` / `Product`, `Firmware`, `Serial`, `OS`, `Protocols`, `First Seen`, … (case-insensitive); also reads `tgt inventory` CSV |
 | `zeek-known-hosts` | Zeek `known_hosts.log` (IP + first seen: discovery, precision, time-to-discover) |
-| `claroty-ctd` | **template** for a CTD asset CSV export |
-| `nozomi` | **template** for a Nozomi Guardian asset export (CSV or JSON) |
-| `alerts-generic` | alert map: columns + regexes that map vendor alert titles onto TGT's event categories |
+| `alerts-generic` | alert map: columns + regexes that map alert titles onto TGT's event categories (and, optionally, ATT&CK techniques) |
 
-> **The `claroty-ctd` and `nozomi` maps are templates.** Column names differ between product
-> versions and export views. Open your export, compare its header row with the candidate
-> lists in `tgt/scoremaps/claroty-ctd.json` (or `nozomi.json`), and copy/edit the map before
-> trusting the numbers. Do the same with the regexes in `alerts-generic.json`, so your
-> product's alert titles land on the right categories. `--map` and `--alert-map` take a
-> bundled name or a path.
+> **Check the map against your export.** Monitors name their export columns differently, and
+> the same product differs between versions and views. Compare your export's header row with
+> the candidate lists in `tgt/scoremaps/generic.json`; if a column isn't matched, copy the
+> map, add your header names and pass it with `--map my-map.json`. Do the same with the
+> regexes in `alerts-generic.json`, so your monitor's alert titles land on the right
+> categories. The JSON report's `export.columns` says which fields were found in the export
+> (a field with no matched column is not scored). `--map` and `--alert-map` take a bundled
+> name or a path.
 
 To check the scoring itself, `tgt score --manifest run.json --self-test-export perfect.csv`
 writes the export a perfect monitor would produce (generic map: every asset that sent
@@ -700,10 +699,10 @@ detect, technique coverage, false alerts, and the suite's pass / fail thresholds
 differ. `tgt bench score DIR --self-test-export OUT` writes perfect exports to check the
 pipeline end to end.
 
-### Tips for Claroty CTD (and similar monitors)
+### Tips for evaluating a monitor
 
-- **Baseline before you attack.** CTD learns the network in its training mode, and
-  baseline-deviation alerts (new asset, new conversation, changes) only mean something once
+- **Baseline before you attack.** Most OT monitors learn the network in a training or
+  baselining mode, and baseline-deviation alerts (new asset, new conversation, changes) only mean something once
   it has left it. Run clean traffic through the learning period, then sprinkle, inject or let
   a campaign reach its change phases.
 - **Enable the threat content.** Make sure the threat-detection, known-threat and
@@ -1069,8 +1068,8 @@ already brings both ends up, and synthetic MACs flood freely across a local veth
 
 ### Proxmox — feed a Traffic Analyser VM (hub bridge)
 
-Typical lab: **TGT in one VM, the analyser** (Zeek, Suricata, Security Onion, Malcolm,
-Claroty CTD, …) **in another, on the same host.** Put both VMs on an isolated Linux
+Typical lab: **TGT in one VM, the analyser** (Zeek, Suricata, Security Onion, Malcolm, a
+commercial OT monitor, …) **in another, on the same host.** Put both VMs on an isolated Linux
 bridge run as a **hub** — no MAC learning, so every frame floods to the analyser, just
 like a SPAN feed.
 

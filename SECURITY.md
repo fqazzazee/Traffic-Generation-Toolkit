@@ -5,8 +5,8 @@
 TGT (Traffic Generation Toolkit) is a **defensive / testing** tool. It generates
 synthetic test traffic onto virtual interfaces **you** create, so you can validate
 passive network monitoring — SPAN/mirror ingestion, IDS/IPS, and asset-discovery
-tooling (Wireshark, Zeek, Suricata, Security Onion, Malcolm, or commercial OT
-platforms such as Claroty CTD, Nozomi, Dragos).
+tooling (Wireshark, Zeek, Suricata, Security Onion, Malcolm, or a commercial OT
+monitoring platform).
 
 TGT does **not** scan, exploit, or interact with third-party systems. Its "incident"
 scenarios reproduce the **detectable network signatures** of known attacks (ports,

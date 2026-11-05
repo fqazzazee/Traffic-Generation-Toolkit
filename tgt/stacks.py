@@ -1,6 +1,6 @@
 """Per-OS TCP/IP stack fingerprints — SYN options, windows, IP ID, DF.
 
-Passive fingerprinting (p0f, Zeek/JA4T-style, Claroty CTD, Nozomi) classifies a
+Passive fingerprinting (p0f, Zeek/JA4T-style, OT and IT monitors) classifies a
 host by how its stack opens a connection: the TCP option *layout* in the SYN
 (``mss,nop,ws,nop,nop,sok`` is Windows; ``mss,sok,ts,nop,ws`` is Linux; a bare
 ``mss`` is an embedded RTOS), the initial window and scale, whether timestamps
