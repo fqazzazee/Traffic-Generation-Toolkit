@@ -1220,3 +1220,94 @@ def _site_reindex() -> None:
 
 
 _site_reindex()
+
+
+# ===========================================================================
+# Serial-to-Ethernet gateways and IIoT (tgt/protocols_iiot.py, site
+# iiot-retrofit): Moxa / Lantronix device servers and a Modbus gateway, LoRa
+# gateways, a BACnet/SC hub, and the field devices that sit behind them
+# (serial slaves and LoRaWAN sensors: no IP of their own — their OUI is the
+# vendor's, the prefix of a LoRaWAN sensor's DevEUI). OUIs are from
+# Wireshark's manuf database; product names are the vendors'; firmware lists,
+# serial formats, sysDescr strings, sysObjectIDs and Moxa search product ids
+# are representative. ``moxa`` identity: ``product_id`` the device-search
+# reply carries.
+# ===========================================================================
+_LANTRONIX = ("00:80:a3", "00:c0:f2")
+_KERLINK = ("70:76:ff",)
+_MULTITECH = ("00:08:00",)
+_CONTEMPORARY = ("00:50:db",)
+_MILESIGHT = ("24:e1:24", "c0:ba:1f")
+_DRAGINO = ("a8:40:41",)
+_ABB_DRIVES = ("00:1c:01",)
+
+
+def _gw(model_id, vendor, product, dtype, ouis, level, os_family, fw, serial,
+        identity=None, banners=None, stack="embedded", aliases=()):
+    _add(DeviceModel(model_id, vendor, product, dtype, ouis, level, os_family,
+                     fw, serial, identity=identity or {},
+                     banners=dict({"http": ""}, **(banners or {})),
+                     aliases=aliases, stack=stack))
+
+
+# -- serial device servers / gateways ---------------------------------------
+_gw("moxa-nport-5150", "Moxa", "NPort 5150 1-port RS-232/422/485 serial "
+    "device server", "serial-gateway", _MOXA, "1", "Moxa NPort firmware",
+    ("V3.9", "V3.10", "V3.11"), "TAGBB#######",
+    {"moxa": {"product_id": 0x5150}},
+    {"snmp_sysdescr": "NPort 5150", "snmp_sysobjectid": "1.3.6.1.4.1.8691.2.7"},
+    aliases=("NPort 5150",))
+_gw("moxa-nport-5650-16", "Moxa", "NPort 5650-16 16-port rackmount RS-232/"
+    "422/485 serial device server", "serial-gateway", _MOXA, "1",
+    "Moxa NPort firmware", ("V3.9", "V3.11", "V3.12"), "TAHCB#######",
+    {"moxa": {"product_id": 0x5650}},
+    {"snmp_sysdescr": "NPort 5650-16",
+     "snmp_sysobjectid": "1.3.6.1.4.1.8691.2.8"},
+    aliases=("NPort 5650-16",))
+_gw("moxa-mgate-mb3170", "Moxa", "MGate MB3170 1-port Modbus TCP to RTU/ASCII "
+    "gateway", "protocol-gateway", _MOXA, "1", "Moxa MGate firmware",
+    ("V4.2", "V4.3", "V4.4"), "TAIDB#######",
+    {"moxa": {"product_id": 0x3170}},
+    {"snmp_sysdescr": "MGate MB3170",
+     "snmp_sysobjectid": "1.3.6.1.4.1.8691.21.1"},
+    aliases=("MGate MB3170",))
+_gw("lantronix-uds1100", "Lantronix", "UDS1100 1-port serial device server",
+    "serial-gateway", _LANTRONIX, "1", "Lantronix device server firmware",
+    ("6.10.0.1", "6.11.0.4", "6.11.0.7"), "########",
+    aliases=("UDS1100",))
+# -- LoRaWAN gateways (Semtech UDP packet forwarder) --------------------------
+_gw("kerlink-wirnet-istation", "Kerlink", "Wirnet iStation LoRaWAN gateway",
+    "lora-gateway", _KERLINK, "2", "KerOS (Linux)",
+    ("5.9.1", "5.10.4", "6.1.2"), "########",
+    banners={"snmp_sysdescr": "Linux {name} KerOS {firmware} armv7l"},
+    stack="linux", aliases=("Wirnet iStation",))
+_gw("multitech-conduit-mtcdt", "Multitech", "MultiTech Conduit MTCDT "
+    "LoRaWAN gateway", "lora-gateway", _MULTITECH, "2", "mPower (Linux)",
+    ("5.3.8", "6.0.2", "6.3.0"), "########",
+    banners={"snmp_sysdescr": "MultiTech Conduit mPower {firmware}"},
+    stack="linux", aliases=("Conduit MTCDT",))
+# -- BACnet/SC hub -----------------------------------------------------------
+_gw("contemporary-basrouter-sc", "Contemporary Controls",
+    "BASrouterSC BACnet/SC router and hub", "bacnet-sc-hub", _CONTEMPORARY,
+    "2", "BASrouterSC firmware (Linux)", ("1.0.6", "1.1.2", "1.2.0"),
+    "BRSC######", stack="linux", aliases=("BASrouterSC",))
+# -- field devices behind gateways (no IP of their own) ----------------------
+_gw("schneider-pm5330", "Schneider Electric", "PowerLogic PM5330 power meter "
+    "(RS-485 Modbus RTU)", "meter", _SCHNEIDER, "0", "PM5000 firmware",
+    ("2.2.1", "2.3.4", "3.0.2"), "#########",
+    {"modbus": _modbus_id("Schneider Electric", "METSEPM5330",
+                          "PM5330", "www.se.com")},
+    aliases=("PM5330",))
+_gw("abb-acs580", "ABB", "ACS580 general-purpose drive (embedded fieldbus, "
+    "Modbus RTU)", "drive", _ABB_DRIVES, "0", "ACS580 primary control "
+    "firmware", ("2.15.0.1", "2.16.0.4", "2.19.0.2"), "#########",
+    {"modbus": _modbus_id("ABB", "ACS580-01", "ACS580", "new.abb.com")},
+    aliases=("ACS580",))
+_gw("milesight-em300-th", "Milesight", "EM300-TH LoRaWAN temperature and "
+    "humidity sensor", "sensor", _MILESIGHT, "0", "Milesight EM300 firmware",
+    ("1.2", "1.3", "1.5"), "6136?#########", aliases=("EM300-TH",))
+_gw("dragino-lht65n", "Dragino", "LHT65N LoRaWAN temperature and humidity "
+    "sensor", "sensor", _DRAGINO, "0", "Dragino LHT65N firmware",
+    ("1.2.3", "1.2.5", "1.3.0"), "A84041########", aliases=("LHT65N",))
+
+_site_reindex()
