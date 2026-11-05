@@ -393,47 +393,90 @@ class Incident:
             i += 1
         return out
 
+    def served(self) -> Dict[str, set]:
+        """Services each internal incident host must expose because the
+        incident connects to it (see ``_ATTACK_SERVICE``): {host: {service}}.
+        Reconnaissance (a port scan) requires nothing."""
+        need: Dict[str, set] = {}
+        for _, vname, atk, _ in self.flows:
+            svc = _ATTACK_SERVICE.get(atk)
+            if svc and not _is_external(self.host(vname)):
+                need.setdefault(vname, set()).add(svc)
+        return need
+
     def map_onto(self, env) -> Dict[str, Host]:
         """Map each internal incident host onto an environment host, so
         sprinkled malware rides on real inventory assets.
 
-        A candidate must share the role, or failing that the role family
-        (see ``_ROLE_FAMILIES``); an embedded device must also come from the
-        same vendor (by MAC OUI), so a Siemens S7 attack never lands on a
-        Rockwell PLC.
+        A candidate must be able to serve every service the incident connects
+        to on that host (see :meth:`served` and ``_can_serve``): an OT control
+        protocol only on a host the environment's own conversations show
+        serving it, or whose product implies it (an S7-315 never answers
+        IEC-104, a Modicon never answers TriStation). It must also share the
+        role or role family (see ``_ROLE_FAMILIES``) — or, failing that, already
+        serve those services at the same Purdue level — and an embedded device
+        must come from the same vendor (MAC OUI, else firmware fingerprint) and
+        product family (``_product_family``), so a Siemens S7 attack never lands
+        on a Rockwell PLC nor a Triconex SIS on a Modicon.
 
         Hosts are mapped top-down through the Purdue model (enterprise stages
         first, plant floor last; see ``_purdue_level``) so the kill chain lands
         as a coherent descent: an upstream stage anchors the zone, and each
         downstream victim prefers a host in the same segment as a neighbour that
         is already placed — keeping a cell's devices together and lateral
-        movement inside one zone. Among candidates: exact role first, then that
-        neighbour affinity, then a host not yet used, then the same OS. Hosts
-        with no candidate — and external adversary infrastructure (see
-        ``_is_external``) — keep their own identity."""
+        movement inside one zone. Among candidates: exact role first, then a
+        host the environment already shows serving the services, then the same
+        product, then that neighbour affinity, then a host not yet used, then
+        the same OS. Hosts with no candidate keep their own identity and appear
+        as new assets (see :meth:`unmapped_hosts`); external adversary
+        infrastructure (see ``_is_external``) is never remapped."""
         adj: Dict[str, set] = {}
         for a, v, _, _ in self.flows:
             adj.setdefault(a, set()).add(v)
             adj.setdefault(v, set()).add(a)
         internal = sorted((h for h in self.hosts if not _is_external(h)),
                           key=lambda h: (-_purdue_level(h.role), h.name))
+        observed = _env_services(env)
+        need = self.served()
         used: set = set()
         mapping: Dict[str, Host] = {}
         for ih in internal:
             vendor = _device_vendor(ih)
-            cands = [h for h in env.hosts if _role_tier(ih.role, h.role)
-                     and (vendor is None or _device_vendor(h) == vendor)]
+            family = _product_family(ih)
+            svcs = need.get(ih.name, set())
+
+            def seen(h: Host) -> bool:
+                return bool(svcs) and svcs <= observed.get(h.name, set())
+
+            cands = [h for h in env.hosts
+                     if (vendor is None or _device_vendor(h) == vendor)
+                     and (family is None or _product_family(h) in (None, family))
+                     and all(_can_serve(h, s, observed) for s in svcs)
+                     and (_role_tier(ih.role, h.role) or
+                          (seen(h) and _purdue_level(h.role)
+                           == _purdue_level(ih.role)))]
             if not cands:
                 continue
             neigh_segs = {env.segment_of(mapping[n])
                           for n in adj.get(ih.name, ()) if n in mapping}
             pick = min(cands, key=lambda h: (
-                -_role_tier(ih.role, h.role),
+                -_role_tier(ih.role, h.role), not seen(h),
+                not (ih.product and h.product.startswith(ih.product)),
                 env.segment_of(h) not in neigh_segs,
                 h.name in used, h.os != ih.os, h.name))
             used.add(pick.name)
             mapping[ih.name] = pick
         return mapping
+
+    def unmapped_hosts(self, env) -> List[Host]:
+        """Internal incident hosts :meth:`map_onto` cannot place on ``env``'s
+        inventory (no compatible asset), in incident order. They keep their own
+        addressing on the wire, so a sensor should report each one as a *new
+        asset* — list them as expected findings in the ground truth. External
+        adversary infrastructure (C2, public attackers) is not included."""
+        mapping = self.map_onto(env)
+        return [h for h in self.hosts
+                if not _is_external(h) and h.name not in mapping]
 
     def build_on(self, messages: int, env,
                  span: str = "access") -> List[Tuple[str, bytes]]:
@@ -528,12 +571,95 @@ def _purdue_level(role: str) -> int:
 
 
 def _device_vendor(host: Host):
-    """Embedded-device vendor from the MAC OUI; ``None`` for generic PC/VM
-    NICs (VMware, Dell), whose OUI says nothing about the software."""
+    """Embedded-device vendor from the MAC OUI; for a generic PC/VM NIC
+    (VMware, Dell), whose OUI says nothing about the software, the vendor of
+    an embedded firmware fingerprint, else ``None``."""
     oui = host.mac[:8].lower()
     if oui in (OUI_WIN, OUI_DELL):
-        return None
+        return _FIRMWARE_VENDORS.get(host.os)
     return OUI_VENDORS.get(oui)
+
+
+# Embedded firmware fingerprints that name their vendor.
+_FIRMWARE_VENDORS = {"rockwell": "Rockwell Automation",
+                     "siemens": OUI_VENDORS[OUI_SIEMENS],
+                     "schneider": OUI_VENDORS[OUI_SCHNEIDER],
+                     "sel": "Schweitzer Engineering Laboratories"}
+
+# Product families by model/order-number substring, and the control protocols
+# the product serves. The OUI alone cannot tell them apart (Triconex and
+# Modicon both carry Schneider's OUI), so a known family must match.
+_PRODUCT_FAMILIES = [
+    (("Triconex",), "triconex", {"tristation"}),
+    (("Modicon", "BMX P34", "BME P58"), "modicon", {"modbus"}),
+    (("PowerLogic",), "powerlogic", {"modbus"}),
+    (("Omron", "NJ501"), "omron", {"enip"}),
+    (("6ES7",), "simatic", {"s7comm"}),
+    (("SICAM",), "sicam", {"iec104"}),
+    (("RTAC",), "rtac", {"dnp3"}),
+    (("SEL-",), "sel-relay", {"dnp3"}),
+    (("PowerFlex",), "powerflex", {"enip"}),
+    (("Logix", "1756-", "1769-", "5069-"), "logix", {"enip"}),
+    (("JACE",), "jace", {"bacnet"}),
+    (("Metasys",), "metasys", {"bacnet"}),
+]
+
+
+def _product_entry(host: Host):
+    for tokens, family, svcs in _PRODUCT_FAMILIES:
+        if any(t in host.product for t in tokens):
+            return family, svcs
+    return None, set()
+
+
+def _product_family(host: Host) -> Optional[str]:
+    """The host's product family from its model string, ``None`` if unknown."""
+    return _product_entry(host)[0]
+
+
+# The service each attack connects to on its victim (None = requires nothing,
+# e.g. a SYN sweep that mostly hits closed ports).
+_ATTACK_SERVICE: Dict[str, Optional[str]] = {
+    "port-scan": None, "eternalblue": "smb", "smb-lateral": "smb",
+    "c2-beacon": "http", "log4shell": "http", "https-c2": "https",
+    "dga-dns": "dns", "dns-tunnel": "dns", "telnet-brute": "telnet",
+    "rdp-brute": "rdp", "s7-control": "s7comm", "iec104-command": "iec104",
+    "tristation": "tristation", "modbus-write": "modbus",
+}
+
+# Identification/variant protocols that imply the host serves the base one.
+_SERVICE_ALIAS = {"s7-id": "s7comm", "enip-id": "enip"}
+
+# Generic IT services any host of the right role/OS may expose even when the
+# environment's baseline never exercises them; everything else (the OT control
+# protocols) must be observed or implied by the product.
+_WINDOWS_SERVICES = {"smb", "rdp", "netbios"}
+_GENERIC_SERVICES = {"http", "https", "dns"}
+
+
+def _env_services(env) -> Dict[str, set]:
+    """{host: {protocol}} each env host serves in its normal conversations
+    (ARP and self-announcements are not services)."""
+    from .protocols import get as proto
+    out: Dict[str, set] = {}
+    for client, server, p in env.conversations:
+        if server != client and proto(p).transport != "l2":
+            out.setdefault(server, set()).add(_SERVICE_ALIAS.get(p, p))
+    return out
+
+
+def _can_serve(host: Host, svc: str, observed: Dict[str, set]) -> bool:
+    """Whether ``host`` plausibly serves ``svc``: the env shows it doing so or
+    its product implies it; otherwise only generic IT services, gated by OS
+    (SMB/RDP need Windows, Telnet an embedded/Linux stack)."""
+    if svc in observed.get(host.name, ()) or svc in _product_entry(host)[1]:
+        return True
+    windows = host.os.startswith("win")
+    if svc in _WINDOWS_SERVICES:
+        return windows
+    if svc == "telnet":
+        return not windows
+    return svc in _GENERIC_SERVICES
 
 
 def _h(name, ip, role, os_, oui=OUI_WIN, product=""):
@@ -581,8 +707,10 @@ _reg(Incident("sunburst", "SUNBURST (SolarWinds)", "IT", "2020",
         "domain": "avsvmcloud.com"})]))
 
 _reg(Incident("conficker", "Conficker", "IT", "2008",
-    "Worm exploiting MS08-067 over SMB (445) with a domain-generation "
-    "algorithm for C2 rendezvous.",
+    "Worm that spread via MS08-067 over SMB (445), with a domain-generation "
+    "algorithm for C2 rendezvous: 445/139 probe, DGA lookups, and the generic "
+    "SMBv1 exploit-attempt indicator (MS17-010-style; no MS08-067 "
+    "NetPathCanonicalize RPC is emitted).",
     [_h("CONFICKER-HOST", "10.20.20.77", "ws", "win2000"),
      _h("WS-LAB", "10.20.20.43", "ws", "winxp"),
      _h("DNS01", "10.20.10.12", "dns", "win2019")],
@@ -615,8 +743,10 @@ _reg(Incident("log4shell", "Log4Shell", "IT", "2021",
 
 # ---- OT incidents ----------------------------------------------------------
 _reg(Incident("stuxnet", "Stuxnet", "OT", "2010",
-    "Sabotage of Siemens S7 PLCs at Natanz: SMBv1 propagation and S7comm "
-    "PLC STOP commands from a compromised engineering WS.",
+    "Sabotage of Siemens S7 PLCs at Natanz: S7comm PLC STOP commands from a "
+    "compromised engineering WS. Its SMB spread (MS08-067 / MS10-061) is "
+    "stood in for by the generic SMBv1 exploit-attempt indicator "
+    "(MS17-010-style).",
     [_h("STEP7-ENGWS", "172.16.2.50", "eng", "win7"),
      _h("WINCC-SCADA", "172.16.2.51", "scada", "winxp"),
      _h("PLC-S7-417", "172.16.2.21", "plc", "siemens", OUI_SIEMENS,
@@ -630,7 +760,8 @@ _reg(Incident("industroyer", "Industroyer / CrashOverride", "OT", "2016",
     "command storm to trip substation breakers.",
     [_h("INDUSTROYER-C2", "195.16.88.6", "web", "linux"),
      _h("SUBSTATION-HMI", "172.16.0.30", "hmi", "win7"),
-     _h("RTU-104", "172.16.1.30", "rtu", "siemens", OUI_SIEMENS)],
+     _h("RTU-104", "172.16.1.30", "rtu", "siemens", OUI_SIEMENS,
+        "SICAM A8000 CP-8050")],
     [("SUBSTATION-HMI", "RTU-104", "port-scan",
       {"scan_ports": [2404, 102, 20000]}),
      ("SUBSTATION-HMI", "RTU-104", "iec104-command", {}),
@@ -649,7 +780,7 @@ _reg(Incident("triton", "TRITON / TRISIS", "OT", "2017",
 
 _reg(Incident("notpetya", "NotPetya", "IT", "2017",
     "Destructive worm (disguised as ransomware) spreading via the same SMBv1 "
-    "EternalBlue signature as WannaCry, with a 445 sweep across the subnet.",
+    "EternalBlue signature as WannaCry, after a 445/139 probe.",
     [_h("NOTPETYA-PATIENT0", "10.20.20.88", "ws", "win7"),
      _h("WS-ACCT", "10.20.20.45", "ws", "win10"),
      _h("WS-OPS", "10.20.20.46", "ws", "winxp"),
@@ -661,7 +792,8 @@ _reg(Incident("notpetya", "NotPetya", "IT", "2017",
 
 _reg(Incident("ryuk", "Ryuk Ransomware", "IT", "2019",
     "Human-operated ransomware: C2 beaconing from a loader, internal 445/3389 "
-    "scanning, then SMBv1 lateral movement across file and user hosts.",
+    "scanning, then SMB spread to file and user hosts, shown with the generic "
+    "SMBv1 exploit-attempt indicator (MS17-010-style).",
     [_h("RYUK-LOADER", "10.20.20.90", "ws", "win10"),
      _h("RYUK-C2", "198.51.100.40", "web", "linux"),
      _h("FILESRV01", "10.20.10.13", "file", "win2019"),
@@ -678,7 +810,8 @@ _reg(Incident("blackenergy", "BlackEnergy 3", "OT", "2015",
     "operator workstation and reconnaissance of substation control ports.",
     [_h("BE-C2", "5.149.254.114", "web", "linux"),
      _h("OPER-WS", "172.16.0.40", "eng", "win7"),
-     _h("RTU-104", "172.16.1.30", "rtu", "siemens", OUI_SIEMENS)],
+     _h("RTU-104", "172.16.1.30", "rtu", "siemens", OUI_SIEMENS,
+        "SICAM A8000 CP-8050")],
     [("OPER-WS", "BE-C2", "c2-beacon", {
         "domain": "5.149.254.114", "uri": "/Microsoft/Update/KC074913.php"}),
      ("OPER-WS", "RTU-104", "port-scan",
@@ -718,8 +851,9 @@ _reg(Incident("havex", "Havex / Dragonfly", "OT", "2014",
       {"scan_ports": [44818, 135, 502, 102, 4840]})]))
 
 _reg(Incident("ekans", "EKANS / Snake", "OT", "2020",
-    "ICS-aware ransomware: SMB lateral movement, then unauthorized Modbus "
-    "writes alongside the stopping of OT processes before encryption.",
+    "ICS-aware ransomware: SMB lateral movement to admin shares, then "
+    "unauthorized Modbus writes as a network-visible stand-in (EKANS itself "
+    "killed OT processes on hosts, which leaves no wire indicator).",
     [_h("EKANS-HOST", "172.16.0.42", "eng", "win10"),
      _h("HIST-OT", "172.16.0.12", "hist", "win2019"),
      _h("PLC-MB", "172.16.1.41", "plc", "schneider", OUI_SCHNEIDER,
@@ -733,7 +867,8 @@ _reg(Incident("pipedream", "PIPEDREAM / INCONTROLLER", "OT", "2022",
     [_h("PIPEDREAM-ENGWS", "172.16.0.43", "eng", "win10"),
      _h("PLC-MODICON", "172.16.1.42", "plc", "schneider", OUI_SCHNEIDER,
         "BME P58 2040"),
-     _h("PLC-OMRON", "172.16.1.43", "plc", "schneider", OUI_SCHNEIDER)],
+     _h("PLC-OMRON", "172.16.1.43", "plc", "schneider", OUI_SCHNEIDER,
+        "Omron NJ501-1300")],
     [("PIPEDREAM-ENGWS", "PLC-MODICON", "port-scan",
       {"scan_ports": [502, 44818, 102, 1911, 2222]}),
      ("PIPEDREAM-ENGWS", "PLC-MODICON", "modbus-write", {}),

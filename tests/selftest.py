@@ -397,15 +397,19 @@ def test_sprinkle_maps_incident_hosts_onto_env_by_role() -> None:
                 check(v is None or incidents._device_vendor(tgt) == v,
                       f"{ic.key}->{e.key}: {name} mapped across vendors "
                       f"onto {tgt.name}")
-    check(incidents.get("industroyer").map_onto(site)["RTU-104"].role == "rtu",
-          "industroyer RTU not mapped onto the site's RTU")
-    check(incidents.get("triton").map_onto(site)["SIS-TRICONEX"].os ==
-          "schneider", "triton SIS not mapped onto a Schneider controller")
-    check("SIS-TRICONEX" not in incidents.get("triton").map_onto(plant),
-          "triton SIS mapped although ot-plant has no Schneider device")
-    rtu = incidents.get("industroyer").map_onto(plant).get("RTU-104")
-    check(rtu is not None and rtu.role == "plc" and rtu.os == "siemens",
-          "industroyer RTU did not fall back to a Siemens field device")
+    check(incidents.get("industroyer").map_onto(site)["RTU-104"].name ==
+          "RTU-104", "industroyer RTU not mapped onto the site's IEC-104 RTU")
+    # no environment has a Triconex SIS: never a Modicon stand-in
+    for e in (site, plant):
+        tri = incidents.get("triton")
+        check("SIS-TRICONEX" not in tri.map_onto(e) and "SIS-TRICONEX" in
+              {h.name for h in tri.unmapped_hosts(e)},
+              f"triton SIS not reported as a new asset on {e.key}")
+    # ot-plant has no IEC-104 RTU: an S7-315 is no substitute
+    ind = incidents.get("industroyer")
+    check("RTU-104" not in ind.map_onto(plant) and
+          [h.name for h in ind.unmapped_hosts(plant)] == ["RTU-104"],
+          "industroyer RTU-104 landed on a non-IEC-104 device in ot-plant")
 
     # whole sprinkle path still hits its target ratio with the env base
     cfg = RunConfig(env="it-org", sprinkle=["wannacry"], messages=2,
@@ -728,15 +732,129 @@ def test_map_onto_descends_the_purdue_model() -> None:
     from tgt import enterprise, incidents
     site = enterprise.get("industrial-site")
     # a two-PLC attack keeps its field devices together in one cell
-    pd = incidents.get("pipedream").map_onto(site)
-    segs = {site.segment_of(pd[n]).name
-            for n in ("PLC-MODICON", "PLC-OMRON")}
-    check(len(segs) == 1, f"pipedream PLCs scattered across cells: {segs}")
+    # a two-PLC attack keeps its field devices together in one cell
+    two = incidents.Incident(
+        "two-plc", "t", "OT", "-", "-",
+        [incidents._h("ENG", "172.16.0.9", "eng", "win7"),
+         incidents._h("MB-A", "172.16.1.8", "plc", "schneider",
+                      incidents.OUI_SCHNEIDER),
+         incidents._h("MB-B", "172.16.1.9", "plc", "schneider",
+                      incidents.OUI_SCHNEIDER)],
+        [("ENG", "MB-A", "modbus-write", {}),
+         ("ENG", "MB-B", "modbus-write", {})]).map_onto(site)
+    segs = {site.segment_of(two[n]).name for n in ("MB-A", "MB-B")}
+    check(len(segs) == 1, f"two-PLC attack scattered across cells: {segs}")
     # and the engineering stage stays up in supervisory, the PLCs down in a cell
+    st = incidents.get("stuxnet").map_onto(site)
+    pd = incidents.get("pipedream").map_onto(site)
     check(site.segment_of(pd["PIPEDREAM-ENGWS"]).zone == "OT-SUPERVISORY" and
-          all(site.segment_of(pd[n]).zone == "OT-CELL"
-              for n in ("PLC-MODICON", "PLC-OMRON")),
-          "pipedream did not descend supervisory -> cell")
+          site.segment_of(pd["PLC-MODICON"]).zone == "OT-CELL" and
+          site.segment_of(st["STEP7-ENGWS"]).zone == "OT-SUPERVISORY" and
+          site.segment_of(st["PLC-S7-417"]).zone == "OT-CELL",
+          "pipedream/stuxnet did not descend supervisory -> cell")
+
+
+def test_sprinkle_servers_serve_their_protocol() -> None:
+    """Every incident host an attack connects to lands on an inventory host
+    that serves that protocol in the env (OT control protocols: observed in
+    the env's own flows; SMB/RDP: a Windows host; Telnet: not Windows), or is
+    reported by unmapped_hosts() as an expected new asset."""
+    import csv
+    import io
+    from tgt import enterprise, incidents, inventory
+    svc_of = {"eternalblue": "smb", "smb-lateral": "smb", "rdp-brute": "rdp",
+              "telnet-brute": "telnet", "s7-control": "s7comm",
+              "iec104-command": "iec104", "tristation": "tristation",
+              "modbus-write": "modbus"}
+    alias = {"s7-id": "s7comm", "enip-id": "enip"}
+    for env in enterprise.all_environments():
+        serves = {r["name"]: {alias.get(s.split()[0], s.split()[0])
+                              for s in r["serves"]}
+                  for r in inventory.hosts(env)}
+        env_ips = {h.ip for h in env.hosts}
+        for inc in incidents.all_incidents():
+            m = inc.map_onto(env)
+            new = {h.name for h in inc.unmapped_hosts(env)}
+            internal = {h.name for h in inc.hosts
+                        if not incidents._is_external(h)}
+            check(new == internal - set(m),
+                  f"{inc.key}->{env.key}: unmapped_hosts {sorted(new)} != "
+                  f"internal hosts left unmapped")
+            for _, vname, atk, _ in inc.flows:
+                svc = svc_of.get(atk)
+                if svc is None or vname not in internal:
+                    continue
+                t = m.get(vname)
+                if t is None:
+                    check(vname in new, f"{inc.key}->{env.key}: {vname} "
+                          "neither mapped nor reported as a new asset")
+                elif svc == "smb" or svc == "rdp":
+                    check(t.os.startswith("win"), f"{inc.key}->{env.key}: "
+                          f"{vname} ({svc}) on non-Windows {t.name}")
+                elif svc == "telnet":
+                    check(not t.os.startswith("win"), f"{inc.key}->{env.key}:"
+                          f" {vname} (telnet) on Windows {t.name}")
+                else:
+                    check(svc in serves[t.name], f"{inc.key}->{env.key}: "
+                          f"{vname} ({svc}) on {t.name}, which does not "
+                          f"serve it ({sorted(serves[t.name])})")
+            # the wire only carries inventory, new-asset or external hosts
+            ok = env_ips | {h.ip for h in inc.hosts
+                            if h.name in new or incidents._is_external(h)}
+            for _, f in inc.build_on(1, env):
+                for ip in P.frame_ips(f) or ():
+                    check(ip in ok, f"{inc.key}->{env.key}: unreported "
+                          f"host {ip} on the wire")
+
+    site, plant = enterprise.get("industrial-site"), enterprise.get("ot-plant")
+    mixed, it = enterprise.get("enterprise-mixed"), enterprise.get("it-org")
+    # TriStation never lands on a Modicon; Triconex is a new asset everywhere
+    for env in enterprise.all_environments():
+        check("SIS-TRICONEX" in {h.name for h in
+                                 incidents.get("triton").unmapped_hosts(env)},
+              f"triton SIS not a new asset on {env.key}")
+    # PIPEDREAM: Modicon M580 onto the M580, Omron is no Modicon
+    pd = incidents.get("pipedream")
+    check(pd.map_onto(site)["PLC-MODICON"].product.startswith("BME P58"),
+          "pipedream M580 not mapped onto the site's M580")
+    check("PLC-OMRON" in {h.name for h in pd.unmapped_hosts(site)},
+          "pipedream Omron PLC landed on a Schneider Modicon")
+    # IEC-104 RTU never on an S7-315 (ot-plant / enterprise-mixed)
+    for env in (plant, mixed):
+        for key in ("industroyer", "blackenergy"):
+            r = incidents.get(key).map_onto(env).get("RTU-104")
+            check(r is None or "iec104" in serves_of(env, r.name),
+                  f"{key}->{env.key}: RTU-104 on {r and r.name}")
+    check(incidents.get("industroyer").map_onto(site)["RTU-104"].product
+          .startswith("SICAM"), "industroyer RTU not on the site's SICAM RTU")
+    # it-org has no plant: OT incident hosts are all reported new assets
+    for inc in incidents.all_incidents():
+        if inc.category == "OT" and inc.key != "vpnfilter":
+            check(not inc.map_onto(it), f"{inc.key}->it-org: OT host mapped")
+            check(len(inc.unmapped_hosts(it)) ==
+                  sum(not incidents._is_external(h) for h in inc.hosts),
+                  f"{inc.key}->it-org: OT hosts not reported as new assets")
+
+    # tgt inventory --sprinkle lists the new assets after the inventory
+    buf = io.StringIO()
+    inventory.write_csv(plant, buf, ["triton", "industroyer"])
+    rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
+    extra = {r["name"]: r for r in rows[len(plant.hosts):]}
+    check(set(extra) == {"SIS-TRICONEX", "RTU-104"} and
+          extra["RTU-104"]["serves"] == "iec104 2404/tcp" and
+          extra["RTU-104"]["segment"] == "OT-CELL-RW" and
+          "new asset" in extra["SIS-TRICONEX"]["risk"],
+          f"inventory --sprinkle new-asset rows wrong: {sorted(extra)}")
+    doc = inventory.to_json(plant, ["triton"])
+    check(doc["sprinkle"]["triton"] == {
+        "mapped": {"TRITON-ENGWS": "ENGWS01"},
+        "new_assets": ["SIS-TRICONEX"]}, "inventory JSON sprinkle mapping")
+
+
+def serves_of(env, name: str) -> set:
+    from tgt import inventory
+    row = next(r for r in inventory.hosts(env) if r["name"] == name)
+    return {s.split()[0] for s in row["serves"]}
 
 
 def test_replay_roundtrip() -> None:
