@@ -24,7 +24,8 @@ upper layer, whose pseudo-header checksum (TCP, UDP, ICMPv6, OSPFv3, PIM,
 VRRPv3) is fixed against the final destination. Non-first fragments get
 their addresses rewritten but no L4 checksum (it is not in them). NDP
 source/target link-layer options follow ``--remap-mac``, and so does an
-EUI-64 interface id (link-local / SLAAC address) built from a remapped MAC.
+EUI-64 interface id (link-local / SLAAC address) built from a remapped MAC;
+an NS sent to its target's solicited-node group moves with the target.
 
 Frames that are IP by EtherType but cannot be parsed (truncated header,
 truncated extension chain, an unknown routing header still in flight) are
@@ -48,6 +49,8 @@ _V6_EXT = (0, 43, 44, 51, 60)
 # Offset of the checksum in the upper layers whose checksum covers the IPv6
 # pseudo-header: TCP, UDP, ICMPv6, OSPFv3, PIM, VRRPv3
 _V6_CSUM = {6: 16, 17: 6, 58: 2, 89: 12, 103: 2, 112: 6}
+# ff02::1:ff00:0/104 — solicited-node multicast prefix (RFC 4291 2.7.1)
+_SOLICITED = bytes.fromhex("ff0200000000000000000001ff")
 
 
 class RewriteError(ValueError):
@@ -364,6 +367,15 @@ class Rewriter:
                     if b != a:
                         inner.append((o, a))
                         buf[o:o + 16] = b
+                        d = off + 24
+                        if (o == p + 8 and buf[p] == 135 and
+                                buf[d:d + 13] == _SOLICITED and
+                                buf[d + 13:d + 16] == a[13:]):
+                            # NS to the target's solicited-node group
+                            buf[d + 13:d + 16] = b[13:]
+                            changed = True
+                            if buf[0:3] == b"\x33\x33\xff":
+                                buf[3:6] = b[13:]
             o = p + (40 if buf[p] == 137 else 24)
             while len(buf) >= o + 8 and buf[o + 1]:
                 if buf[o] in (1, 2) and buf[o + 1] == 1:

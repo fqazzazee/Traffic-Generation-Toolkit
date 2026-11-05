@@ -6536,6 +6536,9 @@ def test_w5f_rewrite_ipv6_checksums_and_extensions() -> None:
           P.mac_to_bytes("00:0e:8c:12:34:56") in out[5][14 + 40:],
           "NDP NS target / source link-layer option not remapped")
     check(_w5f_a6("fd10:9::99") in out[6][14 + 48:], "NDP NA target")
+    check(addrs(out[5])[1] == "ff02::1:ff00:99" and
+          out[5][0:6] == P.mac_to_bytes("33:33:ff:00:00:99"),
+          f"NS solicited-node group not following: {addrs(out[5])}")
     check(addrs(out[7])[0] == "fe80::20e:8cff:fe12:3456",
           f"EUI-64 link-local not following the MAC: {addrs(out[7])}")
     check(_w5f_a6("fd10:9::99") in out[8][54:] and
