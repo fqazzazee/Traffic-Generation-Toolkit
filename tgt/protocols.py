@@ -11,9 +11,11 @@ conversation rather than orphaned segments.
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import random
 import struct
+import threading
 import zlib
 from dataclasses import replace
 from typing import Callable, List
@@ -242,6 +244,27 @@ def begin_build(seed: int | None, cycle: int = 0,
 
 def build_context() -> BuildContext:
     return _bctx
+
+
+# Builds run on more than one thread (the engine prebuilds the next cycle in
+# the background while the control API's injections build on the engine
+# thread); a build holds this lock from begin_build to its last frame.
+BUILD_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def isolated_build(seed: int | None, cycle: int = 0, sport_stride: int = 0):
+    """A build of its own: under :data:`BUILD_LOCK`, with a fresh context
+    for ``(seed, cycle)``, the caller's context and port allocator restored
+    afterwards — so an out-of-band build (an injection) neither waits on nor
+    perturbs the run's own seeded builds."""
+    global _bctx, _next_sport
+    with BUILD_LOCK:
+        saved = (_bctx, _next_sport)
+        try:
+            yield begin_build(seed, cycle, sport_stride)
+        finally:
+            _bctx, _next_sport = saved
 
 
 def _rand32() -> int:
@@ -1124,27 +1147,84 @@ def dhcp_flow(ep: Endpoints, count: int) -> List[bytes]:
     return frames
 
 
-def netbios_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """NetBIOS (137/UDP): name registration/announcement carrying the host name.
+# NetBIOS OS version (major, minor) a Browser host announcement states, by
+# OS fingerprint key (Samba announces 6.1); servers set SV_TYPE_SERVER_NT
+_NB_OS_VERSION = {"win10": (10, 0), "win2019": (10, 0), "win2012": (6, 3),
+                  "win7": (6, 1), "winxp": (5, 1), "win2000": (5, 0)}
+_NB_SERVER_OS = {"win2019", "win2012", "win2000"}
 
-    NetBIOS name-service broadcasts advertise the workstation name and, with
-    the browser service, its OS — a classic passive fingerprint source.
+
+def _nb_encode(name: str, suffix: int) -> bytes:
+    """NetBIOS first-level encoded name (RFC 1001 §14.1) with its suffix."""
+    raw = name.upper()[:15].ljust(15).encode("ascii", "replace") + \
+        bytes([suffix & 0xFF])
+    return b"\x20" + b"".join(bytes([(c >> 4) + 0x41, (c & 0x0F) + 0x41])
+                              for c in raw) + b"\x00"
+
+
+def _host_announcement(name: str, workgroup: str, os_key: str, src_ip: str,
+                       dgm_id: int, update: int) -> bytes:
+    """NetBIOS datagram (138/UDP, DIRECT_GROUP to WORKGROUP<1D>) carrying a
+    [MS-BRWS] HostAnnouncement on \\MAILSLOT\\BROWSE: server name, OS
+    version, server-type flags, 12-minute periodicity."""
+    major, minor = _NB_OS_VERSION.get(os_key, (6, 1))
+    stype = 0x00011003                  # workstation, server, NT wks, pot. browser
+    if os_key in _NB_SERVER_OS:
+        stype |= 0x00008000             # NT server
+    comment = b"Samba" if os_key == "linux" else b""
+    ann = struct.pack("<BBI", 0x01, update & 0xFF, 720000) + \
+        name.upper()[:15].encode("ascii", "replace").ljust(16, b"\x00") + \
+        struct.pack("<BBIBBH", major, minor, stype, 15, 1, 0xAA55) + \
+        comment + b"\x00"
+    mailslot = b"\\MAILSLOT\\BROWSE\x00"
+    off = 32 + 1 + 17 * 2 + 2 + len(mailslot)       # data offset from SMB hdr
+    smb = b"\xffSMB" + bytes([0x25]) + bytes(27) + bytes([17]) + \
+        struct.pack("<HHHHBBHIHHHHHBB", 0, len(ann), 0, 0, 0, 0, 0, 0, 0,
+                    0, off, len(ann), off, 3, 0) + \
+        struct.pack("<HHH", 1, 1, 2) + \
+        struct.pack("<H", len(mailslot) + len(ann)) + mailslot + ann
+    names = _nb_encode(name, 0x00) + _nb_encode(workgroup, 0x1D)
+    return struct.pack("!BBH4sHHH", 0x11, 0x02, dgm_id & 0xFFFF,
+                       P.ip_to_bytes(src_ip), 138, len(names) + len(smb), 0) + \
+        names + smb
+
+
+def netbios_flow(ep: Endpoints, count: int) -> List[bytes]:
+    """NetBIOS name registration (137/UDP) and Browser host announcement
+    (138/UDP) carrying the host name and OS version.
+
+    Both are B-node broadcasts from the announcing host (``client``) to its
+    subnet broadcast (``ep.meta['bcast']``, else the /24) and
+    ff:ff:ff:ff:ff:ff — they stay in the sender's VLAN and nobody answers.
+    The first message registers the name; every message carries a host
+    announcement — a classic passive fingerprint source.
     """
-    name = ep.meta.get("nbname", "WORKSTATION").upper()[:15].ljust(15)
-    def encode_nb(n: str) -> bytes:
-        enc = b""
-        for ch in (n + "\x00")[:16]:
-            b = ord(ch)
-            enc += bytes([(b >> 4) + 0x41, (b & 0x0F) + 0x41])
-        return b"\x20" + enc + b"\x00"
-    frames = []
+    name = str(ep.meta.get("nbname", "WORKSTATION")).upper()[:15]
+    workgroup = str(ep.meta.get("realm", "WORKGROUP")).split(".")[0].upper()
+    os_key = str(ep.meta.get("nb_os", ""))
+    bcast = ep.meta.get("bcast") or \
+        ".".join(ep.client_ip.split(".")[:3] + ["255"])
+
+    def send(sport: int, payload: bytes, ident: int) -> bytes:
+        seg = P.udp(ep.client_ip, bcast, sport, sport, payload)
+        pkt = P.ipv4(ep.client_ip, bcast, P.IPPROTO_UDP, seg,
+                     ttl=ep.ttl_client, ident=ident, df=False)
+        return P.ethernet("ff:ff:ff:ff:ff:ff", ep.client_mac, P.ETH_P_IP,
+                          pkt, vlan=ep.vlan)
+
+    frames, cb = [], _cycle_base(count)
     for i in range(count):
-        # name registration request (broadcast)
-        pkt = struct.pack("!HHHHHH", (i + 1) & 0xFFFF, 0x2910, 1, 0, 0, 1) + \
-            encode_nb(name) + struct.pack("!HH", 0x0020, 0x0001) + \
-            struct.pack("!HHHIHH4s", 0xC00C, 0x0020, 0x0001, 300000, 6,
-                        0x0000, P.ip_to_bytes(ep.client_ip))   # B-node, unique
-        frames.append(P.udp_frame(ep, True, 137, 137, pkt, ident=i))
+        n = cb + i
+        if i == 0:                      # name registration (B-node, unique)
+            pkt = struct.pack("!HHHHHH", (0x8000 + n) & 0xFFFF, 0x2910, 1,
+                              0, 0, 1) + _nb_encode(name, 0x00) + \
+                struct.pack("!HH", 0x0020, 0x0001) + \
+                struct.pack("!HHHIHH4s", 0xC00C, 0x0020, 0x0001, 300000, 6,
+                            0x0000, P.ip_to_bytes(ep.client_ip))
+            frames.append(send(137, pkt, 2 * i))
+        frames.append(send(138, _host_announcement(
+            name, workgroup, os_key, ep.client_ip, 0x4000 + n, n),
+            2 * i + 1))
     return frames
 
 
@@ -1386,7 +1466,8 @@ _reg("ldap", "LDAP / AD", "IT", "389", "tcp", ldap_flow,
 _reg("dhcp", "DHCP", "IT", "67", "udp", dhcp_flow,
      "DORA lease + renewals: host name, option 55 + vendor-class fingerprint")
 _reg("netbios", "NetBIOS-NS", "IT", "137", "udp", netbios_flow,
-     "Name registration/announcement carrying host name + OS")
+     "Broadcast name registration + browser host announcement "
+     "(138/UDP: host name + OS version)")
 _reg("ntp", "NTP", "IT", "123", "udp", ntp_flow,
      "Client polls + stratum-2 server replies with real timestamps")
 

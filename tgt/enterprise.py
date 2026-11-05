@@ -104,21 +104,29 @@ FINGERPRINTS: Dict[str, OSFingerprint] = {
         smb="none", dhcp_vendor="",
         risk="Network device — SNMP/LLDP expose model + firmware"),
     # vendor firmware without a dedicated fingerprint: IEDs, flow computers,
-    # analyzers (RTOS) and cellular / VSAT routers, panel HMIs (Linux-based)
-    "embedded": OSFingerprint("embedded", "Embedded device firmware (RTOS)",
-        64, smb="none", dhcp_vendor="",
-        risk="OT asset — vendor firmware, no EDR; cleartext OT protocols"),
-    "embedded-linux": OSFingerprint("embedded-linux",
-        "Embedded Linux (vendor firmware)", 64, smb="none", dhcp_vendor="",
-        risk="Network / edge device — exposed management services"),
-    # vertical-site appliances (cameras, PDUs, medical devices, robots)
+    # analyzers, medical devices, robots (RTOS) and cellular / VSAT routers,
+    # panel HMIs, cameras, PDUs (Linux-based)
     "linux-embedded": OSFingerprint("linux-embedded", "Embedded Linux", 64,
         smb="none", dhcp_vendor="udhcp 1.36.1",
-        risk="Appliance firmware — vendor-patched only, no EDR agent"),
+        risk="Appliance / edge firmware — vendor-patched only, no EDR agent; "
+             "exposed management services"),
     "rtos": OSFingerprint("rtos", "Embedded RTOS firmware", 64,
         smb="none", dhcp_vendor="",
-        risk="Embedded device — vendor-patched only, no EDR agent"),
+        risk="Embedded device — vendor-patched only, no EDR agent; "
+             "cleartext OT protocols"),
 }
+
+# Older fingerprint keys still accepted (env files, Host(os=...)); a host
+# carries the canonical key.
+OS_ALIASES: Dict[str, str] = {
+    "embedded": "rtos",
+    "embedded-linux": "linux-embedded",
+}
+
+
+def os_key(key: str) -> str:
+    """The canonical OS-fingerprint key for ``key`` (see OS_ALIASES)."""
+    return OS_ALIASES.get(key, key)
 
 
 @dataclass
@@ -141,6 +149,7 @@ class Host:
     fqdn: str = ""
 
     def __post_init__(self) -> None:
+        self.os = os_key(self.os)
         if not self.model:
             self.model = devices.resolve(self.product) or (
                 "" if self.vendor else devices.os_default(self.os))
@@ -858,6 +867,12 @@ class Environment:
             same = self.segment_or_none(server) is seg
             return {"bcast": str(ipaddress.ip_network(seg.subnet)
                                  .broadcast_address) if same else ""}
+        if proto == "netbios":
+            # B-node broadcasts to the announcer's own subnet; the host
+            # announcement states its OS version
+            seg = self.segment_of(client)
+            return {"bcast": str(ipaddress.ip_network(seg.subnet)
+                                 .broadcast_address), "nb_os": client.os}
         if proto == "dhcp":
             seg = self.segment_of(client)
             meta = {"dhcp_router": seg.gateway, "dhcp_domain": DNS_DOMAIN,

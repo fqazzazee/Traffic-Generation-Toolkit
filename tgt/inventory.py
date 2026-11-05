@@ -53,6 +53,7 @@ _FROM_CLIENT = {
     "http": ("os",),             # User-Agent
     "smb": ("os",),              # dialect set (SMBv1 = legacy Windows)
     "dhcp": ("os",),             # vendor class + option-55 fingerprint
+    "netbios": ("os",),          # browser host announcement: OS version
 }
 OBSERVABLE_FIELDS = ("vendor", "product", "model", "firmware", "serial", "os",
                      "fqdn")
@@ -131,7 +132,8 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
 
     for client, server, proto in env.conversations:
         emits(client, proto)
-        emits(server, proto)                    # every builder has replies
+        if proto not in _NOT_SERVED:            # broadcast-only: no reply
+            emits(server, proto)                # every builder has replies
         if client not in ev or server not in ev:
             continue
         for f in _FROM_CLIENT.get(proto, ()):

@@ -5471,6 +5471,399 @@ def test_plugins_example_registers_everything() -> None:
     check("acme-plant" not in out, "plugins: TGT_NO_PLUGINS ignored")
 
 
+# ---------------------------------------------------------------------------
+# W4-C correctness polish
+# ---------------------------------------------------------------------------
+def _w4c_envs() -> list:
+    """The four built-in environments plus every packaged site, the sites
+    loaded straight from their files."""
+    from tgt import enterprise, envfile
+    out = [enterprise.get(k) for k in ("it-org", "ot-plant",
+                                       "enterprise-mixed", "industrial-site")]
+    for f in sorted(os.listdir(envfile.SITES_DIR)):
+        if f.endswith(".json"):
+            out.append(envfile.load(os.path.join(envfile.SITES_DIR, f)))
+    return out
+
+
+def test_w4c_netbios_broadcast_announcements() -> None:
+    """NetBIOS: B-node broadcasts (ff:ff:ff:ff:ff:ff, the sender's subnet
+    broadcast, its own VLAN) — a name registration on 137 and a Browser host
+    announcement on 138 with the host name and OS version; nobody answers
+    and no host 'serves' netbios in the inventory."""
+    import ipaddress
+    from tgt import enterprise, inventory
+    for env in _w4c_envs():
+        protocols.begin_build(3, 0)
+        nb = [f for k, f in env.build(1) if k == "netbios"]
+        talkers = {c for c, _, p in env.conversations if p == "netbios"
+                   and not env.hidden(env.host(c))}
+        check(bool(nb) == bool(talkers), f"{env.key}: netbios frames")
+        by_ip = {h.ip: h for h in env.hosts}
+        seen = set()
+        for f in nb:
+            src, dst = P.frame_ips(f)
+            h = by_ip.get(src)
+            seg = env.segment_of(h) if h else None
+            vlan = struct.unpack("!H", f[14:16])[0] & 0xFFF \
+                if f[12:14] == b"\x81\x00" else None
+            ok = (h is not None and f[0:6] == b"\xff" * 6 and
+                  dst == str(ipaddress.ip_network(seg.subnet)
+                             .broadcast_address) and vlan == seg.vlan)
+            if not ok:
+                check(False, f"{env.key}: netbios frame {src}->{dst} "
+                             f"vlan {vlan} not a subnet broadcast")
+                break
+            seen.add(h.name)
+        check(seen == talkers, f"{env.key}: announcers {sorted(seen)} "
+                               f"!= {sorted(talkers)}")
+        rows = inventory.hosts(env)
+        bad = [r["name"] for r in rows
+               if any(s.startswith("netbios") for s in r["serves"])]
+        check(not bad, f"{env.key}: hosts 'serve' netbios: {bad}")
+    # the host announcement: name, OS version, mailslot; HMI-XP is XP (5.1)
+    env = enterprise.get("ot-plant")
+    protocols.begin_build(3, 0)
+    nb = [f for k, f in env.build(1) if k == "netbios"]
+    ann = [f for f in nb if b"\\MAILSLOT\\BROWSE\x00" in f]
+    reg = [f for f in nb if f not in ann]
+    check(ann and reg, "netbios: registration + host announcement")
+    for f in ann:
+        i = f.index(b"\\MAILSLOT\\BROWSE\x00") + 17
+        name, major, minor = f[i + 6:i + 22], f[i + 22], f[i + 23]
+        check(f[i] == 0x01 and name.rstrip(b"\x00") == b"HMI-XP" and
+              (major, minor) == (5, 1), f"host announcement {f[i:i + 30]!r}")
+        check(struct.unpack("!HH", f[38:42]) == (138, 138),
+              "host announcement ports")
+    # a netbios flow "to" a host: that host sends nothing for it
+    ev = inventory._evidence(enterprise.Environment(
+        "t", "t", "OT", "", env.hosts, [("HMI-XP", "PLC-RW1", "netbios")],
+        env.segments, options={"arp": False}))
+    check(not ev["PLC-RW1"]["vendor"] and ev["HMI-XP"]["os"] >=
+          {"netbios"}, "netbios evidence")
+    # profile-only run: /24 broadcast of the client
+    fr = protocols.get("netbios").build(Endpoints(client_ip="10.1.2.3"), 2)
+    check(all(P.frame_ips(f) == ("10.1.2.3", "10.1.2.255") for f in fr),
+          "netbios: profile-only broadcast address")
+    if shutil_which("tshark"):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "nb.pcap")
+            with PcapWriter(path) as w:
+                for f in nb:
+                    w.write(f)
+            out = subprocess.run(
+                ["tshark", "-r", path, "-T", "fields", "-e",
+                 "browser.command", "-e", "browser.os_major", "-e",
+                 "browser.os_minor", "-e", "nbns.flags.opcode"],
+                capture_output=True, text=True).stdout.split("\n")
+            check(any(ln.startswith("0x01\t5\t1") for ln in out),
+                  f"tshark: host announcement not decoded: {out[:3]}")
+            check(any(ln.strip() == "5" for ln in out),
+                  f"tshark: NBNS registration not decoded: {out[:3]}")
+
+
+def test_w4c_list_columns_aligned() -> None:
+    """tgt list sizes each column to its longest value (modbus-write,
+    firmware-update, electric-substation...)."""
+    import contextlib
+    import io
+    from tgt import cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_list(None)
+    lines = buf.getvalue().splitlines()
+    head = lines.index("Protocols:") + 1
+    hdr = lines[head]
+    cols = [(hdr + " ").index(f" {c} ") + 1
+            for c in ("name", "cat", "port", "xport", "desc")]
+    for p in protocols.all_profiles():
+        ln = next(x for x in lines[head + 1:] if x.startswith(f"  {p.key} "))
+        vals = (p.name, p.category, p.port, p.transport, p.desc)
+        check(all(ln[c - 1] == " " and ln[c:].startswith(v)
+                  for c, v in zip(cols, vals)),
+              f"tgt list: misaligned protocol row {ln!r}")
+    # scenario / environment / incident rows: the '[' column lines up
+    for title in ("Scenarios", "Environments", "Incidents"):
+        i = next(n for n, x in enumerate(lines) if x.startswith(title))
+        rows = []
+        for x in lines[i + 1:]:
+            if not x.strip():
+                break
+            if x.startswith("  ") and not x.startswith("    "):
+                rows.append(x)
+        check(len(rows) > 2 and len({x.index(" [") for x in rows}) == 1,
+              f"tgt list: {title} columns misaligned")
+
+
+def _iec104_apdus(frames, cmac: bytes) -> list:
+    """(time, from client?, ctrl1, ctrl2, type id, cot) of every APDU."""
+    from tgt import schedule
+    out = []
+    for t, f in frames:
+        frm, _, plen, _, l4, tcp = schedule.view(f, cmac)
+        if not tcp or plen <= 0:
+            continue
+        p = l4 + (f[l4 + 12] >> 4) * 4
+        end = p + plen
+        while p + 6 <= end and f[p] == 0x68:
+            c1, c2 = struct.unpack_from("<HH", f, p + 2)
+            asdu = f[p + 1] > 4
+            out.append((t, frm, c1, c2, f[p + 6] if asdu else None,
+                        f[p + 8] & 0x3F if asdu else None))
+            p += 2 + f[p + 1]
+    return out
+
+
+def test_w4c_iec104_timed_gi_and_sequence() -> None:
+    """IEC 104 under the timed scheduler: one persistent connection, a
+    station interrogation at connect and then every REFRESH period (15 min),
+    and N(S)/N(R) that continue across the 256-poll build chunks."""
+    from tgt import schedule, timing
+    ep = Endpoints()
+    st = schedule.profile_streams(["iec104"], ep)
+    st[0].period = 2.0
+    sch = schedule.Scheduler(7)
+    sch.load(st, 0.0, initial=True)
+    frames = [(t, c[0]) for t, _, _, c, _, _ in sch.run(3700.0)]
+    apdus = _iec104_apdus(frames, P.mac_to_bytes(ep.client_mac))
+    gi = [a[0] for a in apdus if a[1] and a[4] == 100 and a[5] == 6]
+    per = timing.REFRESH["iec104"][0]
+    check(len(gi) == 5 and all(abs((b - a) - per) < 15
+                               for a, b in zip(gi, gi[1:])),
+          f"iec104: GI activations at {[round(x) for x in gi]}")
+    term = [a for a in apdus if not a[1] and a[4] == 100 and a[5] == 10]
+    check(len(term) == len(gi), "iec104: every GI terminated")
+    syn = [f for _, f in frames if schedule.view(
+        f, P.mac_to_bytes(ep.client_mac))[1] == 0x02]
+    check(len(syn) == 1, f"iec104: {len(syn)} connections")
+    nxt, rcv, bad = {True: 0, False: 0}, {True: 0, False: 0}, []
+    for t, frm, c1, c2, _, _ in apdus:
+        if c1 & 1 == 0:                              # I-format
+            if (c1 >> 1, c2 >> 1) != (nxt[frm], rcv[frm]):
+                bad.append((round(t, 1), frm, c1 >> 1, c2 >> 1))
+            nxt[frm] = (nxt[frm] + 1) & 0x7FFF
+            rcv[not frm] += 1
+        elif c1 & 3 == 1 and c2 >> 1 != rcv[frm]:   # S-format
+            bad.append((round(t, 1), frm, "S", c2 >> 1))
+    check(not bad and nxt[False] > 3 * timing.CHUNK,
+          f"iec104: sequence breaks {bad[:4]} (server N(S) {nxt[False]})")
+    # the counters wrap at 2^15
+    conn = schedule.Connection()
+    conn.apci = {True: [5, 0x7FFF], False: [0x7FFF, 5]}
+    srv = protocols._iec104_i(0, 0, b"\x0d\x01\x03\x00\x01\x00" + bytes(8))
+    sess = protocols._tcp_flow(ep, 40000, 2404,
+                               [(protocols._iec104_s(0), srv)])
+    f = next(x for x in sess if not schedule.view(
+        x, P.mac_to_bytes(ep.client_mac))[0] and schedule.view(
+        x, P.mac_to_bytes(ep.client_mac))[2] > 0)
+    out = schedule.renumber_iec104(conn, f, P.mac_to_bytes(ep.client_mac))
+    i = out.index(srv[:2])
+    check(struct.unpack_from("<HH", out, i + 2) == (0x7FFF << 1, 5 << 1)
+          and conn.apci[False][0] == 0 and conn.apci[True][1] == 0,
+          "iec104: N(S)/N(R) do not wrap at 2^15")
+
+
+def _w4c_ratio_run(env_key: str, inc: str, ratio: float,
+                   dur: float = 600.0) -> float:
+    from tgt import campaign, schedule
+    cfg = RunConfig(env=env_key, sprinkle=[inc], sprinkle_ratio=ratio,
+                    schedule="timed", duration=dur, seed=3)
+    ph = campaign.phases_for(cfg)[0]
+    sch = schedule.Scheduler(3)
+    sch.ratio = ratio
+    sch.load(campaign.phase_streams(ph, cfg), 0.0, ph.hosts, initial=True)
+    n = {False: 0, True: 0}
+    for _, _, _, copies, source, _ in sch.run(dur):
+        n[source.startswith("sprinkle:")] += len(copies)
+    return n[True] / max(1, sum(n.values()))
+
+
+def test_w4c_sprinkle_ratio_timed() -> None:
+    """--sprinkle-ratio under --schedule timed: sprinkle streams recur so
+    that they make up the requested fraction of wire frames; 0 keeps their
+    natural periods. The engine honours it end to end."""
+    natural = _w4c_ratio_run("it-org", "wannacry", 0.0)
+    check(natural < 0.02, f"timed natural sprinkle share {natural:.3f}")
+    for r in (0.05, 0.2):
+        got = _w4c_ratio_run("it-org", "wannacry", r)
+        check(abs(got - r) / r < 0.2,
+              f"timed --sprinkle-ratio {r}: observed {got:.4f}")
+    got = _w4c_ratio_run("industrial-site", "industroyer", 0.1, 300.0)
+    check(abs(got - 0.1) / 0.1 < 0.25,
+          f"timed --sprinkle-ratio 0.1 on industrial-site: {got:.4f}")
+    with tempfile.TemporaryDirectory() as d:
+        recs, m = _timed_run(d, "r", env="it-org", duration=300.0,
+                             sprinkle=["wannacry"], sprinkle_ratio=0.3)
+    spr = sum(e.get("packets", 0) for e in m["events"]
+              if e["source"].startswith("sprinkle:"))
+    check(recs and 0.2 < spr / len(recs) < 0.4,
+          f"engine timed sprinkle share {spr}/{len(recs)}")
+
+
+def test_w4c_injection_keeps_seeded_baseline() -> None:
+    """Injections build in isolation: a seeded run's own frames are the
+    same with and without a (heavy) injection, and the injected frames are
+    themselves reproducible."""
+    from tgt.engine import Engine
+
+    def run(inject: bool):
+        cfg = RunConfig(env="it-org", seed=21, messages=2, rate=0,
+                        clock="synthetic", start_time="2026-11-05T14:00:00Z")
+        cfg.count = 5000
+        eng = Engine(cfg)
+        seen = []
+        feed = eng.control.feed
+
+        def spy(batch, stop):
+            for idx, item in feed(batch, stop):
+                seen.append(item)
+                yield idx, item
+        eng.control.feed = spy
+        if inject:
+            eng.control.inject("wannacry", duration=600.0, ratio=0.5)
+        eng.start()
+        eng.join(120)
+        return ([f for _, f, s in seen if not s.startswith("inject:")],
+                [f for _, f, s in seen if s.startswith("inject:")])
+    base, _ = run(False)
+    b1, inj1 = run(True)
+    b2, inj2 = run(True)
+    check(len(inj1) > 1000 and len(b1) > 1000,
+          f"injection run sizes {len(b1)}/{len(inj1)}")
+    check(base[:len(b1)] == b1 and b1 == b2,
+          "seeded baseline frames changed by an injection")
+    check(inj1 == inj2, "injected frames not reproducible from the seed")
+    # isolated_build restores the caller's build context
+    ctx = protocols.begin_build(9, 4)
+    with protocols.isolated_build(1, 1):
+        protocols._rand32()
+    check(protocols.build_context() is ctx, "isolated_build leaked context")
+
+
+def test_w4c_os_fingerprint_aliases() -> None:
+    """One embedded-OS pair: rtos / linux-embedded; the older embedded /
+    embedded-linux keys still load (hosts, os: selectors) as aliases."""
+    from tgt import enterprise, envfile, stacks
+    check(not set(enterprise.OS_ALIASES) & set(enterprise.FINGERPRINTS),
+          "alias keys still in FINGERPRINTS")
+    h = enterprise.Host("X", "10.0.0.9", "00:11:22:33:44:55", "rtu",
+                        "embedded")
+    check(h.os == "rtos" and h.fp.label == "Embedded RTOS firmware",
+          f"embedded alias -> {h.os}")
+    check(stacks.for_os("rtos") == "embedded" and
+          stacks.for_os("linux-embedded") == "linux", "embedded OS stacks")
+    doc = {"key": "alias-t", "name": "t", "segments": [
+        {"name": "S", "vlan": 10, "subnet": "10.9.0.0/24", "zone": "OT-CELL",
+         "gateway": "10.9.0.1"}],
+        "hosts": [{"name": "A", "ip": "10.9.0.10", "role": "rtu",
+                   "os": "embedded"},
+                  {"name": "B", "ip": "10.9.0.11", "role": "hmi",
+                   "os": "embedded-linux"}],
+        "flows": [{"from": "os:embedded-linux", "to": "os:embedded",
+                   "proto": "modbus"}]}
+    import json
+    env = envfile.loads(json.dumps(doc), source="t")
+    check([x.os for x in env.hosts] == ["rtos", "linux-embedded"] and
+          env.conversations == [("B", "A", "modbus")],
+          f"alias env file: {[x.os for x in env.hosts]} "
+          f"{env.conversations}")
+    check('"embedded"' not in envfile.export(env), "export keeps alias")
+    for f in os.listdir(envfile.SITES_DIR):
+        txt = open(os.path.join(envfile.SITES_DIR, f)).read()
+        check('"os": "embedded"' not in txt and "embedded-linux" not in txt,
+              f"site {f} uses an alias OS key")
+    labels = {x.fp.label for e in _w4c_envs() for x in e.hosts}
+    check(not {"Embedded device firmware (RTOS)",
+               "Embedded Linux (vendor firmware)"} & labels,
+          "inventory still shows the old embedded OS labels")
+
+
+def test_w4c_score_self_test_is_perfect() -> None:
+    """A perfect monitor's export (score.perfect_export) scores 100 % on
+    every built-in env and packaged site: discovery, observable fields
+    (vendor included, with the map's normalize table applied to both sides)
+    and protocols; NAT-hidden hosts are not in the population, as in a run
+    manifest."""
+    import json
+    from tgt import cli, envfile, inventory, score
+    mapping = score.load_json_spec("generic", "map")
+
+    def grade(truth, d, name):
+        path = os.path.join(d, name + ".csv")
+        score.write_perfect_export(truth, path)
+        rows, info = score.read_export(path, mapping)
+        return score.score(truth, rows, info)
+
+    def perfect(res, what):
+        disc, pr = res["discovery"], res["protocols"]
+        acc = {f: res["fields"][f]["observable"]["accuracy"]
+               for f in score.FIELDS}
+        check(disc["recall"] == 1.0 and disc["precision"] == 1.0 and
+              all(v in (None, 1.0) for v in acc.values()) and
+              pr["precision"] == 1.0 and pr["recall"] == 1.0,
+              f"self-score {what}: recall {disc['recall']} precision "
+              f"{disc['precision']} fields {acc} protocols "
+              f"{pr['precision']}/{pr['recall']}")
+    pops = {}
+    with tempfile.TemporaryDirectory() as d:
+        for env in _w4c_envs():
+            truth = score.Truth(inventory.to_json(env), env.key)
+            res = grade(truth, d, env.key)
+            perfect(res, env.key)
+            pops[env.key] = {a["id"] for a in truth.population()}
+            check(res["fields"]["vendor"]["observable"]["n"] > 0,
+                  f"{env.key}: no vendor scored")
+        # manifest truth: same population (who really emitted) and 100 %
+        envfile.load_user_envs(warn=lambda m: None, force=True)
+        for key in ("it-org", "oil-gas-pipeline"):
+            m = _manifest_run(d, key, RunConfig(env=key, seed=4,
+                                                loop=False), 0)
+            truth = score.Truth(m, key)
+            perfect(grade(truth, d, key + "-m"), key + " (manifest)")
+            check({a["id"] for a in truth.population()} == pops[key],
+                  f"{key}: inventory and manifest populations differ")
+        # the CLI writes the same export
+        nat = next(e for e in _w4c_envs() if e.key == "oil-gas-pipeline")
+        inv = os.path.join(d, "inv.json")
+        with open(inv, "w") as f:
+            json.dump(inventory.to_json(nat), f)
+        out = os.path.join(d, "self.csv")
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = cli.main(["score", "--truth", inv, "--self-test-export",
+                           out])
+        rows, _ = score.read_export(out, mapping)
+        check(rc == 0 and len(rows) == len(pops[nat.key]) <
+              len(nat.hosts), "tgt score --self-test-export")
+
+
+def test_w4c_tshark_expert_every_env() -> None:
+    """Optional: one seeded cycle of every built-in env and packaged site
+    has no tshark expert errors and no warnings but deliberate RSTs."""
+    import subprocess
+    if not shutil_which("tshark"):
+        _skipped.append("test_w4c_tshark_expert_every_env")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        for env in _w4c_envs():
+            path = os.path.join(d, env.key + ".pcap")
+            protocols.begin_build(8, 0)
+            with PcapWriter(path) as w:
+                for _, f in env.build(2):
+                    w.write(f)
+            ex = subprocess.run(["tshark", "-r", path, "-q", "-z",
+                                 "expert,warn"], capture_output=True,
+                                text=True).stdout
+            bad = [ln.strip() for ln in ex.splitlines()
+                   if ln.strip()[:1].isdigit()
+                   and "Connection reset (RST)" not in ln
+                   and not _tshark_dissector_bug(ln)]
+            check("Errors (" not in ex and not bad,
+                  f"tshark expert {env.key}: {bad[:4]}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

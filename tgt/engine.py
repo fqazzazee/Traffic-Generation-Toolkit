@@ -85,6 +85,12 @@ def build_cycle(cfg: RunConfig, seed: Optional[int] = None, cycle: int = 0,
     """
     if seed is None:
         seed = cfg.seed
+    with protocols.BUILD_LOCK:      # one build at a time (see isolated_build)
+        return _build_cycle(cfg, seed, cycle, sport_stride)
+
+
+def _build_cycle(cfg: RunConfig, seed: Optional[int], cycle: int,
+                 sport_stride: int) -> List[Tagged]:
     rng = protocols.begin_build(seed, cycle, sport_stride).rng
     src = f"incident:{cfg.incident}" if cfg.incident else "baseline"
     base: List[Tagged] = [(k, f, src) for k, f in _build_base(cfg)]
@@ -156,8 +162,10 @@ class CycleBuilder:
 
     def build(self, cycle: int) -> List[Tagged]:
         if self.stride is None:
-            first = build_cycle(self.cfg, self.seed, 0)
-            self.stride = sport_stride(protocols.build_context().sports_used)
+            with protocols.BUILD_LOCK:
+                first = build_cycle(self.cfg, self.seed, 0)
+                self.stride = sport_stride(
+                    protocols.build_context().sports_used)
             if cycle == 0:
                 return first
         return build_cycle(self.cfg, self.seed, cycle, self.stride)
@@ -446,6 +454,9 @@ class Engine:
         sched = schedule.Scheduler(seed, epoch0, cfg.day_profile,
                                    phases[0].utc_offset if phases else 0.0,
                                    min_period=cfg.min_period)
+        # --sprinkle-ratio: sprinkle streams' periods follow the target
+        # fraction of wire frames (schedule.Scheduler._ratio_interval)
+        sched.ratio = min(max(cfg.sprinkle_ratio or 0.0, 0.0), 0.9)
         if recorder is not None and cfg.campaign:
             recorder.campaign(phases)
         wall0 = time.perf_counter()

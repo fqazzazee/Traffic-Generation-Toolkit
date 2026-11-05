@@ -451,7 +451,7 @@ def _hosts(cx: _Ctx, raw: Any, path: str):
                                     if dev.embedded else "")))
     if not os_:
         raise cx.err(path, "missing required key 'os'")
-    if os_ not in enterprise.FINGERPRINTS:
+    if enterprise.os_key(os_) not in enterprise.FINGERPRINTS:
         raise cx.err(f"{path}.os", f"unknown OS fingerprint {os_!r} (one of "
                      f"{', '.join(enterprise.FINGERPRINTS)})")
     embedded_dev = dev is not None and dev.embedded
@@ -560,6 +560,8 @@ def select(sel: str, hosts: List[Host], seg_of: Dict[str, Segment],
         field = {"name": h.name, "role": h.role,
                  "zone": hseg.zone if hseg else "external",
                  "model": h.model, "os": h.os, "vendor": h.vendor}[kind]
+        if kind == "os":            # older keys select their canonical
+            value = enterprise.os_key(value)
         if (value == "*" or field == value or
                 (kind == "name" and fnmatch.fnmatchcase(field, value))):
             out.append(h)

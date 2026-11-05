@@ -116,6 +116,9 @@ class Connection:
         self.tsbase: Dict[bool, Optional[int]] = {True: None, False: None}
         self.tslast: Dict[bool, int] = {True: 0, False: 0}
         self.t0 = 0.0
+        # application sequence counters (IEC 104 APCI): side -> [next N(S),
+        # I-frames received]; see renumber_iec104
+        self.apci: Dict[bool, List[int]] = {True: [0, 0], False: [0, 0]}
 
     def rewrite(self, frame: bytes, t: float, cmac: bytes,
                 delta: Optional[Tuple[int, int]]) -> bytes:
@@ -189,6 +192,37 @@ class Connection:
                 (self.s_next - seq) & 0xFFFFFFFF)
 
 
+def renumber_iec104(conn: Connection, frame: bytes, cmac: bytes) -> bytes:
+    """IEC 104 send/receive sequence numbers continued on ``conn``: each
+    I-format APDU gets its side's next N(S) and N(R) = the I-frames that side
+    has received; an S-format APDU acknowledges them all (both counters wrap
+    at 2^15). A persistent connection is built in chunks, each of which
+    numbers from 0; this keeps the numbering continuous across them. The
+    TCP checksum is left for :meth:`Connection.rewrite`."""
+    frm, _, plen, _, l4, tcp = view(frame, cmac)
+    if not tcp or plen <= 0:
+        return frame
+    b = bytearray(frame)
+    p = l4 + (b[l4 + 12] >> 4) * 4
+    end = p + plen
+    me, peer = conn.apci[frm], conn.apci[not frm]
+    while p + 6 <= end and b[p] == 0x68:
+        if b[p + 2] & 1 == 0:                      # I-format
+            struct.pack_into("<HH", b, p + 2, me[0] << 1, me[1] << 1)
+            me[0] = (me[0] + 1) & 0x7FFF
+            peer[1] = (peer[1] + 1) & 0x7FFF
+        elif b[p + 2] & 3 == 1:                    # S-format
+            struct.pack_into("<H", b, p + 4, me[1] << 1)
+        p += 2 + b[p + 1]
+    return bytes(b)
+
+
+# per-protocol application-layer renumbering on persistent connections
+RENUMBER: Dict[str, Callable[[Connection, bytes, bytes], bytes]] = {
+    "iec104": renumber_iec104,
+}
+
+
 # ---------------------------------------------------------------------------
 # Streams
 # ---------------------------------------------------------------------------
@@ -229,6 +263,7 @@ class Stream:
         self.alive = True
         self.next_t = INF
         self.occ = 0                 # occurrences so far
+        self.wire = 0                # wire frames so far (sprinkle ratio)
         self.builds = 0              # builder calls so far
         self.seed = 0
         self.rng = random.Random(0)
@@ -238,6 +273,7 @@ class Stream:
         self.close: List[List[bytes]] = []
         self.lifetime = 0.0
         self.tuple: Optional[tuple] = None
+        self.refreshed = 0.0         # last setup-exchange refresh (REFRESH)
 
     # -- building ----------------------------------------------------------
     def bind(self, seed: int, gen: int = 0) -> None:
@@ -327,11 +363,14 @@ class Stream:
             else None
         delta = None
         first = True
+        renumber = RENUMBER.get(self.key) if conn is not None else None
         for f, dt in zip(frames, offs):
             if conn is not None:
                 if conn.c_next is not None and delta is None and \
                         view(f, self.cmac)[5]:
                     delta = conn.delta(f, self.cmac)
+                if renumber is not None:
+                    f = renumber(conn, f, self.cmac)
                 f = conn.rewrite(f, t + dt, self.cmac, delta)
             out.append((t + dt, self.place(f), first))
             first = False
@@ -363,6 +402,14 @@ class Stream:
             self.conn = None
             self.close = []
             return out
+        ref = timing.REFRESH.get(self.key)
+        if ref and self.conn is not None and t - self.refreshed >= ref[0]:
+            # a setup exchange that recurs on the open connection (IEC 104
+            # general interrogation): from a fresh build, in place of a poll
+            self.refreshed = t
+            groups = exchanges(self._build(1), self.cmac)
+            if len(groups) > ref[1]:
+                return list(groups[ref[1]])
         if not self.polls:
             frames = self._build(timing.CHUNK,
                                  sched if self.conn is None else None)
@@ -373,6 +420,7 @@ class Stream:
             self.close = groups[len(groups) - teardown:]
             if self.conn is None:
                 self.conn = Connection()
+                self.refreshed = t
                 self.tuple = _tuple(frames, self.cmac)
                 if sched is not None and self.tuple is not None:
                     sched.ports[self.tuple] = self
@@ -659,6 +707,11 @@ class Scheduler:
         self.injected = 0
         self.ports: Dict[tuple, Stream] = {}    # open persistent 4-tuples
         self.gen: Dict[tuple, int] = {}         # restarts per stream id
+        # --sprinkle-ratio: target fraction of wire frames from sprinkle
+        # streams (0 = their natural periods); frames so far by sprinkle?
+        self.ratio = 0.0
+        self.wire: Dict[bool, int] = {False: 0, True: 0}
+        self._n_sprinkle = 0
 
     # -- stream management --------------------------------------------------
     def load(self, streams: List[Stream], t: float, hosts=(),
@@ -693,11 +746,14 @@ class Scheduler:
                     s.ep.meta["enip_rpi_us"] = int(s.period * 1e6)
             first = soon.get(sid)
             if first is None:
-                first = s.rng.uniform(0, s.period if initial
-                                      else min(s.period, 30.0))
+                first = s.rng.uniform(0, s.period if initial and not (
+                    self.ratio and s.source.startswith("sprinkle:"))
+                    else min(s.period, 30.0))
             self._schedule(s, t + first, step=False)
             self.streams[sid] = s
             started.append(s)
+        self._n_sprinkle = sum(1 for x in self.streams.values()
+                               if x.source.startswith("sprinkle:"))
         return started, stopped
 
     def inject(self, t: float, key: str, frames: List[List[bytes]],
@@ -719,8 +775,11 @@ class Scheduler:
         """Queue ``s``'s next occurrence: one interval after ``t`` (or at
         ``t`` itself with ``step=False``). Under a day profile, candidate
         times come ``peak`` times as often and each is kept with probability
-        factor/peak (thinning), so the class's rate follows the hour."""
-        if timing.DAY_PROFILES.get(self.day_profile or "flat", {}).get(s.cls):
+        factor/peak (thinning), so the class's rate follows the hour. With a
+        sprinkle ratio, sprinkle streams follow :meth:`_ratio_interval`."""
+        if step and self.ratio > 0 and s.source.startswith("sprinkle:"):
+            t += self._ratio_interval(s, t)
+        elif timing.DAY_PROFILES.get(self.day_profile or "flat", {}).get(s.cls):
             peak = timing.peak(self.day_profile, s.cls)
             if step:
                 t += s.interval() / peak
@@ -733,6 +792,24 @@ class Scheduler:
         s.next_t = t
         self._n += 1
         heapq.heappush(self._sheap, (t, self._n, s))
+
+    def _ratio_interval(self, s: Stream, t: float) -> float:
+        """Next interval of sprinkle stream ``s`` so that sprinkle frames
+        make up ``ratio`` of the wire: the sprinkle streams share the frame
+        rate ``baseline rate * r / (1 - r)`` equally, each recurring as often
+        as its mean frames per occurrence allow, sped up (or slowed down, at
+        most 4x) while the sprinkle total so far is short of (or over) its
+        target. The baseline rate is measured, so it follows day profiles
+        and campaign phases."""
+        r = min(self.ratio, 0.9)
+        base, spr = self.wire[False], self.wire[True]
+        want = base / max(t, 1.0) * r / (1.0 - r)      # sprinkle frames/s
+        if want <= 0 or s.occ == 0:
+            return s.interval()
+        iv = (s.wire / s.occ) * max(1, self._n_sprinkle) / want
+        target = base * r / (1.0 - r)
+        iv *= min(max((spr + 1.0) / (target + 1.0), 0.25), 4.0)
+        return max(1e-3, iv * (1.0 + s.rng.uniform(-s.jitter, s.jitter)))
 
     # -- the merged stream -----------------------------------------------------
     def run(self, t_end: float = INF) -> Iterator[Item]:
@@ -747,9 +824,13 @@ class Scheduler:
                 t, _, s = pop(sheap)
                 if not s.alive or t != s.next_t:
                     continue
+                spr = s.source.startswith("sprinkle:")
                 for ft, copies, occ in s.occur(t, self):
                     self._n += 1
                     push(fheap, (ft, self._n, s.key, copies, s.source, occ))
+                    self.wire[spr] += len(copies)
+                    if spr:
+                        s.wire += len(copies)
                 self._schedule(s, t)
             if not fheap or fheap[0][0] >= t_end:
                 return

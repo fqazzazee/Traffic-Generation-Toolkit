@@ -16,9 +16,12 @@ The engine pulls frames through :meth:`RunControl.feed`, which
 ``set_rate(pps)`` re-paces a rate-limited run. The control API
 (:mod:`tgt.api`) is a thin HTTP layer over these methods.
 
-Note: injected frames are built on the engine thread while the next cycle may
-be building in the background; builders share one module-level context, so a
-run with injections is not bit-for-bit reproducible from its seed (the
+Injected frames are built on the engine thread while the next cycle may be
+building in the background. Each injection pass is an isolated build
+(:func:`tgt.protocols.isolated_build`: under the build lock, seeded from the
+run seed, the injection id and the pass, the run's build context restored
+afterwards), so a seeded run's own frames are the same with or without
+injections; where the injected frames land depends on wall-clock timing (the
 manifest's injection records say exactly what was added and when).
 """
 from __future__ import annotations
@@ -189,8 +192,7 @@ class RunControl:
     def _start(self, inj: Injection) -> None:
         eng = self.engine
         try:
-            inj._frames = build_incident(eng.cfg, inj.incident,
-                                         eng.cfg.sprinkle_messages, inj.label)
+            inj._frames = self._build(inj, 1)
         except Exception as e:  # noqa: BLE001 - reported, run continues
             inj.state, inj.error = "failed", f"{type(e).__name__}: {e}"
             eng.log(f"injection {inj.id} ({inj.incident}) failed: {inj.error}")
@@ -204,6 +206,23 @@ class RunControl:
         self._active[inj.id] = inj
         eng.log(f"injection {inj.id}: {inj.incident} for {inj.duration:g}s "
                 f"at {inj.ratio:.0%} ({len(inj._frames)} frames/pass)")
+
+    def _build(self, inj: Injection, n: int) -> List[tuple]:
+        """Pass ``n`` of ``inj``: an isolated build seeded from the run
+        seed and the injection id, so it leaves the run's builds alone."""
+        import zlib
+        from . import protocols
+        eng = self.engine
+        run = getattr(getattr(eng, "stats", None), "seed", None)
+        seed = zlib.crc32(f"inject:{run}:{inj.id}".encode())
+        stride = getattr(inj, "_stride", 0)
+        with protocols.isolated_build(seed, n, stride) as ctx:
+            out = build_incident(eng.cfg, inj.incident,
+                                 eng.cfg.sprinkle_messages, inj.label)
+            if not stride:          # later passes: fresh ports (no reuse)
+                from .engine import sport_stride
+                inj._stride = sport_stride(ctx.sports_used)
+        return out
 
     def _finish(self, inj: Injection) -> None:
         inj.state = "done"
@@ -225,9 +244,7 @@ class RunControl:
                     self._finish(inj)
                     continue
                 try:                        # next pass: fresh ports / ISNs
-                    inj._frames = build_incident(
-                        self.engine.cfg, inj.incident,
-                        self.engine.cfg.sprinkle_messages, inj.label)
+                    inj._frames = self._build(inj, inj.passes + 1)
                 except Exception as e:  # noqa: BLE001
                     inj.error = f"{type(e).__name__}: {e}"
                     self._finish(inj)
