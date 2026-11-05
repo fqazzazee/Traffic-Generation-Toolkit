@@ -372,12 +372,14 @@ def new_assets(env: Environment, sprinkle: Sequence[str]) -> List[Dict]:
 
 def sprinkle_mapping(env: Environment, sprinkle: Sequence[str]) -> Dict:
     """Where each ``sprinkle`` incident lands on ``env``:
-    {incident: {"mapped": {incident host: env host}, "new_assets": [host]}}."""
-    from . import incidents
+    {incident: {"mapped": {incident host: env host}, "new_assets": [host],
+    "techniques": [ATT&CK ID]}}."""
+    from . import incidents, techniques
     out = {}
     for key in sprinkle:
         inc = incidents.get(key)
         out[key] = {
             "mapped": {k: v.name for k, v in sorted(inc.map_onto(env).items())},
-            "new_assets": [h.name for h in inc.unmapped_hosts(env)]}
+            "new_assets": [h.name for h in inc.unmapped_hosts(env)],
+            "techniques": techniques.for_incident(key)}
     return out

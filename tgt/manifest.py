@@ -4,7 +4,8 @@
 ``tgt-manifest/1``): the seed and config that reproduce the run, the
 environment's inventory, when each asset first/last sent a frame, every flow
 seen (client, server, protocol), and one event per injected attack flow with a
-vendor-neutral category, so a scorer (``tgt score``) can match sensor alerts
+vendor-neutral category and its MITRE ATT&CK technique IDs (``techniques``,
+see :mod:`tgt.techniques`), so a scorer (``tgt score``) can match sensor alerts
 against it. The engine rewrites the file every ~10 s and on exit, atomically,
 so a killed or long run still leaves a valid manifest.
 """
@@ -308,6 +309,7 @@ class Recorder:
         return self.attack_proto.get(key) or key
 
     def to_dict(self, stats=None) -> Dict:
+        from . import techniques
         cfg = self.cfg
         flows = []
         for (c, s, key, source), (t0, t1, n) in self.flows.items():
@@ -335,7 +337,8 @@ class Recorder:
                 "hosts": [c] if c == s else [c, s],
                 "src": rec[2], "dst": rec[3], "protocol": self._proto(key),
                 "detail": f"{key}: {self.attack_desc.get(key, key)}",
-                "source": source, "attack": key, "packets": n})
+                "source": source, "attack": key, "packets": n,
+                "techniques": techniques.for_event(key, source)})
         for aid, (ip, incs) in self.new_assets.items():
             if aid in self.first_seen:
                 srcs = [i if ":" in i else f"sprinkle:{i}" for i in incs]
