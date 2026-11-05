@@ -511,6 +511,30 @@ def _model_cands(h: Dict, obs: Dict) -> List[str]:
     return [x for x in dict.fromkeys(c) if x]
 
 
+def _not_an_asset(ip: Optional[str], external: Dict, infra: List[Dict],
+                  have_inventory: bool) -> bool:
+    """A manifest ``first_seen`` key that names no inventory host and is not
+    something a monitor should list as an asset: a known external endpoint
+    (EDR cloud), a gateway, or — when an inventory exists — any public IP
+    (sprinkle C2 / attacker infrastructure)."""
+    if not ip:
+        return False
+    if ip in external or any(x["ip"] == ip for x in infra):
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    # documentation ranges (198.51.100/24 …) are not "global" to Python but
+    # are what TGT uses for synthetic C2, so test "internal" explicitly
+    return have_inventory and not any(addr in n for n in _INTERNAL_NETS)
+
+
+_INTERNAL_NETS = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+    "169.254.0.0/16", "127.0.0.0/8")]
+
+
 def _truth_asset(h: Dict, new: bool = False) -> Dict[str, Any]:
     obs = h.get("observability") or {}
 
@@ -585,6 +609,9 @@ class Truth:
             for k, ts in fs.items():
                 a = by_id.get(k) or by_ip.get(norm_ip(k) or "") or \
                     by_name.get(k)
+                if a is None and _not_an_asset(norm_ip(k), self.external,
+                                               self.infra, bool(by_name)):
+                    continue                          # cloud / C2 / gateway
                 if a is None and norm_ip(k):          # non-env run: IP ids
                     a = _truth_asset({"asset_id": k, "name": k, "ip": k})
                     self.assets.append(a)

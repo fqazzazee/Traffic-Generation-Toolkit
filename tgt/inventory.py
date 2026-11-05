@@ -117,6 +117,11 @@ def _observability(h: Host, row: Dict, ev: Dict[str, Set[str]]) -> Dict:
         "model": h.model, "firmware": h.firmware, "serial": h.serial,
         "os": row["os"], "fqdn": h.fqdn,
     }
+    # When the MAC OUI is the only vendor evidence on the wire, what a monitor
+    # can observe is the NIC vendor (e.g. VMware for a Windows VM), not the
+    # software vendor.
+    if ev["vendor"] == {"oui"} and row["mac_vendor"]:
+        values["vendor"] = row["mac_vendor"]
     out = {}
     for f in OBSERVABLE_FIELDS:
         seen = sorted(ev[f]) if values[f] else []

@@ -2336,6 +2336,27 @@ def test_seed_flags_and_default_seed() -> None:
               "unseeded run did not pick + log a seed")
 
 
+def test_score_recall_ignores_external_first_seen() -> None:
+    """Manifest first_seen keys for the EDR cloud / C2 (public IPs) are not
+    assets: they must not inflate the recall denominator."""
+    from tgt import inventory as inv, score
+    from tgt import enterprise as ent
+    doc = inv.to_json(ent.get("ot-plant"))
+    fs = {h["asset_id"]: "2026-11-05T00:00:00.000000Z" for h in doc["hosts"]}
+    fs["3.121.6.180"] = fs["198.51.100.7"] = "2026-11-05T00:00:01.000000Z"
+    m = {"schema": "tgt-manifest/1", "inventory": doc, "first_seen": fs,
+         "start": "2026-11-05T00:00:00Z", "end": "2026-11-05T00:01:00Z"}
+    t = score.Truth(m, "test")
+    emitted = [a for a in t.assets if a.get("emitted")]
+    check(len(emitted) == len(doc["hosts"]),
+          f"external first_seen counted as assets: {len(emitted)}")
+    v = {h["name"]: h["observability"]["vendor"] for h in doc["hosts"]}
+    dc = next(n for n, o in v.items() if o["evidence"] == ["oui"])
+    row = next(h for h in doc["hosts"] if h["name"] == dc)
+    check(v[dc]["value"] == row["mac_vendor"],
+          "OUI-only vendor truth should be the NIC vendor")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
