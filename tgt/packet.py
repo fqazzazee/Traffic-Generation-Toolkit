@@ -203,11 +203,16 @@ def rewrite_l2(frame: bytes, src_mac: str, dst_mac: str, vlan: int | None,
 
     New MACs, the other segment's 802.1Q tag and (for IPv4) a new TTL with the
     header checksum recomputed. TCP/UDP checksums do not cover the TTL, so the
-    L4 segment is carried over untouched.
+    L4 segment is carried over untouched. An incoming tag's priority (PCP) and
+    DEI bits are kept on the new tag — GOOSE / SV / PROFINET RT rely on them —
+    and a priority-tagged frame re-addressed with ``vlan=None`` stays
+    priority-tagged (VID 0).
     """
     etype = struct.unpack("!H", frame[12:14])[0]
     body = frame[14:]
+    prio = 0                                    # PCP + DEI (top 4 TCI bits)
     if etype == ETH_P_VLAN:
+        prio = struct.unpack("!H", frame[14:16])[0] & 0xF000
         etype = struct.unpack("!H", frame[16:18])[0]
         body = frame[18:]
     if etype == ETH_P_IP and ttl is not None and len(body) >= 20:
@@ -217,4 +222,8 @@ def rewrite_l2(frame: bytes, src_mac: str, dst_mac: str, vlan: int | None,
         hdr[10:12] = b"\x00\x00"
         hdr[10:12] = struct.pack("!H", checksum16(bytes(hdr)))
         body = bytes(hdr) + body[ihl:]
+    if prio:
+        return (mac_to_bytes(dst_mac) + mac_to_bytes(src_mac) +
+                struct.pack("!HHH", ETH_P_VLAN, prio | ((vlan or 0) & 0x0FFF),
+                            etype) + body)
     return ethernet(dst_mac, src_mac, etype, body, vlan=vlan)
