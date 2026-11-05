@@ -705,8 +705,10 @@ def vnc_flow(ep: Endpoints, count: int) -> List[bytes]:
     authentication) challenge/response, SecurityResult OK, ClientInit
     (shared), ServerInit with the desktop name, then SetPixelFormat /
     SetEncodings and framebuffer update request/response cycles.
-    Meta: ``vnc_desktop`` (else ``host``)."""
+    Meta: ``vnc_desktop`` (else ``host``); ``vnc_auth: "none"`` offers only
+    security type 1 (None) — no challenge, an unauthenticated HMI."""
     desktop = str(_meta(ep, "vnc_desktop", "host", default="HMI-PANEL01")).encode()
+    noauth = str(_meta(ep, "vnc_auth", default="")).lower() == "none"
     seed = _seed(ep, "vnc")
     w, h = 1280, 800
     # 32 bpp, depth 24, little-endian, true colour, 255/255/255, shifts 16/8/0
@@ -716,9 +718,11 @@ def vnc_flow(ep: Endpoints, count: int) -> List[bytes]:
     encodings = (16, 5, 6, 1, 0, -239, -223, -308)    # ZRLE Hextile ... Raw
     set_enc = struct.pack("!BxH", 2, len(encodings)) + \
         struct.pack(f"!{len(encodings)}i", *encodings)
-    steps = [(False, b"RFB 003.008\n"), (True, b"RFB 003.008\n"),
-             (False, b"\x01\x02"), (True, b"\x02"),
-             (False, _prand(seed + "chal", 16)), (True, _prand(seed + "resp", 16)),
+    auth = ([(False, b"\x01\x01"), (True, b"\x01")] if noauth else
+            [(False, b"\x01\x02"), (True, b"\x02"),
+             (False, _prand(seed + "chal", 16)),
+             (True, _prand(seed + "resp", 16))])
+    steps = [(False, b"RFB 003.008\n"), (True, b"RFB 003.008\n")] + auth + [
              (False, struct.pack("!I", 0)), (True, b"\x01"),
              (False, server_init),
              (True, struct.pack("!B3x", 0) + pixfmt), (True, set_enc)]

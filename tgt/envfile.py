@@ -63,6 +63,23 @@ that matches nothing is an error. Optional ``period`` (seconds, or "500ms",
 environment's ``timing`` map for a later time model; the cycle builder does
 not use them yet.
 
+**segments[]** optional keys — ``gateway_mac`` (the gateway's MAC when it
+is not the HSRP virtual MAC), ``wan_rtt_ms`` (round-trip time of the WAN
+link that reaches the segment, a time-model hint), and ``nat``:
+``{"outside_ip": IP, "outside_mac"?: MAC, "local"?: bool}`` — a remote site
+behind a NAT router. Its hosts appear as ``outside_ip`` (with the router's
+MAC) in every frame that leaves the site; ``outside_ip`` may be a host in
+another segment (a cellular modem on a WAN VLAN, whose MAC is then used) or
+an address outside every segment (a carrier / internet address, reached
+through the HQ gateway). Site-internal frames (LAN traffic, ARP) are not on
+the HQ capture and are dropped unless ``local`` is true. See
+:class:`tgt.enterprise.Environment`.
+
+**findings[]** — optional ground truth for planted issues: ``{"id", "title",
+"severity"?: info|low|medium|high|critical, "category"?, "hosts"?: [NAME...],
+"flows"?: [{"client", "server", "proto"}...], "detail"?}``; flows must be
+among the environment's flows. ``tgt inventory -f json`` lists them.
+
 **options** — ``arp`` (default true: start-of-cycle ARP for gateway and
 peers), ``flat`` (one VLAN for every segment), ``dual_homed`` (list of
 ``{"host": NAME, "ip": IP, "mac"?: MAC, "flows"?: [[SERVER, PROTO], ...]}``),
@@ -86,8 +103,13 @@ from .enterprise import Conversation, Environment, Host, Segment
 ZONES = ("IT", "DMZ", "OT-SUPERVISORY", "OT-CELL")
 CATEGORIES = ("IT", "OT", "mixed")
 _TOP_KEYS = {"key", "name", "category", "description", "options", "segments",
-             "hosts", "flows"}
-_SEG_KEYS = {"name", "vlan", "subnet", "zone", "gateway"}
+             "hosts", "flows", "findings"}
+_SEG_KEYS = {"name", "vlan", "subnet", "zone", "gateway", "gateway_mac", "nat",
+             "wan_rtt_ms"}
+_NAT_KEYS = {"outside_ip", "outside_mac", "local"}
+_FINDING_KEYS = {"id", "title", "severity", "category", "hosts", "flows",
+                 "detail"}
+SEVERITIES = ("info", "low", "medium", "high", "critical")
 _HOST_KEYS = {"name", "ip", "role", "os", "model", "vendor", "product", "mac",
               "firmware", "serial", "fqdn", "count", "start", "ip_start",
               "meta", "client_meta"}
@@ -286,9 +308,16 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
                 timing[c] = dict(t)
 
     options = _options(cx, doc.get("options", {}), "options", where, segments)
+    findings = [_finding(cx, f, f"findings[{i}]", where, conv)
+                for i, f in enumerate(cx.list(doc.get("findings", []),
+                                              "findings"))]
+    ids = [f["id"] for f in findings]
+    for i, fid in enumerate(ids):
+        if fid in ids[:i]:
+            raise cx.err(f"findings[{i}].id", f"duplicate finding id {fid!r}")
     try:
         env = Environment(key, name, category, desc, hosts, conv, segments,
-                          options, host_meta, timing)
+                          options, host_meta, timing, findings)
     except ValueError as e:
         raise EnvFileError(f"{source}: {e}") from None
     env.source = source             # type: ignore[attr-defined]
@@ -313,7 +342,65 @@ def _segment(cx: _Ctx, raw: Any, path: str) -> Segment:
             raise cx.err(f"{path}.gateway", f"{gw} is outside {net}")
     else:
         gw = net.network_address + 1
-    return Segment(name, vlan, str(net), zone, str(gw))
+    opts: Dict[str, Any] = {}
+    if "gateway_mac" in d:
+        opts["gateway_mac"] = cx.mac(d["gateway_mac"], f"{path}.gateway_mac")
+    if "wan_rtt_ms" in d:
+        v = d["wan_rtt_ms"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or \
+                not 0 < v <= 60000:
+            raise cx.err(f"{path}.wan_rtt_ms", "expected a round-trip time "
+                         f"in milliseconds (0 < ms <= 60000), got {v!r}")
+        opts["wan_rtt_ms"] = v
+    if "nat" in d:
+        p = f"{path}.nat"
+        n = cx.obj(d["nat"], p, _NAT_KEYS, ("outside_ip",))
+        out = cx.ip(n["outside_ip"], f"{p}.outside_ip")
+        if out in net:
+            raise cx.err(f"{p}.outside_ip", f"{out} is inside the NAT'd "
+                         f"subnet {net}")
+        nat: Dict[str, Any] = {"outside_ip": str(out)}
+        if "outside_mac" in n:
+            nat["outside_mac"] = cx.mac(n["outside_mac"], f"{p}.outside_mac")
+        if "local" in n:
+            nat["local"] = cx.bool(n["local"], f"{p}.local")
+        opts["nat"] = nat
+    return Segment(name, vlan, str(net), zone, str(gw), opts)
+
+
+def _finding(cx: _Ctx, raw: Any, path: str, where: Dict[str, str],
+             conv: List[Conversation]) -> Dict[str, Any]:
+    """One planted finding: who/what a monitor should flag (ground truth)."""
+    d = cx.obj(raw, path, _FINDING_KEYS, ("id", "title"))
+    out: Dict[str, Any] = {"id": cx.str(d["id"], f"{path}.id"),
+                           "title": cx.str(d["title"], f"{path}.title")}
+    if "severity" in d:
+        if d["severity"] not in SEVERITIES:
+            raise cx.err(f"{path}.severity", f"{d['severity']!r} is not one "
+                         f"of {', '.join(SEVERITIES)}")
+        out["severity"] = d["severity"]
+    for k in ("category", "detail"):
+        if k in d:
+            out[k] = cx.str(d[k], f"{path}.{k}")
+    out["hosts"] = []
+    for i, h in enumerate(cx.list(d.get("hosts", []), f"{path}.hosts")):
+        if cx.str(h, f"{path}.hosts[{i}]") not in where:
+            raise cx.err(f"{path}.hosts[{i}]", f"no host named {h!r}")
+        out["hosts"].append(h)
+    out["flows"] = []
+    known = set(conv)
+    for i, f in enumerate(cx.list(d.get("flows", []), f"{path}.flows")):
+        fp = f"{path}.flows[{i}]"
+        f = cx.obj(f, fp, {"client", "server", "proto"},
+                   ("client", "server", "proto"))
+        if (f["client"], f["server"], f["proto"]) not in known:
+            raise cx.err(fp, f"{f['client']} -> {f['server']} "
+                         f"{f['proto']} is not one of the flows")
+        out["flows"].append({"client": f["client"], "server": f["server"],
+                             "proto": f["proto"]})
+    if not out["hosts"] and not out["flows"]:
+        raise cx.err(path, "a finding needs 'hosts' and/or 'flows'")
+    return out
 
 
 def _hosts(cx: _Ctx, raw: Any, path: str):
@@ -627,8 +714,10 @@ def to_dict(env: Environment) -> Dict[str, Any]:
                            "category": env.category, "description": env.desc}
     if env.options:
         doc["options"] = copy.deepcopy(env.options)
-    doc["segments"] = [{"name": s.name, "vlan": s.vlan, "subnet": s.subnet,
-                        "zone": s.zone, "gateway": s.gateway}
+    doc["segments"] = [dict({"name": s.name, "vlan": s.vlan,
+                             "subnet": s.subnet, "zone": s.zone,
+                             "gateway": s.gateway},
+                            **copy.deepcopy(s.options))
                        for s in segments]
     doc["hosts"] = [_host_dict(env, h) for h in hosts]
     flows = []
@@ -637,6 +726,8 @@ def to_dict(env: Environment) -> Dict[str, Any]:
         f.update(env.timing.get(c, {}))
         flows.append(f)
     doc["flows"] = flows
+    if env.findings:
+        doc["findings"] = copy.deepcopy(env.findings)
     return doc
 
 

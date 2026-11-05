@@ -146,7 +146,11 @@ class Recorder:
             for h in env.hosts:
                 self._host(h)
             for c, s, proto in env.conversations:
-                self._add(proto, env.host(c), env.host(s))
+                ch, sh = env.host(c), env.host(s)
+                self._add(proto, ch, sh)
+                vc, vs = env.nat_view(ch, sh)    # as seen through NAT
+                if vc is not ch or vs is not sh:
+                    self._add(proto, vc, vs, self._aid(ch), self._aid(sh))
             for h, ip, fqdn, _ in env.edr_plan():
                 cloud = enterprise._cs_cloud_host(ip, fqdn)
                 self._add("edr", h, cloud, said=ip)

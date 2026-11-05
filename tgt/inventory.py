@@ -42,6 +42,9 @@ _FROM_SERVER = {
     "http": ("os",),             # Server: banner
     "https": ("fqdn",),          # the client's SNI names the server
     "ldap": ("fqdn",),           # rootDSE search names the DC
+    # IEC 61850 MMS Identify; SEL ASCII ID (FID firmware string + serial)
+    "mms": ("vendor", "product", "model", "firmware", "os"),
+    "sel-telnet": ("vendor", "product", "model", "firmware", "serial", "os"),
 }
 _FROM_CLIENT = {
     "http": ("os",),             # User-Agent
@@ -111,8 +114,11 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
     ev: Dict[str, Dict[str, Set[str]]] = {
         h.name: {f: set() for f in OBSERVABLE_FIELDS} for h in env.hosts}
 
+    hidden = {h.name for h in env.hosts if env.hidden(h)}
+
     def emits(name: str, proto: str) -> None:
-        ev[name]["vendor"].add("oui")          # every frame shows the MAC
+        if name not in hidden:                 # behind NAT: the router's MAC
+            ev[name]["vendor"].add("oui")      # every frame shows the MAC
         if protocols.get(proto).transport != "l2":
             ev[name]["os"].add("ttl")          # every IP packet shows the TTL
 
@@ -132,7 +138,8 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
         emits(h.name, "edr")
     if env.arp_enabled:
         for h in env.hosts:
-            emits(h.name, "arp")
+            if h.name not in hidden:
+                emits(h.name, "arp")
     return ev
 
 
@@ -183,6 +190,9 @@ def external(env: Environment) -> List[Dict]:
         e["fqdns"].add(fqdn)
         e["talkers"].add(h.name)
     by_ip = {h.ip: h.name for h in env.hosts}
+    for h in env.hosts:                 # remote sites seen through NAT
+        if env.nat_address(h):
+            by_ip.setdefault(env.nat_address(h), h.name)
     for _, frame in env.build(1):
         ips = packet.frame_ips(frame)
         if not ips:
@@ -203,11 +213,21 @@ def external(env: Environment) -> List[Dict]:
 
 def infrastructure(env: Environment) -> List[Dict]:
     """Network devices whose addresses appear on the wire but are not modeled
-    hosts: each segment's HSRP virtual gateway (routed frames carry its MAC)."""
-    return [{"kind": "hsrp-gateway", "segment": s.name, "vlan": s.vlan,
-             "ip": s.gateway, "mac": s.gateway_mac,
-             "mac_vendor": "Cisco (HSRP virtual MAC)"}
-            for s in env.segments]
+    hosts: each segment's HSRP virtual gateway (routed frames carry its MAC),
+    or its own router (a ``gateway_mac`` option, or a NAT site's router).
+    A NAT site's gateway is only on the wire when the site is ``local``."""
+    out = []
+    for s in env.segments:
+        mac = env.gateway_mac(s)
+        own = mac != f"00:00:0c:07:ac:{s.vlan & 0xFF:02x}"   # not HSRP
+        if s.nat and not s.nat.get("local"):
+            continue                    # behind NAT, never seen from HQ
+        out.append({"kind": "gateway" if own else "hsrp-gateway",
+                    "segment": s.name, "vlan": s.vlan, "ip": s.gateway,
+                    "mac": mac,
+                    "mac_vendor": OUI_VENDORS.get(mac[:8], "")
+                    if own else "Cisco (HSRP virtual MAC)"})
+    return out
 
 
 def _flow(c: str, sv: str, p: str) -> Dict:
@@ -219,6 +239,15 @@ def _flow(c: str, sv: str, p: str) -> Dict:
         flow["activity"] = "engineering" if p in ENGINEERING else "operations"
         flow["note"] = OPERATIONS[p]
     return flow
+
+
+def _segment(env: Environment, s) -> Dict:
+    d = {"name": s.name, "vlan": s.vlan, "subnet": s.subnet, "zone": s.zone,
+         "gateway": s.gateway, "gateway_mac": env.gateway_mac(s)}
+    for k in ("nat", "wan_rtt_ms"):
+        if s.options.get(k):
+            d[k] = s.options[k]
+    return d
 
 
 def to_json(env: Environment, sprinkle: Sequence[str] = ()) -> Dict:
@@ -235,16 +264,19 @@ def to_json(env: Environment, sprinkle: Sequence[str] = ()) -> Dict:
             "known_cves": list(dev.known_cves) if dev else [],
             "observability": _observability(h, row, ev[h.name]),
         })
+        if env.nat_address(h):          # how the HQ capture sees it
+            row["nat_ip"] = env.nat_address(h)
+            row["nat_hidden"] = env.hidden(h)
     doc = {
         "env": env.key, "name": env.name, "category": env.category,
-        "segments": [{"name": s.name, "vlan": s.vlan, "subnet": s.subnet,
-                      "zone": s.zone, "gateway": s.gateway,
-                      "gateway_mac": s.gateway_mac} for s in env.segments],
+        "segments": [_segment(env, s) for s in env.segments],
         "hosts": rows,
         "flows": [_flow(c, sv, p) for c, sv, p in env.conversations],
         "external": external(env),
         "infrastructure": infrastructure(env),
     }
+    if env.findings:                    # planted issues a monitor should flag
+        doc["findings"] = [dict(f) for f in env.findings]
     if sprinkle:
         doc["new_assets"] = new_assets(env, sprinkle)
         doc["sprinkle"] = sprinkle_mapping(env, sprinkle)
