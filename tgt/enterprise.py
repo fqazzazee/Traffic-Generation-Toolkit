@@ -215,6 +215,17 @@ _ZONE_LEVEL = {"IT": "4", "DMZ": "3.5", "OT-SUPERVISORY": "3"}
 _FIELD_ROLES = {"plc", "drive", "meter", "relay", "rtu"}
 
 
+def _ot_addressing(client: "Host", server: "Host") -> dict:
+    """Per-device OT protocol addresses, derived from the IPs so every device
+    differs: the BACnet device instance (third octet * 1000 + host octet,
+    e.g. 10.100.40.21 -> 40021) and the DNP3 link addresses (each side's
+    host octet: master = client, outstation = server)."""
+    s3, s4 = (int(x) for x in server.ip.split(".")[2:])
+    return {"bacnet_instance": s3 * 1000 + s4,
+            "dnp3_master": int(client.ip.rsplit(".", 1)[1]),
+            "dnp3_outstation": s4}
+
+
 # A conversation: client drives `proto` toward server.
 Conversation = Tuple[str, str, str]   # (client_name, server_name, proto_key)
 
@@ -346,6 +357,11 @@ def _ot_conversations(hosts: List[Host]) -> List[Conversation]:
         ("HMI-2000", "HISTORIAN", "smb"), ("HMI-2000", "SCADA01", "http"),
         # supervisory IT chatter
         ("SCADA01", "HISTORIAN", "https"), ("ENGWS01", "HISTORIAN", "dns"),
+        # RSLinx-style browse from the cell HMI; engineering baseline:
+        # controller mode/program reads, S7 block upload + planned download
+        ("HMI-RW", "PLC-RW1", "enip-list"), ("HMI-RW", "PLC-RW2", "enip-list"),
+        ("ENGWS01", "PLC-RW1", "enip-eng"), ("ENGWS01", "PLC-RW2", "enip-eng"),
+        ("ENGWS01", "PLC-S7-1", "s7-eng"), ("ENGWS01", "PLC-S7-2", "s7-eng"),
     ]
     return [c for c in conv if c[0] in by and c[1] in by]
 
@@ -410,7 +426,8 @@ class Environment:
         # the server's own identity: CIP vendor/product code/revision/serial,
         # S7 firmware + serial — so each device reports its own values
         meta.update(devices.identity_meta(server.device, server.firmware,
-                                          server.serial))
+                                          server.serial, server.name))
+        meta.update(_ot_addressing(client, server))
         # Built untagged, host to host; _place() puts each frame on its VLAN.
         return Endpoints(
             client_mac=client.mac, client_ip=client.ip,
@@ -473,6 +490,13 @@ class Environment:
                     peers.append(h)
             return {"dns_names": [(f"{h.name.lower()}.{DNS_DOMAIN}", h.ip)
                                   for h in peers or [server]]}
+        if proto in ("bacnet-id", "enip-list"):
+            # discovery broadcast to the client's subnet when the device
+            # shares it; a routed device is browsed by unicast
+            seg = self.segment_of(client)
+            same = self.segment_of(server) is seg
+            return {"bcast": str(ipaddress.ip_network(seg.subnet)
+                                 .broadcast_address) if same else ""}
         if proto == "dhcp":
             seg = self.segment_of(client)
             meta = {"dhcp_router": seg.gateway, "dhcp_domain": DNS_DOMAIN,
@@ -793,7 +817,41 @@ def _site_conversations(hosts: List[Host]) -> List[Conversation]:
     # Policy violation an analyser should flag: an IT laptop polling a
     # utilities meter directly (L4 -> L1), bypassing the DMZ.
     conv.append(("WS-CONTRACTOR", "METER-UT1", "modbus"))
+    conv += _site_identity_conversations(named)
     return [c for c in conv if c[0] in by and c[1] in by]
+
+
+def _site_identity_conversations(named) -> List[Conversation]:
+    """Every embedded device states its identity in its own protocol, and the
+    engineering / operations baseline runs from the hosts that own it."""
+    conv: List[Conversation] = []
+    # Packaging: RSLinx browse from the line HMI, Studio 5000 going online
+    # from ENG01, and class-1 I/O between each PLC and its PowerFlexes
+    for plc in named("PLC-PK"):
+        conv += [("HMI-PK1", plc, "enip-list"), ("ENG01", plc, "enip-eng")]
+    for i, drv in enumerate(named("DRV-PK")):
+        conv.append((f"PLC-PK{i % 4 + 1}", drv, "enip-io"))
+    # Process: TIA Portal block list / upload / planned download from ENG02
+    for plc in named("PLC-PR"):
+        conv.append(("ENG02", plc, "s7-eng"))
+    # Utilities: Modbus device ID from engineering + the power-monitoring
+    # historian; the operator HMI writes setpoints
+    for plc in named("PLC-UT"):
+        conv += [("ENG01", plc, "modbus-id"), ("HMI-UT1", plc, "modbus-write")]
+    for m in named("METER-UT"):
+        conv.append(("HIST01", m, "modbus-id"))
+    # BMS: the JACE discovers its controllers; the supervisor reads the JACE
+    for ahu in named("BAC-AHU"):
+        conv.append(("BMS-JACE", ahu, "bacnet-id"))
+    conv.append(("BMS-SUP", "BMS-JACE", "bacnet-id"))
+    # Substation: DNP3 device attributes, SCADA time sync, RTU via SNMP
+    for r in named("RELAY"):
+        conv.append(("RTAC01", r, "dnp3-id"))
+    conv += [("SCADA02", "RTAC01", "dnp3-id"),
+             ("SCADA02", "RTAC01", "dnp3-time"),
+             ("SCADA02", "RTU-104", "iec104-time"),
+             ("SCADA02", "RTU-104", "snmp")]
+    return conv
 
 
 ENVIRONMENTS: Dict[str, Environment] = {}
