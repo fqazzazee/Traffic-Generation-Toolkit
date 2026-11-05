@@ -3262,8 +3262,12 @@ def test_tcp_ip_id_and_defaults() -> None:
     core = env.build(1, span="core")
     pairs = 0
     for (_, a), (_, b) in zip(core, core[1:]):
-        if P.frame_ips(a) and P.frame_ips(a) == P.frame_ips(b) and \
-                a[-20:] == b[-20:] and a[12:14] == b[12:14] == b"\x81\x00":
+        # a routed copy: both tagged, same addresses and the very same IP
+        # payload, TTL one lower (a shared tail alone can pair two distinct
+        # datagrams, whose IDs rightly differ)
+        if a[12:14] == b[12:14] == b"\x81\x00" and len(a) == len(b) and \
+                a[30:38] == b[30:38] and a[38:] == b[38:] and \
+                b[26] == a[26] - 1:
             pairs += 1
             check(a[22:24] == b[22:24], "routed copy changed the IP ID")
     check(pairs > 0, "no routed copies found in the core view")
