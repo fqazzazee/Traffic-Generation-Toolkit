@@ -1,0 +1,13 @@
+{
+  "name": "incident-window",
+  "description": "Industrial site with the shift day profile: 6 h baseline, a 1 h Industroyer-style IEC 104 intrusion on top of normal traffic, then 2 h of recovery - for alert timing / time-to-detect scoring.",
+  "env": "industrial-site",
+  "start_time": "2026-11-04T04:00:00Z",
+  "seed": 104,
+  "day_profile": "shift",
+  "phases": [
+    {"name": "baseline", "duration": "6h"},
+    {"name": "intrusion", "duration": "1h", "sprinkle": ["industroyer"]},
+    {"name": "recovery", "duration": "2h"}
+  ]
+}

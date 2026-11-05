@@ -13,6 +13,7 @@
     "(asset|device|node).*(offline|disconnected|stopped communicating)": "asset-offline",
     "ip (address )?change": "ip-change",
     "firmware (change|update|download)": "firmware-change",
+    "(model|hardware|serial) (change|mismatch)|(device|asset) (replaced|changed|properties changed)": "asset-change",
     "(program|logic|project|code) (download|upload|change)|online edit": "plc-program",
     "(mode|state) change|plc (stop|run)|controller (stop|start)": "plc-mode-change",
     "(write|set ?point|force) (command|request|value)|modbus write|ot write": "ot-write",

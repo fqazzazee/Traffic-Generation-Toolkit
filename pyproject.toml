@@ -31,6 +31,7 @@ packages = ["tgt"]
 
 [tool.setuptools.package-data]
 tgt = ["scoremaps/*.json", "envs/*.json", "envs/*.toml", "envs/sites/*.json",
+       "campaigns/*.json", "campaigns/*.toml",
        "envs/sites/*.toml"]
 
 [tool.setuptools.dynamic]
