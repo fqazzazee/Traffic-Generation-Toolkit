@@ -1,0 +1,25 @@
+{
+  "key": "acme-plant",
+  "name": "Acme Sensor Plant",
+  "category": "OT",
+  "description": "Example plugin environment: an edge gateway polling Acme SX-1 smart sensors over CoAP (a plugin protocol) and publishing MQTT to a broker, an HMI reading the gateway, and a managed switch. Loaded by examples/plugins/acme_plant.py.",
+  "segments": [
+    {"name": "OPS", "vlan": 70, "subnet": "10.77.0.0/24", "zone": "OT-SUPERVISORY"},
+    {"name": "SENSORS", "vlan": 77, "subnet": "10.77.10.0/24", "zone": "OT-CELL"}
+  ],
+  "hosts": [
+    {"name": "HMI-A1", "ip": "10.77.0.10", "role": "hmi", "os": "win10"},
+    {"name": "BROKER01", "ip": "10.77.0.20", "role": "hist", "os": "linux"},
+    {"name": "OT-NMS", "ip": "10.77.0.30", "role": "nms", "os": "linux"},
+    {"name": "EDGE01", "ip": "10.77.10.5", "role": "eng", "os": "linux"},
+    {"name": "SX1-{n:02}", "count": 4, "ip_start": "10.77.10.21", "model": "acme-sx1", "role": "meter", "os": "linux"},
+    {"name": "SW-SENS", "ip": "10.77.10.2", "model": "hirschmann-rsp35"}
+  ],
+  "flows": [
+    {"from": "EDGE01", "to": "model:acme-sx1", "proto": "coap", "period": "1s"},
+    {"client": "EDGE01", "server": "BROKER01", "proto": "mqtt", "period": "5s"},
+    {"client": "HMI-A1", "server": "BROKER01", "proto": "mqtt"},
+    {"from": "role:switch", "proto": "lldp"},
+    {"from": "OT-NMS", "to": "role:switch", "proto": "snmp", "period": "5m"}
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "_comment": "Example plugin score map (registered by examples/plugins/acme_plant.py as 'acme-siem'): an alert map for a CSV export with Acme SIEM wording. Use: tgt score --manifest run.json --assets assets.csv --map generic --alerts alerts.csv --alert-map acme-siem",
+  "format": "csv",
+  "columns": {
+    "time": ["time", "timestamp"],
+    "src": ["src", "source", "src_ip"],
+    "dst": ["dst", "destination", "dst_ip"],
+    "title": ["title", "alert", "name"],
+    "category": ["category", "type"]
+  },
+  "categories": {
+    "coap (put|write)|actuator (write|command)": "ot-write",
+    "new (asset|device|node)": "new-asset",
+    "scan|sweep|reconnaissance": "scan"
+  }
+}

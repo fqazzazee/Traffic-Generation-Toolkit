@@ -312,9 +312,14 @@ def test_tshark_dissects_every_builder() -> None:
     if not shutil.which("tshark"):
         _skipped.append("test_tshark_dissects_every_builder")
         return
-    check(set(_DISSECTS_AS) == set(protocols.PROFILES),
+    # plugin protocols (tgt.plugins) declare their own tshark layer
+    from tgt import plugins
+    check(set(_DISSECTS_AS) | set(plugins.DISSECTORS)
+          == set(protocols.PROFILES),
           "_DISSECTS_AS out of sync with the protocol registry")
-    groups = {k: protocols.get(k).build(Endpoints(), 3) for k in _DISSECTS_AS}
+    dissects = dict(_DISSECTS_AS)
+    dissects.update({k: v for k, v in plugins.DISSECTORS.items() if v})
+    groups = {k: protocols.get(k).build(Endpoints(), 3) for k in dissects}
     groups["smb1"] = protocols.smb_flow(Endpoints(meta={"smb": "smb1"}), 3)
     site = [f for _, f in enterprise.get("industrial-site").build(2)]
     # the site cycle gets its own capture: its ARP would otherwise flag the
@@ -334,7 +339,7 @@ def test_tshark_dissects_every_builder() -> None:
                 ["tshark", "-r", path, "-q", "-z", "expert,warn"],
                 capture_output=True, text=True).stdout
     seen = {x for line in layers for x in line.split(":")}
-    for key, layer in list(_DISSECTS_AS.items()) + [("smb1", "smb")]:
+    for key, layer in list(dissects.items()) + [("smb1", "smb")]:
         check(layer in seen, f"tshark: {key} never dissected as {layer}")
     # deliberate RST closes (aborted browser sessions) are the only
     # warnings allowed
@@ -4934,6 +4939,537 @@ def test_every_site_has_wire_backed_findings() -> None:
                 check(_finding_on_wire(env, batch, fl["client"],
                                        fl["server"], fl["proto"]),
                       f"{key}: finding {fd['id']}: {fl} not on the wire")
+
+
+# ---------------------------------------------------------------------------
+# W3-D: multi-interface fan-out, control API, pcapng replay + rewrite, plugins
+# ---------------------------------------------------------------------------
+class _FakeSock:
+    """Stands in for an AF_PACKET socket: records frames, optionally fails."""
+
+    def __init__(self, name: str, fail: bool = False):
+        self.name, self.fail, self.sent = name, fail, []
+
+    def send(self, frame):
+        if self.fail:
+            raise OSError(100, f"Network is down ({self.name})")
+        self.sent.append(frame)
+        return len(frame)
+
+    def close(self):
+        pass
+
+
+def test_fanout_sender_counts_per_interface() -> None:
+    """--iface a,b,c: every frame goes to each socket; an interface that
+    cannot open or send is counted per interface and never stops the
+    others; the manifest carries the per-interface counters."""
+    import json
+    from tgt import sender as S
+    socks = {}
+
+    def fake_open(name):
+        if name == "gone0":
+            raise OSError(19, "No such device")
+        socks[name] = _FakeSock(name, fail=(name == "down0"))
+        return socks[name]
+
+    real = S.RawSender._open_one
+    S.RawSender._open_one = staticmethod(fake_open)
+    try:
+        check(S.split_ifaces(" a, b,a,,c ") == ["a", "b", "c"],
+              "split_ifaces: order/dedupe")
+        with tempfile.TemporaryDirectory() as d:
+            cfg = RunConfig(profiles=["modbus"], rate=0, count=24,
+                            iface="t1,down0,t2,gone0",
+                            pcap_path=os.path.join(d, "f.pcap"),
+                            manifest_path=os.path.join(d, "f.json"))
+            eng = _run_engine(cfg)
+            man = json.load(open(cfg.manifest_path))
+            recs = _pcap_records(cfg.pcap_path)
+        st = eng.stats
+        check(st.packets == 24 and st.errors == 0,
+              f"fan-out: packets={st.packets} errors={st.errors}")
+        check(socks["t1"].sent == socks["t2"].sent and
+              len(socks["t1"].sent) == 24, "fan-out: t1/t2 frames differ")
+        check(len(recs) == 24, "fan-out: pcap != frames sent")
+        pi = st.per_iface
+        check(pi["t1"]["packets"] == pi["t2"]["packets"] == 24 and
+              pi["down0"]["errors"] == 24 and pi["down0"]["packets"] == 0 and
+              pi["gone0"]["errors"] >= 1 and "No such device" in
+              pi["gone0"]["last_error"],
+              f"fan-out: per-interface counters {pi}")
+        check(man["interfaces"] == json.loads(json.dumps(pi)),
+              "fan-out: manifest interfaces != stats")
+        # all interfaces dead -> a send error per frame, nothing recorded
+        S.RawSender._open_one = staticmethod(
+            lambda n: _FakeSock(n, fail=True))
+        with tempfile.TemporaryDirectory() as d:
+            eng = _run_engine(RunConfig(profiles=["modbus"], rate=0, count=6,
+                                        iface="x,y",
+                                        pcap_path=os.path.join(d, "x.pcap")))
+            check(eng.stats.packets == 0 and eng.stats.errors == 6 and
+                  not _pcap_records(os.path.join(d, "x.pcap")),
+                  "fan-out: all-down run recorded frames")
+    finally:
+        S.RawSender._open_one = real
+
+
+_FANOUT_NS = r'''
+import json, os, socket, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+from tgt.config import RunConfig
+from tgt.engine import Engine
+for n in ("w3a", "w3b"):
+    subprocess.run(["ip", "link", "add", n, "type", "veth", "peer", "name",
+                    n + "-mon"], check=True)
+    for x in (n, n + "-mon"):
+        subprocess.run(["ip", "link", "set", x, "up"], check=True)
+rx = {}
+for n in ("w3a-mon", "w3b-mon"):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+    s.bind((n, 0))
+    s.setblocking(False)
+    rx[n] = s
+cfg = RunConfig(profiles=["modbus", "dns", "arp"], rate=0, count=60,
+                iface="w3a,w3b", pcap_path=sys.argv[2])
+eng = Engine(cfg)
+eng.start()
+eng.join(30)
+time.sleep(0.3)
+got = {}
+for n, s in rx.items():
+    frames = []
+    while True:
+        try:
+            frames.append(s.recv(65535).hex())
+        except BlockingIOError:
+            break
+    got[n] = frames
+print(json.dumps({"got": got, "per_iface": eng.stats.per_iface,
+                  "packets": eng.stats.packets}))
+'''
+
+
+def test_fanout_two_veths_in_netns() -> None:
+    """Optional (needs `unshare -rn` + iproute2): fan-out to two real veths
+    in a private network namespace; both peers receive exactly the frames
+    written to the pcap, in order."""
+    import json
+    import shutil
+    import subprocess
+    if not (shutil.which("unshare") and shutil.which("ip")):
+        _skipped.append("test_fanout_two_veths_in_netns")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "ns.pcap")
+        r = subprocess.run(["unshare", "-rn", sys.executable, "-c",
+                            _FANOUT_NS, _REPO, pcap],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or not r.stdout.strip():
+            _skipped.append("test_fanout_two_veths_in_netns")
+            return
+        res = json.loads(r.stdout.strip().splitlines()[-1])
+        sent = [f.hex() for _, f in _pcap_records(pcap)]
+    check(res["packets"] == 60 == len(sent), "netns fan-out: packet count")
+    for n, frames in res["got"].items():
+        mine = [f for f in frames if f in set(sent)]
+        check(mine == sent, f"netns fan-out: {n} got {len(mine)}/{len(sent)}"
+              " frames (or out of order)")
+    check(all(c["packets"] == 60 and c["errors"] == 0
+              for c in res["per_iface"].values()),
+          f"netns fan-out: counters {res['per_iface']}")
+
+
+def test_control_api_endpoints_and_injection() -> None:
+    """--api: status/pause/resume/rate/inject/manifest/stop over HTTP, the
+    security checks, and a timed injection recorded in the manifest with
+    its exact first/last frame and per-attack events."""
+    import contextlib
+    import io
+    import json
+    import time
+    import urllib.request
+    from tgt import api, cli
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(profiles=["modbus", "dns"], rate=400, duration=20,
+                        pcap_path=os.path.join(d, "api.pcap"),
+                        manifest_path=os.path.join(d, "api.json"), seed=9)
+        eng = Engine(cfg)
+        eng.record = True
+        for host, remote, tok in (("0.0.0.0", False, None),
+                                  ("0.0.0.0", True, None)):
+            try:
+                api.ControlServer(eng, host, 0, token=tok,
+                                  allow_remote=remote).close()
+                check(False, f"api: bound {host} remote={remote} tok={tok}")
+            except api.ApiError:
+                pass
+        srv = api.ControlServer(eng, "127.0.0.1", 0).start()
+        tsrv = api.ControlServer(eng, "127.0.0.1", 0, token="s3cret").start()
+        a, ta = f"127.0.0.1:{srv.port}", f"127.0.0.1:{tsrv.port}"
+        eng.start()
+        try:
+            time.sleep(0.2)
+            code, st = api.request(a, "GET", "/status")
+            check(code == 200 and st["running"] and st["seed"] == 9 and
+                  st["config"]["rate"] == 400 and "uptime" in st,
+                  f"api: /status {code} {st.get('error')}")
+            check(api.request(ta, "GET", "/status")[0] == 401 and
+                  api.request(ta, "GET", "/status", token="nope")[0] == 401
+                  and api.request(ta, "GET", "/status",
+                                  token="s3cret")[0] == 200,
+                  "api: bearer token not enforced")
+            check(api.request(a, "GET", "/stop")[0] == 405,
+                  "api: GET /stop not refused")
+            for hdr in ({"Origin": "http://evil.example"},
+                        {"Host": "evil.example"}):
+                req = urllib.request.Request(f"http://{a}/status",
+                                             headers=hdr)
+                try:
+                    urllib.request.urlopen(req, timeout=5)
+                    check(False, f"api: accepted {hdr}")
+                except urllib.error.HTTPError as e:
+                    check(e.code == 403, f"api: {hdr} -> {e.code}")
+            check(api.request(a, "POST", "/inject",
+                              {"incident": "nosuch"})[0] == 404,
+                  "api: unknown incident not 404")
+            code, r = api.request(a, "POST", "/inject",
+                                  {"incident": "wannacry", "duration": 0.6,
+                                   "ratio": 0.3})
+            check(code == 202 and r["injection"]["id"] == "i1",
+                  f"api: inject -> {code} {r}")
+            check(api.request(a, "POST", "/inject",
+                              {"incident": "wannacry"})[0] == 409,
+                  "api: concurrent injection of one incident not refused")
+            check(api.request(a, "POST", "/rate", {"pps": 600})[0] == 200
+                  and eng.cfg.rate == 600 and eng.limiter.pps == 600,
+                  "api: /rate not applied")
+            check(api.request(a, "POST", "/rate")[0] == 400,
+                  "api: /rate without pps not 400")
+            time.sleep(1.2)
+            api.request(a, "POST", "/pause")
+            time.sleep(0.15)
+            n0 = eng.stats.packets
+            time.sleep(0.3)
+            code, st = api.request(a, "GET", "/status")
+            check(st["paused"] and eng.stats.packets == n0,
+                  "api: pause did not hold sending")
+            api.request(a, "POST", "/resume")
+            time.sleep(0.2)
+            check(eng.stats.packets > n0, "api: resume did not continue")
+            code, live = api.request(a, "GET", "/manifest")
+            check(code == 200 and live["schema"] == "tgt-manifest/1",
+                  "api: /manifest")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cli.main(["ctl", "--api", a, "status"])
+            check(rc == 0 and "injection i1 wannacry: done" in out.getvalue(),
+                  f"tgt ctl status: {out.getvalue()[-300:]}")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(["ctl", "--api", a, "stop"])
+            check(rc == 0, "tgt ctl stop failed")
+            eng.join(5)
+            check(not eng.is_alive(), "api: /stop did not stop the run")
+        finally:
+            eng.stop()
+            eng.join(5)
+            srv.close()
+            tsrv.close()
+        man = json.load(open(cfg.manifest_path))
+        frames = _pcap_records(cfg.pcap_path)
+    inj = man["injections"]
+    check(len(inj) == 1 and inj[0]["incident"] == "wannacry" and
+          inj[0]["packets"] > 0 and inj[0]["start"] and inj[0]["end"] and
+          inj[0]["requested"] <= inj[0]["start"] <= inj[0]["end"],
+          f"manifest injections: {inj}")
+    evs = [e for e in man["events"] if e["source"] == "inject:wannacry#i1"
+           and e.get("attack")]
+    check({e["attack"] for e in evs} >= {"eternalblue", "port-scan"},
+          f"manifest: injected attack events {[e.get('attack') for e in evs]}")
+    check(sum(e["packets"] for e in evs) == inj[0]["packets"] and
+          all(inj[0]["start"] <= e["t_start"] <= e["t_end"] <= inj[0]["end"]
+              for e in evs), "manifest: events outside the injection window")
+    check(man["packets"] == len(frames), "api run: manifest != pcap")
+    # 0.6 s window at ~30% of 400-600 pps: one or a few incident passes
+    check(20 <= inj[0]["packets"] <= 400,
+          f"injection size {inj[0]['packets']}")
+
+
+def _pcapng(sections) -> bytes:
+    """Hand-built pcapng: sections = [(endian, [(btype, body), ...])]."""
+    out = b""
+    for e, blocks in sections:
+        shb = struct.pack(e + "IHHq", 0x1A2B3C4D, 1, 0, -1)
+        out += struct.pack(e + "II", 0x0A0D0D0A, 8 + len(shb) + 4) + shb + \
+            struct.pack(e + "I", 8 + len(shb) + 4)
+        for btype, body in blocks:
+            body += b"\0" * (-len(body) % 4)
+            n = 12 + len(body)
+            out += struct.pack(e + "II", btype, n) + body + \
+                struct.pack(e + "I", n)
+    return out
+
+
+def _ng_opt(e, code, val) -> bytes:
+    return struct.pack(e + "HH", code, len(val)) + val + \
+        b"\0" * (-len(val) % 4)
+
+
+def test_pcapng_reader_sections_interfaces_resolution() -> None:
+    from tgt import pcapread
+    eth = protocols.modbus_flow(Endpoints(), 1)[0]
+    raw = protocols.dns_flow(Endpoints(), 1)[0][14:]
+
+    def epb(e, ifid, ticks, data):
+        return struct.pack(e + "IIIII", ifid, ticks >> 32, ticks & 0xFFFFFFFF,
+                           len(data), len(data)) + data
+
+    le, be = "<", ">"
+    ns_idb = struct.pack(le + "HHI", 101, 0, 0) + _ng_opt(le, 9, b"\x09") + \
+        _ng_opt(le, 14, struct.pack(le + "q", 100)) + _ng_opt(le, 0, b"")
+    data = _pcapng([
+        (le, [(1, struct.pack(le + "HHI", 1, 0, 0)),          # if0 eth, usec
+              (1, ns_idb),                                    # if1 raw, ns
+              (4, b"\x01\x00\x08\x00junkjunk"),               # NRB: skipped
+              (6, epb(le, 0, 1_500_000, eth)),
+              (6, epb(le, 1, 2_250_000_000, raw)),
+              (3, struct.pack(le + "I", len(eth)) + eth),     # SPB on if0
+              (2, struct.pack(le + "HHIIII", 0, 0, 0, 3_000_000, len(eth),
+                              len(eth)) + eth),               # obsolete PB
+              (5, b"\0" * 12)]),                              # ISB: skipped
+        (be, [(1, struct.pack(be + "HHI", 1, 0, 0) +
+               _ng_opt(be, 9, b"\x8a") + _ng_opt(be, 0, b"")),  # 2^-10 s
+              (6, epb(be, 0, 4096, eth))]),
+    ])
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pcapng")
+        with open(path, "wb") as fh:
+            fh.write(data)
+        pk = list(pcapread.iter_packets(path))
+        check(pcapread.probe(path) == ("pcapng", 5),
+              f"pcapng probe {pcapread.probe(path)}")
+        with open(path, "wb") as fh:          # truncated final block
+            fh.write(data[:-7])
+        check(len(list(pcapread.iter_packets(path))) == 4,
+              "pcapng: truncated last block not dropped")
+    check(len(pk) == 5, f"pcapng: {len(pk)} packets")
+    if len(pk) == 5:
+        check([p.interface for p in pk] == [0, 1, 0, 0, 0] and
+              [p.linktype for p in pk] == [1, 101, 1, 1, 1],
+              "pcapng: interfaces / link types")
+        want = [1.5, 102.25, 102.25, 3.0, 4.0]
+        check(all(abs(p.ts - w) < 1e-9 for p, w in zip(pk, want)),
+              f"pcapng ts {[p.ts for p in pk]} != {want}")
+        check(pk[0].frame == eth and pk[1].frame[14:] == raw and
+              pk[1].frame[12:14] == b"\x08\x00" and pk[4].frame == eth,
+              "pcapng: frame bytes / raw-IP wrap")
+    # tshark/editcap conversion of a TGT pcap: same frames and timestamps
+    editcap = shutil_which("editcap")
+    if editcap:
+        import subprocess
+        frames = protocols.http_flow(Endpoints(), 2)
+        with tempfile.TemporaryDirectory() as d:
+            src, ng = os.path.join(d, "s.pcap"), os.path.join(d, "s.pcapng")
+            with PcapWriter(src) as w:
+                for i, f in enumerate(frames):
+                    w.write(f, ts=1700000000 + i * 0.125)
+            subprocess.run([editcap, "-F", "pcapng", src, ng], check=True,
+                           capture_output=True)
+            a = pcapread.read_frames(src)
+            b = pcapread.read_frames(ng)
+        check(a == b, "pcapng (editcap) != pcap frames/timestamps")
+
+
+def test_replay_streams_speed_loop_and_rewrite() -> None:
+    import time
+    from tgt.replay import ReplaySource
+    frames = protocols.dns_flow(Endpoints(), 3)       # 6 frames
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "r.pcap")
+        with PcapWriter(src) as w:
+            for i, f in enumerate(frames):
+                w.write(f, ts=1000.0 + i * 0.1)        # 0.5 s span
+        out = os.path.join(d, "o.pcap")
+        cfg = RunConfig(replay_path=src, replay_speed=2.5, replay_loop=2,
+                        rate=20, pcap_path=out, remap_ip=["10.10.10.20=10.9.9.9"],
+                        replay_vlan=7)
+        t0 = time.perf_counter()
+        eng = _run_engine(cfg)
+        took = time.perf_counter() - t0
+        recs = [f for _, f in _pcap_records(out)]
+        # streamed: the source is an iterator, not a list of the file
+        rs = ReplaySource(RunConfig(replay_path=src), paced=False)
+        check(len(rs) == 6 and not isinstance(rs, list) and
+              iter(rs) is not iter(rs), "ReplaySource not a streamed source")
+    check(eng.stats.packets == 12 and len(recs) == 12,
+          f"replay-loop 2: {eng.stats.packets} packets")
+    check(0.3 <= took < 1.5, f"replay x2.5 of 2x0.5 s took {took:.2f}s")
+    check(all(r[12:16] == b"\x81\x00\x00\x07" for r in recs),
+          "replay: --vlan retag missing")
+    check(all(P.ip_to_bytes("10.9.9.9") in r[30:38] for r in recs),
+          "replay: --remap-ip not applied")
+    for i, r in enumerate(recs):
+        verify_ip_l4(r, f"replayed frame {i}")
+
+
+def test_rewrite_remaps_and_fixes_checksums() -> None:
+    from tgt.rewrite import Rewriter, RewriteError
+    ep = Endpoints(client_ip="192.168.1.10", server_ip="192.168.1.20")
+    tcp = protocols.modbus_flow(ep, 2)
+    udp = protocols.dns_flow(ep, 1)
+    arp = protocols.arp_flow(ep, 1)
+    rw = Rewriter.from_specs(remap_ip=["192.168.1.20=10.0.0.99"],
+                             remap_subnet=["192.168.1.0/24=10.100.10.0/24"],
+                             remap_mac=["02:00:00:00:00:01=00:1d:9c:00:00:01"])
+    for i, f in enumerate(tcp + udp):
+        g = rw.apply(f)
+        verify_ip_l4(g, f"rewrite {i}")
+        ips = P.frame_ips(g)
+        check(ips is not None and set(ips) == {"10.100.10.10", "10.0.0.99"},
+              f"rewrite {i}: addresses {ips}")
+    g = rw.apply(arp[0])
+    check(P.ip_to_bytes("10.100.10.10") in g[28:] or
+          P.ip_to_bytes("10.0.0.99") in g[28:], "rewrite: ARP not remapped")
+    check(b"\x00\x1d\x9c\x00\x00\x01" in rw.apply(tcp[0])[:12],
+          "rewrite: MAC not remapped")
+    # a snaplen-truncated segment gets the same (incremental) checksum
+    full, cut = rw.apply(tcp[2]), rw.apply(tcp[2][:60])
+    check(full[:60] == cut, "rewrite: incremental checksum != recomputed")
+    # an offloaded (wrong) TCP checksum comes out valid
+    bad = bytearray(tcp[2])
+    bad[50:52] = b"\xbe\xef"
+    verify_ip_l4(rw.apply(bytes(bad)), "rewrite of offloaded checksum")
+    # UDP sent without a checksum keeps none
+    z = bytearray(udp[0])
+    z[40:42] = b"\0\0"
+    check(rw.apply(bytes(z))[40:42] == b"\0\0", "rewrite: UDP csum 0 changed")
+    # VLAN: add, replace (PCP kept), strip
+    tag = Rewriter(vlan=30).apply(tcp[0])
+    check(tag[12:16] == b"\x81\x00\x00\x1e" and tag[16:] == tcp[0][12:],
+          "rewrite: VLAN add")
+    pcp = bytearray(tag)
+    pcp[14] |= 0xA0
+    re = Rewriter(vlan=40).apply(bytes(pcp))
+    check(re[14:16] == bytes([0xA0, 40]), "rewrite: VLAN replace lost PCP")
+    check(Rewriter(vlan=0).apply(tag) == tcp[0], "rewrite: VLAN strip")
+    check(Rewriter.from_specs() is None, "rewrite: empty spec not None")
+    for kw in ({"remap_ip": ["1.2.3.4"]},
+               {"remap_subnet": ["10.0.0.0/24=10.1.0.0/16"]},
+               {"remap_mac": ["zz=00:00:00:00:00:01"]}, {"vlan": 5000}):
+        try:
+            Rewriter.from_specs(**kw)
+            check(False, f"rewrite: {kw} accepted")
+        except RewriteError:
+            pass
+    if shutil_which("tshark"):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rw.pcap")
+            with PcapWriter(path) as w:
+                for f in tcp + udp + [bytes(bad)]:
+                    w.write(rw.apply(Rewriter(vlan=12).apply(f)))
+            out = subprocess.run(
+                ["tshark", "-r", path, "-o", "ip.check_checksum:TRUE",
+                 "-o", "tcp.check_checksum:TRUE", "-o",
+                 "udp.check_checksum:TRUE", "-T", "fields", "-e",
+                 "ip.checksum.status", "-e", "tcp.checksum.status", "-e",
+                 "udp.checksum.status", "-e", "vlan.id"],
+                capture_output=True, text=True).stdout.split("\n")
+        rows = [ln.split("\t") for ln in out if ln.strip()]
+        check(len(rows) == len(tcp) + len(udp) + 1 and
+              all(r[0] == "1" and "1" in (r[1], r[2]) and r[3] == "12"
+                  for r in rows), f"tshark: rewritten checksums {rows[:3]}")
+
+
+def test_plugins_example_registers_everything() -> None:
+    """examples/plugins/acme_plant.py: discovered + loaded, every kind of
+    registration usable (list/run/env/incident/score map), dissected by
+    tshark like a built-in, its own self-test passes; a broken plugin is
+    reported and rolled back; unloading restores the registries."""
+    import contextlib
+    import io
+    import subprocess
+    from tgt import (devices, enterprise, incidents, manifest, plugins,
+                     score)
+    ex = os.path.join(_REPO, "examples", "plugins")
+    before = (set(protocols.PROFILES), set(scenarios.SCENARIOS),
+              set(enterprise.ENVIRONMENTS), set(incidents.INCIDENTS),
+              set(incidents.ATTACKS), set(devices.CATALOG),
+              set(manifest.ATTACK_CATEGORY), dict(plugins.DISSECTORS))
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "bad")
+        os.mkdir(bad)
+        with open(os.path.join(bad, "half.py"), "w") as f:
+            f.write("from tgt import plugins\n"
+                    "plugins.register_scenario('half-scn', 'H', ['modbus'],"
+                    " 'd')\nraise RuntimeError('boom')\n")
+        with open(os.path.join(bad, "_private.py"), "w") as f:
+            f.write("raise SystemExit('must not be imported')\n")
+        warns = []
+        plugins.unload_all()
+        try:
+            got = plugins.load_plugins([bad, ex], force=True,
+                                       warn=warns.append)
+            check(len(got) == 1 and len(plugins.ERRORS) == 1 and
+                  "boom" in plugins.ERRORS[0][1] and warns,
+                  f"plugins: load {got} errors {plugins.ERRORS}")
+            check("half-scn" not in scenarios.SCENARIOS,
+                  "plugins: failed plugin's registration not rolled back")
+            check("coap" in protocols.PROFILES and "acme-iiot" in
+                  scenarios.SCENARIOS and "acme-plant" in
+                  enterprise.ENVIRONMENTS and "acme-valve-tamper" in
+                  incidents.INCIDENTS and "acme-sx1" in devices.CATALOG and
+                  manifest.ATTACK_CATEGORY.get("coap-put") == "ot-write" and
+                  plugins.DISSECTORS.get("coap") == "coap",
+                  "plugins: example registrations missing")
+            check(score.load_json_spec("acme-siem")["format"] == "csv",
+                  "plugins: score map not resolvable by name")
+            try:
+                plugins.register_protocol("modbus", "x", "OT", "1", "tcp",
+                                          lambda ep, n: [], "clash")
+                check(False, "plugins: clash with a built-in accepted")
+            except plugins.PluginError:
+                pass
+            mod = sys.modules[got[0]]
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = mod.selftest()
+            check(rc == 0, f"example plugin self-test: {out.getvalue()}")
+            # a sprinkled plugin incident on the plugin env, through the
+            # engine + manifest (attack category from the plugin)
+            with tempfile.TemporaryDirectory() as d2:
+                man = _manifest_run(d2, "acme", RunConfig(
+                    env="acme-plant", sprinkle=["acme-valve-tamper"],
+                    loop=False), 400)
+            check(any(e.get("attack") == "coap-put" and
+                      e["category"] == "ot-write" for e in man["events"]),
+                  "plugins: plugin attack event missing from manifest")
+            # selftest's own registry checks accept the plugin protocol
+            if shutil_which("tshark"):
+                n = len(_failures)
+                test_tshark_dissects_every_builder()
+                check(len(_failures) == n, "tshark registry check with a "
+                      "plugin loaded failed")
+        finally:
+            plugins.unload_all()
+    after = (set(protocols.PROFILES), set(scenarios.SCENARIOS),
+             set(enterprise.ENVIRONMENTS), set(incidents.INCIDENTS),
+             set(incidents.ATTACKS), set(devices.CATALOG),
+             set(manifest.ATTACK_CATEGORY), dict(plugins.DISSECTORS))
+    check(after == before, "plugins: unload_all left registrations behind")
+    # CLI discovery through TGT_PLUGIN_PATH (fresh process); TGT_NO_PLUGINS
+    env = dict(os.environ, TGT_PLUGIN_PATH=ex, PYTHONPATH=_REPO)
+    env.pop("TGT_NO_PLUGINS", None)
+    out = subprocess.run([sys.executable, "-m", "tgt", "list"], env=env,
+                         capture_output=True, text=True, cwd=_REPO).stdout
+    check("acme-plant" in out and "coap" in out and "acme_plant.py" in out,
+          "plugins: tgt list does not show the example plugin")
+    env["TGT_NO_PLUGINS"] = "1"
+    out = subprocess.run([sys.executable, "-m", "tgt", "list"], env=env,
+                         capture_output=True, text=True, cwd=_REPO).stdout
+    check("acme-plant" not in out, "plugins: TGT_NO_PLUGINS ignored")
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

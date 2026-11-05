@@ -37,6 +37,8 @@ class Stats:
     seed: Optional[int] = None     # run seed (reproduces every cycle)
     sim_time: float = 0.0          # timed schedule: simulated seconds sent
     per_profile: dict = field(default_factory=dict)
+    # per send interface (--iface a,b): packets, bytes, errors, last_error
+    per_iface: dict = field(default_factory=dict)
 
     @property
     def elapsed(self) -> float:
@@ -243,6 +245,13 @@ class Engine:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._on_log = on_log or (lambda m: None)
+        # live control (pause/resume, rate, timed injection) — see
+        # tgt.control / the --api server in tgt.api
+        from .control import RunControl
+        self.control = RunControl(self)
+        self.record = False         # keep a manifest Recorder even without a path
+        self.recorder = None
+        self.limiter: Optional[RateLimiter] = None
 
     def log(self, msg: str) -> None:
         self._on_log(msg)
@@ -286,7 +295,10 @@ class Engine:
                 sender = RawSender(cfg.iface)
                 try:
                     sender.open()
+                    self.stats.per_iface = getattr(sender, "counters", {})
                     self.log(f"raw socket bound to {cfg.iface}")
+                    for bad in getattr(sender, "open_errors", ()):
+                        self.log(f"interface down, retrying: {bad}")
                 except OSError as e:
                     self.log(f"cannot open raw socket on {cfg.iface}: {e}")
                     if not cfg.pcap_path:
@@ -302,27 +314,29 @@ class Engine:
             t0 = (parse_start(cfg.start_time) if synthetic else 0.0)
             step = 1.0 / cfg.rate if cfg.rate and cfg.rate > 0 else 0.001
             pace = not (synthetic and sender is None)
-            if cfg.manifest_path:
+            if cfg.manifest_path or self.record:
                 from .manifest import Recorder
-                recorder = Recorder(cfg, seed, self.argv, cfg.clock)
-                self.log(f"manifest -> {cfg.manifest_path}")
+                recorder = self.recorder = Recorder(cfg, seed, self.argv,
+                                                    cfg.clock)
+                if cfg.manifest_path:
+                    self.log(f"manifest -> {cfg.manifest_path}")
             last_manifest = time.monotonic()
             if cfg.schedule == "timed" and not cfg.replay_path:
                 self._run_timed(sender, pcap, recorder, seed, synthetic, pace)
                 return
 
             limiter = RateLimiter(cfg.rate if pace else 0)
+            self.limiter = limiter if pace else None
             offsets = None      # realtime replay: send time of each frame
             builder = None
             if cfg.replay_path:
-                from . import pcapread
-                frames_ts = pcapread.read_frames(cfg.replay_path)
-                batch = [("replay", f, "replay") for _, f in frames_ts]
-                if cfg.replay_realtime and len(frames_ts) > 1 and pace:
-                    offsets = replay_offsets([t for t, _ in frames_ts])
-                self.log(f"replaying {len(batch)} packets from {cfg.replay_path}"
-                         + (" (original timing)" if offsets else
-                            f" @ {cfg.rate}pps"))
+                # streamed from disk (pcap or pcapng), rewritten on the fly;
+                # with --replay-realtime/--replay-speed it keeps its own time
+                from .replay import ReplaySource
+                batch = ReplaySource(cfg, stop=self._stop, paced=pace)
+                if batch.realtime:
+                    limiter, self.limiter = RateLimiter(0), None
+                self.log(batch.describe())
             else:
                 builder = CycleBuilder(cfg, seed)
                 tb = time.perf_counter()
@@ -351,7 +365,8 @@ class Engine:
                 # realtime replay is scheduled against absolute target times
                 # from the cycle start, so per-packet overhead never accumulates
                 cycle_start = time.perf_counter()
-                for idx, (key, frame, source) in enumerate(batch):
+                for idx, (key, frame, source) in self.control.feed(
+                        batch, self._stop):
                     if self._stop.is_set():
                         break
                     if offsets is not None:
@@ -461,10 +476,19 @@ class Engine:
                 recorder.begin_phase(ph, ts_of(t))
             cap = ph.rate if ph.rate is not None else cfg.rate
             limiter = RateLimiter(cap if pace and cap and cap > 0 else 0)
+            self.limiter = limiter if pace else None     # /rate adjusts it
             t_end = t + ph.duration if ph.duration else float("inf")
             if cfg.duration and not cfg.campaign:
                 t_end = min(t_end, cfg.duration)
-            for ft, _, key, copies, source, occ in sched.run(t_end):
+            ft = t
+            # the control API gates this stream (pause) and splices injected
+            # incident frames in after the scheduled ones (tgt.control)
+            for _, item in self.control.feed(sched.run(t_end), self._stop):
+                if len(item) == 3:               # injected: (key, frame, src)
+                    key, frame, source = item
+                    copies, occ = [frame], False
+                else:
+                    ft, _, key, copies, source, occ = item
                 if self._stop.is_set():
                     break
                 if pace:
@@ -518,6 +542,8 @@ class Engine:
         self.stats.cycles = max(self.stats.cycles, 1)
 
     def _write_manifest(self, recorder) -> None:
+        if not self.cfg.manifest_path:
+            return
         try:
             recorder.write(self.cfg.manifest_path, self.stats)
         except OSError as e:

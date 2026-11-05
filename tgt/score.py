@@ -35,6 +35,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 SCHEMA = "tgt-score/1"
 SCOREMAPS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "scoremaps")
+# name -> mapping file registered by a plugin (tgt.plugins.register_scoremap)
+PLUGIN_MAPS: Dict[str, str] = {}
 FIELDS = ("vendor", "model", "firmware", "serial", "os")
 METHODS = ("mac", "vlan-ip", "ip", "name")          # strongest first
 CATEGORIES = (
@@ -417,6 +419,8 @@ def load_json_spec(spec: str, kind: str = "map") -> Dict[str, Any]:
     """A mapping file by path, or by name from tgt/scoremaps/."""
     cands = [spec]
     if os.path.sep not in spec:
+        if spec in PLUGIN_MAPS:
+            cands.append(PLUGIN_MAPS[spec])
         cands += [os.path.join(SCOREMAPS, spec),
                   os.path.join(SCOREMAPS, spec + ".json")]
     for p in cands:
@@ -432,6 +436,7 @@ def load_json_spec(spec: str, kind: str = "map") -> Dict[str, Any]:
             return doc
     names = sorted(n[:-5] for n in os.listdir(SCOREMAPS)
                    if n.endswith(".json")) if os.path.isdir(SCOREMAPS) else []
+    names += sorted(PLUGIN_MAPS)
     raise ScoreError(f"{kind} not found: {spec} (bundled: {', '.join(names)})")
 
 

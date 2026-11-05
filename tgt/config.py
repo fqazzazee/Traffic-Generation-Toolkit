@@ -39,6 +39,14 @@ class RunConfig:
     min_period: float = 0.0              # timed: floor every period (volume knob)
     campaign: Optional[str] = None       # timed: phased campaign plan file
     force: bool = False                  # campaign: skip phase-length checks
+    # replay (tgt.replay / tgt.rewrite)
+    replay_speed: float = 0.0            # >0: capture timing / this factor
+    replay_loop: int = 0                 # passes over the file (0 = until stopped)
+    replay_tsresol: Optional[float] = None  # override pcapng ticks per second
+    remap_ip: List[str] = field(default_factory=list)      # "old=new[,..]"
+    remap_subnet: List[str] = field(default_factory=list)  # "a/n=b/n[,..]"
+    remap_mac: List[str] = field(default_factory=list)     # "old=new[,..]"
+    replay_vlan: Optional[int] = None    # retag replayed frames (0 = untag)
 
     def summary(self) -> str:
         target = self.iface or "(pcap only)"
@@ -46,6 +54,8 @@ class RunConfig:
                 f"duration={self.duration}s" if self.duration else "until stopped")
         if self.replay_path:
             what = f"replay={self.replay_path}"
+            if self.replay_speed:
+                what += f" speed=x{self.replay_speed:g}"
         elif self.incident:
             what = f"incident={self.incident}"
         elif self.env:
