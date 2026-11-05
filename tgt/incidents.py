@@ -432,7 +432,9 @@ class Incident:
         host the environment already shows serving the services, then the same
         product, then that neighbour affinity, then a host not yet used, then
         the same OS. Hosts with no candidate keep their own identity and appear
-        as new assets (see :meth:`unmapped_hosts`); external adversary
+        as new assets (see :meth:`unmapped_hosts`), as do hosts whose only
+        candidates already stand in for a flow peer (no flow ever runs from a
+        host to itself); external adversary
         infrastructure (see ``_is_external``) is never remapped."""
         adj: Dict[str, set] = {}
         for a, v, _, _ in self.flows:
@@ -452,8 +454,14 @@ class Incident:
             def seen(h: Host) -> bool:
                 return bool(svcs) and svcs <= observed.get(h.name, set())
 
+            # never onto a host already standing in for a flow peer: that
+            # flow would run from a host to itself (e.g. WannaCry's patient
+            # zero and its victims on a site with a single workstation)
+            peers = {mapping[n].name for n in adj.get(ih.name, ())
+                     if n in mapping}
             cands = [h for h in env.hosts
-                     if (vendor is None or _device_vendor(h) == vendor)
+                     if h.name not in peers
+                     and (vendor is None or _device_vendor(h) == vendor)
                      and (family is None or _product_family(h) in (None, family))
                      and all(_can_serve(h, s, observed) for s in svcs)
                      and (_role_tier(ih.role, h.role) or

@@ -1442,6 +1442,10 @@ _reg_env("industrial-site", "Industrial Site", "mixed",
          "VLANs, plus one IT laptop talking straight to the plant floor.",
          _site_hosts, _site_conversations, _site_segments)
 
+# the environments defined in code (env files and packaged sites register
+# later, through tgt.envfile.register)
+BUILTIN_KEYS = frozenset(ENVIRONMENTS)
+
 
 def get(key: str) -> Environment:
     return ENVIRONMENTS[key]

@@ -3006,7 +3006,11 @@ def test_link_local_frames_never_routed() -> None:
 
 def test_managed_switches_lldp_snmp_syslog() -> None:
     from tgt import devices, enterprise, inventory
+    # the built-in envs' conventions (a switch per VLAN, the n0c-r3ad
+    # community); packaged sites model their own (tests per site below)
     for env in enterprise.all_environments():
+        if env.key not in enterprise.BUILTIN_KEYS:
+            continue
         sws = [h for h in env.hosts if h.role == "switch"]
         check(len(sws) >= len(env.segments) - 1,
               f"{env.key}: {len(sws)} switches for {len(env.segments)} VLANs")
@@ -6332,6 +6336,50 @@ def test_build_run_args_every_tui_option() -> None:
     script = open(os.path.join(_REPO, "scripts", "tgtctl.sh")).read()
     check("TGT_CMD:-run" in script and 'tr , " "' in script,
           "tgtctl.sh does not honour TGT_CMD / multi-interface TGT_IFACE")
+
+
+# -- wave-4 follow-ups: pause shift, no self-flows on remapped incidents ------
+def test_timed_pause_shifts_schedule() -> None:
+    """A paused timed run picks the schedule up where it left off: every
+    later sleep target moves by the paused time, so resuming does not burst
+    the backlog."""
+    import time
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(env="it-org", schedule="timed", speed=600, rate=0,
+                        seed=5, count=40,
+                        pcap_path=os.path.join(d, "p.pcap"))
+        eng = Engine(cfg)
+        targets = []
+        eng._sleep_until = targets.append      # record, never sleep
+        eng.control.paused_total = 1000.0      # as if paused for 1000 s
+        t0 = time.perf_counter()
+        eng.start()
+        eng.join(60)
+        check(not eng.is_alive(), "pause-shift run did not finish")
+        check(targets and min(targets) >= t0 + 1000.0,
+              f"timed sleeps ignore the paused time: {targets[:3]}")
+
+
+def test_incident_mapping_never_self_flows() -> None:
+    """map_onto never places both ends of an incident flow on one host
+    (WannaCry's patient zero and its victims on a single-workstation site)."""
+    from tgt import enterprise, envfile, incidents
+    envfile.load_user_envs(warn=lambda m: None, force=True)
+    bad = []
+    for ek in sorted(enterprise.ENVIRONMENTS):
+        env = enterprise.get(ek)
+        for ik in sorted(incidents.INCIDENTS):
+            inc = incidents.get(ik)
+            m = inc.map_onto(env)
+            bad += [(ek, ik, a, v) for a, v, _, _ in inc.flows
+                    if a in m and v in m and m[a].name == m[v].name]
+    check(not bad, f"incident flows mapped onto one host: {bad[:4]}")
+    if "electric-substation" in enterprise.ENVIRONMENTS:
+        m = incidents.get("wannacry").map_onto(
+            enterprise.get("electric-substation"))
+        check(len({h.name for h in m.values()}) == len(m),
+              "wannacry hosts collapse onto one substation host")
 
 
 def main() -> int:
