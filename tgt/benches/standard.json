@@ -1,0 +1,33 @@
+{
+  "name": "standard",
+  "description": "Two simulated days on the full Purdue industrial site with the shift day profile: a 24 h learning day, a 12 h window with six IT and OT intrusions at fixed offsets, then the 12 h baseline-then-change campaign. Meant for a live run with --speed (60 = 48 min on the wire) or a long synthetic capture.",
+  "env": "industrial-site",
+  "start_time": "2026-11-02T00:00:00Z",
+  "seed": 6600,
+  "day_profile": "shift",
+  "min_period": "10s",
+  "stages": [
+    {"id": "learn", "kind": "baseline", "duration": "24h",
+     "description": "a full working day of normal operation for the monitor to learn"},
+    {"id": "attack", "kind": "incidents", "duration": "12h",
+     "description": "ransomware, ICS reconnaissance, a PLC STOP, an IEC 104 command storm, a safety-system program download and SMB lateral movement",
+     "inject": [
+       {"at": "1h", "incident": "ryuk", "duration": "30m"},
+       {"at": "3h", "incident": "havex", "duration": "30m"},
+       {"at": "5h", "incident": "stuxnet", "duration": "30m"},
+       {"at": "7h", "incident": "industroyer", "duration": "30m"},
+       {"at": "9h", "incident": "triton", "duration": "30m"},
+       {"at": "10h30m", "incident": "colonial", "duration": "30m"}
+     ]},
+    {"id": "change", "kind": "campaign", "plan": "baseline-then-change"}
+  ],
+  "thresholds": {
+    "discovery_recall": {"min": 0.9},
+    "discovery_precision": {"min": 0.9},
+    "field_accuracy": {"min": 0.8},
+    "change_detection_rate": {"min": 0.6},
+    "attack_detection_rate": {"min": 0.8},
+    "attack_median_ttd_s": {"max": 300},
+    "technique_coverage": {"min": 0.7}
+  }
+}

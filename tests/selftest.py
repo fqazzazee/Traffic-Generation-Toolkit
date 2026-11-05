@@ -6805,6 +6805,283 @@ def test_w5a_score_by_technique_and_strict() -> None:
     check(gen["columns"].get("technique") and gen.get("techniques"),
           "alerts-generic: optional technique fields missing")
 
+# ---- tgt bench: seeded evaluation suite + scorecard (#65) -----------------
+def test_bench_suite_validation() -> None:
+    from tgt import bench
+    suites = {os.path.basename(p): bench.load(p) for p in bench.packaged()}
+    check({"quick.json", "standard.json"} <= set(suites),
+          f"packaged suites {sorted(suites)}")
+    q = suites["quick.json"]
+    check(abs(q.duration - 3600) < 1 and q.env == "ot-plant"
+          and [s.kind for s in q.stages] == ["baseline", "incidents",
+                                             "campaign"],
+          f"quick suite shape {q.duration} {[s.kind for s in q.stages]}")
+    check(suites["standard.json"].duration >= 2 * 86400,
+          "standard suite is not multi-day")
+    for name, s in suites.items():
+        check(not s.check(), f"{name}: {s.check()}")
+        check([st.seed for st in s.stages] ==
+              [s.seed + i for i in range(len(s.stages))],
+              f"{name}: stage seeds")
+    # stages follow each other; injections become sprinkle phases
+    check([st.offset for st in q.stages] == [0.0, 1200.0, 2100.0],
+          f"quick offsets {[st.offset for st in q.stages]}")
+    s = bench.Suite({"env": "ot-plant", "seed": 7, "stages": [
+        {"id": "a", "kind": "incidents", "duration": "10m", "inject": [
+            {"at": "1m", "incident": "havex", "duration": "4m"},
+            {"at": "3m", "incident": ["ekans"], "duration": "4m"}]}]},
+        "t.json")
+    ph = [(p["name"], p["duration"], p.get("sprinkle"))
+          for p in s.stages[0].plan_doc["phases"]]
+    check(ph == [("quiet", 60.0, None),
+                 ("inject-havex", 120.0, ["havex"]),
+                 ("inject-ekans+havex", 120.0, ["ekans", "havex"]),
+                 ("inject-ekans", 120.0, ["ekans"]),
+                 ("quiet", 180.0, None)], f"inject phases {ph}")
+    check(s.fingerprint() == bench.Suite(dict(s.doc), "u.json").fingerprint()
+          and s.fingerprint() != bench.Suite(dict(s.doc, seed=8),
+                                             "t.json").fingerprint(),
+          "fingerprint follows suite + seeds")
+    good = {"id": "b", "kind": "baseline", "duration": "5m"}
+    for bad, msg in (
+            ({"env": "ot-plant", "stages": [good], "frob": 1}, "frob"),
+            ({"stages": [good]}, "env"),
+            ({"env": "ot-plant", "stages": []}, "stages"),
+            ({"env": "ot-plant", "stages": [dict(good, kind="soak")]},
+             "kind"),
+            ({"env": "ot-plant", "stages": [good, good]}, "duplicate"),
+            ({"env": "ot-plant", "stages": [dict(good, id="a b")]}, ".id"),
+            ({"env": "ot-plant", "stages": [dict(good, plan="x")]},
+             "not allowed"),
+            ({"env": "ot-plant", "stages": [{"id": "i", "kind": "incidents",
+                                             "duration": "5m", "inject": [
+                {"at": "4m", "incident": "havex", "duration": "2m"}]}]},
+             "end by"),
+            ({"env": "ot-plant", "stages": [{"id": "i", "kind": "incidents",
+                                             "duration": "5m", "inject": [
+                {"at": "1m", "incident": "nope", "duration": "2m"}]}]},
+             "nope"),
+            ({"env": "ot-plant", "stages": [{"id": "c", "kind": "campaign",
+                                             "plan": "baseline-then-change"}
+                                            ]}, "one environment"),
+            ({"env": "ot-plant", "stages": [{"id": "c", "kind": "campaign"}]},
+             "exactly one"),
+            ({"env": "ot-plant", "stages": [{"id": "c", "kind": "campaign",
+                                             "phases": [{"name": "x"}]}]},
+             "duration"),
+            ({"env": "ot-plant", "stages": [good],
+              "thresholds": {"vibes": {"min": 1}}}, "vibes"),
+            ({"env": "ot-plant", "stages": [good],
+              "thresholds": {"discovery_recall": {"least": 1}}}, "min")):
+        try:
+            bench.Suite(bad, "t.json")
+            check(False, f"bad suite accepted: {bad}")
+        except bench.BenchError as e:
+            check(msg in str(e), f"bad suite message {e!r} (want {msg!r})")
+    # an unknown environment is reported by check(), not a crash
+    probs = bench.Suite({"env": "nope", "stages": [good]}, "t.json").check()
+    check(probs and "nope" in probs[0], f"unknown env check {probs}")
+    p = _cli(["bench", "list", "--check"])
+    out, _ = p.communicate(timeout=120)
+    check(p.returncode == 0 and "quick" in out and "standard" in out
+          and "FAILED" not in out, f"bench list --check rc={p.returncode} "
+                                   f"{out[-300:]}")
+
+
+def test_bench_quick_bundle_scores_and_compares() -> None:
+    import csv
+    import json
+    from tgt import bench
+    with tempfile.TemporaryDirectory() as d:
+        b = os.path.join(d, "bundle")
+        p = _cli(["bench", "run", "quick", "--out", b])
+        out, _ = p.communicate(timeout=300)
+        check(p.returncode == 0, f"bench run quick rc={p.returncode} "
+                                 f"{out[-400:]}")
+        if p.returncode:
+            return
+        with open(os.path.join(b, "bench.json")) as f:
+            idx = json.load(f)
+        st = idx["stages"]
+        check(idx["schema"] == "tgt-bench/1" and idx["status"] == "complete"
+              and [s["id"] for s in st] == ["learn", "attack", "change"]
+              and all(s["status"] == "complete" for s in st)
+              and idx["tool"]["version"] and idx["fingerprint"],
+              f"bench index {idx['status']} {[s['status'] for s in st]}")
+        check(st[0]["start"] == "2026-11-02T08:00:00.000000Z"
+              and st[0]["end"] == st[1]["start"]
+              and st[1]["end"] == st[2]["start"]
+              and st[2]["end"] == "2026-11-02T09:00:00.000000Z"
+              and [s["seed"] for s in st] == [6500, 6501, 6502],
+              f"stage windows {[(s['start'], s['end']) for s in st]}")
+        for s in st:
+            check(os.path.getsize(os.path.join(b, s["pcap"])) > 1000
+                  and os.path.exists(os.path.join(b, s["plan"])),
+                  f"stage {s['id']}: pcap / plan missing")
+        with open(os.path.join(b, "manifest.json")) as f:
+            merged = json.load(f)
+        src = {e["source"].split(":")[0] for e in merged["events"]}
+        check(merged["schema"] == "tgt-manifest/1"
+              and len(merged["events"]) == sum(s["events"] for s in st)
+              and {"campaign", "sprinkle"} <= src
+              and all(e["id"].startswith(e["stage"] + "/")
+                      for e in merged["events"])
+              and "ot-plant:PLC-RW3" in merged["first_seen"],
+              f"merged manifest events {len(merged['events'])} {src}")
+        # a perfect monitor's exports score 100 % on every metric
+        pe = os.path.join(d, "perfect")
+        p = _cli(["bench", "score", b, "--self-test-export", pe])
+        p.communicate(timeout=60)
+        card_a, card_b = os.path.join(d, "a.json"), os.path.join(d, "b.json")
+        html = os.path.join(d, "a.html")
+        p = _cli(["bench", "score", b, "--assets",
+                  os.path.join(pe, "assets.csv"), "--map", "generic",
+                  "--alerts", os.path.join(pe, "alerts.csv"), "--alert-map",
+                  os.path.join(pe, "alert-map.json"), "--label", "perfect",
+                  "--out", card_a, "--html", html])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0 and "verdict: PASS" in out,
+              f"bench score rc={p.returncode} {out[-400:]}")
+        with open(card_a) as f:
+            ca = json.load(f)
+        m = ca["metrics"]
+        for k in ("discovery_recall", "discovery_precision",
+                  "field_accuracy", "protocol_recall",
+                  "change_detection_rate", "attack_detection_rate"):
+            check(m[k] == 1.0, f"perfect scorecard {k} = {m[k]}")
+        check(m["attack_median_ttd_s"] == 0 and m["false_alerts"] == 0
+              and ca["label"] == "perfect" and ca["verdict"] == "pass"
+              and ca["detections"]["change"]["events"] == 5
+              and ca["detections"]["attack"]["events"] >= 6
+              and [s["recall"] for s in ca["stages"]] == [1.0, 1.0, 1.0]
+              and all(c["pass"] for c in ca["thresholds"]),
+              f"perfect scorecard {m} {ca['verdict']}")
+        with open(html, encoding="utf-8") as f:
+            page = f.read()
+        check("prefers-color-scheme:dark" in page and "perfect" in page
+              and "http://" not in page and "https://" not in page
+              and "<script" not in page, "scorecard HTML not self-contained")
+        # a weaker monitor: misses assets and the cross-zone / PLC STOP
+        # alerts, raises one false alert
+        with open(os.path.join(pe, "assets.csv")) as f:
+            rows = list(csv.reader(f))
+        weak_assets = os.path.join(d, "weak-assets.csv")
+        with open(weak_assets, "w", newline="") as f:
+            csv.writer(f).writerows(rows[:-4])
+        with open(os.path.join(pe, "alerts.csv")) as f:
+            arows = list(csv.reader(f))
+        weak_alerts = os.path.join(d, "weak-alerts.csv")
+        with open(weak_alerts, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerows([r for r in arows if r[-1] not in
+                         ("cross-zone", "plc-mode-change")])
+            w.writerow(["2026-11-02T08:10:00Z", "172.16.0.11", "",
+                        "tgt scan", "scan"])
+        p = _cli(["bench", "score", b, "--assets", weak_assets, "--map",
+                  "generic", "--alerts", weak_alerts, "--alert-map",
+                  os.path.join(pe, "alert-map.json"), "--label", "weak",
+                  "--out", card_b])
+        out, _ = p.communicate(timeout=120)
+        with open(card_b) as f:
+            cb = json.load(f)
+        check(p.returncode == 0 and cb["verdict"] == "fail"
+              and cb["metrics"]["false_alerts"] == 1
+              and cb["metrics"]["discovery_recall"] < 1
+              and cb["detections"]["per_category"]["change:cross-zone"][
+                  "rate"] == 0, f"weak scorecard {cb['metrics']}")
+        cmp = bench.compare(ca, cb)
+        dm = {x["metric"]: x for x in cmp["metrics"]}
+        check(not cmp["warnings"]
+              and dm["discovery_recall"]["change"] == "worse"
+              and abs(dm["discovery_recall"]["delta"] -
+                      (cb["metrics"]["discovery_recall"] - 1.0)) < 1e-9
+              and dm["false_alerts"]["delta"] == 1
+              and dm["false_alerts"]["change"] == "worse"
+              and dm["field_accuracy"]["change"] == "same",
+              f"compare metrics {dm}")
+        cats = {x["key"]: x for x in cmp["per_category"]}
+        check(cats["attack:plc-mode-change"]["delta"] == -1.0
+              and cats["change:new-asset"]["change"] == "same",
+              f"compare per-category {cats}")
+        back = bench.compare(cb, ca)
+        check({x["metric"]: x["change"] for x in back["metrics"]}[
+            "discovery_recall"] == "better", "compare direction")
+        other = json.loads(json.dumps(cb))
+        other["bench"]["fingerprint"] = "0" * 16
+        check(any("not identical" in w
+                  for w in bench.compare(ca, other)["warnings"]),
+              "compare: no warning for a different bundle")
+        cmp_html = os.path.join(d, "cmp.html")
+        p = _cli(["bench", "compare", card_a, card_b, "--html", cmp_html])
+        out, _ = p.communicate(timeout=60)
+        check(p.returncode == 0 and "Discovery recall" in out
+              and os.path.getsize(cmp_html) > 1000,
+              f"bench compare rc={p.returncode} {out[-300:]}")
+
+
+def test_bench_seeded_and_per_technique() -> None:
+    import json
+    from tgt import bench, score
+    suite = {"name": "tiny", "env": "ot-plant", "seed": 9,
+             "start_time": "2026-11-02T08:00:00Z", "stages": [
+                 {"id": "learn", "kind": "baseline", "duration": "1m"},
+                 {"id": "hit", "kind": "incidents", "duration": "2m",
+                  "inject": [{"at": "30s", "incident": "stuxnet",
+                              "duration": "1m"}]}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "tiny.json")
+        with open(path, "w") as f:
+            json.dump(suite, f)
+        pcaps = []
+        for run in ("r1", "r2"):
+            p = _cli(["bench", "run", path, "--out", os.path.join(d, run)])
+            out, _ = p.communicate(timeout=120)
+            check(p.returncode == 0, f"tiny bench rc={p.returncode} "
+                                     f"{out[-300:]}")
+            pcaps.append([open(os.path.join(d, run, "stages", f"{s}.pcap"),
+                               "rb").read() for s in ("learn", "hit")])
+        check(pcaps[0] == pcaps[1], "seeded bench stages are not "
+                                    "byte-identical run to run")
+        p = _cli(["bench", "run", path, "--out", os.path.join(d, "r1")])
+        out, _ = p.communicate(timeout=60)
+        check(p.returncode == 2 and "--overwrite" in out,
+              f"bench run over a bundle: rc={p.returncode}")
+        # per-technique coverage: from the events' technique IDs ...
+        index, stages = bench.load_bundle(os.path.join(d, "r1"))
+        for _, m in stages:
+            for e in m["events"]:
+                e["techniques"] = (["T0816", "T0858"]
+                                   if e["category"] == "plc-mode-change"
+                                   else ["T0866"])
+        merged = bench.merge_manifests(stages, index)
+        truth = score.Truth(merged, "m")
+        rows: list = []
+        alerts = [{"row": i + 1, "time": score.parse_time(e["t_start"]),
+                   "title": "x", "raw_category": "", "category":
+                   e["category"], "src": e["src"] or "", "dst": ""}
+                  for i, e in enumerate(merged["events"])
+                  if e["category"] == "plc-mode-change"]
+        info = {"columns": {}, "rows": 0, "source": "-", "map": "-",
+                "protocol_ignore": []}
+        res = score.score(truth, rows, info, alerts=alerts)
+        res["detections"].pop("by_technique", None)
+        card = bench.scorecard(index, stages, res)
+        pt = card["detections"]["per_technique"]
+        check(pt and pt["T0816"]["rate"] == 1.0 and pt["T0866"]["rate"] == 0
+              and pt["T0858"]["events"] == pt["T0816"]["events"]
+              and card["metrics"]["technique_coverage"] == 2 / 3,
+              f"per-technique fallback {pt}")
+        # ... or the scorer's own by_technique when it has one
+        res["detections"]["by_technique"] = {
+            "T0846": {"name": "Remote System Discovery", "events": 4,
+                      "detected": 1, "rate": 0.25, "median_ttd_s": 3.0}}
+        card = bench.scorecard(index, stages, res)
+        check(card["detections"]["per_technique"]["T0846"]["detected"] == 1
+              and card["metrics"]["technique_coverage"] == 1.0,
+              "per-technique from by_technique")
+        check(card["verdict"] is None and card["metrics"][
+            "discovery_recall"] == 0.0, "no thresholds -> no verdict")
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
