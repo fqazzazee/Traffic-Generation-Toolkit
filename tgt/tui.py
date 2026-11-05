@@ -155,6 +155,7 @@ class UI:
         self.replay_loop = 0                 # passes (0 = until stopped)
         self.replay_vlan: Optional[int] = None   # None keep, 0 untag, N retag
         self.remap: Dict[str, str] = {"ip": "", "subnet": "", "mac": ""}
+        self.remap_env: Optional[str] = None     # replay onto env by role
         # live injection defaults
         self.inject_duration = 60.0
         self.phases = None                   # campaign phases of the last start
@@ -427,7 +428,9 @@ class UI:
             remap_ip=self.remap_list("ip") if replay else [],
             remap_subnet=self.remap_list("subnet") if replay else [],
             remap_mac=self.remap_list("mac") if replay else [],
-            replay_vlan=self.replay_vlan if replay else None)
+            replay_vlan=self.replay_vlan if replay else None,
+            remap_env=self.remap_env if replay else None,
+            remap_seed=self.seed if replay and self.remap_env else None)
 
     def _campaign_config(self) -> RunConfig:
         """As cli.cmd_campaign: load + build the phases (handed to the
@@ -485,7 +488,8 @@ class UI:
             replay_speed=self.replay_speed, replay_loop=self.replay_loop,
             remap_ip=self.remap_list("ip"),
             remap_subnet=self.remap_list("subnet"),
-            remap_mac=self.remap_list("mac"), vlan=self.replay_vlan)
+            remap_mac=self.remap_list("mac"), vlan=self.replay_vlan,
+            remap_env=self.remap_env)
 
     def _check_start(self, cfg: RunConfig) -> Optional[str]:
         """Why ``cfg`` cannot start (None when it can) — the checks the CLI
@@ -940,6 +944,9 @@ def _tagging_lines(ui: UI) -> List[Line]:
         if ui.span == "core":
             out.append(("+ routed hops", _cattr(C_DIM)))
         return out
+    if ui.mode() == "replay" and ui.remap_env:
+        return [(f"env {ui.remap_env} VLANs", _cattr(C_YELLOW)),
+                (f"SPAN {ui.span}", _cattr(C_DIM))]
     if ui.mode() == "replay" and ui.replay_vlan is not None:
         return [("untagged" if ui.replay_vlan == 0 else
                  f"retag VLAN {ui.replay_vlan}", _cattr(C_YELLOW))]
@@ -1732,6 +1739,21 @@ def _remap_field(kind: str, label: str, what: str) -> Field:
                  show=_is_replay, keys="Enter edit · Space clear", space=clear)
 
 
+def _act_remap_env(stdscr, ui: UI, step: int):
+    if step:
+        return
+    v = _prompt(stdscr, "Remap the capture onto environment (key, - = none)",
+                ui.remap_env or "")
+    if not v:
+        return
+    if _cleared(v):
+        ui.remap_env = None
+    elif v.strip() in enterprise.ENVIRONMENTS:
+        ui.remap_env = v.strip()
+    else:
+        ui.add_log(f"unknown environment: {v.strip()}")
+
+
 def _ip_prompt(stdscr, ui: UI, label: str, cur: str) -> str:
     v = _prompt(stdscr, label, cur) or cur
     try:
@@ -1824,8 +1846,9 @@ RUN_FIELDS = [
           "Where the sensor taps the environment: access = each frame once, on "
           "its sender's VLAN; core = also the router's copy on the receiver's "
           "VLAN (gateway MAC, TTL-1).",
-          show=lambda ui: ui.mode() == "env", toggle=True,
-          keys="←→/Space switch"),
+          show=lambda ui: ui.mode() == "env" or (_is_replay(ui) and
+                                                  bool(ui.remap_env)),
+          toggle=True, keys="←→/Space switch"),
     Field("Findings", _findings_value, None, _findings_help,
           show=lambda ui: _has_env(ui) and bool(ui.findings()),
           long_help=True),
@@ -1878,6 +1901,15 @@ RUN_FIELDS = [
     _remap_field("ip", "  remap IP", "IPv4 addresses (IP + ARP)"),
     _remap_field("subnet", "  remap subnet", "subnets, keeping host bits,"),
     _remap_field("mac", "  remap MAC", "MAC addresses (Ethernet + ARP)"),
+    Field("  remap onto env",
+          lambda ui: (ui.remap_env, C_YELLOW) if ui.remap_env
+          else ("none", C_DIM), _act_remap_env,
+          "Map the capture's internal hosts onto a modeled environment by "
+          "role (IP, MAC and segment VLAN; external hosts stay); the "
+          "mapping goes into the manifest. Not combined with the remap / "
+          "retag rows above.",
+          show=_is_replay, keys="Enter type · Space clear",
+          space=lambda stdscr, ui, step: setattr(ui, "remap_env", None)),
     Field("Schedule",
           lambda ui: (f"‹ {ui.schedule} ›", C_CYAN if ui.schedule == "timed"
                       else 0), _act_schedule,
