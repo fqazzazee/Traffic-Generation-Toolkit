@@ -91,7 +91,7 @@ def test_modbus_signature() -> None:
         ihl = (f[14] & 0x0F) * 4
         if f[14 + 9] == P.IPPROTO_TCP:
             dport = struct.unpack("!H", f[14 + ihl + 2:14 + ihl + 4])[0]
-            payload = f[14 + ihl + 20:]
+            payload = f[14 + ihl + (f[14 + ihl + 12] >> 4) * 4:]
             if dport == 502 and len(payload) >= 8:
                 tid, proto, length, unit, fc = struct.unpack("!HHHBB",
                                                              payload[:8])
@@ -336,7 +336,12 @@ def test_tshark_dissects_every_builder() -> None:
     seen = {x for line in layers for x in line.split(":")}
     for key, layer in list(_DISSECTS_AS.items()) + [("smb1", "smb")]:
         check(layer in seen, f"tshark: {key} never dissected as {layer}")
-    if "Errors (" in expert or "Warns (" in expert:
+    # deliberate RST closes (aborted browser sessions) are the only
+    # warnings allowed
+    warns = [ln for ln in expert.splitlines()
+             if ln.strip() and ln.strip()[0].isdigit()
+             and "Connection reset (RST)" not in ln]
+    if "Errors (" in expert or warns:
         detail = [ln.strip() for ln in expert.splitlines()
                   if "Malformed" in ln or "Warning" in ln or "incorrect" in ln]
         real = [ln for ln in detail if not _tshark_dissector_bug(ln)]
@@ -2267,7 +2272,9 @@ def test_run_manifest_contract() -> None:
                 "flows_seen", "phases", "events"}
         check(want <= set(m), f"manifest missing {want - set(m)}")
         check(m["schema"] == "tgt-manifest/1" and m["seed"] == 5
-              and m["clock"] == "synthetic" and m["cycles"] == 2
+              # cycle sizes vary (per-OS stacks: RST closes, delayed ACKs), so
+              # 2n packets may spill into a third cycle
+              and m["clock"] == "synthetic" and m["cycles"] in (2, 3)
               and m["packets"] == 2 * n and m["argv"] == ["run", "--test"],
               "manifest header fields wrong")
         check(m["start"] == "2026-11-05T14:00:00.000000Z", m["start"])
@@ -3099,6 +3106,301 @@ def test_netbios_announce_is_not_a_service() -> None:
           f"HISTORIAN serves {rows['HISTORIAN']['serves']}")
     check("netbios" in rows["HMI-XP"]["uses"], "HMI-XP netbios use lost")
     check("arp" in rows["PLC-RW1"]["uses"], "ARP use not in inventory")
+
+# ---------------------------------------------------------------------------
+# W2-B: per-OS TCP/IP stack fingerprints (#40) and TLS templates (#41)
+# ---------------------------------------------------------------------------
+def _tcp_view(frame: bytes):
+    """(src_ip, ip_id, df, flags, window, options, payload, seq) of a TCP
+    frame, else None."""
+    t = _l4(frame)
+    if not t or t[0] != P.IPPROTO_TCP:
+        return None
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    ip_id, frag = struct.unpack("!HH", frame[off + 4:off + 8])
+    seg = t[5]
+    doff = (seg[12] >> 4) * 4
+    return (t[1], ip_id, bool(frag & 0x4000), seg[13],
+            struct.unpack("!H", seg[14:16])[0], seg[20:doff], seg[doff:],
+            struct.unpack("!I", seg[4:8])[0])
+
+
+def _stack_flow(client: str, server: str, count: int = 3, proto=None):
+    ep = Endpoints(stack_client=client, stack_server=server)
+    return [_tcp_view(f) for f in (proto or protocols.modbus_flow)(ep, count)]
+
+
+def test_tcp_syn_options_per_os() -> None:
+    want = {  # stack -> (SYN option bytes w/o timestamps, SYN window)
+        "win10": ("020405b40103030801010402", 64240),
+        "win2012": ("020405b40103030801010402", 8192),
+        "win7": ("020405b40103030201010402", 8192),
+        "winxp": ("020405b401010402", 64240),
+        "win2000": ("020405b401010402", 65535),
+        "siemens": ("020405b4", 8192),
+        "rockwell": ("020405b4", 8192),
+        "sel": ("02040218", 2144),
+    }
+    for key, (opts, win) in want.items():
+        syn = _stack_flow(key, "win10")[0]
+        check(syn[3] == P.SYN and syn[5].hex() == opts and syn[4] == win,
+              f"{key}: SYN options/window {syn[5].hex()} / {syn[4]}")
+    # Linux: mss,sok,ts,nop,ws7 with TSecr 0; SYN+ACK from Linux has IP ID 0
+    lin = _stack_flow("linux", "linux")
+    o = lin[0][5]
+    check(o[:6].hex() == "020405b40402" and o[6:8] == b"\x08\x0a"
+          and o[12:16] == bytes(4) and o[16:].hex() == "01030307"
+          and lin[0][4] == 64240, f"linux SYN options {o.hex()}")
+    check(lin[1][1] == 0 and lin[1][4] == 65160, "linux SYN+ACK id/window")
+    # timestamps on every later segment, TSecr echoing the peer's last TSval
+    last = {}
+    for v in lin[2:]:
+        ts = v[5]
+        check(len(ts) == 12 and ts[2:4] == b"\x08\x0a",
+              "linux data segment lacks the timestamp option")
+        tsval, tsecr = struct.unpack("!II", ts[4:12])
+        peer = [k for k in last if k != v[0]]
+        if peer:
+            check(tsecr == last[peer[0]], "TSecr does not echo the peer TSval")
+        last[v[0]] = tsval
+    # SYN+ACK answers only what the SYN offered; DF per stack
+    sa = _stack_flow("siemens", "win10")[1]
+    check(sa[5].hex() == "020405b4", "win10 SYN+ACK to a bare-MSS SYN")
+    sa = _stack_flow("win10", "linux")[1]
+    check(sa[5].hex() == "020405b401010402" "01030307",
+          f"linux SYN+ACK without timestamps {sa[5].hex()}")
+    check(not _stack_flow("win10", "siemens")[1][2], "Siemens sets DF")
+    check(_stack_flow("win10", "rockwell")[0][2], "Windows clears DF")
+    # established windows: scaled when both scale, raw otherwise
+    w = _stack_flow("win10", "win10")
+    check(w[2][4] == 1026, f"win10 scaled window {w[2][4]}")
+    w = _stack_flow("win10", "siemens")
+    srv = next(v for v in w[2:] if v[0] == "10.10.10.20")
+    check(w[2][4] == 65535 and srv[4] == 8192,
+          "unscaled windows win10<->siemens")
+
+
+def test_tcp_ip_id_and_defaults() -> None:
+    from tgt import enterprise
+    # per-session counter for Windows: +1 per datagram
+    ids = [v[1] for v in _stack_flow("win10", "win10") if v[0] == "10.10.10.10"]
+    check(all((b - a) & 0xFFFF == 1 for a, b in zip(ids, ids[1:])),
+          "Windows IP ID does not increment by one")
+    # profile-only defaults: Windows client, port-typical embedded server
+    flow = [_tcp_view(f) for f in protocols.s7comm_flow(Endpoints(), 1)]
+    check(flow[0][5].hex() == "020405b40103030801010402"
+          and flow[1][5].hex() == "020405b4" and not flow[1][2],
+          "default s7comm stacks are not Windows client / Siemens server")
+    flow = [_tcp_view(f) for f in protocols.modbus_flow(Endpoints(), 1)]
+    check(flow[1][4] == 4380, "default Modbus server is not a Modicon stack")
+    # environment: one IP-ID counter per Windows/embedded host, rising in
+    # wire order across all of its flows; routed copies keep the ID
+    env = enterprise.get("industrial-site")
+    hosts = {h.ip: h for h in env.hosts}
+    seen: dict = {}
+    bad = []
+    for _, f in env.build(2):
+        ips = P.frame_ips(f)
+        h = hosts.get(ips[0]) if ips else None
+        if h is None or env.host(h.name).stack == "linux":
+            continue
+        off = 18 if f[12:14] == b"\x81\x00" else 14
+        ident = struct.unpack("!H", f[off + 4:off + 6])[0]
+        prev = seen.get(h.ip)
+        if prev is not None and (ident - prev) & 0xFFFF != 1:
+            bad.append(h.name)
+        seen[h.ip] = ident
+    check(seen and not bad, f"per-host IP ID not sequential: {sorted(set(bad))[:5]}")
+    core = env.build(1, span="core")
+    pairs = 0
+    for (_, a), (_, b) in zip(core, core[1:]):
+        if P.frame_ips(a) and P.frame_ips(a) == P.frame_ips(b) and \
+                a[-20:] == b[-20:] and a[12:14] == b[12:14] == b"\x81\x00":
+            pairs += 1
+            check(a[22:24] == b[22:24], "routed copy changed the IP ID")
+    check(pairs > 0, "no routed copies found in the core view")
+
+
+def test_tcp_segmentation_acks_and_rst() -> None:
+    from tgt import enterprise
+    # pure delayed ACKs between polls; FIN close for OT pollers
+    flow = _stack_flow("win10", "rockwell", 4)
+    pure = [v for v in flow[3:-3] if v[3] == P.ACK and not v[6]]
+    check(len(pure) >= 3, "no delayed pure ACKs between Modbus polls")
+    # no segment exceeds the MSS; large TLS flights are split
+    env = enterprise.get("industrial-site")
+    batch = env.build(2)
+    rst, https = set(), set()
+    for k, f in batch:
+        v = _tcp_view(f)
+        if not v:
+            continue
+        check(len(v[6]) <= 1460, f"{k}: TCP payload {len(v[6])} > MSS")
+        if v[3] & P.RST:
+            rst.add(k)
+            check(k in ("http", "https"), f"{k} session closed with RST")
+        if k == "https" and v[3] == P.SYN:
+            https.add(v[0])
+    check("http" in rst or "https" in rst, "no aborted (RST) web sessions")
+    ep = Endpoints(client_ip="10.9.9.9")
+    check(protocols._aborts(ep, 41000, 443) == protocols._aborts(ep, 41000, 443),
+          "RST choice is not deterministic")
+    n = sum(protocols._aborts(Endpoints(client_ip=f"10.9.{i}.1"), 41000, 443)
+            for i in range(240))
+    check(20 <= n <= 60, f"RST fraction off: {n}/240")
+
+
+def _hello(frames):
+    for f in frames:
+        v = _tcp_view(f)
+        if v and v[6][:1] == b"\x16" and v[6][5:6] == b"\x01":
+            return v[6]
+    return b""
+
+
+def test_tls_client_hello_templates() -> None:
+    from tgt import enterprise, tls
+
+    def ep(t, ip="10.5.5.5", srv="openssl"):
+        return Endpoints(client_ip=ip, meta={"sni": "app.corp.local",
+                                             "tls_client": t, "tls_server": srv})
+    for key in tls.TEMPLATES:
+        h = _hello(protocols.https_flow(ep(key), 1))
+        check(h and h[11:43] != bytes(32), f"{key}: zero/absent client random")
+        check(h != _hello(protocols.https_flow(ep(key, "10.5.5.6"), 1)),
+              f"{key}: identical ClientHello on two connections")
+    xp = _hello(protocols.https_flow(ep("schannel-xp"), 1))
+    check(xp[9:11] == b"\x03\x01" and b"app.corp.local" not in xp
+          and len(xp) == 5 + 4 + 2 + 32 + 1 + 2 + 22 + 2,
+          "XP ClientHello is not TLS 1.0 without extensions")
+    w7 = _hello(protocols.https_flow(ep("schannel7"), 1))
+    n = struct.unpack("!H", w7[44:46])[0]          # no session id
+    suites = struct.unpack(f"!{n // 2}H", w7[46:46 + n])
+    check(w7[9:11] == b"\x03\x03" and not any(0x1300 < c < 0x1310
+                                               for c in suites),
+          "Windows 7 offers TLS 1.3 suites")
+    # one ClientHello per TCP connection across a whole site cycle
+    per_conn: dict = {}
+    for k, f in enterprise.get("industrial-site").build(3):
+        v = _tcp_view(f)
+        if v and k in ("https", "edr") and v[6][:1] == b"\x16" \
+                and v[6][5:6] == b"\x01":
+            key = (v[0], _l4(f)[3])
+            per_conn[key] = per_conn.get(key, 0) + 1
+    check(per_conn and max(per_conn.values()) == 1,
+          "more than one ClientHello on a TCP connection")
+
+
+def test_tls_server_flights_consistent() -> None:
+    def flight(t, srv):
+        e = Endpoints(meta={"sni": "app.corp.local", "tls_client": t,
+                            "tls_server": srv})
+        return b"".join(_tcp_view(f)[6] for f in protocols.https_flow(e, 2)
+                        if _tcp_view(f)[0] == e.server_ip)
+
+    def records(blob):
+        out, i = [], 0
+        while i + 5 <= len(blob):
+            ln = struct.unpack("!H", blob[i + 3:i + 5])[0]
+            out.append((blob[i], blob[i + 1:i + 3], blob[i + 5:i + 5 + ln]))
+            i += 5 + ln
+        return out
+    r = records(flight("chrome", "openssl"))       # TLS 1.3
+    sh = r[0][2]
+    check(r[0][0] == 22 and sh[0] == 2 and b"\x00\x2b\x00\x02\x03\x04" in sh
+          and r[1][0] == 20 and r[2][0] == 23, "TLS 1.3 server flight shape")
+    check(struct.unpack("!H", sh[4 + 2 + 32 + 33:4 + 2 + 32 + 35])[0]
+          in (0x1301, 0x1302, 0x1303), "TLS 1.3 ServerHello suite")
+    r = records(flight("chrome", "schannel"))      # TLS 1.2
+    types = [x[2][0] for x in r if x[0] == 22]
+    check(types[:4] == [2, 11, 12, 14] and 20 in [x[0] for x in r],
+          f"TLS 1.2 server flight {types}")
+    sh = r[0][2]
+    check(sh[4:6] == b"\x03\x03" and
+          struct.unpack("!H", sh[4 + 2 + 32 + 33:4 + 2 + 32 + 35])[0]
+          not in (0x1301, 0x1302, 0x1303),
+          "TLS 1.2 ServerHello picked a TLS 1.3 suite")
+    r = records(flight("schannel-xp", "schannel"))  # XP: TLS 1.0, RSA
+    types = [x[2][0] for x in r if x[0] == 22]
+    check(r[0][1] == b"\x03\x01" and types[:3] == [2, 11, 14],
+          f"XP server flight {types}")
+    r = records(flight("schannel-2000", "schannel"))  # SSL 3.0 refused
+    check(len(r) == 1 and r[0][0] == 21 and r[0][2] == b"\x02\x46",
+          "SSL 3.0 client not refused with protocol_version")
+
+
+def test_tshark_tls_ja3_and_certificates() -> None:
+    """Optional: tshark computes a distinct JA3/JA4 per client family (stable
+    within a family), parses every certificate with CN = SAN = SNI, and finds
+    nothing malformed."""
+    import shutil
+    import subprocess
+    from tgt import enterprise, tls
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_tls_ja3_and_certificates")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/tls.pcap"
+        with PcapWriter(path) as w:
+            n = 0
+            for key in tls.TEMPLATES:
+                for srv in ("schannel", "openssl", "schannel-legacy"):
+                    for rep in range(2):
+                        n += 1
+                        e = Endpoints(client_ip=f"10.7.{n}.10",
+                                      server_ip=f"10.7.{n}.20",
+                                      meta={"sni": f"h{n}.corp.local",
+                                            "tls_client": key,
+                                            "tls_server": srv})
+                        for f in protocols.https_flow(e, 2):
+                            w.write(f)
+            for _, f in enterprise.get("industrial-site").build(1):
+                w.write(f)
+        rows = subprocess.run(
+            ["tshark", "-r", path, "-Y", "tls.handshake.type==1", "-T",
+             "fields", "-e", "ip.src", "-e", "tls.handshake.ja3",
+             "-e", "tls.handshake.ja4"],
+            capture_output=True, text=True).stdout.splitlines()
+        certs = subprocess.run(
+            ["tshark", "-r", path, "-T", "fields", "-E", "separator=|",
+             "-e", "tcp.stream", "-e", "tls.handshake.extensions_server_name",
+             "-e", "x509sat.uTF8String", "-e", "x509ce.dNSName",
+             "-Y", "tls.handshake.type==1 || tls.handshake.type==11"],
+            capture_output=True, text=True).stdout.splitlines()
+        expert = subprocess.run(["tshark", "-r", path, "-q", "-z", "expert"],
+                                capture_output=True, text=True).stdout
+    ja3: dict = {}
+    keys = list(tls.TEMPLATES)
+    for line in rows:
+        ip, j3, j4 = (line.split("\t") + ["", ""])[:3]
+        o = ip.split(".")
+        if o[:2] != ["10", "7"]:
+            continue
+        key = keys[(int(o[2]) - 1) // 6]
+        ja3.setdefault(key, set()).add((j3, j4))
+    check(set(ja3) == set(keys), f"no ClientHello seen for {set(keys) - set(ja3)}")
+    for key, vals in ja3.items():
+        check(len(vals) == 1, f"{key}: JA3/JA4 not stable: {vals}")
+    flat = [next(iter(v)) for v in ja3.values()]
+    check(len({a for a, _ in flat}) == len(flat)
+          and len({b for _, b in flat}) == len(flat),
+          "two client families share a JA3/JA4")
+    sni, ncert = {}, 0
+    for line in certs:
+        stream, name, utf8, dns = (line.split("|") + [""] * 3)[:4]
+        if name:
+            sni[stream] = name
+        elif dns:
+            ncert += 1
+            want = sni.get(stream, dns)
+            check(dns == want and utf8.split(",")[-1] == want,
+                  f"certificate CN/SAN {utf8}/{dns} != SNI {want}")
+    check(ncert >= 10, f"only {ncert} certificates parsed by tshark")
+    check("Malformed" not in expert and "Errors (" not in expert,
+          "tshark reports malformed TLS")
+    warn = expert.split("Warns (")[1].split("Notes (")[0] if "Warns (" in expert else ""
+    check(all("Connection reset" in ln for ln in warn.splitlines()[3:]
+              if ln.strip()), "tshark TLS warnings besides deliberate RSTs")
 
 
 def main() -> int:

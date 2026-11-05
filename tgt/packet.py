@@ -80,11 +80,12 @@ def ethernet(dst_mac: str, src_mac: str, ethertype: int, payload: bytes,
 
 
 def ipv4(src_ip: str, dst_ip: str, proto: int, payload: bytes,
-         ttl: int = 64, ident: int = 0, dscp: int = 0) -> bytes:
+         ttl: int = 64, ident: int = 0, dscp: int = 0,
+         df: bool = True) -> bytes:
     ver_ihl = (4 << 4) | 5
     tos = (dscp & 0x3F) << 2
     total_len = 20 + len(payload)
-    flags_frag = 0x4000  # Don't Fragment
+    flags_frag = 0x4000 if df else 0  # Don't Fragment
     header = struct.pack(
         "!BBHHHBBH4s4s",
         ver_ihl, tos, total_len, ident & 0xFFFF, flags_frag,
@@ -102,13 +103,16 @@ def _l4_checksum(src_ip: str, dst_ip: str, proto: int, segment: bytes) -> int:
 
 
 def tcp(src_ip: str, dst_ip: str, sport: int, dport: int, seq: int, ack: int,
-        flags: int, payload: bytes = b"", window: int = 8192) -> bytes:
-    data_off = (5 << 4)  # 5 * 4 = 20 byte header, no options
+        flags: int, payload: bytes = b"", window: int = 8192,
+        options: bytes = b"") -> bytes:
+    if len(options) % 4:                 # pad options to a 32-bit boundary
+        options += b"\x00" * (4 - len(options) % 4)
+    data_off = (5 + len(options) // 4) << 4
     seg = struct.pack(
         "!HHIIBBHHH",
         sport, dport, seq & 0xFFFFFFFF, ack & 0xFFFFFFFF,
-        data_off, flags, window, 0, 0,
-    ) + payload
+        data_off, flags, window & 0xFFFF, 0, 0,
+    ) + options + payload
     chk = _l4_checksum(src_ip, dst_ip, IPPROTO_TCP, seg)
     seg = seg[:16] + struct.pack("!H", chk) + seg[18:]
     return seg
@@ -151,6 +155,8 @@ class Endpoints:
     ``ttl_client``/``ttl_server`` and ``meta`` let a flow carry an OS/device
     fingerprint (Windows TTL 128 vs Linux 64, HTTP User-Agent, SMB dialect,
     vendor strings) so an analyser can classify assets and flag legacy ones.
+    ``stack_client``/``stack_server`` name each side's TCP/IP stack
+    (:mod:`tgt.stacks`; "" = Windows client / port-typical server).
     """
     client_mac: str = "02:00:00:00:00:01"
     client_ip: str = "10.10.10.10"
@@ -160,10 +166,13 @@ class Endpoints:
     ttl_client: int = 64
     ttl_server: int = 64
     meta: dict = field(default_factory=dict)
+    stack_client: str = ""
+    stack_server: str = ""
 
 
 def ip_frame(ep: Endpoints, from_client: bool, proto: int, l4: bytes,
-             ttl: int | None = None, ident: int = 0) -> bytes:
+             ttl: int | None = None, ident: int = 0,
+             df: bool = True) -> bytes:
     if ttl is None:
         ttl = ep.ttl_client if from_client else ep.ttl_server
     if from_client:
@@ -172,7 +181,7 @@ def ip_frame(ep: Endpoints, from_client: bool, proto: int, l4: bytes,
     else:
         s_mac, d_mac, s_ip, d_ip = (ep.server_mac, ep.client_mac,
                                     ep.server_ip, ep.client_ip)
-    pkt = ipv4(s_ip, d_ip, proto, l4, ttl=ttl, ident=ident)
+    pkt = ipv4(s_ip, d_ip, proto, l4, ttl=ttl, ident=ident, df=df)
     return ethernet(d_mac, s_mac, ETH_P_IP, pkt, vlan=ep.vlan)
 
 
@@ -227,3 +236,18 @@ def rewrite_l2(frame: bytes, src_mac: str, dst_mac: str, vlan: int | None,
                 struct.pack("!HHH", ETH_P_VLAN, prio | ((vlan or 0) & 0x0FFF),
                             etype) + body)
     return ethernet(dst_mac, src_mac, etype, body, vlan=vlan)
+
+
+def set_ip_id(frame: bytes, ident: int) -> bytes:
+    """``frame`` with its IPv4 Identification set to ``ident`` (header
+    checksum recomputed; L4 checksums do not cover it). Non-IPv4 frames are
+    returned unchanged."""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    if frame[off - 2:off] != b"\x08\x00" or len(frame) < off + 20:
+        return frame
+    ihl = (frame[off] & 0x0F) * 4
+    hdr = bytearray(frame[off:off + ihl])
+    hdr[4:6] = struct.pack("!H", ident & 0xFFFF)
+    hdr[10:12] = b"\x00\x00"
+    hdr[10:12] = struct.pack("!H", checksum16(bytes(hdr)))
+    return frame[:off] + bytes(hdr) + frame[off + ihl:]

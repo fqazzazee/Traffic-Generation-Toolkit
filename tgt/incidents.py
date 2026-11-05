@@ -233,16 +233,19 @@ def dns_tunnel(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def https_c2(ep: Endpoints, count: int) -> List[bytes]:
-    """Encrypted C2 over TLS: repeated ClientHellos to a C2 host carrying its
-    SNI — what a sensor fingerprints (JA3/SNI) as beaconing to a bad domain."""
+    """Encrypted C2 over TLS: a new TLS connection per beacon to a C2 host
+    carrying its SNI — what a sensor fingerprints (JA3/SNI) as beaconing to a
+    bad domain. The implant uses the OS TLS library (WinHTTP -> SChannel)."""
+    from dataclasses import replace
     meta = dict(ep.meta)
     meta["sni"] = meta.get("domain", "cdn.evil-c2.example")
-    beacon = Endpoints(client_mac=ep.client_mac, client_ip=ep.client_ip,
-                       server_mac=ep.server_mac, server_ip=ep.server_ip,
-                       vlan=ep.vlan, ttl_client=ep.ttl_client,
-                       ttl_server=ep.ttl_server, meta=meta)
+    meta.setdefault("tls_client", "schannel10")
+    beacon = replace(ep, meta=meta)
     from .protocols import https_flow
-    return https_flow(beacon, count)
+    frames: List[bytes] = []
+    for _ in range(max(1, count)):
+        frames += https_flow(beacon, 1)
+    return frames
 
 
 def rdp_brute(ep: Endpoints, count: int) -> List[bytes]:
@@ -369,7 +372,8 @@ class Incident:
         m.update(meta)
         return Endpoints(client_mac=a.mac, client_ip=a.ip,
                          server_mac=v.mac, server_ip=v.ip,
-                         ttl_client=a.fp.ttl, ttl_server=v.fp.ttl, meta=m)
+                         ttl_client=a.fp.ttl, ttl_server=v.fp.ttl, meta=m,
+                         stack_client=a.stack, stack_server=v.stack)
 
     def build(self, messages: int,
               resolve: Optional[Callable[[str], Host]] = None

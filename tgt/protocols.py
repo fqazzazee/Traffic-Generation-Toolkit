@@ -19,6 +19,7 @@ from dataclasses import replace
 from typing import Callable, List
 
 from . import packet as P
+from . import stacks
 from .packet import Endpoints
 
 # A flow builder: (endpoints, message_count) -> list of frames
@@ -29,7 +30,14 @@ FlowBuilder = Callable[[Endpoints, int], List[bytes]]
 # TCP session helper
 # ---------------------------------------------------------------------------
 class TcpSession:
-    """Tracks sequence/ack numbers for a single TCP conversation."""
+    """Tracks sequence/ack numbers for a single TCP conversation.
+
+    Each side's segments follow its own TCP/IP stack (:mod:`tgt.stacks`, from
+    ``ep.stack_client`` / ``ep.stack_server``): SYN option layout, windows and
+    scaling, timestamps when both sides agree, IP ID pattern and DF. Payloads
+    larger than the negotiated MSS are segmented, and the receiver ACKs every
+    second full segment.
+    """
 
     def __init__(self, ep: Endpoints, sport: int, dport: int,
                  iss: int | None = None, irs: int | None = None):
@@ -41,6 +49,25 @@ class TcpSession:
         self.c_seq = _rand32() if iss is None else iss   # client next seq
         self.s_seq = _rand32() if irs is None else irs   # server next seq
         self.frames: List[bytes] = []
+        self._init_stacks()
+
+    def _init_stacks(self) -> None:
+        ep = self.ep
+        c = stacks.get(ep.stack_client or stacks.DEFAULT_CLIENT)
+        s = stacks.get(ep.stack_server or stacks.server_default(self.dport))
+        self.stk = {True: c, False: s}
+        self.ws = c.wscale >= 0 and s.wscale >= 0
+        self.sack = c.sack and s.sack
+        self.ts = c.ts == "initiate" and s.ts in ("initiate", "respond")
+        self.mss = min(c.mss, s.mss) - (12 if self.ts else 0)
+        key = (ep.client_ip, ep.server_ip, self.sport, self.dport)
+        # IP ID and timestamp-clock starting points, per side and connection
+        self._ipid = {True: stacks.hash_int(*key, "ipid-c", bits=16),
+                      False: stacks.hash_int(*key, "ipid-s", bits=16)}
+        self._tsbase = {True: stacks.hash_int(*key, "ts-c"),
+                        False: stacks.hash_int(*key, "ts-s")}
+        self._tsecr = {True: 0, False: 0}
+        self._clock = 0           # ms since the SYN (1 kHz timestamp clock)
 
     def _emit(self, from_client: bool, flags: int, payload: bytes = b"") -> None:
         if from_client:
@@ -51,12 +78,38 @@ class TcpSession:
             sport, dport = self.dport, self.sport
         if flags == P.SYN:              # bare SYN: nothing to acknowledge yet
             ack = 0
+        st = self.stk[from_client]
+        tsval = (self._tsbase[from_client] + self._clock) & 0xFFFFFFFF
+        self._clock += 1
+        if flags & P.SYN:
+            first = from_client          # SYN offers; SYN+ACK answers
+            opts = stacks.syn_options(
+                st, ws=st.wscale >= 0 if first else self.ws,
+                sack=st.sack if first else self.sack,
+                ts=st.ts == "initiate" if first else self.ts,
+                tsval=tsval, tsecr=self._tsecr[from_client])
+            window = st.syn_win if first else (st.synack_win or st.syn_win)
+        else:
+            opts = (stacks.ts_option(tsval, self._tsecr[from_client])
+                    if self.ts else b"")
+            window = st.win >> st.wscale if self.ws else min(st.win, 0xFFFF)
+            if flags & P.RST:
+                window = 0
+        self._tsecr[not from_client] = tsval
+        if st.ipid == "zero" or (st.ipid == "conn" and flags & P.SYN
+                                 and not from_client):
+            ident = 0                    # Linux SYN+ACK: no socket yet, id 0
+        else:
+            ident = self._ipid[from_client]
+            self._ipid[from_client] = (ident + 1) & 0xFFFF
         seg = P.tcp(
             self.ep.client_ip if from_client else self.ep.server_ip,
             self.ep.server_ip if from_client else self.ep.client_ip,
-            sport, dport, seq, ack, flags, payload,
+            sport, dport, seq, ack, flags, payload, window=window,
+            options=opts,
         )
-        self.frames.append(P.ip_frame(self.ep, from_client, P.IPPROTO_TCP, seg))
+        self.frames.append(P.ip_frame(self.ep, from_client, P.IPPROTO_TCP, seg,
+                                      ident=ident, df=st.df))
         # advance sequence numbers
         adv = len(payload) + (1 if flags & (P.SYN | P.FIN) else 0)
         if from_client:
@@ -69,30 +122,67 @@ class TcpSession:
         self._emit(False, P.SYN | P.ACK)
         self._emit(True, P.ACK)
 
+    def _send(self, from_client: bool, payload: bytes) -> None:
+        """``payload`` in MSS-sized segments (PSH on the last); the peer ACKs
+        every second full segment, as delayed-ACK stacks do."""
+        mss = max(1, self.mss)
+        chunks = [payload[i:i + mss] for i in range(0, len(payload), mss)]
+        for n, chunk in enumerate(chunks):
+            last = n == len(chunks) - 1
+            self._emit(from_client, P.PSH | P.ACK if last else P.ACK, chunk)
+            if not last and n % 2 == 1:
+                self._emit(not from_client, P.ACK)
+
     def request(self, payload: bytes) -> None:
-        self._emit(True, P.PSH | P.ACK, payload)
+        self._send(True, payload)
 
     def response(self, payload: bytes) -> None:
-        self._emit(False, P.PSH | P.ACK, payload)
+        self._send(False, payload)
 
-    def teardown(self) -> None:
+    def delayed_ack(self, from_client: bool = True) -> None:
+        """A pure ACK sent when the delayed-ACK timer fires (nothing to
+        piggyback it on, e.g. a poller idle until its next cycle)."""
+        self._clock += self.stk[from_client].delack_ms
+        self._emit(from_client, P.ACK)
+
+    def teardown(self, rst: bool = False) -> None:
+        """FIN handshake, or with ``rst`` an abortive close (RST+ACK from the
+        client, as a browser dropping a connection does)."""
+        if rst:
+            self._emit(True, P.RST | P.ACK)
+            return
         self._emit(True, P.FIN | P.ACK)
         self._emit(False, P.FIN | P.ACK)
         self._emit(True, P.ACK)
 
 
 def _tcp_flow(ep: Endpoints, sport: int, dport: int,
-              exchanges: List[tuple[bytes, bytes]]) -> List[bytes]:
-    """Build one TCP session: handshake, each (request, response), teardown."""
+              exchanges: List[tuple[bytes, bytes]], abort: bool = False,
+              idle_from: int = 0) -> List[bytes]:
+    """Build one TCP session: handshake, each (request, response), teardown.
+
+    The client idles between exchanges (a poll interval), so from exchange
+    ``idle_from`` on, a response that is not the last is followed by the
+    client's delayed pure ACK. ``abort`` closes with RST instead of FIN.
+    """
     s = TcpSession(ep, sport, dport)
     s.handshake()
-    for req, resp in exchanges:
+    for n, (req, resp) in enumerate(exchanges):
         if req:
             s.request(req)
         if resp:
             s.response(resp)
-    s.teardown()
+            if idle_from <= n < len(exchanges) - 1:
+                s.delayed_ack()
+    s.teardown(rst=abort)
     return s.frames
+
+
+def _aborts(ep: Endpoints, sport: int, dport: int, one_in: int = 6) -> bool:
+    """Deterministically pick about one session in ``one_in`` to be aborted
+    with RST (browsers and HTTP libraries drop idle keep-alive connections)."""
+    return stacks.hash_int(ep.client_ip, ep.server_ip, sport, dport,
+                           "rst") % one_in == 0
 
 
 # A client ephemeral source port that increments per session for realism.
@@ -561,7 +651,9 @@ def http_flow(ep: Endpoints, count: int) -> List[bytes]:
                 f"Content-Type: application/json\r\n"
                 f"Content-Length: {len(body)}\r\n\r\n").encode() + body
         exchanges.append((req, resp))
-    return _tcp_flow(ep, _sport(), 80, exchanges)
+    sport = _sport()
+    return _tcp_flow(ep, sport, 80, exchanges,
+                     abort=_aborts(ep, sport, 80))
 
 
 # ---------------------------------------------------------------------------
@@ -702,32 +794,30 @@ def ldap_flow(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def https_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """HTTPS (443): TLS ClientHello + ServerHello (SNI + cipher list).
+    """HTTPS (443): one TLS handshake, then ``count`` encrypted requests.
 
-    The SNI host and offered ciphers make the session fingerprintable
-    (JA3-style) so an analyser sees encrypted web traffic and its endpoints.
+    The ClientHello follows the client's TLS stack (``ep.meta['tls_client']``,
+    a :data:`tgt.tls.TEMPLATES` key: Chrome, Firefox, SChannel 10/7/XP/2000,
+    OpenSSL, Falcon; default Chrome), so JA3/JA4 identify the client OS and
+    software; the SNI is ``ep.meta['sni']``. The server
+    (``ep.meta['tls_server']``: openssl | schannel | schannel-legacy |
+    embedded) answers consistently — TLS 1.3 when both sides support it, else
+    TLS 1.2/1.0 with a certificate whose CN is the SNI — or refuses an
+    unsupported client with a fatal alert.
     """
-    sni = ep.meta.get("sni", ep.meta.get("host", "server.corp.local")).encode()
-    exchanges = []
-    for i in range(count):
-        # SNI extension
-        server_name = struct.pack("!BH", 0, len(sni)) + sni
-        sni_list = struct.pack("!H", len(server_name)) + server_name
-        sni_ext = struct.pack("!HH", 0x0000, len(sni_list)) + sni_list
-        exts = sni_ext
-        ciphers = struct.pack("!HHHH", 0x1301, 0x1302, 0xc02f, 0xc030)
-        body = (struct.pack("!H", 0x0303) + bytes(32) + b"\x00" +
-                struct.pack("!H", len(ciphers)) + ciphers +
-                b"\x01\x00" + struct.pack("!H", len(exts)) + exts)
-        hello = struct.pack("!B", 0x01) + struct.pack("!I", len(body))[1:] + body
-        rec = struct.pack("!BHH", 0x16, 0x0301, len(hello)) + hello  # handshake
-        # ServerHello record (minimal)
-        sh_body = struct.pack("!H", 0x0303) + bytes(32) + b"\x00" + \
-            struct.pack("!H", 0x1301) + b"\x00\x00\x00"
-        sh = struct.pack("!B", 0x02) + struct.pack("!I", len(sh_body))[1:] + sh_body
-        srec = struct.pack("!BHH", 0x16, 0x0303, len(sh)) + sh
-        exchanges.append((rec, srec))
-    return _tcp_flow(ep, _sport(), 443, exchanges)
+    from . import tls
+    sni = ep.meta.get("sni", ep.meta.get("host", "server.corp.local"))
+    tpl = tls.TEMPLATES.get(ep.meta.get("tls_client", ""),
+                            tls.TEMPLATES["chrome"])
+    srv = tls.SERVERS.get(ep.meta.get("tls_server", ""),
+                          tls.SERVERS["openssl"])
+    sport = _sport()
+    exchanges, handshake = tls.session(
+        tpl, srv, sni, count,
+        (ep.client_ip, ep.server_ip, sport, ep.meta.get("cycle", "")))
+    return _tcp_flow(ep, sport, 443, exchanges, idle_from=handshake,
+                     abort=(tpl.key in ("chrome", "firefox")
+                            and _aborts(ep, sport, 443)))
 
 
 def edr_flow(ep: Endpoints, count: int) -> List[bytes]:
@@ -740,9 +830,11 @@ def edr_flow(ep: Endpoints, count: int) -> List[bytes]:
     AWS-hosted with dynamic IPs), so the SNI is what a sensor fingerprints EDR
     traffic on. Set the host via ``ep.meta['sni']``; defaults to the US-1 sensor
     proxy."""
-    if not ep.meta.get("sni") and not ep.meta.get("domain"):
-        ep = replace(ep, meta={**ep.meta, "sni": "ts01-b.cloudsink.net"})
-    return https_flow(ep, count)
+    meta = dict(ep.meta)
+    if not meta.get("sni") and not meta.get("domain"):
+        meta["sni"] = "ts01-b.cloudsink.net"
+    meta.setdefault("tls_client", "falcon")
+    return https_flow(replace(ep, meta=meta), count)
 
 
 def dhcp_flow(ep: Endpoints, count: int) -> List[bytes]:
@@ -1021,7 +1113,7 @@ _reg("dns", "DNS", "IT", "53", "udp", dns_flow,
 _reg("http", "HTTP", "IT", "80", "tcp", http_flow,
      "Web browsing GET / 200 OK with per-host User-Agent")
 _reg("https", "HTTPS / TLS", "IT", "443", "tcp", https_flow,
-     "TLS ClientHello/ServerHello with SNI + cipher list")
+     "Per-OS TLS handshake (JA3/JA4, SNI, certificate) + app data")
 _reg("edr", "CrowdStrike EDR", "IT", "443", "tcp", edr_flow,
      "Falcon sensor TLS telemetry to the CrowdStrike cloud (cloudsink SNI)")
 _reg("smb", "SMB / CIFS", "IT", "445", "tcp", smb_flow,
