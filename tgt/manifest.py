@@ -93,6 +93,13 @@ class Recorder:
         self.cfg, self.seed, self.argv, self.clock = cfg, seed, list(argv), clock
         self.git = _git_sha()
         self.env = enterprise.get(cfg.env) if cfg.env else None
+        # replay --remap-env: the capture's hosts stand in for env hosts,
+        # whose inventory (and asset ids) is the ground truth
+        self.remap = None
+        if cfg.replay_path and getattr(cfg, "remap_env", None):
+            from .remapenv import plan_for
+            self.remap = plan_for(cfg)
+            self.env = self.remap.env
         self.addr_aid: Dict[str, str] = {}      # ip / mac -> asset id
         self.aid_ip: Dict[str, str] = {}
         # (key, addr a, addr b) -> (client aid, server aid, client ip, server ip)
@@ -107,6 +114,8 @@ class Recorder:
         if self.env is not None:
             from . import inventory
             self.inventory = inventory.to_json(self.env, self.sprinkle)
+            if self.remap is not None:
+                self.remap.annotate(self.inventory)
         self._index()
         self._cache: Dict[tuple, tuple] = {}
         self._pairs: Dict[tuple, str] = {}
@@ -397,6 +406,8 @@ class Recorder:
             "injections": [self._injection_row(r) for r in
                            list(self.injections)],
         }
+        if self.remap is not None:
+            doc["remap"] = self.remap.to_json()
         if self.plan is not None:
             doc["campaign"] = {"name": self.plan.name,
                                "plan": self.plan.source,

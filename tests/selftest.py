@@ -7315,6 +7315,370 @@ def test_tshark_codesys_clean() -> None:
                                                    ":udp:data"))
                        for ln in lens), "tshark: codesys frames mis-decoded")
 
+# -- W5-F: IPv6 rewrite + replay onto an environment by role ----------------
+
+def _w5f_a6(text: str) -> bytes:
+    import ipaddress
+    return ipaddress.IPv6Address(text).packed
+
+
+def _w5f_ip6(src: str, dst: str, chain: list, nh: int, upper: bytes,
+             hlim: int = 64, final: str = "", fix: bool = True) -> bytes:
+    """IPv6 packet: ``chain`` = [(ext header type, body after its next-
+    header byte)], then the upper layer ``nh`` (checksum filled in against
+    ``final`` or ``dst``)."""
+    s, d = _w5f_a6(src), _w5f_a6(dst)
+    ck = {6: 16, 17: 6, 58: 2}.get(nh)
+    if fix and ck is not None:
+        u = bytearray(upper)
+        u[ck:ck + 2] = b"\0\0"
+        pd = _w5f_a6(final) if final else d
+        c = P.checksum16(s + pd + struct.pack("!IxxxB", len(u), nh)
+                         + bytes(u))
+        struct.pack_into("!H", u, ck, c or 0xFFFF)
+        upper = bytes(u)
+    types = [t for t, _ in chain] + [nh]
+    exts = b"".join(bytes([types[i + 1]]) + body
+                    for i, (_, body) in enumerate(chain))
+    pl = exts + upper
+    return struct.pack("!IHBB", 0x60000000, len(pl), types[0], hlim) + s + d \
+        + pl
+
+
+def _w5f_v6_frames() -> list:
+    """An IPv6 sample: TCP (802.1Q-tagged), UDP, ICMPv6 echo behind
+    hop-by-hop + destination options, NDP NS/NA with link-layer options,
+    EUI-64 link-local echo, an SRH-routed TCP SYN, a fragmented UDP
+    datagram (first + non-first fragment)."""
+    A, B = "fd00:1::10", "fd00:1::20"
+    ma, mb = "02:00:00:00:00:0a", "00:1d:9c:00:00:0b"
+
+    def eth(dst, src, pkt, vlan=None):
+        return P.ethernet(dst, src, 0x86DD, pkt, vlan=vlan)
+
+    def tcp(sp, dp, seq, ack, flags, data=b""):
+        return struct.pack("!HHIIBBHHH", sp, dp, seq, ack, 5 << 4, flags,
+                           65535, 0, 0) + data
+
+    def udp(sp, dp, data):
+        return struct.pack("!HHHH", sp, dp, 8 + len(data), 0) + data
+    mb_q = b"\x00\x01\x00\x00\x00\x06\x01\x03\x00\x00\x00\x01"
+    out = [eth(mb, ma, _w5f_ip6(A, B, [], 6, tcp(40000, 502, 1, 0, 0x02)),
+               10),
+           eth(ma, mb, _w5f_ip6(B, A, [], 6, tcp(502, 40000, 9, 2, 0x12)),
+               10),
+           eth(mb, ma, _w5f_ip6(A, B, [], 6, tcp(40000, 502, 2, 10, 0x18,
+                                                 mb_q)), 10)]
+    q = (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+         b"\x04plc1\x04corp\x05local\x00\x00\x1c\x00\x01")
+    out.append(eth(mb, ma, _w5f_ip6(A, B, [], 17, udp(53000, 53, q))))
+    echo = struct.pack("!BBHHH", 128, 0, 0, 7, 1) + b"tgt-v6"
+    padn = b"\x00\x01\x04\x00\x00\x00\x00"          # len 0 + PadN(4)
+    out.append(eth(mb, ma, _w5f_ip6(A, B, [(0, padn), (60, padn)], 58,
+                                    echo)))
+    ns = (struct.pack("!BBHI", 135, 0, 0, 0) + _w5f_a6(B) + b"\x01\x01"
+          + P.mac_to_bytes(ma))
+    out.append(eth("33:33:ff:00:00:20", ma,
+                   _w5f_ip6(A, "ff02::1:ff00:20", [], 58, ns, hlim=255)))
+    na = (struct.pack("!BBHI", 136, 0, 0, 0x60000000) + _w5f_a6(B)
+          + b"\x02\x01" + P.mac_to_bytes(mb))
+    out.append(eth(ma, mb, _w5f_ip6(B, A, [], 58, na, hlim=255)))
+    out.append(eth(mb, ma, _w5f_ip6("fe80::ff:fe00:a",
+                                    "fe80::21d:9cff:fe00:b", [], 58, echo)))
+    # segment routing header (type 4): A -> fd00:1::99 (segment), final B
+    srh = (bytes([4, 4, 1, 1, 0, 0, 0]) + _w5f_a6(B)
+           + _w5f_a6("fd00:1::99"))
+    out.append(eth(mb, ma, _w5f_ip6(A, "fd00:1::99", [(43, srh)], 6,
+                                    tcp(40002, 502, 5, 0, 0x02), final=B)))
+    # a UDP datagram in two fragments
+    data = bytes(range(256)) * 2
+    u = bytearray(udp(40001, 47808, data))
+    c = P.checksum16(_w5f_a6(A) + _w5f_a6(B) + struct.pack(
+        "!IxxxB", len(u), 17) + bytes(u))
+    struct.pack_into("!H", u, 6, c)
+    for fo, part in ((1, bytes(u[:264])), ((264 // 8) << 3, bytes(u[264:]))):
+        pl = bytes([17, 0]) + struct.pack("!HI", fo, 0xABCD) + part
+        out.append(eth(mb, ma, struct.pack("!IHBB", 0x60000000, len(pl), 44,
+                                           64) + _w5f_a6(A) + _w5f_a6(B)
+                       + pl))
+    return out
+
+
+def _w5f_v6_check(frame: bytes) -> "bool | None":
+    """Own IPv6 upper-layer checksum check: True/False, None when the
+    packet carries no checkable checksum (fragment, unknown upper layer)."""
+    off = 14
+    while struct.unpack_from("!H", frame, off - 2)[0] in (0x8100, 0x88A8):
+        off += 4
+    if struct.unpack_from("!H", frame, off - 2)[0] != 0x86DD:
+        return None
+    plen = struct.unpack_from("!H", frame, off + 4)[0]
+    nh, p, final = frame[off + 6], off + 40, frame[off + 24:off + 40]
+    while nh in (0, 43, 44, 60):
+        if nh == 44:
+            return None
+        if nh == 43 and frame[p + 3]:
+            n = (frame[p + 1] * 8) // 16
+            final = (frame[p + 8:p + 24] if frame[p + 2] == 4 else
+                     frame[p + 8 + 16 * (n - 1):p + 8 + 16 * n])
+        nh, p = frame[p], p + (frame[p + 1] + 1) * 8
+    if nh not in (6, 17, 58):
+        return None
+    seg = frame[p:off + 40 + plen]
+    return P.checksum16(frame[off + 8:off + 24] + final + struct.pack(
+        "!IxxxB", len(seg), nh) + seg) == 0
+
+
+def test_w5f_rewrite_ipv6_checksums_and_extensions() -> None:
+    """--remap-ip / --remap-subnet / --remap-mac on IPv6: addresses (and NDP
+    targets, link-layer options, EUI-64 ids, SRH segments) rewritten, mixed
+    with IPv4 rules in one run; every upper-layer checksum still valid
+    (own check + tshark), fragments handled, VLAN tags kept, unparseable
+    frames left alone and counted."""
+    import ipaddress
+    from tgt.rewrite import Rewriter, RewriteError
+    frames = _w5f_v6_frames()
+    v4 = protocols.modbus_flow(Endpoints(client_ip="192.168.1.10",
+                                         server_ip="192.168.1.20"), 1)
+    rw = Rewriter.from_specs(
+        remap_ip=["fd00:1::20=fd10:9::99", "192.168.1.20=10.0.0.99"],
+        remap_subnet=["fd00:1::/64=fd20:2::/64",
+                      "192.168.1.0/24=10.100.10.0/24"],
+        remap_mac=["02:00:00:00:00:0a=00:0e:8c:12:34:56"])
+    check("1 IPv6 subnet" in rw.describe() and "1 IPv6" in rw.describe(),
+          f"rewrite describe: {rw.describe()}")
+    out = [rw.apply(f) for f in frames]
+    for i, (a, b) in enumerate(zip(frames, out)):
+        ok = _w5f_v6_check(b)
+        check(_w5f_v6_check(a) in (True, None) and ok in (True, None),
+              f"ipv6 rewrite {i}: bad upper-layer checksum")
+    for i, g in enumerate(v4):
+        verify_ip_l4(rw.apply(g), f"mixed v4 rewrite {i}")
+    broken = bytearray(out[2])
+    broken[-1] ^= 0x01
+    check(_w5f_v6_check(bytes(broken)) is False, "own v6 checksum check")
+
+    def addrs(f):
+        off = 18 if f[12:14] == b"\x81\x00" else 14
+        return (str(ipaddress.IPv6Address(f[off + 8:off + 24])),
+                str(ipaddress.IPv6Address(f[off + 24:off + 40])))
+    check(addrs(out[0]) == ("fd20:2::10", "fd10:9::99") and
+          out[0][12:16] == frames[0][12:16], f"tcp6: {addrs(out[0])}")
+    check(addrs(out[4]) == ("fd20:2::10", "fd10:9::99"), "hbh/dstopt echo")
+    check(_w5f_a6("fd10:9::99") in out[5][14 + 48:] and
+          P.mac_to_bytes("00:0e:8c:12:34:56") in out[5][14 + 40:],
+          "NDP NS target / source link-layer option not remapped")
+    check(_w5f_a6("fd10:9::99") in out[6][14 + 48:], "NDP NA target")
+    check(addrs(out[5])[1] == "ff02::1:ff00:99" and
+          out[5][0:6] == P.mac_to_bytes("33:33:ff:00:00:99"),
+          f"NS solicited-node group not following: {addrs(out[5])}")
+    check(addrs(out[7])[0] == "fe80::20e:8cff:fe12:3456",
+          f"EUI-64 link-local not following the MAC: {addrs(out[7])}")
+    check(_w5f_a6("fd10:9::99") in out[8][54:] and
+          _w5f_a6("fd20:2::99") in out[8][54:], "SRH segments not remapped")
+    # fragments: first keeps a valid checksum over the reassembly, the
+    # non-first one only has its addresses rewritten
+    check(addrs(out[10]) == ("fd20:2::10", "fd10:9::99") and
+          out[10][62:] == frames[10][62:], "non-first fragment payload")
+    whole = out[9][62:] + out[10][62:]
+    check(P.checksum16(out[9][22:54] + struct.pack("!IxxxB", len(whole), 17)
+                       + whole) == 0, "fragmented UDP checksum")
+    # unparseable: truncated extension chain -> untouched, counted
+    bad = frames[4][:14 + 40 + 4]
+    before = rw.unparsed
+    check(rw.apply(bad)[12:] == bad[12:] and rw.unparsed == before + 1,
+          "truncated IPv6 extension chain not left alone / counted")
+    # a non-pseudo-header upper layer (OSPF-free sample: proto 59 = none)
+    none = P.ethernet("00:1d:9c:00:00:0b", "02:00:00:00:00:0a", 0x86DD,
+                      _w5f_ip6("fd00:1::10", "fd00:1::20", [], 59, b""))
+    check(addrs(rw.apply(none)) == ("fd20:2::10", "fd10:9::99"),
+          "no-next-header packet not re-addressed")
+    for kw in ({"remap_ip": ["10.0.0.1=fd00::1"]},
+               {"remap_subnet": ["fd00::/64=fd01::/48"]},
+               {"remap_subnet": ["10.0.0.0/8=fd00::/8"]}):
+        try:
+            Rewriter.from_specs(**kw)
+            check(False, f"rewrite: {kw} accepted")
+        except RewriteError:
+            pass
+    if shutil_which("tshark"):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "v6.pcap")
+            with PcapWriter(path) as w:
+                for f in out:
+                    w.write(f)
+            bad = _expert_warns([("v6", f) for f in out])
+            rows = subprocess.run(
+                ["tshark", "-r", path, "-o", "tcp.check_checksum:TRUE",
+                 "-o", "udp.check_checksum:TRUE", "-T", "fields", "-e",
+                 "tcp.checksum.status", "-e", "udp.checksum.status", "-e",
+                 "icmpv6.checksum.status"], capture_output=True,
+                text=True).stdout.split("\n")
+        check(not bad, f"tshark expert on rewritten IPv6: {bad[:3]}")
+        stat = [x for ln in rows for x in ln.split("\t") if x.strip()]
+        check(len(stat) >= 9 and all(x == "1" for x in stat),
+              f"tshark IPv6 checksum status: {stat}")
+
+
+def _w5f_capture(d: str, env: str = "ot-plant") -> str:
+    path = os.path.join(d, f"{env}.pcap")
+    _run_engine(RunConfig(env=env, rate=0, loop=False, seed=7,
+                          pcap_path=path), timeout=60)
+    return path
+
+
+def test_w5f_remap_env_roles_and_determinism() -> None:
+    """--remap-env: the capture's hosts land on environment hosts of a
+    compatible role (PLCs on PLCs serving the same protocol, vendor kept,
+    switches on switches), the same seed maps the same way, frames carry
+    the env addresses + segment VLANs with valid checksums, unmappable
+    hosts keep their identity, and the manifest's ground truth is the
+    replayed env hosts."""
+    import json
+    from tgt import enterprise, pcapread, remapenv, score
+    from tgt.rewrite import RewriteError
+    with tempfile.TemporaryDirectory() as d:
+        src = _w5f_capture(d)
+        env = enterprise.get("industrial-site")
+        a = remapenv.RemapPlan(src, env, "access", seed=0)
+        b = remapenv.RemapPlan(src, env, "access", seed=0)
+        key = [(p.key, h.name) for p, h, _, _ in a.mapped]
+        check(key == [(p.key, h.name) for p, h, _, _ in b.mapped] and
+              json.dumps(a.to_json()) == json.dumps(b.to_json()),
+              "remap-env: same seed, different mapping")
+        check(len(a.mapped) >= 12, f"remap-env: only {len(a.mapped)} mapped")
+        ehosts = {e.host.name: e for e in remapenv._env_hosts(env)}
+        names = [h.name for _, h, _, _ in a.mapped]
+        check(len(set(names)) == len(names), "two hosts on one env host")
+        for p, h, seg, _ in a.mapped:
+            check(remapenv.score(p, ehosts[h.name]) is not None,
+                  f"remap-env: {p.key} ({p.role}) on incompatible {h.name}")
+            check(seg is env.segment_of(h), f"{h.name}: wrong segment")
+            if p.role == "plc":
+                ports = ehosts[h.name].serves | ehosts[h.name].can
+                check(h.role in ("plc", "rtu", "relay", "drive", "meter") and
+                      any(x in ports for x in p.serves),
+                      f"PLC {p.key} -> {h.name} ({h.role})")
+                check(p.vendor == remapenv._oui_vendor(h.mac),
+                      f"PLC {p.key} {p.vendor} -> {h.name} {h.mac}")
+            if p.role == "switch":
+                check(h.role == "switch", f"switch {p.key} -> {h.role}")
+        roles = {p.key: p.role for p in a.profiles}
+        check(roles.get("172.16.2.21") == "plc" and
+              roles.get("172.16.0.2") == "switch" and
+              roles.get("172.16.0.40") == "nms",
+              f"classifier: {roles}")
+        # placement: env addresses + VLANs, checksums valid
+        rw = a.rewriter()
+        orig = {P.ip_to_bytes(p.ip) for p, _, _, _ in a.mapped if p.ip}
+        new = {h.ip for _, h, _, _ in a.mapped}
+        vlans = {seg.vlan for seg in env.segments}
+        n_in = n_out = 0
+        out = []
+        for _, f in pcapread.iter_frames(src):
+            n_in += 1
+            for g in rw.apply_all(f):
+                n_out += 1
+                out.append(("replay", g))
+                ips = P.frame_ips(g)
+                if ips is not None:
+                    check(not ({P.ip_to_bytes(x) for x in ips} & orig),
+                          f"original address left in {ips}")
+                    verify_ip_l4(g, "remap-env frame")
+                if ips is not None and set(ips) & new:
+                    vid = (struct.unpack("!H", g[14:16])[0] & 0x0FFF
+                           if g[12:14] == b"\x81\x00" else None)
+                    check(vid in vlans, f"{ips}: VLAN {vid} not an env "
+                                        "segment's")
+        check(n_in == n_out, f"access span: {n_in} in, {n_out} out")
+        bad = _expert_warns(out)
+        check(not bad, f"tshark expert on remap-env replay: {bad[:3]}")
+        # core span adds the routed copies (TTL - 1)
+        core = remapenv.RemapPlan(src, env, "core", seed=0).rewriter()
+        n_core = sum(len(core.apply_all(f))
+                     for _, f in pcapread.iter_frames(src))
+        check(n_core > n_in, "core span: no routed copies")
+        # unmappable: OT hosts onto an IT-only environment keep identity
+        it = remapenv.RemapPlan(src, enterprise.get("it-org"), "access")
+        kept = {p.key for p, _ in it.unmapped}
+        check({"172.16.1.21", "172.16.2.21"} <= kept and all(
+            why for _, why in it.unmapped), f"it-org kept: {kept}")
+        f = next(f for _, f in pcapread.iter_frames(src)
+                 if (P.frame_ips(f) or ("",))[0] == "172.16.2.21")
+        check("172.16.2.21" in (P.frame_ips(it.rewriter().apply_all(f)[0])
+                                or ()), "unmapped PLC was re-addressed")
+        # the run: manifest ground truth = the env hosts the replay showed
+        man, rep = os.path.join(d, "m.json"), os.path.join(d, "r.json")
+        cfg = RunConfig(replay_path=src, remap_env="industrial-site",
+                        rate=0, loop=False, pcap_path=os.path.join(
+                            d, "o.pcap"), manifest_path=man)
+        _run_engine(cfg, timeout=60)
+        with open(man) as fh:
+            doc = json.load(fh)
+        ids = {f"industrial-site:{h.name}" for _, h, _, _ in a.mapped}
+        check(ids <= set(doc.get("first_seen", {})) and
+              doc.get("remap", {}).get("env") == "industrial-site" and
+              len(doc["remap"]["hosts"]) == len(a.mapped),
+              "manifest: remap-env ground truth missing")
+        pop = {x["id"] for x in score.Truth(doc, man).population()}
+        check(pop == ids, f"score population != mapped hosts: "
+                          f"{sorted(pop ^ ids)[:4]}")
+        rows = [r for r in doc["inventory"]["hosts"] if "replay" in r]
+        check(len(rows) == len(ids) and all(
+            not r["observability"]["firmware"]["observable"] for r in rows),
+            "manifest: replayed hosts not annotated")
+        remapenv.plan_for(cfg).write_report(rep)
+        with open(rep) as fh:
+            check(json.load(fh)["schema"] == remapenv.SCHEMA, "report")
+        # IPv6-only hosts are listed, not mapped
+        v6 = os.path.join(d, "v6.pcap")
+        with PcapWriter(v6) as w:
+            for g in _w5f_v6_frames():
+                w.write(g)
+        p6 = remapenv.RemapPlan(v6, env)
+        check(not p6.mapped and p6.unmapped and all(
+            "IPv6-only" in why for _, why in p6.unmapped),
+            f"IPv6-only: {[(p.key, w) for p, w in p6.unmapped]}")
+        try:
+            remapenv.RemapPlan(src, env, "mirror")
+            check(False, "remap-env: bad span accepted")
+        except RewriteError:
+            pass
+
+
+def test_w5f_remap_env_cli_checks() -> None:
+    """tgt run --remap-env: bad combinations are refused (exit 2) before
+    anything is sent; service args carry it."""
+    import contextlib
+    import io
+    from tgt import cli, service
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "x.pcap")
+        with PcapWriter(src) as w:
+            for f in protocols.modbus_flow(Endpoints(), 1):
+                w.write(f)
+        base = ["run", "--replay", src, "--pcap", os.path.join(d, "o.pcap"),
+                "--once"]
+        for extra in (["--remap-env", "no-such-env"],
+                      ["--remap-env", "ot-plant", "--remap-ip",
+                       "1.1.1.1=2.2.2.2"],
+                      ["--remap-env", "ot-plant", "--vlan", "5"],
+                      ["--remap-report", os.path.join(d, "r.json")]):
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(base + extra)
+            check(rc == 2, f"tgt run {extra}: exit {rc}, want 2")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main(["run", "--remap-env", "ot-plant", "--pcap",
+                           os.path.join(d, "o.pcap"), "--once"])
+        check(rc == 2, "--remap-env without --replay accepted")
+    args = service.build_run_args(None, [], 10, 5, replay="/x.pcap",
+                                  remap_env="ot-plant", span="core")
+    check("--remap-env ot-plant --span core" in args,
+          f"service args: {args}")
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

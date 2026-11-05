@@ -317,6 +317,7 @@ class Engine:
         pcap: Optional[PcapWriter] = None
         recorder = None
         pool = None
+        replay = None
         self.stats.running = True
         self.stats.started = time.perf_counter()
         seed = cfg.seed if cfg.seed is not None else new_seed()
@@ -364,7 +365,8 @@ class Engine:
                 # streamed from disk (pcap or pcapng), rewritten on the fly;
                 # with --replay-realtime/--replay-speed it keeps its own time
                 from .replay import ReplaySource
-                batch = ReplaySource(cfg, stop=self._stop, paced=pace)
+                batch = replay = ReplaySource(cfg, stop=self._stop,
+                                              paced=pace)
                 if batch.realtime:
                     limiter, self.limiter = RateLimiter(0), None
                 self.log(batch.describe())
@@ -452,6 +454,10 @@ class Engine:
                 sender.close()
             if pcap is not None:
                 pcap.close()
+            rw = getattr(replay, "rewriter", None)
+            if rw is not None and rw.unparsed:
+                self.log(f"rewrite: {rw.unparsed} unparseable IP frames "
+                         "sent as captured")
             if recorder is not None:
                 self._write_manifest(recorder)
             self.stats.running = False

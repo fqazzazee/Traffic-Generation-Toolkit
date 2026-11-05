@@ -47,6 +47,9 @@ class RunConfig:
     remap_subnet: List[str] = field(default_factory=list)  # "a/n=b/n[,..]"
     remap_mac: List[str] = field(default_factory=list)     # "old=new[,..]"
     replay_vlan: Optional[int] = None    # retag replayed frames (0 = untag)
+    # replay onto a modeled environment by role (tgt.remapenv); uses `span`
+    remap_env: Optional[str] = None      # environment key
+    remap_seed: Optional[int] = None     # mapping tie-break seed (None = 0)
 
     def summary(self) -> str:
         target = self.iface or "(pcap only)"
@@ -56,6 +59,10 @@ class RunConfig:
             what = f"replay={self.replay_path}"
             if self.replay_speed:
                 what += f" speed=x{self.replay_speed:g}"
+            if self.remap_env:
+                what += f" remap-env={self.remap_env}"
+                if self.span != "access":
+                    what += f" span={self.span}"
         elif self.incident:
             what = f"incident={self.incident}"
         elif self.env:

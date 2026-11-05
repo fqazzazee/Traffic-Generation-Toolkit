@@ -4,11 +4,13 @@
 ``tgt run --replay FILE``: every pass re-reads the file record by record (so a
 multi-gigabyte capture replays in constant memory), re-addresses each frame
 through :class:`tgt.rewrite.Rewriter` when ``--remap-*`` / ``--vlan`` are
-given, and — with ``--replay-realtime`` or ``--replay-speed X`` — sleeps so
-frames leave with the capture's own spacing divided by ``X`` (2 = twice as
-fast, 0.5 = half speed). Idle gaps longer than :data:`MAX_GAP` seconds (of
-capture time) are cut to it, and a source that falls more than a second
-behind (a pause, a slow host) resynchronises instead of bursting.
+given (or onto a modeled environment by role with ``--remap-env``, see
+:mod:`tgt.remapenv`), and — with ``--replay-realtime`` or ``--replay-speed
+X`` — sleeps so frames leave with the capture's own spacing divided by
+``X`` (2 = twice as fast, 0.5 = half speed). Idle gaps longer than
+:data:`MAX_GAP` seconds (of capture time) are cut to it, and a source that
+falls more than a second behind (a pause, a slow host) resynchronises
+instead of bursting.
 ``--replay-loop N`` stops the run after N passes (0 = until stopped).
 """
 from __future__ import annotations
@@ -18,7 +20,7 @@ import time
 from typing import Iterator, Optional, Tuple
 
 from . import pcapread
-from .rewrite import Rewriter
+from .rewrite import Rewriter, RewriteError
 
 MAX_GAP = 5.0
 
@@ -30,7 +32,18 @@ def gap(prev_ts: float, ts: float, max_gap: float = MAX_GAP) -> float:
 
 
 def rewriter_for(cfg) -> Optional[Rewriter]:
-    """The run's Rewriter (None when nothing is remapped)."""
+    """The run's Rewriter (None when nothing is remapped). Raises
+    RewriteError on bad / conflicting options."""
+    if getattr(cfg, "remap_env", None):
+        if (getattr(cfg, "remap_ip", None) or getattr(cfg, "remap_subnet",
+                                                      None)
+                or getattr(cfg, "remap_mac", None)
+                or getattr(cfg, "replay_vlan", None) is not None):
+            raise RewriteError("--remap-env picks every address and VLAN "
+                               "itself: drop --remap-ip/--remap-subnet/"
+                               "--remap-mac/--vlan")
+        from .remapenv import plan_for
+        return plan_for(cfg).rewriter()
     return Rewriter.from_specs(
         getattr(cfg, "remap_ip", ()) or (),
         getattr(cfg, "remap_subnet", ()) or (),
@@ -99,8 +112,11 @@ class ReplaySource:
                 self._wait(target)
                 if self.stop is not None and self.stop.is_set():
                     return
-            yield "replay", (rw.apply(frame) if rw is not None else frame), \
-                "replay"
+            if rw is None:
+                yield "replay", frame, "replay"
+            else:
+                for out in rw.apply_all(frame):
+                    yield "replay", out, "replay"
         self.done += 1
         if self.passes and self.done >= self.passes and self.stop is not None:
             self.stop.set()
