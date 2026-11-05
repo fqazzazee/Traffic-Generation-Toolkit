@@ -837,16 +837,17 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--count", type=int, default=0,
                     help="stop after N packets")
     _timed_args(pc)
-    r.add_argument("--api", metavar="[HOST:]PORT",
-                   help="serve the control API (status/stop/pause/resume/"
-                        "rate/inject/manifest) here, e.g. 127.0.0.1:8787; "
-                        "see 'tgt ctl'")
-    r.add_argument("--api-token", metavar="TOKEN",
-                   help="require 'Authorization: Bearer TOKEN' (default: "
-                        "$TGT_API_TOKEN)")
-    r.add_argument("--api-allow-remote", action="store_true",
-                   help="allow binding the API to a non-loopback address "
-                        "(needs a token)")
+    for rp in (r, pc):          # tgt run and tgt campaign both serve it
+        rp.add_argument("--api", metavar="[HOST:]PORT",
+                        help="serve the control API (status/stop/pause/"
+                             "resume/rate/inject/manifest) here, e.g. "
+                             "127.0.0.1:8787; see 'tgt ctl'")
+        rp.add_argument("--api-token", metavar="TOKEN",
+                        help="require 'Authorization: Bearer TOKEN' "
+                             "(default: $TGT_API_TOKEN)")
+        rp.add_argument("--api-allow-remote", action="store_true",
+                        help="allow binding the API to a non-loopback "
+                             "address (needs a token)")
 
     import os as _os
     c = sub.add_parser("ctl", help="control a running 'tgt run --api' "

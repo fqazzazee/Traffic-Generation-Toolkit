@@ -7,6 +7,7 @@ monitor).
 """
 from __future__ import annotations
 
+import collections
 import random
 import threading
 import time
@@ -39,6 +40,13 @@ class Stats:
     per_profile: dict = field(default_factory=dict)
     # per send interface (--iface a,b): packets, bytes, errors, last_error
     per_iface: dict = field(default_factory=dict)
+    # (time, packets, bytes) samples taken by readers for the rolling rate
+    _samples: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=4096), repr=False,
+        compare=False)
+
+    # seconds the rolling rate (rolling() / recent_pps) averages over
+    WINDOW = 5.0
 
     @property
     def elapsed(self) -> float:
@@ -55,6 +63,34 @@ class Stats:
     def mbps(self) -> float:
         e = self.elapsed
         return (self.bytes * 8 / 1e6) / e if e > 0 else 0.0
+
+    def rolling(self, window: Optional[float] = None,
+                now: Optional[float] = None) -> Tuple[float, float]:
+        """(pps, Mb/s) over about the last ``window`` seconds (default
+        :data:`WINDOW`), so a stall shows as a drop instead of vanishing into
+        the lifetime average (:attr:`pps`). Sampled on read: a monitor that
+        calls this every frame gets a smooth rate; until a second sample
+        exists it is the lifetime average."""
+        window = self.WINDOW if window is None else window
+        now = time.perf_counter() if now is None else now
+        s = self._samples
+        s.append((now, self.packets, self.bytes))
+        # keep one sample at least ``window`` old as the baseline
+        try:
+            while len(s) > 2 and now - s[1][0] >= window:
+                s.popleft()
+            t0, p0, b0 = s[0]
+        except IndexError:              # another reader trimmed it
+            return self.pps, self.mbps
+        dt = now - t0
+        if dt < min(0.5, window) or not self.started:
+            return self.pps, self.mbps
+        return ((self.packets - p0) / dt,
+                (self.bytes - b0) * 8 / 1e6 / dt)
+
+    @property
+    def recent_pps(self) -> float:
+        return self.rolling()[0]
 
 
 # A built frame: (profile/attack key, frame bytes, source label) — the source

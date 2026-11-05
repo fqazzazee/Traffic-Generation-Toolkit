@@ -16,8 +16,10 @@ from typing import List, Optional
 from .packet import Endpoints
 
 CONF_PATH = "/etc/tgt/tgt.conf"
+UNIT_PATH = "/etc/systemd/system/tgt.service"
 _DEFAULT_EP = Endpoints()          # `tgt run` defaults; omitted when unchanged
 PID_PATHS = ("/run/tgt.pid", "/tmp/tgt.pid")
+COMMANDS = ("run", "campaign")     # TGT_CMD: the subcommand the service runs
 
 
 @dataclass
@@ -53,14 +55,21 @@ def read_config(path: str = CONF_PATH) -> dict:
     return out
 
 
-def write_config(iface: str, run_args: str, path: str = CONF_PATH) -> tuple[bool, str]:
+def write_config(iface: str, run_args: str, path: str = CONF_PATH,
+                 command: str = "run") -> tuple[bool, str]:
     # The file is sourced by /bin/sh (tgtctl.sh, the systemd unit), so every
     # value is shell-quoted: a path with spaces, quotes or `$(…)` stays data.
     # TGT_RUN_ARGS itself is a shell-quoted argument list (see build_run_args)
-    # that the consumers expand with `eval set -- $TGT_RUN_ARGS`.
+    # that the consumers expand with `eval set -- $TGT_RUN_ARGS`. TGT_IFACE
+    # may list several interfaces (a,b: fan-out). TGT_CMD is the tgt
+    # subcommand the service runs: run (default) or campaign (the arguments
+    # then come from build_campaign_args).
+    if command not in COMMANDS:
+        return False, f"unknown service command {command!r}"
     body = (
         "# TGT service configuration — managed by the TGT TUI.\n"
         f"TGT_IFACE={shlex.quote(iface)}\n"
+        f"TGT_CMD={shlex.quote(command)}\n"
         f"TGT_RUN_ARGS={shlex.quote(run_args)}\n"
     )
     try:
@@ -72,6 +81,16 @@ def write_config(iface: str, run_args: str, path: str = CONF_PATH) -> tuple[bool
         return False, f"permission denied writing {path} (run as root)"
     except OSError as e:
         return False, f"error writing {path}: {e}"
+
+
+def unit_runs_command(path: str = UNIT_PATH) -> bool:
+    """False when an installed systemd unit predates TGT_CMD (it would run
+    `tgt run` whatever the config says; `tgtctl.sh register` rewrites it)."""
+    try:
+        with open(path) as fh:
+            return "TGT_CMD" in fh.read()
+    except OSError:
+        return True
 
 
 def service_state() -> ServiceState:
@@ -147,7 +166,15 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                    day_profile: Optional[str] = None,
                    min_period: float = 0.0,
                    duration: float = 0.0,
-                   clock: str = "wall") -> str:
+                   clock: str = "wall",
+                   start_time: Optional[str] = None,
+                   api: Optional[str] = None,
+                   replay_speed: float = 0.0,
+                   replay_loop: int = 0,
+                   remap_ip: Optional[List[str]] = None,
+                   remap_subnet: Optional[List[str]] = None,
+                   remap_mac: Optional[List[str]] = None,
+                   vlan: Optional[int] = None) -> str:
     """Serialize a selection into a `tgt run` argument string for the service.
 
     The result is shell-quoted (``shlex.split`` gives the argv back), so
@@ -155,12 +182,29 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
     the service's traffic reproducible and ``manifest`` keeps its ground
     truth; ``schedule="timed"`` (with ``speed``, ``day_profile``,
     ``min_period``) selects the time model, in which ``rate`` is only a cap.
+    ``clock="synthetic"`` stamps from ``start_time``; ``api`` serves the
+    control API (``tgt ctl``) at [HOST:]PORT. The replay options
+    (``replay_speed``, ``replay_loop``, ``remap_*``, ``vlan`` = retag) only
+    apply with ``replay``. The send interface(s) are not part of the string:
+    they go in TGT_IFACE (see :func:`write_config`).
     """
     parts: List[str] = []
     if replay:
         parts += ["--replay", replay]
-        if replay_realtime:
+        if replay_realtime and not replay_speed:
             parts += ["--replay-realtime"]
+        if replay_speed and replay_speed > 0:
+            parts += ["--replay-speed", f"{replay_speed:g}"]
+        if replay_loop and replay_loop > 0:
+            parts += ["--replay-loop", str(int(replay_loop))]
+        for flag, specs in (("--remap-ip", remap_ip),
+                            ("--remap-subnet", remap_subnet),
+                            ("--remap-mac", remap_mac)):
+            for spec in specs or ():
+                if spec:
+                    parts += [flag, spec]
+        if vlan is not None:
+            parts += ["--vlan", str(int(vlan))]
     elif incident:
         parts += ["--incident", incident]
     elif env:
@@ -193,8 +237,12 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
         parts += ["--duration", f"{duration:g}"]
     if clock and clock != "wall":
         parts += ["--clock", clock]
+        if start_time:
+            parts += ["--start-time", start_time]
     if manifest:
         parts += ["--manifest", manifest]
+    if api:
+        parts += ["--api", api]
     if messages and messages != 5:
         parts += ["--messages", str(messages)]
     if client_ip and client_ip != _DEFAULT_EP.client_ip:
@@ -205,4 +253,41 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
         parts += ["--pcap", pcap]
     if once:
         parts += ["--once"]
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def build_campaign_args(plan: str, rate: Optional[float] = None,
+                        seed: Optional[int] = None,
+                        manifest: Optional[str] = None,
+                        clock: str = "wall",
+                        start_time: Optional[str] = None,
+                        speed: float = 1.0, min_period: float = 0.0,
+                        pcap: Optional[str] = None,
+                        api: Optional[str] = None,
+                        force: bool = False) -> str:
+    """Serialize a campaign run into `tgt campaign` arguments (shell-quoted
+    like :func:`build_run_args`); save it with ``write_config(...,
+    command="campaign")``. ``rate`` is a cap (None/0 = none); the plan
+    supplies the environment, phases, span and day profile."""
+    parts: List[str] = [plan]
+    if rate:
+        parts += ["--rate", f"{rate:g}"]
+    if seed is not None:
+        parts += ["--seed", str(int(seed))]
+    if speed and speed != 1.0:
+        parts += ["--speed", f"{speed:g}"]
+    if min_period and min_period > 0:
+        parts += ["--min-period", f"{min_period:g}"]
+    if clock and clock != "wall":
+        parts += ["--clock", clock]
+        if start_time:
+            parts += ["--start-time", start_time]
+    if manifest:
+        parts += ["--manifest", manifest]
+    if api:
+        parts += ["--api", api]
+    if pcap:
+        parts += ["--pcap", pcap]
+    if force:
+        parts += ["--force"]
     return " ".join(shlex.quote(p) for p in parts)

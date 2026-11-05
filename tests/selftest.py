@@ -5864,6 +5864,476 @@ def test_w4c_tshark_expert_every_env() -> None:
                   f"tshark expert {env.key}: {bad[:4]}")
 
 
+# -- W4-A: TUI toggles + service wiring for the new run options (#62) --
+def _tui_labels(tui, ui, panel="Run"):
+    ui.focus = tui.PANELS.index(panel)
+    return [f.label.strip() for f in tui._fields(ui)]
+
+
+def _tui_ui(tui):
+    ui = tui.UI()
+    ui.engine = None
+    ui.ifaces = {}
+    ui.send_iface, ui.extra_ifaces, ui.pcap = None, [], None
+    return ui
+
+
+def _tui_exercise(tui, ui, label: str) -> None:
+    """Every visible row of every panel has help, a value, and ←/→ that
+    neither prompts nor raises (stdscr=None)."""
+    skip = {"Create veth pair", "Delete veth pair", "Save config",
+            "Start service", "Stop service", "Restart service"}
+    for focus in range(len(tui.PANELS)):
+        ui.focus = focus
+        for f in tui._fields(ui):
+            check(bool(f.help(ui)),
+                  f"tui[{label}]: {tui.PANELS[focus]}/{f.label} has no help")
+            f.value(ui)
+            if f.act and f.label not in skip:
+                for step in (1, -1, 0):       # 0: prompt/pick cancel (None)
+                    f.act(None, ui, step)
+                    f.act(None, ui, -step if step else 0)
+
+
+def test_tui_run_rows_follow_mode() -> None:
+    """Run-panel visibility: timed-only rows, synthetic start time, env
+    findings + inventory export, campaign mode, replay extras; each mode's
+    rows all have help and survive ←/→."""
+    from tgt import campaign, enterprise, envfile, tui
+    before = set(enterprise.ENVIRONMENTS)
+    envfile.load_user_envs(warn=lambda m: None, force=True)
+    try:
+        ui = _tui_ui(tui)
+        labels = _tui_labels(tui, ui)
+        for want in ("Preset", "Campaign", "Schedule", "Rate", "Loop",
+                     "Clock", "Seed", "Manifest", "API", "PCAP output"):
+            check(want in labels, f"tui: custom Run rows miss {want}")
+        for hide in ("speed", "day profile", "min period", "duration",
+                     "start time", "Findings", "Export inventory",
+                     "replay speed", "remap IP", "skip checks"):
+            check(hide not in labels, f"tui: custom Run rows show {hide}")
+        _tui_exercise(tui, ui, "custom")
+
+        # timed: its rows appear, Loop goes, the rate becomes a cap
+        ui = _tui_ui(tui)
+        ui.set_schedule("timed")
+        labels = _tui_labels(tui, ui)
+        check(all(x in labels for x in ("speed", "day profile",
+                                        "min period", "duration"))
+              and "Loop" not in labels and ui.rate == 0,
+              f"tui: timed rows {labels} rate {ui.rate}")
+        ui.speed, ui.duration, ui.min_period = 60.0, 3600.0, 2.0
+        ui.day_profile = "shift"
+        cfg = ui.build_config()
+        check(cfg.schedule == "timed" and cfg.speed == 60 and
+              cfg.duration == 3600 and cfg.min_period == 2 and
+              cfg.day_profile == "shift" and cfg.rate == 0,
+              f"tui: timed config {cfg}")
+        _tui_exercise(tui, ui, "timed")
+        ui.set_schedule("cycle")
+        check(ui.rate == 20 and ui.build_config().duration == 0,
+              "tui: leaving timed did not restore the cycle rate")
+        ui.clock = "synthetic"
+        check("start time" in _tui_labels(tui, ui),
+              "tui: synthetic clock hides the start time")
+        ui.start_time = "2026-11-05T14:00:00Z"
+        check(ui.build_config().start_time == ui.start_time,
+              "tui: start time not in the config")
+        tui._act_start(None, ui, 1)
+        check(ui.start_time == "2026-11-05T15:00:00Z",
+              f"tui: start time ±1h gave {ui.start_time}")
+
+        # an environment with planted findings: count, list, export
+        ui = _tui_ui(tui)
+        tui._apply_preset(None, ui, ("e", "water-utility"))
+        env = enterprise.get("water-utility")
+        labels = _tui_labels(tui, ui)
+        check("Findings" in labels and "Export inventory" in labels,
+              f"tui: site rows {labels}")
+        row = next(f for f in tui._fields(ui) if f.label == "Findings")
+        text = row.help(ui)
+        check(str(len(env.findings)) in row.value(ui)[0] and
+              all(f["title"] in text for f in env.findings) and
+              row.long_help,
+              "tui: findings row does not list the site's findings")
+        with tempfile.TemporaryDirectory() as d:
+            paths = ui.export_inventory(os.path.join(d, "gt", "water.csv"))
+            check([os.path.basename(p) for p in paths] ==
+                  ["water.csv", "water.json"] and
+                  all(os.path.getsize(p) > 1000 for p in paths),
+                  f"tui: inventory export {paths}")
+            import json
+            doc = json.load(open(paths[1]))
+            check(doc.get("env") == "water-utility" and
+                  len(doc.get("findings", [])) == len(env.findings),
+                  "tui: exported JSON lacks the findings")
+        _tui_exercise(tui, ui, "site")
+
+        # preset picker: environments grouped built-in / sites / files
+        groups = {}
+        for grp, choice, _l, _d in tui._preset_items(ui):
+            if choice[0] == "e":
+                groups.setdefault(grp, []).append(choice[1])
+        sites = sorted(os.path.splitext(f)[0] for f in
+                       os.listdir(envfile.SITES_DIR) if f.endswith(".json"))
+        check(sorted(groups.get("Environments · sites", [])) == sites and
+              len(sites) >= 7 and set(before) <= set(
+                  groups.get("Environments · built-in", [])) | set(
+                  sum(groups.values(), [])),
+              f"tui: preset groups {sorted(groups)}")
+        check(set(groups.get("Environments · built-in", [])) >=
+              {"it-org", "ot-plant", "enterprise-mixed", "industrial-site"},
+              "tui: built-in envs not grouped as built-in")
+
+        # campaign mode
+        plans = campaign.packaged()
+        check(len(plans) >= 3, "campaign examples missing")
+        ui = _tui_ui(tui)
+        ui.pcap = os.path.join(tempfile.gettempdir(), "tgt-w4a.pcap")
+        check(ui.set_campaign(plans[0]) and ui.mode() == "campaign" and
+              ui.rate == 0, "tui: campaign mode not entered")
+        labels = _tui_labels(tui, ui)
+        check("skip checks" in labels and "speed" in labels and
+              "Schedule" not in labels and "duration" not in labels and
+              "Malware sprinkle" not in labels and "Loop" not in labels,
+              f"tui: campaign rows {labels}")
+        ui.seed, ui.speed, ui.api = 7, 120.0, "127.0.0.1:8799"
+        cfg = ui.build_config()
+        plan = campaign.load(plans[0])
+        check(cfg.campaign == plans[0] and cfg.schedule == "timed" and
+              cfg.env == plan.base_env().key and cfg.seed == 7 and
+              ui.phases and len(ui.phases) == len(plan.phases),
+              f"tui: campaign config {cfg}")
+        check(ui.service_command() == "campaign", "tui: service command")
+        _tui_exercise(tui, ui, "campaign")
+        ui.set_campaign(plans[0])
+        ui.set_campaign(None)
+        check(ui.mode() == "env" and ui.rate == 20,
+              f"tui: leaving campaign mode gave {ui.mode()} rate {ui.rate}")
+        ui.set_campaign(plans[0])
+        tui._apply_preset(None, ui, ("c", None))
+        check(ui.mode() == "custom" and ui.rate == 20,
+              "tui: a preset did not leave campaign mode cleanly")
+
+        # replay extras
+        with tempfile.TemporaryDirectory() as d:
+            cap = os.path.join(d, "in.pcap")
+            with PcapWriter(cap) as w:
+                for _k, fr in build_batch(RunConfig(profiles=["modbus"],
+                                                    messages=1)):
+                    w.write(fr)
+            ui = _tui_ui(tui)
+            ui.set_replay(cap)
+            labels = _tui_labels(tui, ui)
+            check(all(x in labels for x in (
+                "replay speed", "passes", "VLAN retag", "remap IP",
+                "remap subnet", "remap MAC")) and "Schedule" not in labels
+                and "Seed" not in labels and "Campaign" not in labels,
+                f"tui: replay rows {labels}")
+            ui.replay_speed, ui.replay_loop, ui.replay_vlan = 2.0, 3, 0
+            ui.remap["ip"] = "10.10.10.10=192.0.2.10"
+            ui.remap["mac"] = "02:00:00:00:00:01=02:00:00:00:00:99"
+            cfg = ui.build_config()
+            check(cfg.replay_speed == 2 and cfg.replay_loop == 3 and
+                  cfg.replay_vlan == 0 and cfg.remap_ip ==
+                  ["10.10.10.10=192.0.2.10"] and cfg.remap_mac and
+                  ui._check_start(cfg) is None,
+                  f"tui: replay config {cfg}")
+            ui.remap["subnet"] = "nonsense"
+            check(ui._check_start(ui.build_config()) is not None,
+                  "tui: a bad remap is not refused before start")
+            ui.remap["subnet"] = ""
+            _tui_exercise(tui, ui, "replay")
+    finally:
+        for k in set(enterprise.ENVIRONMENTS) - before:
+            enterprise.ENVIRONMENTS.pop(k, None)
+
+
+def test_tui_traffic_families_fanout_quit_log() -> None:
+    """Traffic tab grouped by family (fold, filter); fan-out interfaces;
+    q asks first while generating; the log is safe from other threads."""
+    import threading
+    from tgt import protocols as PR, tui
+    ui = _tui_ui(tui)
+    names = [f for f, _ in tui.FAMILIES]
+    fams = {PR.get(k).key: tui.proto_family(PR.get(k)) for k in PR.PROFILES}
+    check(all(f in names for f in fams.values()),
+          f"tui: protocols outside the families: {fams}")
+    for fam in ("OT/ICS", "Substation/L2", "Building", "Medical", "IT",
+                "Infra/Discovery", "Remote access", "Vendor engineering"):
+        check(fam in fams.values(), f"tui: family {fam} is empty")
+    ui.set_scenario(None)
+    ui.selected = ["modbus"]
+    ui.focus = tui.PANELS.index("Traffic")
+    fields = tui._fields(ui)
+    heads = [f for f in fields if f.ident.startswith("family:")]
+    protos = [f for f in fields if f.ident.startswith("proto:")]
+    check(len(heads) >= 8 and [f.ident for f in protos] ==
+          [f"proto:{k}" for k in PR.PROFILES if fams[k] == "OT/ICS"],
+          "tui: only the family holding a selected protocol starts open")
+    ot = heads[0]
+    ui.row = 0
+    tui._activate(None, ui, 0)                     # fold OT/ICS
+    check(not any(f.ident.startswith("proto:") for f in tui._fields(ui))
+          and tui._fields(ui)[ui.row].ident == ot.ident,
+          "tui: folding a family failed / lost the cursor")
+    tui._activate(None, ui, +1)                    # → opens it again
+    row = next(i for i, f in enumerate(tui._fields(ui))
+               if f.ident == "proto:dnp3")
+    ui.row = row
+    tui._activate(None, ui, 0)                     # toggle dnp3 on
+    check("dnp3" in ui.selected and
+          tui._fields(ui)[ui.row].ident == "proto:dnp3",
+          "tui: toggling a protocol moved the cursor")
+    ui.proto_filter = "goose"
+    got = [f.ident for f in tui._fields(ui)]
+    check(got == ["family:Substation/L2", "proto:goose"],
+          f"tui: filter 'goose' shows {got}")
+    ui.proto_filter = ""
+
+    # fan-out: a second interface, counters per interface in the config
+    ui.focus = tui.PANELS.index("Interfaces")
+    ui.ifaces = {n: {"name": n, "state": "up", "kind": "veth",
+                     "peer": n + "-mon"} for n in ("tgt0", "tgt1")}
+    ui.ifaces.update({n + "-mon": {"name": n + "-mon", "state": "up",
+                                   "kind": "veth", "peer": n}
+                      for n in ("tgt0", "tgt1")})
+    ui.send_iface = "tgt0"
+    check("Fan-out" in [f.label for f in tui._fields(ui)],
+          "tui: fan-out row hidden with two interfaces")
+    ui.extra_ifaces = ["tgt1"]
+    check(ui.iface_spec() == "tgt0,tgt1" and
+          ui.build_config().iface == "tgt0,tgt1",
+          f"tui: fan-out spec {ui.iface_spec()}")
+    tui._act_send(None, ui, +1)                    # primary -> tgt1
+    check(ui.send_iface == "tgt1" and ui.extra_ifaces == [],
+          "tui: the new primary stays in the fan-out list")
+
+    # q while generating asks first; any other key cancels
+    class _Live:
+        def is_alive(self):
+            return True
+    ui.engine = _Live()
+    check(tui._handle_key(None, ui, ord("q")) and ui.quit_armed,
+          "tui: q quit a live run without asking")
+    check(tui._handle_key(None, ui, ord("x")) and not ui.quit_armed,
+          "tui: another key did not cancel the quit")
+    tui._handle_key(None, ui, ord("q"))
+    check(not tui._handle_key(None, ui, ord("y")), "tui: y did not confirm")
+    ui.engine = None
+    check(not tui._handle_key(None, ui, ord("q")),
+          "tui: q must quit at once when idle")
+
+    # log: concurrent writers + a reader never raise, stay capped
+    ui.clear_log()
+    errors = []
+
+    def writer(n):
+        try:
+            for i in range(2000):
+                ui.add_log(f"w{n} {i}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    while any(t.is_alive() for t in threads):
+        lines = ui.log_lines()
+        check(len(lines) <= 300, "tui: log grew past its cap")
+    for t in threads:
+        t.join()
+    check(not errors and len(ui.log_lines()) == 300,
+          f"tui: concurrent log writes: {errors} {len(ui.log_lines())}")
+
+
+def test_rolling_pps_shows_stalls() -> None:
+    """Stats.rolling: the recent rate drops to 0 in a stall while the
+    lifetime average barely moves; RateLimiter resyncs instead of
+    bursting the backlog."""
+    import time
+    from tgt.engine import Stats
+    from tgt.sender import RateLimiter
+    s = Stats()
+    t0 = time.perf_counter()
+    s.started = t0 - 100.0
+    s.packets, s.bytes = 10000, 1000000
+    check(abs(s.rolling(now=t0)[0] - 100.0) < 1.0,
+          "rolling: first sample should be the lifetime average")
+    s.packets += 500
+    s.bytes += 50000
+    pps, mbps = s.rolling(now=t0 + 1.0)
+    check(abs(pps - 500.0) < 1e-6 and abs(mbps - 0.4) < 1e-6,
+          f"rolling: 500 frames in 1 s gave {pps} pps {mbps} Mb/s")
+    pps, _ = s.rolling(now=t0 + 10.0)              # nothing sent for 9 s
+    check(pps == 0.0 and s.pps > 50, f"rolling: stall shows {pps} pps")
+    for i in range(1, 11):                         # back to 100 pps
+        s.packets += 50
+        pps, _ = s.rolling(now=t0 + 10.0 + 0.5 * i)
+    check(abs(pps - 100.0) < 1e-6, f"rolling: recovery gave {pps} pps")
+    lim = RateLimiter(100)
+    lim._next -= 1.0                               # a 1 s stall
+    start, n = time.perf_counter(), 0
+    while time.perf_counter() - start < 0.1:
+        lim.wait()
+        n += 1
+    check(n <= 25, f"rate limiter burst {n} frames in 100 ms at 100 pps")
+
+
+def test_tui_inject_api_and_manifest() -> None:
+    """A TUI-started run (pcap only): seed + manifest + control API; the
+    TUI's injection lands in the traffic, the ENGINE box and the manifest;
+    the API serves while it runs and closes after."""
+    import json
+    import time
+    from tgt import api, incidents, tui
+    tui_cattr = tui._cattr
+    tui._cattr = lambda color, extra=0: extra      # no curses screen here
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            ui = _tui_ui(tui)
+            ok, msg = ui.inject("wannacry", 5)
+            check(not ok and "start" in msg, "tui: inject while idle")
+            ui.set_scenario(None)
+            ui.selected = ["modbus"]
+            ui.pcap = os.path.join(d, "run.pcap")
+            ui.manifest = os.path.join(d, "run.json")
+            ui.seed, ui.rate, ui.api = 4242, 400.0, "127.0.0.1:0"
+            ui.start_stop()
+            check(ui.running() and ui.api_server is not None,
+                  "tui: run / API did not start")
+            port = ui.api_server.port
+            code, doc = api.request(f"127.0.0.1:{port}", "GET", "/status")
+            check(code == 200 and doc.get("seed") == 4242,
+                  f"tui: API status {code} {doc}")
+            ok, msg = ui.inject("wannacry", 1.0)
+            check(ok, f"tui: inject failed: {msg}")
+            ok2, msg2 = ui.inject("wannacry", 1.0)
+            check(not ok2 and "already" in msg2,
+                  "tui: a second inject of the same incident was accepted")
+            seen_box = False
+            deadline = time.time() + 15
+            attacks = {k for k, _ in incidents.get("wannacry").build(1)}
+            while time.time() < deadline:
+                lines = [t for t, _ in tui._engine_extra_lines(ui)]
+                seen_box = seen_box or any("wannacry" in t for t in lines)
+                st = ui.engine.control.status()
+                if st and st[0]["state"] == "done":
+                    break
+                time.sleep(0.05)
+            check(seen_box, "tui: active injection not in the ENGINE box")
+            check(st and st[0]["state"] == "done" and st[0]["packets"] > 0
+                  and st[0]["via"] == "tui",
+                  f"tui: injection status {st}")
+            mal = set(incidents.ATTACKS)
+            counts = dict(ui.stats().per_profile)
+            check(any(k in mal for k in counts),
+                  f"tui: no attack frames in the mix {counts}")
+            check(bool(attacks & set(counts)), "tui: wannacry frames missing")
+            check(ui.stats().recent_pps >= 0, "tui: recent pps")
+            ui.start_stop()                        # stop
+            ui.engine.join(5)
+            ui.refresh()
+            check(ui.api_server is None, "tui: API kept serving after stop")
+            man = json.load(open(ui.manifest))
+            check(man.get("seed") == 4242 and man.get("injections") and
+                  man["injections"][0]["incident"] == "wannacry",
+                  f"tui: manifest {sorted(man)}")
+    finally:
+        tui._cattr = tui_cattr
+
+
+def test_build_run_args_every_tui_option() -> None:
+    """Every run option the TUI sets reaches `tgt run` / `tgt campaign`
+    through the service config (sourced like tgtctl.sh does, multi-iface
+    TGT_IFACE and TGT_CMD included)."""
+    import shlex
+    import shutil
+    import subprocess
+    from tgt import campaign, cli, service, tui
+    args = service.build_run_args(
+        None, [], 0, 5, env="water-utility", seed=99,
+        manifest="/var/lib/tgt/m 1.json", schedule="timed", speed=60,
+        day_profile="flat", min_period=2, duration=7200, clock="synthetic",
+        start_time="2026-11-05T14:00:00Z", api="127.0.0.1:8787")
+    ns = cli.build_parser().parse_args(["run"] + shlex.split(args))
+    check(ns.env == "water-utility" and ns.seed == 99 and
+          ns.manifest == "/var/lib/tgt/m 1.json" and ns.schedule == "timed"
+          and ns.speed == 60 and ns.day_profile == "flat" and
+          ns.min_period == 2 and ns.duration == 7200 and
+          ns.clock == "synthetic" and ns.start_time ==
+          "2026-11-05T14:00:00Z" and ns.api == "127.0.0.1:8787",
+          f"build_run_args timed/clock/api: {args}")
+    rargs = service.build_run_args(
+        None, [], 50, 5, replay="/caps/a b.pcapng", replay_speed=2,
+        replay_loop=3, remap_ip=["10.0.0.1=192.0.2.1,10.0.0.2=192.0.2.2"],
+        remap_subnet=["10.1.0.0/16=10.9.0.0/16"],
+        remap_mac=["00:11:22:33:44:55=02:00:00:00:00:09"], vlan=0)
+    ns = cli.build_parser().parse_args(["run"] + shlex.split(rargs))
+    check(ns.replay == "/caps/a b.pcapng" and ns.replay_speed == 2 and
+          ns.replay_loop == 3 and ns.remap_ip ==
+          ["10.0.0.1=192.0.2.1,10.0.0.2=192.0.2.2"] and
+          ns.remap_subnet == ["10.1.0.0/16=10.9.0.0/16"] and
+          ns.remap_mac == ["00:11:22:33:44:55=02:00:00:00:00:09"] and
+          ns.vlan == 0 and not ns.replay_realtime,
+          f"build_run_args replay: {rargs}")
+    plain = service.build_run_args(None, ["modbus"], 20, 5, vlan=5,
+                                   replay_speed=2, start_time="x")
+    check("--vlan" not in plain and "--replay-speed" not in plain and
+          "--start-time" not in plain, f"replay/clock args leaked: {plain}")
+    plan = campaign.packaged()[0]
+    cargs = service.build_campaign_args(
+        plan, rate=100, seed=5, manifest="/tmp/c m.json", clock="synthetic",
+        start_time="2026-11-05T00:00:00Z", speed=30, min_period=1,
+        pcap="/tmp/c.pcap", api="127.0.0.1:8788", force=True)
+    ns = cli.build_parser().parse_args(["campaign"] + shlex.split(cargs))
+    check(ns.plan == plan and ns.rate == 100 and ns.seed == 5 and
+          ns.manifest == "/tmp/c m.json" and ns.clock == "synthetic" and
+          ns.start_time == "2026-11-05T00:00:00Z" and ns.speed == 30 and
+          ns.min_period == 1 and ns.pcap == "/tmp/c.pcap" and
+          ns.api == "127.0.0.1:8788" and ns.force,
+          f"build_campaign_args: {cargs}")
+    # the TUI's own selection round-trips the same way
+    ui = _tui_ui(tui)
+    ui.set_campaign(plan)
+    ui.seed, ui.api = 11, "127.0.0.1:8790"
+    ns = cli.build_parser().parse_args(
+        [ui.service_command()] + shlex.split(ui.run_args()))
+    check(ns.command == "campaign" and ns.plan == plan and ns.seed == 11 and
+          ns.api == "127.0.0.1:8790", f"tui campaign args: {ui.run_args()}")
+    with tempfile.TemporaryDirectory() as d:
+        conf = os.path.join(d, "tgt.conf")
+        ok, msg = service.write_config("tgt0,tgt1", cargs, path=conf,
+                                       command="campaign")
+        rc = service.read_config(conf)
+        check(ok and rc.get("TGT_CMD") == "campaign" and
+              rc.get("TGT_IFACE") == "tgt0,tgt1",
+              f"write_config campaign: {msg} {rc}")
+        check(not service.write_config("x", "", path=conf,
+                                       command="rm -rf")[0],
+              "write_config accepted an unknown command")
+        unit = os.path.join(d, "tgt.service")
+        with open(unit, "w") as f:
+            f.write("ExecStart=/bin/sh -c 'exec tgt run'\n")
+        check(not service.unit_runs_command(unit) and
+              service.unit_runs_command(os.path.join(d, "none")),
+              "unit_runs_command")
+        sh = shutil.which("sh")
+        if sh:                  # as the systemd unit / daemon expand it
+            r = subprocess.run(
+                [sh, "-c", '. "$1" && eval "set -- $TGT_RUN_ARGS" && '
+                 'printf "%s\\n" "${TGT_CMD:-run}" --iface "$TGT_IFACE" "$@"',
+                 "sh", conf], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=10)
+            argv = r.stdout.splitlines()
+            ns = cli.build_parser().parse_args(argv)
+            check(ns.command == "campaign" and ns.iface == "tgt0,tgt1" and
+                  ns.plan == plan and ns.force,
+                  f"sourced campaign config argv: {argv} {r.stderr}")
+    script = open(os.path.join(_REPO, "scripts", "tgtctl.sh")).read()
+    check("TGT_CMD:-run" in script and 'tr , " "' in script,
+          "tgtctl.sh does not honour TGT_CMD / multi-interface TGT_IFACE")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
