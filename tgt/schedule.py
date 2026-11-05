@@ -254,7 +254,8 @@ class Stream:
         self.rtt = timing.pick(*timing.RTT[path], ep.client_ip, ep.server_ip,
                                "rtt")
         self.proc = timing.pick(
-            *timing.PROCESSING["embedded" if embedded else "host"],
+            *(timing.PROCESSING.get(key) or
+              timing.PROCESSING["embedded" if embedded else "host"]),
             ep.server_ip, "proc")
         self.delack = {
             True: stacks.get(ep.stack_client or stacks.DEFAULT_CLIENT)

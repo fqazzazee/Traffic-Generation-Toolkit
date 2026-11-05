@@ -18,7 +18,7 @@ import ipaddress
 import json
 from typing import Dict, List, Sequence, Set, TextIO
 
-from . import packet, protocols
+from . import devices, packet, protocols, protocols_iiot
 from .protocols_ot import ENGINEERING, OPERATIONS
 from .enterprise import (CROWDSTRIKE_CLOUD_IPS, OUI_VENDORS, Environment,
                          Host)
@@ -27,7 +27,8 @@ COLUMNS = ["name", "ip", "mac", "mac_vendor", "vendor", "product", "role",
            "os", "segment", "vlan", "subnet", "zone", "gateway", "legacy",
            "risk", "serves", "uses",
            # appended (keep the original order for existing consumers)
-           "asset_id", "model", "firmware", "serial", "purdue_level", "fqdn"]
+           "asset_id", "model", "firmware", "serial", "purdue_level", "fqdn",
+           "behind"]
 
 # Which host fields a protocol carries, by the side that sends them. A field
 # is observable iff some flow the host takes part in carries it today.
@@ -74,10 +75,12 @@ _ANNOUNCES = {
 _NOT_SERVED = {"netbios"}
 
 
-def _service(proto: str) -> str:
-    """'modbus 502/tcp', or just 'arp' / 'icmp' for portless protocols."""
+def _service(proto: str, port: int = 0) -> str:
+    """'modbus 502/tcp', or just 'arp' / 'icmp' for portless protocols
+    (``port``: the one really used, when not the registered one)."""
     p = protocols.get(proto)
-    return proto if p.port == "-" else f"{proto} {p.port}/{p.transport}"
+    return proto if p.port == "-" else \
+        f"{proto} {port or p.port}/{p.transport}"
 
 
 def _asset_id(env: Environment, h: Host) -> str:
@@ -95,7 +98,8 @@ def hosts(env: Environment) -> List[Dict]:
         if (server != client and server in serves
                 and protocols.get(proto).transport != "l2"
                 and proto not in _NOT_SERVED):
-            serves[server].add(_service(proto))
+            serves[server].add(_service(proto, protocols_iiot.flow_dport(
+                env, (client, server, proto))))
     # Falcon-covered Windows hosts beacon EDR telemetry to the CrowdStrike cloud
     for h in env.edr_hosts():
         uses[h.name].add("edr")
@@ -117,6 +121,35 @@ def hosts(env: Environment) -> List[Dict]:
             "firmware": h.firmware, "serial": h.serial,
             "purdue_level": env.purdue_level(h), "fqdn": h.fqdn,
         })
+    return rows
+
+
+def field_devices(env: Environment) -> List[Dict]:
+    """Rows (``COLUMNS``) for the devices behind gateways
+    (``env.field_devices``): known assets with no IP or MAC of their own,
+    placed where their gateway is, ``behind`` naming it. A passive monitor
+    only sees the gateway's traffic (slave ids / DevAddrs inside it)."""
+    rows = []
+    for d in env.field_devices:
+        gw = env.host(d["behind"])
+        seg = env.segment_of(gw)
+        dev = devices.find(d["model"])
+        addr = (f"{d['address']:08X}" if d["protocol"] == "lorawan"
+                else d["address"])          # a LoRaWAN DevAddr reads in hex
+        rows.append({
+            "name": d["name"], "ip": "", "mac": "", "mac_vendor": "",
+            "vendor": d["vendor"], "product": d["product"],
+            "role": d["role"], "os": dev.os_family if dev else "",
+            "segment": seg.name, "vlan": "", "subnet": "", "zone": seg.zone,
+            "gateway": "", "legacy": False,
+            "risk": f"{d['protocol']} address {addr} behind "
+                    f"{d['behind']} ({d['via']}, port {d['port']})",
+            "serves": [d["protocol"]], "uses": [],
+            "asset_id": f"{env.key}:{d['name']}", "model": d["model"],
+            "firmware": d["firmware"], "serial": d["serial"],
+            "purdue_level": (dev.purdue_level if dev and dev.purdue_level
+                             else env.purdue_level(gw)),
+            "fqdn": "", "behind": d["behind"]})
     return rows
 
 
@@ -297,6 +330,18 @@ def to_json(env: Environment, sprinkle: Sequence[str] = ()) -> Dict:
         if env.nat_address(h):          # how the HQ capture sees it
             row["nat_ip"] = env.nat_address(h)
             row["nat_hidden"] = env.hidden(h)
+    for row, d in zip(field_devices(env), env.field_devices):
+        dev = devices.find(d["model"])
+        row.update({
+            "embedded": True, "edr": False, "modules": [],
+            "known_cves": list(dev.known_cves) if dev else [],
+            "via": d["via"], "port": d["port"], "address": d["address"],
+            "protocol": d["protocol"],
+            # nothing about it is on the wire as an asset of its own
+            "observability": {f: {"value": row.get(f) or "",
+                                  "observable": False, "evidence": []}
+                              for f in OBSERVABLE_FIELDS}})
+        rows.append(row)
     doc = {
         "env": env.key, "name": env.name, "category": env.category,
         "segments": [_segment(env, s) for s in env.segments],
@@ -314,6 +359,10 @@ def to_json(env: Environment, sprinkle: Sequence[str] = ()) -> Dict:
         tm = timing.conversation_timing(env, conv)
         fl["period_s"] = round(tm["period"], 3)
         fl["jitter"] = tm["jitter"]
+        # a device server's serial port N listens on its own TCP port
+        port = protocols_iiot.flow_dport(env, conv)
+        if port:
+            fl["dport"], fl["service"] = port, _service(conv[2], port)
     if sprinkle:
         doc["new_assets"] = new_assets(env, sprinkle)
         doc["sprinkle"] = sprinkle_mapping(env, sprinkle)
@@ -324,7 +373,8 @@ def write_csv(env: Environment, out: TextIO,
               sprinkle: Sequence[str] = ()) -> None:
     w = csv.DictWriter(out, fieldnames=COLUMNS, lineterminator="\n")
     w.writeheader()
-    for row in hosts(env) + (new_assets(env, sprinkle) if sprinkle else []):
+    for row in hosts(env) + field_devices(env) + (
+            new_assets(env, sprinkle) if sprinkle else []):
         row["legacy"] = "yes" if row["legacy"] else "no"
         row["serves"] = "; ".join(row["serves"])
         row["uses"] = "; ".join(row["uses"])

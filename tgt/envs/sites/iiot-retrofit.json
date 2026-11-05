@@ -1,0 +1,70 @@
+{
+  "key": "iiot-retrofit",
+  "name": "Brownfield Plant IIoT Retrofit",
+  "category": "OT",
+  "description": "A brownfield process plant whose serial field equipment reaches the network through gateways. PLANT-SERIAL: a Moxa NPort 5650-16 in the MCC room (port 1: four ABB ACS580 drives polled as Modbus RTU over raw TCP 4001; port 3: two SEL-351S relays polled over DNP3 serial on TCP 4003), an MGate MB3170 Modbus TCP -> RTU gateway in front of six PowerLogic PM5330 meters, and an NPort 5150 whose boiler RTU (an end-of-life SCADAPack 334E) a Windows 7 HMI reaches through a RealCOM virtual COM port (TCP 950 + 966); a transient engineering laptop runs the Moxa device search (UDP 4800 broadcast). IIOT-FIELD: Kerlink and MultiTech LoRaWAN gateways forward Milesight / Dragino sensor uplinks to the network server in the DMZ over the Semtech UDP packet forwarder (1700/udp). BMS-SC: Desigo PXC5 controllers and a JACE-8000 hold BACnet/SC WebSocket connections over TLS 1.3 to a Contemporary Controls BASrouterSC hub (opaque on the wire). The 21 devices behind the gateways are listed in tgt inventory with 'behind' set: known assets that a passive monitor cannot discover as IP assets. Run: tgt run --env iiot-retrofit --pcap iiot.pcap --once --rate 0",
+  "segments": [
+    {"name": "CORP", "vlan": 10, "subnet": "10.70.10.0/24", "zone": "IT"},
+    {"name": "IIOT-DMZ", "vlan": 50, "subnet": "10.70.50.0/24", "zone": "DMZ"},
+    {"name": "SCADA", "vlan": 100, "subnet": "10.170.0.0/24", "zone": "OT-SUPERVISORY"},
+    {"name": "PLANT-SERIAL", "vlan": 110, "subnet": "10.170.10.0/24", "zone": "OT-CELL"},
+    {"name": "IIOT-FIELD", "vlan": 120, "subnet": "10.170.20.0/24", "zone": "OT-CELL"},
+    {"name": "BMS-SC", "vlan": 130, "subnet": "10.170.30.0/24", "zone": "OT-CELL"}
+  ],
+  "hosts": [
+    {"name": "SW-CORE", "ip": "10.70.10.2", "model": "cisco-c9300-48p"},
+    {"name": "DC01", "ip": "10.70.10.10", "role": "dc", "os": "win2019"},
+    {"name": "WS{n:02}", "count": 3, "ip_start": "10.70.10.101", "role": "ws", "os": "win10"},
+    {"name": "LNS01", "ip": "10.70.50.20", "role": "lns", "os": "linux", "fqdn": "lns01.corp.local"},
+    {"name": "SW-SCADA", "ip": "10.170.0.2", "model": "moxa-eds-508a"},
+    {"name": "SCADA01", "ip": "10.170.0.10", "role": "scada", "os": "win2019"},
+    {"name": "HIST01", "ip": "10.170.0.11", "role": "hist", "os": "win2019"},
+    {"name": "ENG01", "ip": "10.170.0.20", "role": "eng", "os": "win10"},
+    {"name": "HMI-BLR01", "ip": "10.170.0.31", "role": "hmi", "os": "win7"},
+    {"name": "NMS01", "ip": "10.170.0.40", "role": "nms", "os": "linux"},
+    {"name": "SW-PLANT", "ip": "10.170.10.2", "model": "moxa-eds-508a"},
+    {"name": "NPORT-MCC1", "ip": "10.170.10.21", "model": "moxa-nport-5650-16", "role": "gateway", "os": "rtos"},
+    {"name": "NPORT-BLR1", "ip": "10.170.10.22", "model": "moxa-nport-5150", "role": "gateway", "os": "rtos"},
+    {"name": "MGATE-PWR1", "ip": "10.170.10.23", "model": "moxa-mgate-mb3170", "role": "gateway", "os": "rtos"},
+    {"name": "ENG-LT01", "ip": "10.170.10.90", "role": "eng", "os": "win10"},
+    {"name": "LORA-GW01", "ip": "10.170.20.21", "model": "kerlink-wirnet-istation", "role": "gateway", "os": "linux-embedded"},
+    {"name": "LORA-GW02", "ip": "10.170.20.22", "model": "multitech-conduit-mtcdt", "role": "gateway", "os": "linux-embedded"},
+    {"name": "SC-HUB01", "ip": "10.170.30.10", "model": "contemporary-basrouter-sc", "role": "gateway", "os": "linux-embedded"},
+    {"name": "JACE-01", "ip": "10.170.30.11", "model": "tridium-jace-8000"},
+    {"name": "PXC-{n:02}", "count": 2, "ip_start": "10.170.30.21", "model": "siemens-desigo-pxc5", "os": "bacnet"}
+  ],
+  "field_devices": [
+    {"name": "VFD-MCC1-{n:02}", "count": 4, "behind": "NPORT-MCC1", "via": "modbus-rtu-tcp", "port": 1, "address": 1, "model": "abb-acs580"},
+    {"name": "RELAY-MCC1-{n}", "count": 2, "behind": "NPORT-MCC1", "via": "dnp3-serial", "port": 3, "address": 11, "model": "sel-351s"},
+    {"name": "PM-MAIN-{n:02}", "count": 6, "behind": "MGATE-PWR1", "via": "modbus", "address": 1, "model": "schneider-pm5330"},
+    {"name": "BLR-RTU1", "behind": "NPORT-BLR1", "via": "realcom", "address": 1, "model": "schneider-scadapack-334e"},
+    {"name": "TH-{n:02}", "count": 5, "behind": "LORA-GW01", "via": "lorawan-udp", "address": "26011B01", "model": "milesight-em300-th"},
+    {"name": "COLD-{n:02}", "count": 3, "behind": "LORA-GW02", "via": "lorawan-udp", "address": "260B4F10", "model": "dragino-lht65n"}
+  ],
+  "flows": [
+    {"from": "role:ws", "to": "DC01", "proto": "dns"},
+    {"from": "role:ws", "to": "DC01", "proto": "kerberos"},
+    {"client": "SCADA01", "server": "NPORT-MCC1", "proto": "modbus-rtu-tcp"},
+    {"client": "SCADA01", "server": "NPORT-MCC1", "proto": "dnp3-serial"},
+    {"client": "HIST01", "server": "MGATE-PWR1", "proto": "modbus"},
+    {"client": "HMI-BLR01", "server": "NPORT-BLR1", "proto": "realcom"},
+    {"client": "HMI-BLR01", "server": "NPORT-BLR1", "proto": "realcom-cmd"},
+    {"from": "ENG-LT01", "to": "NPORT-*", "proto": "moxa-discovery"},
+    {"client": "ENG-LT01", "server": "MGATE-PWR1", "proto": "moxa-discovery"},
+    {"client": "ENG01", "server": "NPORT-MCC1", "proto": "moxa-discovery"},
+    {"client": "LORA-GW01", "server": "LNS01", "proto": "lorawan-udp"},
+    {"client": "LORA-GW02", "server": "LNS01", "proto": "lorawan-udp"},
+    {"from": "JACE-01", "to": "SC-HUB01", "proto": "bacnet-sc"},
+    {"from": "PXC-*", "to": "SC-HUB01", "proto": "bacnet-sc"},
+    {"from": "NMS01", "to": "NPORT-*", "proto": "snmp"},
+    {"client": "NMS01", "server": "MGATE-PWR1", "proto": "snmp"},
+    {"from": "NMS01", "to": "SW-*", "proto": "snmp"},
+    {"from": "SW-*", "proto": "lldp"},
+    {"from": "LORA-GW*", "to": "NMS01", "proto": "syslog"}
+  ],
+  "findings": [
+    {"id": "eol-rtu-behind-realcom", "title": "End-of-life RTU reached through a RealCOM virtual COM port from a Windows 7 HMI", "severity": "high", "category": "legacy-device", "hosts": ["HMI-BLR01", "NPORT-BLR1"], "flows": [{"client": "HMI-BLR01", "server": "NPORT-BLR1", "proto": "realcom"}, {"client": "HMI-BLR01", "server": "NPORT-BLR1", "proto": "realcom-cmd"}], "detail": "The boiler RTU (SCADAPack 334E, end of life) has no IP of its own: the Windows 7 HMI polls it as Modbus RTU through the NPort 5150's RealCOM data channel (TCP 950) and command channel (TCP 966). It shows up only as the gateway's traffic."},
+    {"id": "raw-serial-tunnel", "title": "Unauthenticated raw-TCP serial tunnels carry drive setpoint writes and relay polls", "severity": "high", "category": "unauthorized-write", "hosts": ["NPORT-MCC1"], "flows": [{"client": "SCADA01", "server": "NPORT-MCC1", "proto": "modbus-rtu-tcp"}, {"client": "SCADA01", "server": "NPORT-MCC1", "proto": "dnp3-serial"}], "detail": "NPort ports 1 and 3 run in TCP-server mode with no IP filter: anyone reaching 10.170.10.21:4001 can send Modbus RTU writes (FC 6) to the four ACS580 drives, and 4003 talks DNP3 straight to the SEL-351S relays. No Modbus/TCP header, so a 502-only rule misses it."},
+    {"id": "lorawan-udp-forwarder", "title": "LoRaWAN gateways forward over the unauthenticated Semtech UDP protocol across zones", "severity": "medium", "category": "cross-zone-access", "hosts": ["LORA-GW01", "LORA-GW02", "LNS01"], "flows": [{"client": "LORA-GW01", "server": "LNS01", "proto": "lorawan-udp"}, {"client": "LORA-GW02", "server": "LNS01", "proto": "lorawan-udp"}], "detail": "The gateways in the OT cell push sensor uplinks to the DMZ network server on 1700/udp (no authentication, no transport encryption, spoofable gateway EUI) instead of an authenticated Basics Station / TLS link."}
+  ]
+}

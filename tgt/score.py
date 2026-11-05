@@ -572,8 +572,10 @@ def _truth_asset(h: Dict, new: bool = False) -> Dict[str, Any]:
         "ip": ip, "mac": norm_mac(h.get("mac") or ""),
         "vlan": _vlan(h.get("vlan")), "role": h.get("role", ""),
         "fields": fields, "protocols": protos, "new": new,
-        # a host behind NAT (not on this capture) never reaches the monitor
-        "emitted": not h.get("nat_hidden"), "first_seen": None,
+        # a host behind NAT (not on this capture) never reaches the monitor,
+        # nor does a serial / LoRaWAN device behind a gateway (no IP / MAC)
+        "emitted": not (h.get("nat_hidden") or h.get("behind")),
+        "first_seen": None,
     }
 
 
