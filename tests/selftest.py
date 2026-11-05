@@ -2797,6 +2797,9 @@ def test_env_file_directories_cli_and_tui() -> None:
             else:
                 os.environ["TGT_ENV_PATH"] = old
         try:
+            # packaged sites (tgt/envs/sites) load first on every search path
+            got = [k for k in got if os.path.dirname(envfile.source_of(
+                enterprise.get(k))) != envfile.SITES_DIR]
             check(got == ["example-site"], f"user envs loaded: {got}")
             check(len(warnings) == 2 and any("bad.json" in w for w in warnings)
                   and any("'it-org'" in w for w in warnings),
@@ -3015,8 +3018,12 @@ def test_managed_switches_lldp_snmp_syslog() -> None:
             descr = devices.banner(sw.device, "snmp_sysdescr", sw.name,
                                    sw.firmware, sw.serial).encode()
             check(descr in blob, f"{env.key}: {sw.name} sysDescr not on wire")
-        check(b"n0c-r3ad" in blob and b"public" not in blob,
-              f"{env.key}: SNMP community not the site's")
+        if env.options.get("default_snmp_community"):   # planted finding
+            check(all(env.snmp_community(sw).encode() in blob for sw in sws),
+                  f"{env.key}: default SNMP community not on the wire")
+        else:
+            check(b"n0c-r3ad" in blob and b"public" not in blob,
+                  f"{env.key}: SNMP community not the site's")
         rows = {r["name"]: r for r in inventory.hosts(env)}
         for sw in sws:
             check("snmp 161/udp" in rows[sw.name]["serves"] and
@@ -3623,6 +3630,295 @@ def test_tshark_ot_identity_matches_inventory() -> None:
     check({h.ip for h in site.hosts if h.name.startswith("PLC-PR")}
           <= set(eng.split()), "tshark: S7 upload/download not seen")
 
+
+# --- W3-C sites: redundancy rings, healthcare, BMS, batch (protocols_site) --
+_DISSECTS_AS.update({
+    "mrp": "pn_mrp", "dlr": "dlr", "dicom": "dicom", "hl7": "hl7",
+    "knxip": "kip", "bacnet-cov": "bacapp", "enip-write": "cipcm",
+    "smb-logon": "ntlmssp",
+})
+_W3C_SITES = ("auto-assembly", "hospital-iomt", "smart-building-dc",
+              "pharma-batch")
+
+
+def _l2_payload(frame: bytes):
+    """(ethertype, vlan, payload) of a VLAN-tagged or untagged frame."""
+    if frame[12:14] == b"\x81\x00":
+        return (struct.unpack("!H", frame[16:18])[0],
+                struct.unpack("!H", frame[14:16])[0] & 0x0FFF, frame[18:])
+    return struct.unpack("!H", frame[12:14])[0], None, frame[14:]
+
+
+def _tcp_data(l4: bytes) -> bytes:
+    """TCP payload of a TCP header + data (honours the data offset)."""
+    return l4[(l4[12] >> 4) * 4:]
+
+
+def test_site_builders_wire_format() -> None:
+    """Byte-level checks of the ring, DICOM, HL7, KNX, COV, recipe-write and
+    NTLM logon builders."""
+    f = protocols.get("mrp").build(Endpoints(meta={
+        "mrp_prio": 0x8000, "mrp_domain_uuid": "ab" * 16}), 2)
+    et, vid, pl = _l2_payload(f[0])
+    check(f[0][:6] == bytes.fromhex("01154e000001") and et == 0x88E3
+          and vid is not None and f[0][14] >> 5 == 7,
+          "mrp: not a PCP-7 tagged MRP_Test to 01:15:4e:00:00:01")
+    check(pl[:4] == b"\x00\x01\x02\x12" and pl[4:6] == b"\x80\x00"
+          and pl[6:12] == f[0][6:12] and b"\xab" * 16 in pl,
+          "mrp: MRP_Test TLV / priority / SA / domain UUID wrong")
+    check({fr[6:12] for fr in f} == {f[0][6:12]} and len(f) == 4,
+          "mrp: test frames should leave both ring ports of one manager")
+    f = protocols.get("dlr").build(Endpoints(meta={
+        "dlr_precedence": 200, "dlr_beacon_interval": 400}), 2)
+    et, vid, pl = _l2_payload(f[0])
+    check(f[0][:6] == bytes.fromhex("01216c000001") and et == 0x80E1
+          and pl[:3] == b"\x02\x01\x01" and pl[3] in (1, 2),
+          "dlr: not a beacon to 01:21:6c:00:00:01")
+    check(pl[13] == 200 and struct.unpack("!I", pl[14:18])[0] == 400,
+          "dlr: precedence / beacon interval not stated")
+    ep = Endpoints(meta={"dicom_ae": "PACS_AE", "client_dicom_ae": "CT_AE",
+                         "client_dicom_impl_uid": "1.2.3.4",
+                         "client_dicom_impl_version": "CT_SW_1",
+                         "client_dicom_software": "SP4",
+                         "client_dicom_serial": "123456CN7"})
+    tcp = [_l4(x) for x in protocols.get("dicom").build(ep, 2)]
+    to_scp = b"".join(_tcp_data(t[5]) for t in tcp if t[4] == 104)
+    from_scp = b"".join(_tcp_data(t[5]) for t in tcp if t[3] == 104)
+    check(to_scp[:1] == b"\x01" and to_scp[10:26] == b"PACS_AE".ljust(16)
+          and to_scp[26:42] == b"CT_AE".ljust(16),
+          "dicom: A-ASSOCIATE-RQ called/calling AE titles")
+    check(b"1.2.3.4" in to_scp and b"CT_SW_1" in to_scp,
+          "dicom: implementation class UID / version name missing")
+    check(from_scp[:1] == b"\x02" and b"\x06\x00\x00\x00\x00\x04" in from_scp,
+          "dicom: no A-ASSOCIATE-AC / A-RELEASE-RP")
+    check(b"ANON^TEST" in to_scp and b"SP4" in to_scp
+          and b"123456CN7" in to_scp, "dicom: C-STORE data set identity")
+    ep = Endpoints(meta={"hl7_app": "ENGINE", "hl7_facility": "HOSP",
+                         "client_hl7_app": "EHR", "client_hl7_facility": "H1",
+                         "hl7_events": "mixed"})
+    tcp = [_l4(x) for x in protocols.get("hl7").build(ep, 2)]
+    msgs = [_tcp_data(t[5]) for t in tcp if _tcp_data(t[5])]
+    check(all(m[:1] == b"\x0b" and m.endswith(b"\x1c\r") for m in msgs),
+          "hl7: MLLP framing")
+    req = [m for m in msgs if b"|ACK^" not in m]
+    check(req and all(m[1:].startswith(b"MSH|^~\\&|EHR|H1|ENGINE|HOSP|")
+                      for m in req), "hl7: MSH sending/receiving app")
+    check(any(b"ADT^A01" in m for m in req) and any(b"ORU^R01" in m
+                                                    for m in req),
+          "hl7: ADT^A01 / ORU^R01 missing")
+    check(sum(b"MSA|AA|" in m for m in msgs) == len(req),
+          "hl7: every message needs an AA acknowledgement")
+    f = protocols.get("knxip").build(Endpoints(), 2)
+    knx = [_l4(x) for x in f]
+    check(knx[0][2] == "224.0.23.12" and knx[0][5][8:12] ==
+          b"\x06\x10\x02\x01", "knxip: SEARCH_REQUEST not multicast")
+    check(any(t[5][8:12] == b"\x06\x10\x05\x30" for t in knx),
+          "knxip: no ROUTING_INDICATION")
+    cov = [_l4(x)[5][8:] for x in protocols.get("bacnet-cov")
+           .build(Endpoints(), 2)]
+    check(cov[0][6:10] == b"\x00\x05\x01\x05" or cov[0][7] == 0x05,
+          "bacnet-cov: no SubscribeCOV")
+    check(any(c[6:8] == b"\x10\x02" for c in cov),
+          "bacnet-cov: no UnconfirmedCOVNotification")
+    wr = b"".join(_tcp_data(_l4(x)[5]) for x in protocols.get("enip-write").build(
+        Endpoints(meta={"recipe_unit": "GR102"}), 1))
+    check(b"\x52\x02\x20\x06\x24\x01" in wr and b"\x4d" in wr
+          and b"\x91\x09GR102_RCP\x00\x91\x07Temp_SP\x00" in wr
+          and b"\xcd\x00\x00\x00" in wr,
+          "enip-write: no Write Tag (0x4D) inside an Unconnected Send")
+    sm = b"".join(_tcp_data(_l4(x)[5]) for x in protocols.get("smb-logon").build(
+        Endpoints(meta={"smb_user": "svc_x", "smb_domain": "DOM"}), 1))
+    check(b"NTLMSSP\x00\x03\x00\x00\x00" in sm and "svc_x".encode(
+        "utf-16-le") in sm and "DOM".encode("utf-16-le") in sm,
+          "smb-logon: NTLMSSP AUTHENTICATE without domain\\user")
+
+
+def test_w3c_sites_load_and_plant_findings() -> None:
+    """The four W3-C sites load from tgt/envs/sites, build, keep L2 ring /
+    KNX traffic on one segment, never ARP for external endpoints, and carry
+    their planted findings on the wire."""
+    from tgt import enterprise, envfile, inventory
+    envfile.load_user_envs()
+    for key in _W3C_SITES:
+        env = enterprise.ENVIRONMENTS.get(key)
+        check(env is not None, f"site {key} not auto-loaded")
+        if env is None:
+            continue
+        batch = env.build(1)
+        mac_seg = {P.mac_to_bytes(h.mac): env.segment_of(h).vlan
+                   for h in env.hosts}
+        for k, fr in batch:
+            if k in ("mrp", "dlr", "knxip"):
+                check(_vlan(fr) is not None and
+                      mac_seg.get(fr[6:12]) == _vlan(fr),
+                      f"{key}: {k} frame left its segment / was routed")
+        ext_ips = {h.ip for h in env.external}
+        for k, fr in batch:
+            et, _, pl = _l2_payload(fr)
+            if et == 0x0806:
+                spa, tpa = (".".join(map(str, pl[a:a + 4]))
+                            for a in (14, 24))
+                check(spa not in ext_ips and tpa not in ext_ips,
+                      f"{key}: ARP for an external endpoint")
+        doc = inventory.to_json(env)
+        inv_ips = {h["ip"] for h in doc["hosts"]}
+        listed = {e["ip"]: e for e in doc["external"]}
+        for h in env.external:
+            check(h.ip in listed and h.ip not in inv_ips and
+                  listed[h.ip]["kind"] == h.role and
+                  (not h.fqdn or h.fqdn in listed[h.ip]["fqdns"]),
+                  f"{key}: external {h.name} not listed as external")
+        check(not any(e["kind"] == "unknown" for e in doc["external"]),
+              f"{key}: unexplained public address on the wire")
+        if key == "hospital-iomt":
+            rows = {h["ip"]: h for h in doc["hosts"]}
+            for c, s, p in env.conversations:
+                if p != "dicom":
+                    continue
+                h = env.host(c)
+                blob = b"".join(fr for k, fr in batch if k == "dicom"
+                                and _l4(fr)[1] == h.ip)
+                row = rows[h.ip]
+                check(row["firmware"].encode() in blob and
+                      row["serial"].encode() in blob and
+                      h.device.identity["dicom"]["model"].encode() in blob,
+                      f"{key}: {c} DICOM identity != inventory")
+    conv = {k: set(enterprise.ENVIRONMENTS.get(k).conversations) for k in _W3C_SITES
+            if enterprise.ENVIRONMENTS.get(k) is not None}
+    aa = conv.get("auto-assembly", set())
+    check(("LAPTOP-INTEG", "ET-BIW-05", "pn-dcp-set") in aa and
+          ("ENG-TIA", "ROB-BIW-04", "vnc") in aa and
+          ("EDGE-GW01", "CLOUD-MQTT", "sparkplug") in aa and
+          ("PLC-BIW-R1", "PLC-BIW-R2", "pn-rt") in aa,
+          "auto-assembly: planted findings / redundant pair missing")
+    env = enterprise.ENVIRONMENTS.get("auto-assembly")
+    if env is not None:
+        who = {fr[6:12] for k, fr in env.build(1) if k == "pn-dcp"
+               and b"et-biw-03" in fr and fr[:6] != b"\x01\x0e\xcf\x00\x00\x00"}
+        check(len(who) == 2, "auto-assembly: duplicate NameOfStation "
+              f"answered by {len(who)} devices")
+    env = enterprise.ENVIRONMENTS.get("hospital-iomt")
+    if env is not None:
+        check(env.host("CR-LEGACY") in env.legacy_hosts() and
+              ("PUMP-017", "PUMP-VENDOR-CLOUD", "https")
+              in conv["hospital-iomt"], "hospital-iomt: findings missing")
+    env = enterprise.ENVIRONMENTS.get("smart-building-dc")
+    if env is not None:
+        check(("GUEST-03", "JACE-01", "bacnet-id") in conv["smart-building-dc"]
+              and ("CAM-10", "HIK-CLOUD", "https") in conv["smart-building-dc"]
+              and env.snmp_community(env.host("UPS-01")) == "public",
+              "smart-building-dc: findings missing")
+    env = enterprise.ENVIRONMENTS.get("pharma-batch")
+    if env is not None:
+        batch = env.build(1)
+        writers = {_l4(fr)[1] for k, fr in batch if k == "enip-write"}
+        check(env.host("LIMS01").ip in writers,
+              "pharma-batch: no recipe write from the LIMS host")
+        svc = "svc_batch".encode("utf-16-le")
+        users = {_l4(fr)[1] for k, fr in batch if k == "smb-logon"
+                 and svc in fr}
+        check(len(users) >= 5, f"pharma-batch: svc_batch from {len(users)} "
+              "hosts")
+
+
+def test_tshark_w3c_sites_clean() -> None:
+    """Optional: each W3-C site decodes with no tshark warnings or errors
+    beyond deliberate RST closes, and the new dissectors see their layers."""
+    import shutil
+    import subprocess
+    from tgt import enterprise, envfile
+    envfile.load_user_envs()
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_w3c_sites_clean")
+        return
+    want = {"auto-assembly": ("pn_mrp", "dlr", "pn_dcp", "mqtt"),
+            "hospital-iomt": ("dicom", "hl7"),
+            "smart-building-dc": ("kip", "bacapp", "snmp"),
+            "pharma-batch": ("cipcm", "ntlmssp", "syslog")}
+    for key, layers in want.items():
+        env = enterprise.ENVIRONMENTS.get(key)
+        if env is None:
+            continue
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/{key}.pcap"
+            with PcapWriter(path) as w:
+                for _, f in env.build(1):
+                    w.write(f)
+            seen = subprocess.run(
+                ["tshark", "-r", path, "-T", "fields", "-e",
+                 "frame.protocols"], capture_output=True, text=True).stdout
+            expert = subprocess.run(
+                ["tshark", "-r", path, "-q", "-z", "expert,warn"],
+                capture_output=True, text=True).stdout
+        seen_set = {x for ln in seen.split() for x in ln.split(":")}
+        for layer in layers:
+            check(layer in seen_set, f"tshark {key}: no {layer} layer")
+        warns = [ln.strip() for ln in expert.splitlines()
+                 if ln.strip() and ln.strip()[0].isdigit()
+                 and "Connection reset (RST)" not in ln]
+        check("Errors (" not in expert and not warns,
+              f"tshark {key}: {warns[:3]}")
+
+
+def test_env_file_external_endpoints() -> None:
+    """``external[]``: parsed, selectable by exact name / role only, kept out
+    of segments, exported and reloaded."""
+    import copy
+    from tgt import envfile, inventory
+    base = {"key": "t-ext", "segments": [
+        {"name": "A", "vlan": 10, "subnet": "10.8.0.0/24", "zone": "OT-CELL"},
+        {"name": "B", "vlan": 20, "subnet": "10.8.1.0/24", "zone": "IT"}],
+        "hosts": [{"name": "GW-1", "ip": "10.8.0.10", "role": "gateway",
+                   "os": "linux"},
+                  {"name": "DNS", "ip": "10.8.1.10", "role": "dc",
+                   "os": "win2019"}] +
+                 [{"name": f"WS{i}", "ip": f"10.8.1.{20 + i}", "role": "ws",
+                   "os": "win10"} for i in range(8)],
+        "external": [{"name": "GW-CLOUD", "ip": "203.0.113.50",
+                      "role": "mqtt-broker", "os": "linux",
+                      "fqdn": "broker.example.net"}],
+        "flows": [{"from": "GW-*", "to": "role:mqtt-broker",
+                   "proto": "mqtt"},
+                  {"client": "GW-1", "server": "DNS", "proto": "dns"}]}
+    env = envfile.from_dict(copy.deepcopy(base), "x.json")
+    check(set(env.conversations) == {("GW-1", "GW-CLOUD", "mqtt"),
+                                     ("GW-1", "DNS", "dns")},
+          f"external selectors: {env.conversations}")
+    check(env.is_external("GW-CLOUD") and env.host("GW-CLOUD").ip ==
+          "203.0.113.50" and env.segment_or_none(env.host("GW-CLOUD")) is None,
+          "external endpoint lookup")
+    dns = b"".join(f for k, f in env.build(1) if k == "dns")
+    check(b"\x06broker\x07example\x03net" in dns,
+          "DNS does not resolve the external FQDN")
+    again = envfile.from_dict(envfile.to_dict(env), "y.json")
+    check([h.ip for h in again.external] == ["203.0.113.50"] and
+          set(again.conversations) == set(env.conversations),
+          "external endpoints lost on export/reload")
+    check([e["ip"] for e in inventory.to_json(env)["external"]
+           if e["kind"] != "edr-cloud"] == ["203.0.113.50"],
+          "inventory external list")
+    for mutate, want in (
+            (lambda d: d["external"][0].update(ip="10.8.0.99"),
+             "inside a segment"),
+            (lambda d: d["external"][0].update(name="DNS"),
+             "duplicate host name"),
+            (lambda d: d["external"][0].update(ip="10.8.1.10"),
+             "already used"),
+            (lambda d: d["flows"].append({"from": "WS0", "to": "@A",
+                                          "proto": "https"}), None)):
+        d = copy.deepcopy(base)
+        mutate(d)
+        try:
+            e2 = envfile.from_dict(d, "x.json")
+        except envfile.EnvFileError as e:
+            check(want is not None and want in str(e),
+                  f"external schema error for {want!r}: {e}")
+        else:
+            if want is not None:
+                _failures.append(f"external error not raised: {want!r}")
+            else:       # "@A" picks segment hosts, never the external
+                check(all(s != "GW-CLOUD" for _, s, p in e2.conversations
+                          if p == "https"), "@SEG matched an external")
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
