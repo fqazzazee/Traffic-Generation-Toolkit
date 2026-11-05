@@ -679,4 +679,346 @@ def identity_meta(model: Optional[DeviceModel], firmware: str,
         digits = "".join(c for c in serial if c.isdigit())
         if digits:
             meta["hart_device_id"] = int(digits) % (1 << 24)
+    # PROFINET DCP identity and the site protocols (tgt/protocols_site.py)
+    pn = model.identity.get("profinet")
+    if pn:
+        meta.update({"pn_vendor_id": pn["vendor_id"],
+                     "pn_device_id": pn["device_id"],
+                     "pn_role": pn.get("role", 0x01),
+                     "dcp_vendor": pn.get("vendor_value", model.product)})
+    for proto in ("dicom", "hl7", "knx"):
+        for k, v in model.identity.get(proto, {}).items():
+            meta[f"{proto}_{k}"] = v
+    if "dicom" in model.identity:
+        meta["dicom_software"] = firmware
+        meta["dicom_serial"] = serial
     return meta
+
+
+# ===========================================================================
+# Vertical-site devices (tgt/envs/sites: auto-assembly, hospital-iomt,
+# smart-building-dc, pharma-batch). OUIs are from Wireshark's manuf
+# database; CIP / BACnet / KNX / PROFINET vendor ids, Siemens order numbers,
+# DICOM manufacturer strings and the APC sysDescr layout are as published.
+# PROFINET device ids, CIP product codes, firmware lists, serial formats and
+# DICOM implementation class UIDs (under each vendor's registered root) are
+# representative. New ``identity`` sections: ``profinet`` (DCP vendor/device
+# id, role, DeviceVendorValue), ``dicom``, ``hl7`` and ``knx`` (see
+# identity_meta).
+# ===========================================================================
+_SIEMENS_BT = ("00:05:19", "00:c0:e4")            # Siemens Building Technologies
+_SIEMENS_HC = ("88:4b:39",)                       # Siemens Healthcare
+_FANUC = ("00:e0:e4",)
+_KUKA = ("00:60:c8",)
+_BECKHOFF = ("00:01:05",)
+_WAGO = ("00:30:de",)
+_PHOENIX = ("00:a0:45", "a8:74:1d")
+_GE_HC = ("44:4b:5d",)
+_CARESTREAM = ("00:1d:4a",)
+_MINDRAY = ("00:0f:14", "38:0b:26")
+_ALARIS = ("f8:c6:78", "00:d0:75")                # CareFusion / Alaris (BD)
+_RAULAND = ("00:90:5e",)
+_APC = ("00:c0:b7",)
+_RARITAN = ("00:0d:5d",)
+_EMERSON_NP = ("00:09:f5",)                       # Emerson Network Power (Vertiv)
+_CARRIER = ("00:02:52", "34:6d:9c")
+_AXIS = ("ac:cc:8e", "00:40:8c", "b8:a4:4f")
+_HIKVISION = ("44:19:b6", "c0:56:e3", "bc:ad:28")
+_MERCURY = ("00:0f:e5",)
+_EMERSON_PM = ("00:40:03",)                       # Emerson Process Management
+
+_SITE_SIEMENS_DESCR = ("Siemens, SIMATIC {kind}, {model}, {order}, HW: "
+                       "Version 1, FW: Version {{firmware}}, {{serial}}")
+
+# --- Siemens factory automation --------------------------------------------
+_add(DeviceModel(
+    "siemens-cpu-1515r-2pn", "Siemens", "SIMATIC S7-1500R CPU 1515R-2 PN",
+    "plc", _SIEMENS, "1", "SIMATIC S7 firmware",
+    ("V2.9.4", "V3.0.3", "V3.1.1"), _S7_SERIAL,
+    (Module(1, "6ES7 515-2RM00-0AB0", "CPU 1515R-2 PN (redundant)"),
+     Module(2, "6ES7 521-1BL00-0AB0", "DI 32x24VDC HF")),
+    identity={"s7": {"order": "6ES7 515-2RM00-0AB0",
+                     "module": "CPU 1515R-2 PN"},
+              "profinet": {"vendor_id": 0x002A, "device_id": 0x010E,
+                           "role": 0x03, "vendor_value": "S7-1500"}},
+    banners={"http": "", "snmp_sysdescr": _SIEMENS_SYSDESCR,
+             "snmp_sysobjectid": _SIEMENS_SNMP},
+    aliases=("6ES7 515-2RM00-0AB0",), stack="siemens"))
+_add(DeviceModel(
+    "siemens-et200sp-im155-6pn-hf", "Siemens",
+    "SIMATIC ET 200SP IM 155-6 PN HF", "remote-io", _SIEMENS, "1",
+    "ET 200SP interface module firmware", ("V4.2.1", "V4.2.3", "V6.0.0"),
+    _S7_SERIAL,
+    (Module(0, "6ES7 155-6AU01-0CN0", "IM 155-6 PN HF"),
+     Module(1, "6ES7 131-6BF01-0BA0", "DI 8x24VDC ST"),
+     Module(2, "6ES7 132-6BF01-0BA0", "DQ 8x24VDC/0.5A ST"),
+     Module(3, "6ES7 134-6GD01-0BA1", "AI 4xI 2-/4-wire ST")),
+    identity={"profinet": {"vendor_id": 0x002A, "device_id": 0x0313,
+                           "role": 0x01, "vendor_value": "ET200SP"}},
+    banners={"http": "",
+             "snmp_sysdescr": _SITE_SIEMENS_DESCR.format(
+                 kind="ET 200SP", model="IM 155-6 PN HF",
+                 order="6ES7 155-6AU01-0CN0"),
+             "snmp_sysobjectid": _SIEMENS_SNMP},
+    aliases=("IM 155-6 PN HF",), stack="siemens"))
+_add(DeviceModel(
+    "siemens-scalance-xc208", "Siemens", "SCALANCE XC208 managed switch",
+    "switch", _SIEMENS, "2", "SCALANCE X firmware", ("4.3", "4.4", "4.5"),
+    "VPK#######",
+    identity={"profinet": {"vendor_id": 0x002A, "device_id": 0x0A06,
+                           "role": 0x01, "vendor_value": "SCALANCE XC-200"}},
+    banners={"http": "", "snmp_sysdescr": _SITE_SIEMENS_DESCR.format(
+                 kind="NET", model="SCALANCE XC208",
+                 order="6GK5 208-0BA00-2AC2").replace("{firmware}",
+                                                      "V{firmware}"),
+             "snmp_sysobjectid": "1.3.6.1.4.1.4329.20.1.1.1.1"},
+    aliases=("SCALANCE XC208",), stack="siemens"))
+_add(DeviceModel(
+    "siemens-iot2050", "Siemens", "SIMATIC IOT2050 Advanced edge gateway",
+    "gateway", _SIEMENS, "2", "SIMATIC Industrial OS (Debian)",
+    ("1.3.1", "1.4.1", "1.5.2"), "PS#######",
+    (Module(0, "6ES7 647-0BA00-1YA2", "IOT2050 Advanced"),),
+    banners={"http": "", "snmp_sysdescr": "Linux iot2050-debian "
+             "5.10.194-cip39 #1 SMP PREEMPT aarch64 (Industrial OS {firmware})"},
+    aliases=("SIMATIC IOT2050",), stack="linux"))
+_add(DeviceModel(
+    "siemens-knx-n146", "Siemens", "KNX IP Router N 146/02", "bms-controller",
+    _SIEMENS_BT, "1", "KNX IP router firmware", ("2.1.4", "2.2.0"),
+    "00010#######",
+    (Module(0, "5WG1146-1AB02", "N 146/02 KNX IP router"),),
+    identity={"knx": {"manufacturer": 0x0001, "name": "IP Router N146/02"}},
+    banners={"http": ""}, aliases=("N 146/02",), stack="embedded"))
+_add(DeviceModel(
+    "siemens-desigo-pxc5", "Siemens", "Desigo PXC5.E003 automation station",
+    "bms-controller", _SIEMENS_BT, "1", "Desigo PX firmware",
+    ("6.20.215", "6.30.012", "7.00.075"), "PXC#########",
+    identity={"bacnet": {"vendor_id": 7, "vendor_name": "Siemens Building "
+                         "Technologies", "model_name": "PXC5.E003",
+                         "app_version": "PX {firmware}"}},
+    banners={"http": ""}, aliases=("PXC5.E003",), stack="embedded"))
+
+# --- Rockwell lines -------------------------------------------------------
+_add(DeviceModel(
+    "rockwell-1734-aentr", "Rockwell Automation",
+    "POINT I/O 1734-AENTR dual-port EtherNet/IP adapter", "remote-io",
+    _ROCKWELL, "1", "POINT I/O adapter firmware",
+    ("5.012", "6.012", "7.001"), _CIP_SERIAL,
+    (Module(0, "1734-AENTR", "Dual-port EtherNet/IP adapter (DLR)"),
+     Module(1, "1734-IB8", "8-pt 24 V DC sink input"),
+     Module(2, "1734-OB8E", "8-pt 24 V DC protected output")),
+    identity={"cip": {"vendor_id": 1, "device_type": 0x0C,
+                      "product_code": 141, "product_name": "1734-AENTR/B"}},
+    banners={"http": "", "snmp_sysdescr": "1734-AENTR/B {firmware}"},
+    aliases=("1734-AENTR",), stack="rockwell"))
+_add(DeviceModel(
+    "rockwell-powerflex-525", "Rockwell Automation", "PowerFlex 525 AC drive",
+    "drive", _ROCKWELL, "0", "PowerFlex drive firmware",
+    ("5.001", "6.001", "7.001"), _CIP_SERIAL,
+    identity={"cip": {"vendor_id": 1, "device_type": 0x02,
+                      "product_code": 150, "product_name": "PowerFlex 525"}},
+    banners={"http": "", "snmp_sysdescr": "PowerFlex 525 {firmware}"},
+    aliases=("PowerFlex 525",), stack="rockwell-drive"))
+
+# --- Robots ---------------------------------------------------------------
+_add(DeviceModel(
+    "fanuc-r30ib-plus", "FANUC", "R-30iB Plus robot controller", "robot",
+    _FANUC, "1", "FANUC robot controller software",
+    ("V9.30P/38", "V9.40P/27", "V9.40P/45"), "F######",
+    identity={"cip": {"vendor_id": 356, "device_type": 0x0C,
+                      "product_code": 2, "product_name": "R-30iB Plus"}},
+    banners={"http": "", "snmp_sysdescr": "FANUC R-30iB Plus {firmware}"},
+    aliases=("R-30iB Plus",), stack="embedded"))
+_add(DeviceModel(
+    "kuka-krc4", "KUKA", "KR C4 robot controller", "robot", _KUKA, "1",
+    "KUKA System Software on Windows 7 Embedded",
+    ("KSS 8.3.48", "KSS 8.6.15", "KSS 8.7.6"), "#######",
+    banners={"http": "", "smb_os": "Windows Embedded Standard 7601 "
+             "Service Pack 1"},
+    known_cves=("CVE-2019-0708",),   # BlueKeep: KSS ships an unpatched Win7
+    aliases=("KR C4",), stack="win7"))
+
+# --- Beckhoff / WAGO / Phoenix Contact ------------------------------------
+_add(DeviceModel(
+    "beckhoff-cx5140", "Beckhoff Automation", "CX5140 Embedded PC (TwinCAT 3)",
+    "plc", _BECKHOFF, "1", "TwinCAT 3 on Windows 10 IoT Enterprise",
+    ("TC3.1.4024.53", "TC3.1.4024.56", "TC3.1.4026.12"), "######",
+    (Module(0, "CX5140-0185", "Embedded PC, Atom E3845"),
+     Module(1, "EL1809", "16-ch digital input"),
+     Module(2, "EL2809", "16-ch digital output")),
+    banners={"http": "", "smb_os": "Windows 10 IoT Enterprise LTSC 17763"},
+    aliases=("CX5140",), stack="win10"))
+_add(DeviceModel(
+    "beckhoff-ek9300", "Beckhoff Automation", "EK9300 PROFINET bus coupler",
+    "remote-io", _BECKHOFF, "1", "EK9300 firmware", ("08", "11", "13"),
+    "########",
+    (Module(0, "EK9300", "PROFINET RT bus coupler"),
+     Module(1, "EL1008", "8-ch digital input"),
+     Module(2, "EL2008", "8-ch digital output")),
+    identity={"profinet": {"vendor_id": 0x0120, "device_id": 0x2453,
+                           "role": 0x01, "vendor_value": "EK9300"}},
+    banners={"http": ""}, aliases=("EK9300",), stack="embedded"))
+_add(DeviceModel(
+    "wago-750-8212", "WAGO", "PFC200 750-8212 controller", "plc", _WAGO,
+    "1", "WAGO PFC firmware (Linux RT)",
+    ("03.10.08(22)", "04.02.13(24)", "04.04.03(26)"), "#############",
+    (Module(0, "750-8212", "PFC200 G2 2ETH RS"),
+     Module(1, "750-1405", "16-ch digital input"),
+     Module(2, "750-1504", "16-ch digital output")),
+    identity={"modbus": {"vendor": "WAGO GmbH & Co. KG",
+                         "vendor_url": "www.wago.com",
+                         "product_code": "750-8212",
+                         "product_name": "PFC200 CS 2ETH RS"}},
+    banners={"http": "lighttpd", "snmp_sysdescr": "WAGO 750-8212 PFC200 CS "
+             "2ETH RS FW {firmware}",
+             "snmp_sysobjectid": "1.3.6.1.4.1.13576"},
+    aliases=("750-8212",), stack="linux"))
+_add(DeviceModel(
+    "phoenix-axc-f-2152", "Phoenix Contact", "PLCnext Control AXC F 2152",
+    "plc", _PHOENIX, "1", "PLCnext firmware (Linux)",
+    ("2023.0.4", "2024.0.2", "2025.0.1"), "#######",
+    (Module(0, "2404267", "AXC F 2152 controller"),),
+    identity={"profinet": {"vendor_id": 0x00B0, "device_id": 0x0170,
+                           "role": 0x03, "vendor_value": "AXC F 2152"}},
+    banners={"http": "", "snmp_sysdescr": "Phoenix Contact AXC F 2152 "
+             "PLCnext {firmware}", "snmp_sysobjectid": "1.3.6.1.4.1.4346"},
+    aliases=("AXC F 2152",), stack="linux"))
+
+# --- Healthcare: imaging, monitoring, infusion, nurse call ----------------
+_add(DeviceModel(
+    "ge-revolution-evo", "GE Healthcare", "Revolution EVO CT scanner console",
+    "modality", _GE_HC, "2", "GE CT console (Linux)",
+    ("Revo_EVO.SP2", "Revo_EVO.SP4", "Revo_EVO.SP5"), "######CN#",
+    identity={"dicom": {"manufacturer": "GE MEDICAL SYSTEMS",
+                        "model": "Revolution EVO", "modality": "CT",
+                        "impl_uid": "1.2.840.113619.6.374",
+                        "impl_version": "REVO_EVO_SP"}},
+    banners={"http": ""}, aliases=("Revolution EVO",), stack="linux"))
+_add(DeviceModel(
+    "siemens-magnetom-vida", "Siemens Healthineers", "MAGNETOM Vida 3T MRI",
+    "modality", _SIEMENS_HC, "2", "syngo MR XA (Windows 10)",
+    ("syngo MR XA31", "syngo MR XA50", "syngo MR XA51"), "######",
+    identity={"dicom": {"manufacturer": "SIEMENS", "model": "MAGNETOM Vida",
+                        "modality": "MR", "impl_uid": "1.3.12.2.1107.5.2",
+                        "impl_version": "MR_XA50"}},
+    banners={"http": "", "smb_os": "Windows 10 Enterprise LTSC 17763"},
+    aliases=("MAGNETOM Vida",), stack="win10"))
+_add(DeviceModel(
+    "carestream-directview-cr975", "Carestream Health",
+    "DirectView CR 975 computed radiography", "modality", _CARESTREAM, "2",
+    "Windows XP Embedded", ("5.7.412", "5.8.111"), "CR975####",
+    identity={"dicom": {"manufacturer": "Carestream Health",
+                        "model": "DirectView CR 975", "modality": "CR",
+                        "impl_uid": "1.2.276.0.7230010.3.0.3.5.4",
+                        "impl_version": "OFFIS_DCMTK_354"}},
+    banners={"http": "", "smb_os": "Windows 5.1"},
+    known_cves=("CVE-2008-4250", "CVE-2017-0144", "CVE-2019-0708"),
+    aliases=("DirectView CR 975",), stack="winxp"))
+_add(DeviceModel(
+    "mindray-benevision-n17", "Mindray", "BeneVision N17 patient monitor",
+    "patient-monitor", _MINDRAY, "1", "Mindray monitor firmware",
+    ("01.38.00", "01.42.01", "02.03.00"), "??-#######",
+    identity={"hl7": {"app": "MINDRAY_N17"}},
+    banners={"http": ""}, aliases=("BeneVision N17",), stack="embedded"))
+_add(DeviceModel(
+    "bd-alaris-8015", "BD (CareFusion)", "Alaris PC Unit 8015 infusion system",
+    "infusion-pump", _ALARIS, "1", "Alaris PC unit firmware",
+    ("9.33", "12.1.2", "12.3.0"), "#########",
+    banners={"http": ""}, aliases=("Alaris 8015",), stack="embedded"))
+_add(DeviceModel(
+    "rauland-responder5", "Rauland-Borg", "Responder 5 nurse call server",
+    "nurse-call", _RAULAND, "2", "Responder 5 (Linux appliance)",
+    ("5.6.1", "5.7.2", "5.8.0"), "R5-######",
+    identity={"hl7": {"app": "RESPONDER5"}},
+    banners={"http": "nginx"}, aliases=("Responder 5",), stack="linux"))
+
+# --- Data centre power + cooling, building systems, cameras, access -------
+_APC_NMC = ("APC Web/SNMP Management Card (MB:v4.5.4 PF:v{firmware} "
+            "PN:apc_hw{hw}_aos_{firmware}.bin AF1:v{firmware} "
+            "AN1:apc_hw{hw}_{app}_{firmware}.bin MN:{mn} HR:{hr} SN: {serial} "
+            "MD:{md}) (Embedded PowerNet SNMP Agent SW v2.2 compatible)")
+_add(DeviceModel(
+    "apc-srt-ap9641", "Schneider Electric (APC)",
+    "Smart-UPS SRT 10kVA with NMC3 AP9641", "ups", _APC, "1",
+    "APC NMC3 (Linux)", ("2.2.0.6", "2.4.1.1", "2.5.0.8"), "ZA##########",
+    banners={"http": "",
+             "snmp_sysdescr": _APC_NMC.replace("{hw}", "21")
+             .replace("{app}", "su").replace("{mn}", "AP9641")
+             .replace("{hr}", "A01").replace("{md}", "09/20/2022"),
+             "snmp_sysobjectid": "1.3.6.1.4.1.318.1.3.27"},
+    aliases=("AP9641",), stack="linux"))
+_add(DeviceModel(
+    "apc-ap8853", "Schneider Electric (APC)", "Rack PDU 2G switched AP8853",
+    "pdu", _APC, "1", "APC NMC2 (AOS)", ("6.8.2", "6.9.6", "7.0.6"),
+    "5A##########",
+    banners={"http": "",
+             "snmp_sysdescr": _APC_NMC.replace("{hw}", "05")
+             .replace("{app}", "rpdu2g").replace("{mn}", "AP8853")
+             .replace("{hr}", "02").replace("{md}", "05/14/2019"),
+             "snmp_sysobjectid": "1.3.6.1.4.1.318.1.3.4.6"},
+    aliases=("AP8853",), stack="embedded"))
+_add(DeviceModel(
+    "raritan-px3-5190r", "Raritan", "PX3-5190R intelligent rack PDU", "pdu",
+    _RARITAN, "1", "Raritan Xerus (Linux)",
+    ("3.6.20.5-48233", "4.0.20.5-49038", "4.1.0.5-49500"), "1INT#######",
+    banners={"http": "", "snmp_sysdescr": "Raritan PX3-5190R, Firmware "
+             "Version {firmware}",
+             "snmp_sysobjectid": "1.3.6.1.4.1.13742.6"},
+    aliases=("PX3-5190R",), stack="linux"))
+_add(DeviceModel(
+    "vertiv-liebert-cw-unity", "Vertiv", "Liebert CW CRAH with IntelliSlot "
+    "Unity card", "hvac", _EMERSON_NP, "1", "Liebert Unity firmware (Linux)",
+    ("7.6.1.0", "8.0.4.0", "8.2.1.0"), "####?#####",
+    identity={"modbus": {"vendor": "Vertiv", "vendor_url": "www.vertiv.com",
+                         "product_code": "IS-UNITY-DP",
+                         "product_name": "Liebert CW"}},
+    banners={"http": "", "snmp_sysdescr": "Liebert CW IntelliSlot Unity "
+             "Card {firmware}", "snmp_sysobjectid": "1.3.6.1.4.1.476.1.42"},
+    aliases=("Liebert CW",), stack="linux"))
+_add(DeviceModel(
+    "carrier-30xa-prodialog", "Carrier", "AquaForce 30XA chiller "
+    "(PRO-DIALOG+ control)", "hvac", _CARRIER, "1", "PRO-DIALOG+ firmware",
+    ("SR-1.43", "SR-1.52"), "####Q#####",
+    identity={"modbus": {"vendor": "Carrier", "vendor_url": "www.carrier.com",
+                         "product_code": "30XA-PD+",
+                         "product_name": "AquaForce 30XA"}},
+    banners={"http": ""}, aliases=("30XA PRO-DIALOG+",), stack="embedded"))
+_add(DeviceModel(
+    "axis-p3245-v", "Axis Communications", "AXIS P3245-V network camera",
+    "camera", _AXIS, "1", "AXIS OS (Linux)",
+    ("10.12.199", "11.8.64", "11.11.73"), "ACCC8E%%%%%%",
+    banners={"http": ""}, aliases=("AXIS P3245-V",), stack="linux"))
+_add(DeviceModel(
+    "hikvision-ds-2cd2143g2", "Hikvision", "DS-2CD2143G2-IU network camera",
+    "camera", _HIKVISION, "1", "Hikvision embedded Linux",
+    ("V5.7.3 build 220112", "V5.7.15 build 230726"), "DS-2CD2143G2-IU2022##",
+    banners={"http": "App-webs/"}, aliases=("DS-2CD2143G2-IU",),
+    stack="linux"))
+_add(DeviceModel(
+    "mercury-lp4502", "Mercury Security", "LP4502 intelligent access "
+    "controller", "access-control", _MERCURY, "1", "Mercury LP firmware",
+    ("1.29.1", "1.31.0", "2.2.2"), "########", banners={"http": ""},
+    aliases=("LP4502",), stack="linux"))
+
+# --- Pharma DCS -----------------------------------------------------------
+_add(DeviceModel(
+    "emerson-deltav-pk", "Emerson", "DeltaV PK Controller", "plc",
+    _EMERSON_PM, "1", "DeltaV controller firmware",
+    ("14.3.1", "14.FP3", "15.FP1"), "PK########",
+    (Module(0, "VE3008", "PK Controller"),),
+    banners={"http": ""}, aliases=("DeltaV PK",), stack="embedded"))
+
+
+def _site_reindex() -> None:
+    """Refresh the derived lookups for the models added above."""
+    global EMBEDDED_OUIS
+    for m in CATALOG.values():
+        for a in m.aliases:
+            _ALIASES.setdefault(a, m.model_id)
+        if m.embedded:
+            for o in m.ouis:
+                OUI_VENDORS.setdefault(o, m.vendor)
+    EMBEDDED_OUIS = frozenset(o for m in CATALOG.values() if m.embedded
+                              for o in m.ouis)
+
+
+_site_reindex()
