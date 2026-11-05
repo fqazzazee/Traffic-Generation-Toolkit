@@ -222,14 +222,22 @@ def cmd_inventory(args) -> int:
               file=sys.stderr)
         return 2
     env = enterprise.get(args.env)
+    from . import incidents
+    sprinkle = [x.strip() for chunk in (args.sprinkle or [])
+                for x in chunk.split(",") if x.strip()]
+    for k in sprinkle:
+        if k not in incidents.INCIDENTS:
+            print(f"unknown malware variant: {k}. Try 'tgt list'.",
+                  file=sys.stderr)
+            return 2
     write = inventory.write_json if args.format == "json" else inventory.write_csv
     if args.output:
         with open(args.output, "w", newline="", encoding="utf-8") as f:
-            write(env, f)
+            write(env, f, sprinkle)
         print(f"wrote {len(env.hosts)} hosts ({args.format}) to {args.output}",
               file=sys.stderr)
     else:
-        write(env, sys.stdout)
+        write(env, sys.stdout, sprinkle)
     return 0
 
 
@@ -261,6 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="csv = one row per host; json adds segments + flows")
     pv.add_argument("--output", "-o", metavar="FILE",
                     help="write here instead of stdout")
+    pv.add_argument("--sprinkle", action="append", metavar="INCIDENT",
+                    help="also list the hosts these sprinkled incidents add "
+                         "as new assets (no compatible inventory host); "
+                         "comma-separated, repeatable")
 
     pi = sub.add_parser("iface", help="manage virtual interfaces")
     isub = pi.add_subparsers(dest="iface_cmd", required=True)
