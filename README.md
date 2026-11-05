@@ -130,10 +130,13 @@ pcap only        TGT ENGINE ──▶ PCAP file ┈import┈▶ SENSOR     (offl
 
 Packets animate along the path as it generates, and each box carries live data:
 
-- **TGT ENGINE:** the preset, any sprinkled malware, the traffic mix (share of frames per
-  protocol, biggest first; malware rows always stay on screen), pps and elapsed time.
+- **TGT ENGINE:** the preset, any sprinkled malware, live injections (`⚡industroyer 11s`
+  left), the campaign phase and its countdown (`▸ 2/5 module-swap · 1s left`), simulated
+  time and speed for a timed run, the traffic mix (share of frames per protocol, biggest
+  first; malware rows always stay on screen), the rolling pps over the last ~5 s (so a
+  stall shows at once) and elapsed time.
 - **SEND / PCAP:** interface, link state and type (or the pcap file), packets, bytes,
-  Mb/s, errors, frames per cycle.
+  Mb/s, errors, frames per cycle; with several send interfaces, one counter line each.
 - **MONITOR** (veth only): the peer and its state, the SPAN view and VLAN tagging.
 - **SENSOR:** your sensor's name and how it gets the traffic: the veth peer it listens on,
   the interface it gets a SPAN of, or the pcap it imports.
@@ -143,10 +146,10 @@ preset, explains the selected row underneath, and the key bar lists what the key
 
 | Panel | What you do |
 |---|---|
-| **Run** | pick a preset from a filterable list (scenarios; environments, including packaged sites and env files in your env directories; incidents; pcap replay) and set the run options that apply to it: SPAN view, malware sprinkle, rate, messages, loop, pcap output, endpoints |
-| **Traffic** | toggle protocols for a custom mix; live per-protocol counters |
-| **Interfaces** | pick the send interface and see how it reaches the sensor (veth pair or real interface that needs a SPAN), name the sensor, create/delete a veth pair (delete asks you to type the name and is never offered for a real interface) |
-| **Service** | service status and the exact `tgt run` it would execute; save config + start/stop/restart |
+| **Run** | pick a preset from a filterable list grouped Built-in / Sites / Files / Plugins (scenarios; environments, with each site's planted findings; incidents; pcap replay) or a **Campaign** plan, then set the options that apply: SPAN view, malware sprinkle, **Schedule** (cycle or timed, with speed, day profile, min period, duration), **Clock** and start time, **Seed**, **Manifest**, control **API**, rate, messages, loop, pcap output, endpoints; replay adds speed, loop count, IP/subnet/MAC remaps and VLAN retag. **Findings** lists what the env plants for a monitor to raise, and **Export inventory** writes its ground truth as CSV + JSON |
+| **Traffic** | protocols grouped into folding families (OT, IT, infrastructure, …) with `/` to filter; toggle them for a custom mix; live per-protocol counters |
+| **Interfaces** | pick the send interface and see how it reaches the sensor (veth pair or real interface that needs a SPAN), name the sensor, **Fan-out** to more interfaces (same frames to each, per-interface counters), create/delete a veth pair (delete asks you to type the name and is never offered for a real interface) |
+| **Service** | service status and the exact `tgt run` (or `tgt campaign`) it would execute; save config + start/stop/restart |
 
 Choosing a preset puts its protocols on the **Traffic** tab (an incident's attack-only
 traffic, such as a port scan, is listed next to them), and toggling one there starts a
@@ -156,8 +159,11 @@ panel shows that command line, so a run you tune in the TUI can move to a script
 service unchanged. Below 80 columns the diagram collapses to a one-line flow strip.
 
 **Keys:** `Tab` panel · `↑/↓` move · `←/→` change · `Enter` pick/edit/run · `Space`
-toggle · `s` start/stop · `c` clear log · `?` help · `q` quit. The key bar at the bottom
-of each panel is the authoritative list.
+toggle · `s` start/stop · `i` inject an incident into the running engine for a while
+(same as [`tgt ctl inject`](#control-api-and-tgt-ctl), recorded in the manifest) · `p`
+pause/resume · `/` filter protocols on Traffic (`Esc` clears) · `c` clear log · `?` help ·
+`q` quit (asks first while a run is live). In a text prompt, `-` clears the value. The key
+bar at the bottom of each panel is the authoritative list.
 
 ---
 
@@ -452,7 +458,7 @@ appear in `tgt list` by their `key`. `tgt/envs/` has exports of the built-ins,
 
 | section | keys |
 |---|---|
-| `hosts[]` | `name`, `ip`, `role`, `os` (fingerprint key: `win10`, `linux`, `rockwell`, `siemens`, `ios`, …) or a catalog `model` that fills them; optional `vendor`, `product`, `mac`, `firmware`, `serial`, `fqdn`, `meta`; `count` + `ip_start` repeat an entry (`name` is a `{n}` template) |
+| `hosts[]` | `name`, `ip`, `role`, `os` (fingerprint key: `win10`, `linux`, `rockwell`, `siemens`, `ios`, `rtos`, `linux-embedded`, …; the old `embedded` / `embedded-linux` still load) or a catalog `model` that fills them; optional `vendor`, `product`, `mac`, `firmware`, `serial`, `fqdn`, `meta`; `count` + `ip_start` repeat an entry (`name` is a `{n}` template) |
 | `flows[]` | `client` + `server`, or selectors `from` [+ `to`]: a host name (globs ok), `role:`, `zone:`, `model:`, `*`, each optionally `@SEGMENT`; `mode` `all` or `round-robin`; `proto`; optional `period` / `jitter` for the timed scheduler. No `to` = a self-announcement |
 | `segments[]` | `name`, `vlan`, `subnet`, `zone`, optional `gateway`, `gateway_mac`, `wan_rtt_ms`, `nat` (`outside_ip`, `outside_mac`, `local`) |
 | `external[]` | internet endpoints (public IP, `fqdn`), named in flows like hosts |
@@ -478,8 +484,10 @@ quick for smoke tests, but nothing like a plant. **`--schedule timed`** gives ea
 conversation its own clock (`tgt/timing.py`, a plain editable table):
 
 - **per-flow periods with jitter** — HMI polling every 0.5–2 s at ±3 %, DNP3 2–10 s, CIP
-  class-1 I/O every 20–100 ms, LLDP 30 s, SNMP 5 min, NetBIOS 12 min, DHCP renewals every
-  4 h, engineering reads every 20–60 min during the day shift; each conversation keeps one stable period,
+  class-1 I/O every 20–100 ms, LLDP 30 s, SNMP 5 min, NetBIOS 12 min (B-node broadcasts
+  with a browser host announcement, kept on the sender's VLAN), DHCP renewals every
+  4 h, engineering reads every 20–60 min during the day shift, an IEC 104 general
+  interrogation every 15 min on the open connection (N(S)/N(R) stay continuous); each conversation keeps one stable period,
   so a plant's pollers do not all tick together. Env-file `period` / `jitter` override it;
 - **request → response RTT** by path (same segment, routed, WAN) plus device processing time;
 - **persistent sessions** — HMI/SCADA/historian pollers keep one long-lived TCP connection
@@ -605,6 +613,11 @@ tgt score --truth truth.json --assets known_hosts.log --map zeek-known-hosts --z
 > product's alert titles land on the right categories. `--map` and `--alert-map` take a
 > bundled name or a path.
 
+To check the scoring itself, `tgt score --manifest run.json --self-test-export perfect.csv`
+writes the export a perfect monitor would produce (generic map: every asset that sent
+traffic, identity fields only where observable). Scoring that file must give 100 %; it does
+on every built-in env and packaged site.
+
 **7. Read the report.** `report.html` is one self-contained page (light and dark) with
 summary tiles, per-field accuracy, a per-asset table with each field marked correct, partial,
 wrong or missing, missed and false-positive assets, baseline coverage and detections.
@@ -688,7 +701,10 @@ tgt run --env it-org --sprinkle wannacry --sprinkle-ratio 0.1   -i tgt0   # exac
 tgt run --env ot-plant --sprinkle-random --sprinkle-ratio 0.05  -i tgt0   # random attack, 5%
 ```
 
-- **`--sprinkle-ratio 0.0–0.9`** — fixed malware fraction regardless of base size.
+- **`--sprinkle-ratio 0.0–0.9`** — fixed malware fraction regardless of base size. Under
+  `--schedule timed` the attack streams recur as often as needed to hold that share of
+  wire frames (following day profiles and campaign phases); without it they keep their
+  natural periods.
 - **`--sprinkle-random`** — random variant + jittered placement each cycle.
 - To add an attack *during* a run, use [`tgt ctl inject`](#control-api-and-tgt-ctl).
 
@@ -757,8 +773,10 @@ tgt run [options]
 tgt inventory (-e ENV | --env-file F) [-f csv|json] [-o FILE] [--sprinkle INCIDENT]
 tgt campaign PLAN [--list | --check] [--force] [-i IFACE] [--pcap F] [--manifest F]
                   [--clock wall|synthetic] [--start-time ISO] [--seed N] [--speed X] [--min-period S]
+                  [--api [HOST:]PORT --api-token T]
 tgt score (--manifest RUN.json | --truth INV.json) --assets EXPORT --map MAP
           [--alerts F --alert-map MAP] [--zeek DIR] [--tolerance S] [--skew S] [--html F] [--json F]
+          | --self-test-export OUT.csv
 tgt ctl [--api ADDR] [--token T] status|stop|pause|resume|rate PPS|inject INCIDENT|manifest
 ```
 
@@ -869,11 +887,14 @@ map. The API reference is the docstring of [`tgt/plugins.py`](tgt/plugins.py).
 Config — `/etc/tgt/tgt.conf` (also editable live from the TUI's Service panel):
 
 ```sh
-TGT_IFACE=tgt0
+TGT_IFACE=tgt0                  # or tgt0,tgt1: every listed veth is created, same frames to each
+TGT_CMD=run                     # or campaign: TGT_RUN_ARGS then starts with the plan name
 TGT_RUN_ARGS="--env industrial-site --schedule timed --manifest '/var/tmp/tgt run.json'"
 ```
 
 `TGT_RUN_ARGS` is a shell-quoted argument list, so a quoted path with spaces stays one argument.
+Units registered before `TGT_CMD` existed always run `tgt run` and create only one veth: run
+`tgtctl.sh register` again to use campaigns or fan-out (the TUI's Service panel warns).
 The systemd unit runs least-privilege (`CAP_NET_ADMIN` + `CAP_NET_RAW` only), creates the veth
 in `ExecStartPre`, and stops cleanly on `systemctl stop` (SIGTERM flushes the pcap and
 manifest). It restarts on failure but gives up after 5 quick failures in 2 minutes; once the
