@@ -91,7 +91,7 @@ def test_modbus_signature() -> None:
         ihl = (f[14] & 0x0F) * 4
         if f[14 + 9] == P.IPPROTO_TCP:
             dport = struct.unpack("!H", f[14 + ihl + 2:14 + ihl + 4])[0]
-            payload = f[14 + ihl + 20:]
+            payload = f[14 + ihl + (f[14 + ihl + 12] >> 4) * 4:]
             if dport == 502 and len(payload) >= 8:
                 tid, proto, length, unit, fc = struct.unpack("!HHHBB",
                                                              payload[:8])
@@ -330,7 +330,12 @@ def test_tshark_dissects_every_builder() -> None:
     seen = {x for line in layers for x in line.split(":")}
     for key, layer in list(_DISSECTS_AS.items()) + [("smb1", "smb")]:
         check(layer in seen, f"tshark: {key} never dissected as {layer}")
-    if "Errors (" in expert or "Warns (" in expert:
+    # deliberate RST closes (aborted browser sessions) are the only
+    # warnings allowed
+    warns = [ln for ln in expert.splitlines()
+             if ln.strip() and ln.strip()[0].isdigit()
+             and "Connection reset (RST)" not in ln]
+    if "Errors (" in expert or warns:
         detail = [ln.strip() for ln in expert.splitlines()
                   if "Malformed" in ln or "Warning" in ln or "incorrect" in ln]
         _failures.append("tshark expert warnings: " + "; ".join(detail[:5]))
@@ -1896,6 +1901,149 @@ def test_version_single_source() -> None:
           and 'dynamic = ["version"]' in toml
           and 'attr = "tgt.__version__"' in toml,
           "pyproject.toml must take its version from tgt.__version__")
+
+
+# ---------------------------------------------------------------------------
+# W2-B: per-OS TCP/IP stack fingerprints (#40) and TLS templates (#41)
+# ---------------------------------------------------------------------------
+def _tcp_view(frame: bytes):
+    """(src_ip, ip_id, df, flags, window, options, payload, seq) of a TCP
+    frame, else None."""
+    t = _l4(frame)
+    if not t or t[0] != P.IPPROTO_TCP:
+        return None
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    ip_id, frag = struct.unpack("!HH", frame[off + 4:off + 8])
+    seg = t[5]
+    doff = (seg[12] >> 4) * 4
+    return (t[1], ip_id, bool(frag & 0x4000), seg[13],
+            struct.unpack("!H", seg[14:16])[0], seg[20:doff], seg[doff:],
+            struct.unpack("!I", seg[4:8])[0])
+
+
+def _stack_flow(client: str, server: str, count: int = 3, proto=None):
+    ep = Endpoints(stack_client=client, stack_server=server)
+    return [_tcp_view(f) for f in (proto or protocols.modbus_flow)(ep, count)]
+
+
+def test_tcp_syn_options_per_os() -> None:
+    want = {  # stack -> (SYN option bytes w/o timestamps, SYN window)
+        "win10": ("020405b40103030801010402", 64240),
+        "win2012": ("020405b40103030801010402", 8192),
+        "win7": ("020405b40103030201010402", 8192),
+        "winxp": ("020405b401010402", 64240),
+        "win2000": ("020405b401010402", 65535),
+        "siemens": ("020405b4", 8192),
+        "rockwell": ("020405b4", 8192),
+        "sel": ("02040218", 2144),
+    }
+    for key, (opts, win) in want.items():
+        syn = _stack_flow(key, "win10")[0]
+        check(syn[3] == P.SYN and syn[5].hex() == opts and syn[4] == win,
+              f"{key}: SYN options/window {syn[5].hex()} / {syn[4]}")
+    # Linux: mss,sok,ts,nop,ws7 with TSecr 0; SYN+ACK from Linux has IP ID 0
+    lin = _stack_flow("linux", "linux")
+    o = lin[0][5]
+    check(o[:6].hex() == "020405b40402" and o[6:8] == b"\x08\x0a"
+          and o[12:16] == bytes(4) and o[16:].hex() == "01030307"
+          and lin[0][4] == 64240, f"linux SYN options {o.hex()}")
+    check(lin[1][1] == 0 and lin[1][4] == 65160, "linux SYN+ACK id/window")
+    # timestamps on every later segment, TSecr echoing the peer's last TSval
+    last = {}
+    for v in lin[2:]:
+        ts = v[5]
+        check(len(ts) == 12 and ts[2:4] == b"\x08\x0a",
+              "linux data segment lacks the timestamp option")
+        tsval, tsecr = struct.unpack("!II", ts[4:12])
+        peer = [k for k in last if k != v[0]]
+        if peer:
+            check(tsecr == last[peer[0]], "TSecr does not echo the peer TSval")
+        last[v[0]] = tsval
+    # SYN+ACK answers only what the SYN offered; DF per stack
+    sa = _stack_flow("siemens", "win10")[1]
+    check(sa[5].hex() == "020405b4", "win10 SYN+ACK to a bare-MSS SYN")
+    sa = _stack_flow("win10", "linux")[1]
+    check(sa[5].hex() == "020405b401010402" "01030307",
+          f"linux SYN+ACK without timestamps {sa[5].hex()}")
+    check(not _stack_flow("win10", "siemens")[1][2], "Siemens sets DF")
+    check(_stack_flow("win10", "rockwell")[0][2], "Windows clears DF")
+    # established windows: scaled when both scale, raw otherwise
+    w = _stack_flow("win10", "win10")
+    check(w[2][4] == 1026, f"win10 scaled window {w[2][4]}")
+    w = _stack_flow("win10", "siemens")
+    srv = next(v for v in w[2:] if v[0] == "10.10.10.20")
+    check(w[2][4] == 65535 and srv[4] == 8192,
+          "unscaled windows win10<->siemens")
+
+
+def test_tcp_ip_id_and_defaults() -> None:
+    from tgt import enterprise
+    # per-session counter for Windows: +1 per datagram
+    ids = [v[1] for v in _stack_flow("win10", "win10") if v[0] == "10.10.10.10"]
+    check(all((b - a) & 0xFFFF == 1 for a, b in zip(ids, ids[1:])),
+          "Windows IP ID does not increment by one")
+    # profile-only defaults: Windows client, port-typical embedded server
+    flow = [_tcp_view(f) for f in protocols.s7comm_flow(Endpoints(), 1)]
+    check(flow[0][5].hex() == "020405b40103030801010402"
+          and flow[1][5].hex() == "020405b4" and not flow[1][2],
+          "default s7comm stacks are not Windows client / Siemens server")
+    flow = [_tcp_view(f) for f in protocols.modbus_flow(Endpoints(), 1)]
+    check(flow[1][4] == 4380, "default Modbus server is not a Modicon stack")
+    # environment: one IP-ID counter per Windows/embedded host, rising in
+    # wire order across all of its flows; routed copies keep the ID
+    env = enterprise.get("industrial-site")
+    hosts = {h.ip: h for h in env.hosts}
+    seen: dict = {}
+    bad = []
+    for _, f in env.build(2):
+        ips = P.frame_ips(f)
+        h = hosts.get(ips[0]) if ips else None
+        if h is None or env.host(h.name).stack == "linux":
+            continue
+        off = 18 if f[12:14] == b"\x81\x00" else 14
+        ident = struct.unpack("!H", f[off + 4:off + 6])[0]
+        prev = seen.get(h.ip)
+        if prev is not None and (ident - prev) & 0xFFFF != 1:
+            bad.append(h.name)
+        seen[h.ip] = ident
+    check(seen and not bad, f"per-host IP ID not sequential: {sorted(set(bad))[:5]}")
+    core = env.build(1, span="core")
+    pairs = 0
+    for (_, a), (_, b) in zip(core, core[1:]):
+        if P.frame_ips(a) and P.frame_ips(a) == P.frame_ips(b) and \
+                a[-20:] == b[-20:] and a[12:14] == b[12:14] == b"\x81\x00":
+            pairs += 1
+            check(a[22:24] == b[22:24], "routed copy changed the IP ID")
+    check(pairs > 0, "no routed copies found in the core view")
+
+
+def test_tcp_segmentation_acks_and_rst() -> None:
+    from tgt import enterprise
+    # pure delayed ACKs between polls; FIN close for OT pollers
+    flow = _stack_flow("win10", "rockwell", 4)
+    pure = [v for v in flow[3:-3] if v[3] == P.ACK and not v[6]]
+    check(len(pure) >= 3, "no delayed pure ACKs between Modbus polls")
+    # no segment exceeds the MSS; large TLS flights are split
+    env = enterprise.get("industrial-site")
+    batch = env.build(2)
+    rst, https = set(), set()
+    for k, f in batch:
+        v = _tcp_view(f)
+        if not v:
+            continue
+        check(len(v[6]) <= 1460, f"{k}: TCP payload {len(v[6])} > MSS")
+        if v[3] & P.RST:
+            rst.add(k)
+            check(k in ("http", "https"), f"{k} session closed with RST")
+        if k == "https" and v[3] == P.SYN:
+            https.add(v[0])
+    check("http" in rst or "https" in rst, "no aborted (RST) web sessions")
+    ep = Endpoints(client_ip="10.9.9.9")
+    check(protocols._aborts(ep, 41000, 443) == protocols._aborts(ep, 41000, 443),
+          "RST choice is not deterministic")
+    n = sum(protocols._aborts(Endpoints(client_ip=f"10.9.{i}.1"), 41000, 443)
+            for i in range(240))
+    check(20 <= n <= 60, f"RST fraction off: {n}/240")
 
 
 def main() -> int:

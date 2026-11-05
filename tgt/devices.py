@@ -61,6 +61,8 @@ class DeviceModel:
     edr_capable: bool = False
     known_cves: Tuple[str, ...] = ()
     aliases: Tuple[str, ...] = ()  # product strings that resolve to this model
+    # TCP/IP stack fingerprint (tgt.stacks key); "" = from the OS fingerprint
+    stack: str = ""
 
     def __hash__(self) -> int:     # the dict fields make the default unhashable
         return hash(self.model_id)
@@ -125,7 +127,7 @@ def _logix(model_id, product, name, code, fw, aliases, modules=()):
                  "snmp_sysdescr": "Rockwell Automation {product} "
                                   "Firmware {firmware}",
                  "snmp_sysobjectid": _ROCKWELL_SNMP},
-        known_cves=_LOGIX_CVES, aliases=aliases))
+        known_cves=_LOGIX_CVES, aliases=aliases, stack="rockwell"))
 
 
 _CLX_RACK = (Module(1, "1756-EN2T", "EtherNet/IP bridge"),
@@ -168,7 +170,7 @@ _add(DeviceModel(
     identity={"cip": {"vendor_id": 1, "device_type": 0x02,
                       "product_code": 2192, "product_name": "PowerFlex 755"}},
     banners={"http": "", "snmp_sysdescr": "PowerFlex 755 {firmware}"},
-    aliases=("PowerFlex 755",)))
+    aliases=("PowerFlex 755",), stack="rockwell-drive"))
 
 # ---------------------------------------------------------------------------
 # Siemens SIMATIC
@@ -184,7 +186,7 @@ def _s7(model_id, product, order, module, fw, cves, aliases, modules=()):
         identity={"s7": {"order": order, "module": module}},
         banners={"http": "", "snmp_sysdescr": _SIEMENS_SYSDESCR,
                  "snmp_sysobjectid": _SIEMENS_SNMP},
-        known_cves=cves, aliases=aliases))
+        known_cves=cves, aliases=aliases, stack="siemens"))
 
 
 _s7("siemens-cpu-315-2pndp", "SIMATIC S7-300 CPU 315-2 PN/DP",
@@ -223,7 +225,7 @@ _add(DeviceModel(
     banners={"http": "", "snmp_sysdescr": "SICAM A8000 CP-8050 {firmware}",
              "snmp_sysobjectid": "1.3.6.1.4.1.4329"},
     known_cves=("CVE-2023-28489",),   # web server RCE, < CPCI85 V05
-    aliases=("SICAM A8000 CP-8050",)))
+    aliases=("SICAM A8000 CP-8050",), stack="embedded"))
 
 # ---------------------------------------------------------------------------
 # Schneider Electric
@@ -244,7 +246,8 @@ _add(DeviceModel(
              "snmp_sysdescr": "Schneider Electric BMX P34 2020 {firmware}",
              "snmp_sysobjectid": "1.3.6.1.4.1.3833.1.7.255.3"},
     known_cves=_MODICON_CVES,
-    aliases=("BMX P34 2020 Modicon M340", "BMX P34 2020")))
+    aliases=("BMX P34 2020 Modicon M340", "BMX P34 2020"),
+    stack="schneider"))
 _add(DeviceModel(
     "schneider-bme-p58-2040", "Schneider Electric", "Modicon M580 BME P58 2040",
     "plc", _SCHNEIDER, "1", "Modicon M580 firmware",
@@ -260,7 +263,8 @@ _add(DeviceModel(
              "snmp_sysdescr": "Schneider Electric BME P58 2040 {firmware}",
              "snmp_sysobjectid": "1.3.6.1.4.1.3833.1.7.255.3"},
     known_cves=_MODICON_CVES,
-    aliases=("BME P58 2040 Modicon M580", "BME P58 2040")))
+    aliases=("BME P58 2040 Modicon M580", "BME P58 2040"),
+    stack="schneider"))
 _add(DeviceModel(
     "schneider-pm5560", "Schneider Electric", "PowerLogic PM5560 power meter",
     "meter", _SCHNEIDER, "1", "PowerLogic meter firmware",
@@ -269,7 +273,7 @@ _add(DeviceModel(
                          "product_code": "METSEPM5560",
                          "product_name": "PM5560"}},
     banners={"http": "", "snmp_sysdescr": "PM5560 {firmware}"},
-    aliases=("PowerLogic PM5560",)))
+    aliases=("PowerLogic PM5560",), stack="embedded"))
 
 # ---------------------------------------------------------------------------
 # Building management
@@ -281,13 +285,13 @@ _add(DeviceModel(
     identity={"bacnet": {"vendor_id": 36, "model_name": "JACE-8000"}},
     banners={"http": "Niagara Web Server",
              "snmp_sysdescr": "Niagara 4 JACE-8000 {firmware}"},
-    aliases=("JACE-8000",)))
+    aliases=("JACE-8000",), stack="embedded"))
 _add(DeviceModel(
     "jci-fec2611", "Johnson Controls", "Metasys FEC2611 field equipment "
     "controller", "bms-controller", _JCI, "1", "Metasys FEC firmware",
     ("10.1.0", "11.0.0", "12.0.0"), "##?######",
     identity={"bacnet": {"vendor_id": 5, "model_name": "FEC2611-0"}},
-    aliases=("Metasys FEC2611",)))
+    aliases=("Metasys FEC2611",), stack="embedded"))
 
 # ---------------------------------------------------------------------------
 # Schweitzer Engineering Laboratories — substation protection + automation
@@ -298,7 +302,7 @@ def _sel(model_id, product, dtype, level, fw, aliases, dnp3):
         level, "SEL firmware", fw, "##########",
         identity={"dnp3": dnp3},
         banners={"http": "", "snmp_sysdescr": "{product} {firmware}"},
-        aliases=aliases))
+        aliases=aliases, stack="sel"))
 
 
 _sel("sel-751", "SEL-751 feeder protection relay", "relay", "1",

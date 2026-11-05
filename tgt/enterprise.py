@@ -23,8 +23,9 @@ import ipaddress
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from . import devices, protocols
-from .packet import Endpoints, bytes_to_mac, mac_to_bytes, rewrite_l2
+from . import devices, protocols, stacks
+from .packet import (Endpoints, bytes_to_mac, frame_ips, mac_to_bytes,
+                     rewrite_l2, set_ip_id)
 
 # Vendor OUIs — an analyser also fingerprints assets by MAC prefix.
 OUI_WIN = "00:50:56"        # VMware-hosted Windows/Linux
@@ -141,6 +142,15 @@ class Host:
         if dev is not None:
             return dev.embedded
         return self.mac[:8].lower() in devices.EMBEDDED_OUIS
+
+    @property
+    def stack(self) -> str:
+        """TCP/IP stack fingerprint (:mod:`tgt.stacks` key): the catalog
+        model's hint, else the OS fingerprint's family."""
+        dev = self.device
+        if dev is not None and dev.stack:
+            return dev.stack
+        return stacks.for_os(self.os)
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +425,8 @@ class Environment:
         return Endpoints(
             client_mac=client.mac, client_ip=client.ip,
             server_mac=server.mac, server_ip=server.ip,
-            ttl_client=client.fp.ttl, ttl_server=server.fp.ttl, meta=meta)
+            ttl_client=client.fp.ttl, ttl_server=server.fp.ttl, meta=meta,
+            stack_client=client.stack, stack_server=server.stack)
 
     def _place(self, frame: bytes, client: Host, server: Host,
                span: str) -> List[bytes]:
@@ -498,7 +509,8 @@ class Environment:
             server_mac=cloud.mac, server_ip=cloud.ip,
             ttl_client=win.fp.ttl, ttl_server=64,
             meta={"sni": cloud.product, "domain": cloud.product,
-                  "nbname": win.name, "ua": win.fp.ua})
+                  "nbname": win.name, "ua": win.fp.ua},
+            stack_client=win.stack, stack_server="linux")
 
     def _edr_streams(self, messages: int,
                      span: str) -> List[List[Tuple[str, List[bytes]]]]:
@@ -560,14 +572,36 @@ class Environment:
         if edr:
             streams += self._edr_streams(messages, span)
         out: List[Tuple[str, bytes]] = []
+        stamp = self._ip_id_stamper()
         i = 0
         while any(i < len(s) for s in streams):
             for s in streams:
                 if i < len(s):
                     proto, group = s[i]
-                    out.extend((proto, g) for g in group)
+                    out.extend((proto, g) for g in stamp(group))
             i += 1
         return out
+
+    def _ip_id_stamper(self) -> Callable[[List[bytes]], List[bytes]]:
+        """Windows and embedded stacks number every IP datagram a host sends
+        from one counter, so a host's IP IDs rise in wire order across all its
+        flows. Returns a function that re-stamps one frame group (a frame and
+        its routed copy keep the same ID)."""
+        by_ip = {h.ip: h for h in self.hosts
+                 if stacks.get(h.stack).ipid == "host"}
+        counters: Dict[str, int] = {}
+
+        def stamp(group: List[bytes]) -> List[bytes]:
+            ips = frame_ips(group[0])
+            host = by_ip.get(ips[0]) if ips else None
+            if host is None:
+                return group
+            n = counters.get(host.ip)
+            if n is None:
+                n = stacks.hash_int(host.name, "ipid", bits=16)
+            counters[host.ip] = (n + 1) & 0xFFFF
+            return [set_ip_id(g, n) for g in group]
+        return stamp
 
     def protocols(self) -> List[str]:
         """Protocols this environment's conversations use, in registry order

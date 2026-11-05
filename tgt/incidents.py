@@ -369,7 +369,8 @@ class Incident:
         m.update(meta)
         return Endpoints(client_mac=a.mac, client_ip=a.ip,
                          server_mac=v.mac, server_ip=v.ip,
-                         ttl_client=a.fp.ttl, ttl_server=v.fp.ttl, meta=m)
+                         ttl_client=a.fp.ttl, ttl_server=v.fp.ttl, meta=m,
+                         stack_client=a.stack, stack_server=v.stack)
 
     def build(self, messages: int,
               resolve: Optional[Callable[[str], Host]] = None
