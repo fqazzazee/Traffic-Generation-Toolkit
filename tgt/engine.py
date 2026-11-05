@@ -162,6 +162,19 @@ def _sprinkle(base: List[tuple[str, bytes]],
     return merged
 
 
+def replay_offsets(timestamps: List[float],
+                   max_gap: float = 5.0) -> List[float]:
+    """Send time of each replayed frame relative to the first.
+
+    Gaps are clamped to ``[0, max_gap]`` so out-of-order timestamps or a long
+    idle stretch in the capture do not stall the replay.
+    """
+    out = [0.0]
+    for prev, cur in zip(timestamps, timestamps[1:]):
+        out.append(out[-1] + min(max(cur - prev, 0.0), max_gap))
+    return out
+
+
 class Engine:
     def __init__(self, cfg: RunConfig,
                  on_log: Optional[Callable[[str], None]] = None):
@@ -189,6 +202,14 @@ class Engine:
         return bool(self._thread and self._thread.is_alive())
 
     # -- internal ----------------------------------------------------------
+    def _sleep_until(self, target: float) -> None:
+        """Sleep until ``perf_counter() >= target``; wakes early on stop()."""
+        delay = target - time.perf_counter()
+        if delay > 0.05:
+            self._stop.wait(delay)
+        elif delay > 0:
+            time.sleep(delay)
+
     def _run(self) -> None:
         cfg = self.cfg
         sender: Optional[RawSender] = None
@@ -213,16 +234,15 @@ class Engine:
                 self.log(f"writing pcap -> {cfg.pcap_path}")
 
             limiter = RateLimiter(cfg.rate)
-            delays = None
+            offsets = None      # realtime replay: send time of each frame
             if cfg.replay_path:
                 from . import pcapread
                 frames_ts = pcapread.read_frames(cfg.replay_path)
                 batch = [("replay", f) for _, f in frames_ts]
                 if cfg.replay_realtime and len(frames_ts) > 1:
-                    delays = [0.0] + [frames_ts[i][0] - frames_ts[i - 1][0]
-                                      for i in range(1, len(frames_ts))]
+                    offsets = replay_offsets([t for t, _ in frames_ts])
                 self.log(f"replaying {len(batch)} packets from {cfg.replay_path}"
-                         + (" (original timing)" if delays else
+                         + (" (original timing)" if offsets else
                             f" @ {cfg.rate}pps"))
             else:
                 batch = build_batch(cfg)
@@ -236,28 +256,39 @@ class Engine:
             self.stats.cycle_frames = len(batch)
 
             while not self._stop.is_set():
+                # realtime replay is scheduled against absolute target times
+                # from the cycle start, so per-packet overhead never accumulates
+                cycle_start = time.perf_counter()
                 for idx, (key, frame) in enumerate(batch):
                     if self._stop.is_set():
                         break
-                    if delays is not None:
-                        if delays[idx] > 0:
-                            time.sleep(min(delays[idx], 5.0))
+                    if offsets is not None:
+                        self._sleep_until(cycle_start + offsets[idx])
                     else:
-                        limiter.wait()
+                        limiter.wait(self._stop)
+                    if self._stop.is_set():
+                        break
+                    sent = True
                     if sender is not None:
                         try:
                             sender.send(frame)
                         except OSError as e:
+                            sent = False
                             self.stats.errors += 1
                             self.stats.last_error = str(e)
-                    if pcap is not None:
-                        pcap.write(frame)
-                    self.stats.packets += 1
-                    self.stats.bytes += len(frame)
-                    self.stats.per_profile[key] = \
-                        self.stats.per_profile.get(key, 0) + 1
+                    # only frames that really left (or are file-only) count and
+                    # land in the pcap, so the pcap stays ground truth
+                    if sent:
+                        if pcap is not None:
+                            pcap.write(frame)
+                        self.stats.packets += 1
+                        self.stats.bytes += len(frame)
+                        self.stats.per_profile[key] = \
+                            self.stats.per_profile.get(key, 0) + 1
 
-                    if cfg.count and self.stats.packets >= cfg.count:
+                    # --count bounds attempts, so a dead interface still ends
+                    if cfg.count and (self.stats.packets
+                                      + self.stats.errors) >= cfg.count:
                         self._stop.set()
                         break
                     if cfg.duration and self.stats.elapsed >= cfg.duration:
@@ -266,7 +297,7 @@ class Engine:
                 if not cfg.loop:
                     break
                 # random mode: re-roll the variant + placement for the next cycle
-                if cfg.sprinkle_random and delays is None and not self._stop.is_set():
+                if cfg.sprinkle_random and offsets is None and not self._stop.is_set():
                     batch = build_batch(cfg)
         finally:
             if sender is not None:

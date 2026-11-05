@@ -14,7 +14,15 @@ LINKTYPE_ETHERNET = 1
 
 
 class PcapWriter:
-    def __init__(self, path: str, snaplen: int = 65535):
+    """Append frames to a classic pcap.
+
+    The file is flushed to disk at least every ``flush_interval`` seconds (and
+    on close), so a run killed by SIGKILL/OOM still leaves a readable capture
+    holding everything up to the last flush.
+    """
+
+    def __init__(self, path: str, snaplen: int = 65535,
+                 flush_interval: float = 1.0):
         self._fh = open(path, "wb")
         self._fh.write(struct.pack(
             "!IHHiIII",
@@ -22,6 +30,13 @@ class PcapWriter:
         ))
         self.count = 0
         self.bytes = 0
+        self.flush_interval = flush_interval
+        self._last_flush = time.monotonic()
+        self.flush()
+
+    def flush(self) -> None:
+        self._fh.flush()
+        self._last_flush = time.monotonic()
 
     def write(self, frame: bytes, ts: float | None = None) -> None:
         if ts is None:
@@ -32,6 +47,8 @@ class PcapWriter:
         self._fh.write(frame)
         self.count += 1
         self.bytes += len(frame)
+        if time.monotonic() - self._last_flush >= self.flush_interval:
+            self.flush()
 
     def close(self) -> None:
         try:

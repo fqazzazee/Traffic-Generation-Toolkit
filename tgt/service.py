@@ -7,12 +7,16 @@ present and the tgtctl PID-file daemon otherwise.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import List, Optional
 
+from .packet import Endpoints
+
 CONF_PATH = "/etc/tgt/tgt.conf"
+_DEFAULT_EP = Endpoints()          # `tgt run` defaults; omitted when unchanged
 PID_PATHS = ("/run/tgt.pid", "/tmp/tgt.pid")
 
 
@@ -39,7 +43,10 @@ def read_config(path: str = CONF_PATH) -> dict:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, val = line.partition("=")
-                val = val.strip().strip('"').strip("'")
+                try:                    # undo shell quoting, as `.` would
+                    val = "".join(shlex.split(val, comments=True))
+                except ValueError:
+                    val = val.strip().strip('"').strip("'")
                 out[key.strip()] = val
     except OSError:
         pass
@@ -47,10 +54,14 @@ def read_config(path: str = CONF_PATH) -> dict:
 
 
 def write_config(iface: str, run_args: str, path: str = CONF_PATH) -> tuple[bool, str]:
+    # The file is sourced by /bin/sh (tgtctl.sh, the systemd unit), so every
+    # value is shell-quoted: a path with spaces, quotes or `$(…)` stays data.
+    # TGT_RUN_ARGS itself is a shell-quoted argument list (see build_run_args)
+    # that the consumers expand with `eval set -- $TGT_RUN_ARGS`.
     body = (
         "# TGT service configuration — managed by the TGT TUI.\n"
-        f"TGT_IFACE={iface}\n"
-        f'TGT_RUN_ARGS="{run_args}"\n'
+        f"TGT_IFACE={shlex.quote(iface)}\n"
+        f"TGT_RUN_ARGS={shlex.quote(run_args)}\n"
     )
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -123,11 +134,22 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                    sprinkle: Optional[List[str]] = None,
                    sprinkle_random: bool = False,
                    sprinkle_ratio: float = 0.0,
-                   span: str = "access") -> str:
-    """Serialize a selection into a `tgt run` argument string for the service."""
+                   span: str = "access",
+                   replay_realtime: bool = False,
+                   pcap: Optional[str] = None,
+                   once: bool = False,
+                   client_ip: Optional[str] = None,
+                   server_ip: Optional[str] = None) -> str:
+    """Serialize a selection into a `tgt run` argument string for the service.
+
+    The result is shell-quoted (``shlex.split`` gives the argv back), so
+    paths containing spaces or quotes survive the round trip.
+    """
     parts: List[str] = []
     if replay:
         parts += ["--replay", replay]
+        if replay_realtime:
+            parts += ["--replay-realtime"]
     elif incident:
         parts += ["--incident", incident]
     elif env:
@@ -148,4 +170,12 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
     parts += ["--rate", f"{rate:g}"]
     if messages and messages != 5:
         parts += ["--messages", str(messages)]
-    return " ".join(parts)
+    if client_ip and client_ip != _DEFAULT_EP.client_ip:
+        parts += ["--client-ip", client_ip]
+    if server_ip and server_ip != _DEFAULT_EP.server_ip:
+        parts += ["--server-ip", server_ip]
+    if pcap:
+        parts += ["--pcap", pcap]
+    if once:
+        parts += ["--once"]
+    return " ".join(shlex.quote(p) for p in parts)

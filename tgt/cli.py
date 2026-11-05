@@ -10,16 +10,17 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import time
 
-from . import net, protocols, scenarios
+from . import __version__, net, protocols, scenarios
 from .config import RunConfig
 from .engine import Engine
 from .packet import Endpoints
 from . import enterprise
 
-VERSION = "1.5.0"
+VERSION = __version__
 
 
 # ---------------------------------------------------------------------------
@@ -187,23 +188,47 @@ def cmd_run(args) -> int:
               "file.", file=sys.stderr)
         return 2
 
-    print(f"TGT run: {cfg.summary()}")
-    eng = Engine(cfg, on_log=lambda m: print(f"  [engine] {m}"))
+    print(f"TGT run: {cfg.summary()}", flush=True)
+    eng = Engine(cfg, on_log=lambda m: print(f"  [engine] {m}", flush=True))
+    # SIGTERM (systemctl/podman stop, timeout) and SIGHUP stop the engine like
+    # Ctrl-C does, so the pcap is flushed + closed and the summary printed.
+    caught: list[int] = []
+
+    def _on_signal(signum, _frame):
+        caught.append(signum)
+        eng.stop()
+
+    old_handlers = _install_signal_handlers(_on_signal)
+    tty = sys.stdout.isatty()
+    last_line = time.monotonic()
     eng.start()
     try:
         while eng.is_alive():
             time.sleep(0.25)
             s = eng.stats
-            sys.stdout.write(
-                f"\r  sent={s.packets:<8} bytes={s.bytes:<10} "
-                f"pps={s.pps:7.1f} Mbps={s.mbps:6.2f} err={s.errors} "
-                f"t={s.elapsed:5.1f}s")
-            sys.stdout.flush()
+            line = (f"sent={s.packets:<8} bytes={s.bytes:<10} "
+                    f"pps={s.pps:7.1f} Mbps={s.mbps:6.2f} err={s.errors} "
+                    f"t={s.elapsed:5.1f}s")
+            if tty:                     # live, overwritten in place
+                sys.stdout.write(f"\r  {line}")
+                sys.stdout.flush()
+            elif time.monotonic() - last_line >= STATS_INTERVAL:
+                # logs/journald/pipes: a plain line every STATS_INTERVAL s
+                last_line = time.monotonic()
+                print(f"  {line}", flush=True)
+            if caught:
+                eng.join(timeout=3)
+                break
     except KeyboardInterrupt:
         print("\n  stopping…")
         eng.stop()
         eng.join(timeout=3)
-    print()
+    finally:
+        _restore_signal_handlers(old_handlers)
+    if tty:
+        print()
+    if caught:
+        print(f"  stopping on {signal.Signals(caught[0]).name}…")
     s = eng.stats
     print(f"summary: {s.packets} packets, {s.bytes} bytes, {s.errors} errors "
           f"in {s.elapsed:.1f}s")
@@ -213,6 +238,40 @@ def cmd_run(args) -> int:
     if s.last_error:
         print(f"last error: {s.last_error}")
     return 0 if s.errors == 0 else 1
+
+
+# Non-TTY stdout (service logs, pipes) gets one stats line this often.
+STATS_INTERVAL = 10.0
+_STOP_SIGNALS = ("SIGTERM", "SIGHUP")
+
+
+def _install_signal_handlers(handler) -> dict:
+    """Route SIGTERM/SIGHUP to ``handler``; returns the previous handlers.
+
+    Installing a handler also makes the process stoppable as PID 1 in a
+    container (the kernel drops default-action signals sent to PID 1).
+    A signal that is already ignored (e.g. SIGHUP under ``nohup``) stays so.
+    """
+    old = {}
+    for name in _STOP_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                continue
+            old[sig] = signal.signal(sig, handler)
+        except (ValueError, OSError):    # not the main thread / unsupported
+            pass
+    return old
+
+
+def _restore_signal_handlers(old: dict) -> None:
+    for sig, h in old.items():
+        try:
+            signal.signal(sig, h)
+        except (ValueError, OSError, TypeError):
+            pass
 
 
 def cmd_inventory(args) -> int:
@@ -339,6 +398,11 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command in (None, "tui"):
+        # SIGTERM/SIGHUP exit cleanly (curses restores the terminal) — and
+        # at all when running as PID 1 in a container
+        def _exit(signum, _frame):
+            raise SystemExit(128 + signum)
+        _install_signal_handlers(_exit)
         return cmd_tui(args)
     return {
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,

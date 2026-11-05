@@ -13,6 +13,10 @@ COPY tgt/ ./tgt/
 COPY pyproject.toml README.md docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh
 
-# The entrypoint auto-creates the tgt0 veth pair (if privileged) before running.
+# The entrypoint auto-creates the tgt0 veth pair (if privileged) before running,
+# then execs tgt as PID 1; tgt handles SIGTERM itself, so `podman stop` ends a
+# run cleanly (pcap flushed) without waiting for the SIGKILL timeout.
+# `--init` is optional (adds a zombie-reaping init in front of tgt).
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/opt/tgt/docker-entrypoint.sh"]
 CMD ["tui"]
