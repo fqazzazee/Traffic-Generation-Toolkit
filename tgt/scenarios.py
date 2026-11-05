@@ -38,6 +38,18 @@ SCENARIOS = {
         ["http", "dns", "ntp", "icmp", "arp"],
         "Non-OT traffic only — useful to confirm the sensor separates IT from "
         "OT and does not misclassify."),
+    "substation": Scenario(
+        "substation", "IEC 61850 Substation",
+        ["goose", "sv", "mms", "ptp", "iec104", "dnp3"],
+        "Station bus + process bus: GOOSE trips, 9-2LE sampled values, MMS "
+        "client/server with IED identity, PTP time, and IEC 104 / DNP3 "
+        "telecontrol to the SCADA gateway. GOOSE/SV/PTP are link-local."),
+    "profinet-cell": Scenario(
+        "profinet-cell", "PROFINET Cell",
+        ["pn-dcp", "pn-dcp-set", "pn-rt", "s7comm", "s7-id"],
+        "Siemens PROFINET cell: DCP Identify discovery, a DCP Set (IP / "
+        "NameOfStation change), cyclic RT IO data and S7 engineering "
+        "access. DCP/RT are raw Layer 2."),
 }
 
 
