@@ -23,7 +23,7 @@ Dragos**. Runs on a workstation, in **WSL**, or in a **Podman / Docker** contain
 
 - [What it does](#what-it-does) · [Quick start](#quick-start) · [The TUI](#the-tui)
 - Traffic: [Protocols](#protocols) · [Scenarios](#scenarios) · [Modeled networks](#modeled-networks) · [Your own environments](#your-own-environments) · [Realism & timing](#realism--timing)
-- **[Evaluating a monitor](#evaluating-a-monitor)** — ground truth, baseline, change detection, scoring
+- **[Evaluating a monitor](#evaluating-a-monitor)** — ground truth, baseline, change detection, scoring, [benchmark suites](#benchmark-suites-tgt-bench)
 - Attacks: [Incidents](#attack-incidents) · [Sprinkle](#sprinkle-malware-into-normal-traffic) · [Live injection](#control-api-and-tgt-ctl)
 - Running: [CLI](#cli-reference) · [Multiple interfaces](#send-on-several-interfaces) · [Control API](#control-api-and-tgt-ctl) · [Replay pcaps](#replay-a-pcap) · [Plugins](#plugins) · [Service](#run-as-a-service) · [WSL / Podman / Proxmox](#deployment) · [Sensor in another VM](#sensor-on-another-machine-or-vm)
 - [Verify](#verify) · [Authorized use](#authorized-use) · [Layout](#project-layout)
@@ -47,18 +47,23 @@ send on a real interface and let a switch or hypervisor mirror it; see
 
 **Highlights:**
 
-- **70+ byte-accurate protocols** — OT/ICS, IEC 61850 substation and PROFINET L2, building
-  automation, medical, IT, network infrastructure, remote access, vendor engineering —
-  each device stating its real **vendor, model, firmware and serial** on the wire.
-- **11 modeled networks** (4 built-in, 7 vertical sites: water, power, pipeline, auto,
-  hospital, smart building, pharma) with VLANs, NAT'd remote sites, per-OS **TCP/IP and
-  TLS (JA3/JA4) fingerprints** and **planted findings** — or describe your own in a JSON file.
+- **85+ byte-accurate protocols** — OT/ICS, IEC 61850 substation and PROFINET L2, building
+  automation, medical, IT, network infrastructure, remote access, vendor engineering
+  (incl. CODESYS V3), **secured OT** (CIP Security, S7comm-plus over TLS, OPC UA
+  SignAndEncrypt, IEC 104 / DNP3 over TLS, Modbus Security) and **serial gateways / IIoT**
+  (Modbus RTU over TCP, terminal servers, BACnet/SC, LoRaWAN) — each device stating its real
+  **vendor, model, firmware and serial** on the wire where the protocol carries it.
+- **12 modeled networks** (4 built-in, 8 vertical sites: water, power, pipeline, auto,
+  hospital, smart building, pharma, IIoT retrofit) with VLANs, NAT'd remote sites, devices
+  behind serial and LoRa gateways, per-OS **TCP/IP and TLS (JA3/JA4) fingerprints** and
+  **planted findings** — or describe your own in a JSON file.
 - **A real time model** — every conversation on its own period, request/response RTTs,
   long-lived polling sessions, a working-day profile, and a synthetic clock that writes a
   **multi-day pcap in minutes**.
 - **Ground truth and scoring** — `tgt inventory` says what a monitor *should* find, `--manifest`
   records what was actually sent, and `tgt score` grades the monitor's asset and alert export
-  into an HTML report.
+  into an HTML report — with **MITRE ATT&CK for ICS** coverage per technique. `tgt bench`
+  plays a fixed, seeded suite and turns the exports into one comparable **scorecard**.
 - **17 famous attack scenarios** you can sprinkle into normal traffic, inject live, or run as
   phases of a change-detection **campaign**.
 - pcap/pcapng replay with re-addressing · a live flow-diagram TUI · a control API · plugins ·
@@ -239,6 +244,28 @@ serial without an active scan. `tgt list` prints every key with a one-line descr
 | `ftp` · `tftp` · `http-fw` | 21/tcp, 69/udp, 80/tcp | cleartext FTP login, config backup + firmware upload · device TFTP image fetch · HTTP Basic firmware POST/PUT |
 | `s7plus` | 102/tcp | S7CommPlus (S7-1200/1500) session with **order number + firmware**, variable polls |
 | `fins` · `slmp` · `srtp` · `hart-ip` | 9600/udp, 5007, 18245, 5094/tcp | Omron controller data read (**model, version**) · Mitsubishi Read Type Name (**CPU model**) · GE SRTP register reads · HART-IP unique ID, long tag, PV |
+| `codesys` · `codesys-disc` | 11740/tcp, 1740/udp | CODESYS V3 runtime (WAGO PFC, Schneider M241/M251, Eaton XC300): **DeviceInfo** (vendor, device, firmware, serial), channel open, device + application login, project info, monitoring reads · gateway network scan + replies. No stock Wireshark dissector: decodes as TCP/UDP data |
+
+**Secured OT** — the same polls inside TLS / DTLS, so identity in the payload is no longer on
+the wire (certificates still are on TLS ≤ 1.2)
+
+| keys | port | carries · identity exposed |
+|---|---|---|
+| `enip-tls` · `enip-dtls` | 2221/tcp, 2221/udp | CIP Security: TLS 1.2 mutual auth around RegisterSession + CIP polls · Forward_Open over TLS, then class-1 I/O as DTLS 1.2 records · **client and server certificates** |
+| `s7plus-tls` | 102/tcp | S7-1500 V2.9+: COTP + InitSsl in clear, then TLS 1.3 inside COTP DT (tshark: `--disable-heuristic ses_cotp`, on its own capture) |
+| `opcua-sign-encrypt` | 4840/tcp | Basic256Sha256 OpenSecureChannel with **application certificate + thumbprint**, then encrypted MSG chunks |
+| `iec104-tls` · `dnp3-tls` | 19998, 19999/tcp | IEC 62351-3: TLS 1.2 mutual auth, the plaintext polls as records |
+| `modbus-sec` | 802/tcp | Modbus/TCP Security: TLS 1.2, client certificate carrying the **Modbus role** (tshark needs the role OID as a UAT entry) |
+
+**Serial gateways and IIoT** — field devices reached through a gateway; behind it they have
+no IP of their own (see `field_devices[]`)
+
+| keys | port | carries · identity exposed |
+|---|---|---|
+| `modbus-rtu-tcp` · `dnp3-serial` | 4000+N/tcp | Modbus RTU frames (slave id + CRC-16) or DNP3 serial link frames sent raw to a device server's port N, slaves polled in turn (tshark: `-d tcp.port==4001,mbrtu`, `-d tcp.port==4003,dnp3`) |
+| `realcom` · `realcom-cmd` · `moxa-discovery` | 950, 966/tcp, 4800/udp | Moxa RealCOM virtual COM port data + command channel (port setup, keep-alives) · NPort Administrator search broadcast + replies (**model**, MAC, IP) |
+| `bacnet-sc` | 443/tcp | BACnet Secure Connect: TLS 1.3 + WebSocket to the hub, heartbeats (opaque on the wire) |
+| `lorawan-udp` | 1700/udp | Semtech UDP packet forwarder: PUSH_DATA rxpk/stat JSON (**gateway EUI**, sensor DevAddr, frame counters), PULL_DATA, PULL_RESP + TX_ACK |
 
 ### TCP/IP stacks, TLS fingerprints and certificates
 
@@ -326,7 +353,7 @@ tgt run --env industrial-site  -i tgt0 --rate 500     # large Purdue-model plant
 
 ### Packaged sites
 
-Seven vertical sites ship as env files in `tgt/envs/sites/` and load like built-ins
+Eight vertical sites ship as env files in `tgt/envs/sites/` and load like built-ins
 (`--env water-utility`). Each records its **planted findings** in the ground truth
 (`tgt inventory -e SITE -f json` → `findings[]`), backed by traffic on the wire:
 
@@ -335,10 +362,11 @@ Seven vertical sites ship as env files in `tgt/envs/sites/` and load like built-
 | `water-utility` | 55 · 13 | AVEVA-style SCADA pair, Rockwell CompactLogix + PowerFlex, Modicon M580 + Danfoss VFDs, Hach analyzers; **8 lift stations behind cellular-modem NAT** (Sierra, Digi, Moxa), SCADAPack RTUs over DNP3/Modbus | unauthenticated VNC HMI · cleartext Telnet to a modem · default SNMP community · EOL WinXP HMI · EOL SCADAPack 334E |
 | `electric-substation` | 24 · 5 | SEL-3530 RTAC polling SEL, ABB, GE and SIPROTEC IEDs over MMS/DNP3, GOOSE, 9-2LE merging units, PTP grandmaster; SCADA (DNP3 + IEC 104) across the WAN | GOOSE from an unexpected publisher · relay engineering from corporate · rogue PTP grandmaster · SEL factory passwords over Telnet |
 | `oil-gas-pipeline` | 50 · 10 | gas-control centre, FortiGate VPN + vendor jump host, **5 compressor/meter stations over VSAT NAT** (~650 ms RTT): ControlLogix, M580, SICAM A8000 (IEC 104), ROC800 / Totalflow, SCADAPack | vendor remote access · metering config write from a corporate PC · flat station network · EOL Win7 HMI |
-| `auto-assembly` | 90 · 6 | S7-1500R redundant pair, ET 200SP, KUKA robots on PROFINET + MRP; PLCnext, Beckhoff, WAGO; CompactLogix DLR rings, PowerFlex, FANUC; IOT2050 edge gateway to a cloud MQTT broker | PROFINET DCP Set-IP from a laptop · duplicate NameOfStation · VNC on a Win7 robot controller · cleartext MQTT to the internet |
+| `auto-assembly` | 94 · 6 | S7-1500R redundant pair, ET 200SP, KUKA robots on PROFINET + MRP; PLCnext, Beckhoff, WAGO; CompactLogix DLR rings, PowerFlex, FANUC; CODESYS V3 controllers (WAGO, Modicon M251, Eaton XC300) and their engineering laptop in the paint shop; IOT2050 edge gateway to a cloud MQTT broker | PROFINET DCP Set-IP from a laptop · duplicate NameOfStation · VNC on a Win7 robot controller · cleartext MQTT to the internet |
 | `hospital-iomt` | 72 · 8 | EHR, HL7 engine, PACS/RIS/LIS; GE CT + Siemens MRI over DICOM, Mindray monitors → HL7, 20 BD Alaris pumps, nurse call, BACnet BMS | cleartext PHI (HL7/DICOM) · EOL XP Embedded CR reader · infusion pump talking to the internet · sanctioned MRI vendor remote service (info) |
 | `smart-building-dc` | 84 · 6 | Niagara/JACE, Desigo, JCI FECs on BACnet (polls + COV), KNX IP router; APC/Raritan PDUs, UPS, CRAH, chillers, PM5560 meters; Axis/Hikvision cameras, Mercury access control, guest Wi-Fi | default SNMP communities · Hikvision P2P cloud phone-home · BMS reachable from guest Wi-Fi |
-| `pharma-batch` | 43 · 5 | FactoryTalk Batch, PI historian, MES, DeltaV + ControlLogix 5580 PlantPAx units, POINT I/O, PowerFlex 755, GxP audit syslog | recipe write from a corporate host · shared service account · corporate → plant bypassing the DMZ |
+| `pharma-batch` | 43 · 5 | FactoryTalk Batch, PI historian, MES, DeltaV + ControlLogix 5580 PlantPAx units, POINT I/O, PowerFlex 755, GxP audit syslog; **CIP Security** (HMIs over TLS, PLC-to-PLC I/O over DTLS) and an OPC UA SignAndEncrypt historian link next to plaintext CIP | recipe write from a corporate host · shared service account · corporate → plant bypassing the DMZ · controllers accept plaintext CIP next to CIP Security |
+| `iiot-retrofit` | 23 · 6 (+21 behind gateways) | Moxa NPort device servers (ABB drives as Modbus RTU over TCP, SEL relays over DNP3 serial), an MGate Modbus gateway to PM5330 meters, a boiler RTU through RealCOM; Kerlink / MultiTech LoRaWAN gateways with Milesight / Dragino sensors; BACnet/SC hub with Desigo and JACE controllers | EOL RTU reached through RealCOM from a Win7 HMI · unauthenticated raw-TCP serial tunnels carrying setpoint writes · LoRaWAN forwarded over unauthenticated Semtech UDP across zones |
 
 **NAT'd remote sites.** In `water-utility` and `oil-gas-pipeline` the remote stations sit
 behind their modem's or VSAT terminal's NAT, as a control-centre SPAN sees them: every
@@ -408,7 +436,7 @@ level and FQDN. The JSON adds:
 
 | key | contents |
 |---|---|
-| `hosts[]` | the rows above + rack `modules`, `known_cves`, `embedded`, `edr`, and per-field **`observability`**: whether a passive monitor can learn each field from the traffic this host actually sends, and from which protocol |
+| `hosts[]` | the rows above + rack `modules`, `known_cves`, `embedded`, `edr`, `encrypted[]` (secured OT the host speaks, and whether its certificates are in clear), and per-field **`observability`**: whether a passive monitor can learn each field from the traffic this host actually sends, and from which protocol. Devices behind a gateway are rows with `behind` set and no IP or MAC: known assets that cannot be discovered as IP assets, so `tgt score` leaves them out of discovery |
 | `segments[]` | VLAN, subnet, zone, gateway, NAT |
 | `flows[]` | the expected communication baseline: client, server, protocol, port, period and jitter |
 | `findings[]` | planted issues (packaged sites): id, title, severity, category, hosts, flows |
@@ -459,7 +487,8 @@ appear in `tgt list` by their `key`. `tgt/envs/` has exports of the built-ins,
 | section | keys |
 |---|---|
 | `hosts[]` | `name`, `ip`, `role`, `os` (fingerprint key: `win10`, `linux`, `rockwell`, `siemens`, `ios`, `rtos`, `linux-embedded`, …; the old `embedded` / `embedded-linux` still load) or a catalog `model` that fills them; optional `vendor`, `product`, `mac`, `firmware`, `serial`, `fqdn`, `meta`; `count` + `ip_start` repeat an entry (`name` is a `{n}` template) |
-| `flows[]` | `client` + `server`, or selectors `from` [+ `to`]: a host name (globs ok), `role:`, `zone:`, `model:`, `*`, each optionally `@SEGMENT`; `mode` `all` or `round-robin`; `proto`; optional `period` / `jitter` for the timed scheduler. No `to` = a self-announcement |
+| `flows[]` | `client` + `server`, or selectors `from` [+ `to`]: a host name (globs ok), `role:`, `zone:`, `model:`, `*`, each optionally `@SEGMENT`; `mode` `all` or `round-robin`; `proto`; optional `period` / `jitter` for the timed scheduler; `"secure": true` picks the protocol's secured variant (`enip` → `enip-tls`, …; a host's `meta` `"secure": true` makes it the default, and a model or firmware that can't is an error). No `to` = a self-announcement |
+| `field_devices[]` | devices with no IP behind a gateway host: `name`, `behind`, `via` (`modbus-rtu-tcp`, `dnp3-serial`, `realcom`, `modbus` gateway, `lorawan-udp`), `port`, `address`, optional `model`, `vendor`, `product`, `role`, `firmware`, `serial`, `count` |
 | `segments[]` | `name`, `vlan`, `subnet`, `zone`, optional `gateway`, `gateway_mac`, `wan_rtt_ms`, `nat` (`outside_ip`, `outside_mac`, `local`) |
 | `external[]` | internet endpoints (public IP, `fqdn`), named in flows like hosts |
 | `findings[]` | `id`, `title`, `severity`, `category`, `hosts`, `flows`, `detail` — listed in the inventory |
@@ -632,6 +661,44 @@ wrong or missing, missed and false-positive assets, baseline coverage and detect
 | **baseline coverage** | (with `--zeek`) expected flows seen in `conn.log`, plus unexpected conversations |
 | **detection rate** | manifest events (attack flows, campaign changes) matched by an alert in the right category, touching the event's hosts, inside the window (`--skew` before, `--tolerance` after) |
 | **time to detect** | alert time minus event start, median overall and per category; plus false and unmapped alerts |
+| **technique coverage** | per **MITRE ATT&CK for ICS** (and Enterprise, for IT stages) technique: events, detected, rate and median time to detect |
+
+**ATT&CK techniques.** Every attack event in the manifest carries the technique IDs its
+traffic shows (`T0846` Remote System Discovery for a scan, `T0855` Unauthorized Command
+Message for IEC 104 or Modbus writes, `T0843` Program Download, `T1071.001` web C2, …);
+`tgt list` shows them per incident and the table is [`tgt/attack_ics.json`](tgt/attack_ics.json).
+Only techniques visible on the wire are tagged (no ransomware *impact*, for instance). An
+alert map may tag alerts too — a `technique` column of IDs, or a `techniques` table of
+`{title regex: ID}` — and `--strict-technique` then only lets an alert match an event that
+shares a technique (a parent ID such as `T1071` matches its sub-techniques).
+
+### Benchmark suites (`tgt bench`)
+
+Running baseline → attacks → changes by hand is easy to get subtly different each time.
+`tgt bench` plays a **packaged, seeded suite** so two monitors — or two versions of one —
+see byte-identical traffic, then turns their exports into **one scorecard** you can compare:
+
+```bash
+tgt bench list                                                    # quick (1 h), standard (2 days)
+sudo tgt bench run quick -i tgt0 --speed 30 --out bench-q         # ~2 min on the wire
+tgt bench run standard --clock synthetic --pcap-dir pcaps --out bench-s   # offline import
+tgt bench score bench-q --assets export.csv --map my-map.json \
+                --alerts alerts.csv --alert-map my-alerts.json --label "monitor A" \
+                --out a.json --html a.html
+tgt bench compare a.json b.json --html a-vs-b.html
+```
+
+A suite (`tgt/benches/*.json`) is an ordered list of fixed-seed stages on one environment: a
+**baseline** to learn, an **incidents** window with attacks injected at fixed offsets, and a
+**campaign** of asset and conversation changes. `bench run` writes a bundle — a manifest per
+stage, a merged `manifest.json`, optional pcaps and `bench.json` (suite, seeds, stage windows,
+a fingerprint of the traffic). `bench score` scores the asset export once against the end
+state of the whole bench, and detections per stage. The scorecard has discovery recall and
+precision, field accuracy, change-detection and attack-detection rates with median times to
+detect, technique coverage, false alerts, and the suite's pass / fail thresholds.
+`bench compare` puts two scorecards side by side and warns when their traffic fingerprints
+differ. `tgt bench score DIR --self-test-export OUT` writes perfect exports to check the
+pipeline end to end.
 
 ### Tips for Claroty CTD (and similar monitors)
 
@@ -756,6 +823,7 @@ tgt run [options]
       --sprinkle N[,N]      mix incident(s) into the base traffic
       --sprinkle-ratio F    malware fraction 0.0–0.9      --sprinkle-random
       --replay FILE         replay a pcap/pcapng (see Replay a pcap)
+      --remap-env ENV       replay onto an environment's hosts  --remap-report F
  where
   -i, --iface A[,B]         send on interface(s) (root); a,b = same frames to each
       --pcap PATH           write frames to a pcap
@@ -776,7 +844,10 @@ tgt campaign PLAN [--list | --check] [--force] [-i IFACE] [--pcap F] [--manifest
                   [--api [HOST:]PORT --api-token T]
 tgt score (--manifest RUN.json | --truth INV.json) --assets EXPORT --map MAP
           [--alerts F --alert-map MAP] [--zeek DIR] [--tolerance S] [--skew S] [--html F] [--json F]
-          | --self-test-export OUT.csv
+          [--strict-technique] | --self-test-export OUT.csv
+tgt bench list | run SUITE --out DIR [-i IFACE | --pcap-dir D] [--speed X] [--clock synthetic]
+tgt bench score DIR --assets EXPORT --map MAP [--alerts F --alert-map MAP] [--label L] [--html F]
+tgt bench compare A.json B.json [--html F]
 tgt ctl [--api ADDR] [--token T] status|stop|pause|resume|rate PPS|inject INCIDENT|manifest
 ```
 
@@ -843,9 +914,22 @@ tgt run --replay plant.pcap -i tgt0 \
 Reads classic libpcap (both byte orders, µs/ns) and **pcapng** (`--replay-tsresol` overrides
 its timestamp resolution); Ethernet, raw-IP and Linux SLL. Files stream record by record, so
 multi-gigabyte captures replay in constant memory. `--remap-ip` / `--remap-subnet` (host bits
-kept) / `--remap-mac` rewrite IP and ARP addresses and recompute checksums; `--vlan N` retags
-every frame (`0` strips the tag). Long idle gaps are shortened. TUI: **Run → Preset → replay a
-pcap file…**.
+kept) / `--remap-mac` rewrite IPv4 and **IPv6** addresses (mixed in one run), ARP and NDP, and
+recompute checksums — IPv6 extension headers and fragments are walked, and `--remap-mac` also
+rewrites EUI-64 addresses and NDP link-layer options; `--vlan N` retags every frame (`0` strips
+the tag). Long idle gaps are shortened. TUI: **Run → Preset → replay a pcap file…**.
+
+**Replay onto a modeled network.** `--remap-env ENV` profiles the capture's hosts (ports
+served and used, OUI, TTL), gives each internal host a free host of a compatible role and
+vendor in the environment — same IP, MAC and VLAN as that host — and keeps external hosts,
+routers and anything without a match as they are. The mapping is printed (`--remap-report
+F.json` writes it) and the run manifest records it, so `tgt score` grades against exactly
+the hosts the replay became:
+
+```bash
+tgt run --replay plant.pcap --remap-env industrial-site --remap-report map.json \
+        --manifest replay.json -i tgt0
+```
 
 ---
 
@@ -1073,15 +1157,17 @@ loopback unless you need it elsewhere, and then behind a token.
 ```
 tgt/
   cli · tui · engine · sender · net · config · service      run, UI, live send, veth, service glue
-  packet · pcap · pcapread · replay · rewrite               frames, pcap write, pcap/pcapng replay + remap
+  packet · pcap · pcapread · replay · rewrite · remapenv    frames, pcap write, pcap/pcapng replay, v4/v6 remap, remap onto an env
   protocols                                                 registry + IT/classic OT builders
   protocols_ot · protocols_ind · protocols_infra            OT identity/ops · PROFINET/61850/PTP · SNMP/LLDP/MQTT…
   protocols_eng · protocols_site · protocols_util           remote access/vendor eng · ring/medical/building · SEL
+  protocols_codesys · protocols_sec · protocols_iiot        CODESYS V3 · secured OT (TLS/DTLS) · serial gateways, BACnet/SC, LoRaWAN
   stacks · tls                                              per-OS TCP/IP stacks · TLS fingerprints + certificates
   enterprise · devices · envfile · inventory                environments · device catalog · env files · ground truth
   scenarios · incidents                                     protocol mixes · attack scenarios
   timing · schedule · campaign                              time model · timed scheduler · phased campaigns
   manifest · score · scoremaps/                             run manifest · tgt score · column/alert maps
+  techniques · attack_ics.json · bench · benches/           ATT&CK tags · technique table · tgt bench · suites
   control · api · plugins                                   live control · HTTP API · plugin loader
   envs/ (built-in exports, examples, sites/) · campaigns/   data files
 examples/plugins/   acme_plant.py (+ env file, alert map)
