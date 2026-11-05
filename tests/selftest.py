@@ -1769,9 +1769,10 @@ def test_engine_failed_sends_not_counted_or_written() -> None:
 
 def test_replay_realtime_keeps_original_timing() -> None:
     import time
-    from tgt.engine import replay_offsets
-    check(replay_offsets([10.0, 10.5, 10.4, 30.0]) == [0.0, 0.5, 0.5, 5.5],
-          "replay_offsets: gaps not clamped to [0, 5]")
+    from tgt.replay import gap
+    ts = [10.0, 10.5, 10.4, 30.0]
+    check([gap(a, b) for a, b in zip(ts, ts[1:])] == [0.5, 0.0, 5.0],
+          "replay gap: not clamped to [0, 5]")
     frame = protocols.dns_flow(Endpoints(), 1)[0]
     span, n = 0.6, 1200                     # 0.5 ms gaps: drift would show
     with tempfile.TemporaryDirectory() as d:
@@ -5733,11 +5734,15 @@ def test_w4c_injection_keeps_seeded_baseline() -> None:
     base, _ = run(False)
     b1, inj1 = run(True)
     b2, inj2 = run(True)
-    check(len(inj1) > 1000 and len(b1) > 1000,
+    # passes build on the injection worker, so how many injected frames
+    # an unpaced run interleaves depends on timing; what they are does not
+    check(len(inj1) > 50 and len(inj2) > 50 and len(b1) > 1000,
           f"injection run sizes {len(b1)}/{len(inj1)}")
-    check(base[:len(b1)] == b1 and b1 == b2,
+    check(base[:len(b1)] == b1 and base[:len(b2)] == b2,
           "seeded baseline frames changed by an injection")
-    check(inj1 == inj2, "injected frames not reproducible from the seed")
+    m = min(len(inj1), len(inj2))
+    check(inj1[:m] == inj2[:m],
+          "injected frames not reproducible from the seed")
     # isolated_build restores the caller's build context
     ctx = protocols.begin_build(9, 4)
     with protocols.isolated_build(1, 1):
@@ -6380,6 +6385,138 @@ def test_incident_mapping_never_self_flows() -> None:
             enterprise.get("electric-substation"))
         check(len({h.name for h in m.values()}) == len(m),
               "wannacry hosts collapse onto one substation host")
+
+
+# -- PR #63 review fixes: pause gate, injection worker, API, sender ---------
+def test_review_pause_gate_and_paused_time() -> None:
+    """RunControl.gate holds a frame through a pause that began while the
+    engine was waiting to send it, and paused_for counts the current
+    pause (cycle-mode --duration excludes paused time)."""
+    import threading
+    import time
+    from tgt.control import RunControl
+    rc, stop = RunControl(), threading.Event()
+    check(rc.gate(stop), "gate: blocks while running")
+    rc.pause()
+    out = []
+    t = threading.Thread(target=lambda: out.append(rc.gate(stop)))
+    t.start()
+    time.sleep(0.35)
+    check(not out and t.is_alive(), "gate: did not hold during a pause")
+    check(rc.paused_for() >= 0.3, f"paused_for {rc.paused_for():.2f}")
+    rc.resume()
+    t.join(2)
+    check(out == [True], f"gate after resume: {out}")
+    check(rc.paused_total >= 0.3, "paused_total not accumulated")
+    rc.pause()
+    out.clear()
+    t = threading.Thread(target=lambda: out.append(rc.gate(stop)))
+    t.start()
+    stop.set()
+    t.join(2)
+    check(out == [False], f"gate after stop while paused: {out}")
+
+
+def test_review_injection_worker() -> None:
+    """Injection passes build on a worker; a pass that builds no frames
+    fails the injection (no rebuild per base frame), and the build is
+    addressed onto the engine's current environment (a campaign phase)."""
+    import threading
+    from tgt import control, enterprise
+    from tgt.engine import Engine
+    cfg = RunConfig(env="it-org", seed=3, rate=0, count=3000,
+                    clock="synthetic", start_time="2026-11-05T14:00:00Z")
+    eng = Engine(cfg)
+    calls = []
+
+    def empty(inj, n):
+        calls.append(n)
+        return []
+    eng.control._build = empty
+    inj = eng.control.inject("wannacry", duration=60.0)
+    eng.start()
+    eng.join(60)
+    check(inj.state == "failed" and "no frames" in inj.error,
+          f"empty injection: {inj.state} {inj.error!r}")
+    check(len(calls) == 1, f"empty injection rebuilt {len(calls)} times")
+    # env_now: the injection lands on the environment the engine sends now
+    ot = enterprise.get("ot-plant")
+    fr = control.build_incident(cfg, "industroyer", 1, env=ot)
+    ips = {h.ip for h in ot.hosts}
+    seen = set()
+    for _, f, _ in fr:
+        off = 18 if f[12:14] == b"\x81\x00" else 14
+        if f[off - 2:off] == b"\x08\x00":
+            seen.add(".".join(map(str, f[off + 12:off + 16])))
+    check(seen & ips, "build_incident(env=) ignored the given environment")
+
+
+def test_review_api_rejects_close_connection() -> None:
+    """A rejected request closes the connection (its unread body is never
+    parsed as the next request); a negative Content-Length is a 400."""
+    import http.client
+    from tgt import api
+    from tgt.engine import Engine
+    eng = Engine(RunConfig(profiles=["modbus"], rate=10))
+    srv = api.ControlServer(eng, "127.0.0.1", 0, token="t0k").start()
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
+        c.request("POST", "/inject", body="incident=wannacry",
+                  headers={"Content-Type":
+                           "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        r.read()
+        check(r.status == 401 and r.getheader("Connection") == "close",
+              f"api: rejected POST {r.status} {r.getheader('Connection')}")
+        c.close()
+        c = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
+        c.putrequest("POST", "/rate?pps=5")
+        c.putheader("Authorization", "Bearer t0k")
+        c.putheader("Content-Length", "-1")
+        c.endheaders()
+        r = c.getresponse()
+        r.read()
+        check(r.status == 400, f"api: negative Content-Length -> {r.status}")
+        c.close()
+    finally:
+        srv.close()
+
+
+def test_review_sender_reopens_deleted_iface() -> None:
+    """A send that fails because the interface is gone drops that socket
+    and reopens the interface by name on the retry schedule."""
+    import errno as _errno
+    from tgt.sender import RawSender
+
+    class Gone:
+        closed = False
+
+        def send(self, frame):
+            raise OSError(_errno.ENXIO, "No such device or address")
+
+        def close(self):
+            Gone.closed = True
+
+    class Fine:
+        def send(self, frame):
+            return len(frame)
+
+        def close(self):
+            pass
+    s = RawSender("a,b")
+    s.socks = {"a": Fine(), "b": Gone()}
+    s.send(b"x" * 60)
+    check(s.socks["b"] is None and Gone.closed and s._retry_at.get("b"),
+          "sender: dead-ifindex socket kept")
+    check(s.counters["a"]["packets"] == 1 and s.counters["b"]["errors"] == 1,
+          f"sender counters {s.counters}")
+    s.socks = {"a": Fine(), "b": Fine()}
+    s.socks["b"] = type("Down", (), {
+        "send": lambda self, f: (_ for _ in ()).throw(
+            OSError(_errno.ENETDOWN, "Network is down")),
+        "close": lambda self: None})()
+    s.send(b"x" * 60)
+    check(s.socks["b"] is not None, "sender: link-down socket dropped")
 
 
 def main() -> int:

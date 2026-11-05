@@ -6,4 +6,4 @@ Pure Python standard library — no scapy, no external packages.
 """
 # The one place the version lives: pyproject.toml reads it (dynamic version)
 # and `tgt --version` prints it.
-__version__ = "1.5.0"
+__version__ = "2.0.0"
