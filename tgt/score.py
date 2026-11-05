@@ -503,7 +503,7 @@ def read_export(path: str, mapping: Dict[str, Any]) -> Tuple[List[Dict], Dict]:
         if rec["ips"] or rec["macs"] or rec["name"]:
             out.append(rec)
     return out, {"rows": len(rows), "columns": present,
-                 "protocol_ignore": sorted(ignore)}
+                 "protocol_ignore": sorted(ignore), "normalize": norm}
 
 
 # --------------------------------------------------------------------------
@@ -570,7 +570,8 @@ def _truth_asset(h: Dict, new: bool = False) -> Dict[str, Any]:
         "ip": ip, "mac": norm_mac(h.get("mac") or ""),
         "vlan": _vlan(h.get("vlan")), "role": h.get("role", ""),
         "fields": fields, "protocols": protos, "new": new,
-        "emitted": True, "first_seen": None,
+        # a host behind NAT (not on this capture) never reaches the monitor
+        "emitted": not h.get("nat_hidden"), "first_seen": None,
     }
 
 
@@ -1076,6 +1077,10 @@ def score(truth: Truth, rows: List[Dict], export_info: Dict[str, Any],
                      "inferred": {"n": 0, "reported": 0, "correct": 0,
                                   "partial": 0, "wrong": 0}}
     proto = {"assets": 0, "tp": 0, "exported": 0, "truth": 0}
+    # the map's normalize table renames export values onto canonical
+    # spellings ("Rockwell Automation" -> "Rockwell"); truth values get the
+    # same renaming so a value spelled like TGT's still compares equal
+    norm = export_info.get("normalize") or (lambda f, v: v)
     ttds = []
     per_asset = []
     for a in truth.assets:
@@ -1100,7 +1105,9 @@ def score(truth: Truth, rows: List[Dict], export_info: Dict[str, Any],
             if not cands or not cols.get(f):
                 continue
             got = r[f]
-            outcome = compare(f, got, cands) if got else "missing"
+            outcome = compare(f, got, list(dict.fromkeys(
+                list(cands) + [norm(f, c) for c in cands]))) \
+                if got else "missing"
             ent["fields"][f] = {"truth": cands[0], "got": got,
                                 "observable": observable, "outcome": outcome}
             agg = fields[f]["observable" if observable else "inferred"]
@@ -1426,15 +1433,57 @@ def to_html(res: Dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 # CLI
 
+# --------------------------------------------------------------------------
+# self-test: the export a perfect monitor would produce
+
+EXPORT_COLUMNS = ("ip", "mac", "vlan", "name") + FIELDS + ("protocols",
+                                                            "first_seen")
+
+
+def perfect_export(truth: Truth) -> List[Dict[str, str]]:
+    """Rows (``EXPORT_COLUMNS``, readable with the ``generic`` map) a perfect
+    monitor would export for ``truth``: every asset that put traffic on the
+    wire, once, with only the identity values the wire reveals (the NIC
+    vendor where the MAC OUI is the only vendor evidence, model / firmware /
+    serial / OS only where some flow carries them), the protocols it serves
+    or uses and when it was first seen. Scoring it against the same truth
+    gives 100 % — the scorer's and the inventory's self-consistency check."""
+    rows = []
+    for a in truth.population():
+        row = {"ip": a["ip"] or "", "mac": a["mac"] or "",
+               "vlan": "" if a["vlan"] is None else str(a["vlan"]),
+               "name": a["name"]}
+        for f in FIELDS:
+            cands, observable = a["fields"][f]
+            row[f] = cands[0] if observable and cands else ""
+        row["protocols"] = ";".join(sorted(a["protocols"]))
+        row["first_seen"] = _iso(a["first_seen"]) or ""
+        rows.append(row)
+    return rows
+
+
+def write_perfect_export(truth: Truth, path: str) -> int:
+    rows = perfect_export(truth)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS, lineterminator="\n")
+        w.writeheader()
+        w.writerows(rows)
+    return len(rows)
+
+
 def add_arguments(p) -> None:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--manifest", metavar="RUN.json",
                      help="run manifest from 'tgt run --manifest'")
     src.add_argument("--truth", metavar="INVENTORY.json",
                      help="'tgt inventory -f json' document")
-    p.add_argument("--assets", required=True, metavar="EXPORT",
+    p.add_argument("--self-test-export", metavar="OUT.csv",
+                   help="write the asset export a perfect monitor would "
+                        "produce for this truth (generic map) and exit; "
+                        "scoring it must give 100%%")
+    p.add_argument("--assets", metavar="EXPORT",
                    help="the monitor's asset export (CSV/JSON/Zeek log)")
-    p.add_argument("--map", required=True, metavar="MAP",
+    p.add_argument("--map", metavar="MAP",
                    help="column map: a path or a bundled name (generic, "
                         "zeek-known-hosts, claroty-ctd, nozomi)")
     p.add_argument("--zeek", metavar="DIR",
@@ -1459,6 +1508,14 @@ def add_arguments(p) -> None:
 def run(args) -> int:
     try:
         truth = load_truth(args.manifest or args.truth)
+        if getattr(args, "self_test_export", None):
+            n = write_perfect_export(truth, args.self_test_export)
+            print(f"wrote {args.self_test_export}: {n} assets (score it "
+                  "with --map generic)", file=sys.stderr)
+            return 0
+        if not args.assets or not args.map:
+            raise ScoreError("--assets and --map are required (or "
+                             "--self-test-export)")
         mapping = load_json_spec(args.map, "map")
         rows, info = read_export(args.assets, mapping)
         info["source"] = args.assets

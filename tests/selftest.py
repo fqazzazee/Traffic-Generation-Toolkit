@@ -5779,6 +5779,91 @@ def test_w4c_os_fingerprint_aliases() -> None:
           "inventory still shows the old embedded OS labels")
 
 
+def test_w4c_score_self_test_is_perfect() -> None:
+    """A perfect monitor's export (score.perfect_export) scores 100 % on
+    every built-in env and packaged site: discovery, observable fields
+    (vendor included, with the map's normalize table applied to both sides)
+    and protocols; NAT-hidden hosts are not in the population, as in a run
+    manifest."""
+    import json
+    from tgt import cli, envfile, inventory, score
+    mapping = score.load_json_spec("generic", "map")
+
+    def grade(truth, d, name):
+        path = os.path.join(d, name + ".csv")
+        score.write_perfect_export(truth, path)
+        rows, info = score.read_export(path, mapping)
+        return score.score(truth, rows, info)
+
+    def perfect(res, what):
+        disc, pr = res["discovery"], res["protocols"]
+        acc = {f: res["fields"][f]["observable"]["accuracy"]
+               for f in score.FIELDS}
+        check(disc["recall"] == 1.0 and disc["precision"] == 1.0 and
+              all(v in (None, 1.0) for v in acc.values()) and
+              pr["precision"] == 1.0 and pr["recall"] == 1.0,
+              f"self-score {what}: recall {disc['recall']} precision "
+              f"{disc['precision']} fields {acc} protocols "
+              f"{pr['precision']}/{pr['recall']}")
+    pops = {}
+    with tempfile.TemporaryDirectory() as d:
+        for env in _w4c_envs():
+            truth = score.Truth(inventory.to_json(env), env.key)
+            res = grade(truth, d, env.key)
+            perfect(res, env.key)
+            pops[env.key] = {a["id"] for a in truth.population()}
+            check(res["fields"]["vendor"]["observable"]["n"] > 0,
+                  f"{env.key}: no vendor scored")
+        # manifest truth: same population (who really emitted) and 100 %
+        envfile.load_user_envs(warn=lambda m: None, force=True)
+        for key in ("it-org", "oil-gas-pipeline"):
+            m = _manifest_run(d, key, RunConfig(env=key, seed=4,
+                                                loop=False), 0)
+            truth = score.Truth(m, key)
+            perfect(grade(truth, d, key + "-m"), key + " (manifest)")
+            check({a["id"] for a in truth.population()} == pops[key],
+                  f"{key}: inventory and manifest populations differ")
+        # the CLI writes the same export
+        nat = next(e for e in _w4c_envs() if e.key == "oil-gas-pipeline")
+        inv = os.path.join(d, "inv.json")
+        with open(inv, "w") as f:
+            json.dump(inventory.to_json(nat), f)
+        out = os.path.join(d, "self.csv")
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = cli.main(["score", "--truth", inv, "--self-test-export",
+                           out])
+        rows, _ = score.read_export(out, mapping)
+        check(rc == 0 and len(rows) == len(pops[nat.key]) <
+              len(nat.hosts), "tgt score --self-test-export")
+
+
+def test_w4c_tshark_expert_every_env() -> None:
+    """Optional: one seeded cycle of every built-in env and packaged site
+    has no tshark expert errors and no warnings but deliberate RSTs."""
+    import subprocess
+    if not shutil_which("tshark"):
+        _skipped.append("test_w4c_tshark_expert_every_env")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        for env in _w4c_envs():
+            path = os.path.join(d, env.key + ".pcap")
+            protocols.begin_build(8, 0)
+            with PcapWriter(path) as w:
+                for _, f in env.build(2):
+                    w.write(f)
+            ex = subprocess.run(["tshark", "-r", path, "-q", "-z",
+                                 "expert,warn"], capture_output=True,
+                                text=True).stdout
+            bad = [ln.strip() for ln in ex.splitlines()
+                   if ln.strip()[:1].isdigit()
+                   and "Connection reset (RST)" not in ln
+                   and not _tshark_dissector_bug(ln)]
+            check("Errors (" not in ex and not bad,
+                  f"tshark expert {env.key}: {bad[:4]}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
