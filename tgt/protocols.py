@@ -45,6 +45,8 @@ class TcpSession:
         else:
             seq, ack = self.s_seq, self.c_seq
             sport, dport = self.dport, self.sport
+        if flags == P.SYN:              # bare SYN: nothing to acknowledge yet
+            ack = 0
         seg = P.tcp(
             self.ep.client_ip if from_client else self.ep.server_ip,
             self.ep.server_ip if from_client else self.ep.client_ip,
