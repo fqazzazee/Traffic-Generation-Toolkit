@@ -139,11 +139,22 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                    pcap: Optional[str] = None,
                    once: bool = False,
                    client_ip: Optional[str] = None,
-                   server_ip: Optional[str] = None) -> str:
+                   server_ip: Optional[str] = None,
+                   seed: Optional[int] = None,
+                   manifest: Optional[str] = None,
+                   schedule: str = "cycle",
+                   speed: float = 1.0,
+                   day_profile: Optional[str] = None,
+                   min_period: float = 0.0,
+                   duration: float = 0.0,
+                   clock: str = "wall") -> str:
     """Serialize a selection into a `tgt run` argument string for the service.
 
     The result is shell-quoted (``shlex.split`` gives the argv back), so
-    paths containing spaces or quotes survive the round trip.
+    paths containing spaces or quotes survive the round trip. ``seed`` makes
+    the service's traffic reproducible and ``manifest`` keeps its ground
+    truth; ``schedule="timed"`` (with ``speed``, ``day_profile``,
+    ``min_period``) selects the time model, in which ``rate`` is only a cap.
     """
     parts: List[str] = []
     if replay:
@@ -167,7 +178,23 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
             parts += ["--sprinkle-random"]
         if sprinkle_ratio and sprinkle_ratio > 0:
             parts += ["--sprinkle-ratio", f"{sprinkle_ratio:g}"]
+    if schedule and schedule != "cycle" and not replay:
+        parts += ["--schedule", schedule]
+        if speed and speed != 1.0:
+            parts += ["--speed", f"{speed:g}"]
+        if day_profile:
+            parts += ["--day-profile", day_profile]
+        if min_period and min_period > 0:
+            parts += ["--min-period", f"{min_period:g}"]
     parts += ["--rate", f"{rate:g}"]
+    if seed is not None:
+        parts += ["--seed", str(int(seed))]
+    if duration and duration > 0:
+        parts += ["--duration", f"{duration:g}"]
+    if clock and clock != "wall":
+        parts += ["--clock", clock]
+    if manifest:
+        parts += ["--manifest", manifest]
     if messages and messages != 5:
         parts += ["--messages", str(messages)]
     if client_ip and client_ip != _DEFAULT_EP.client_ip:
