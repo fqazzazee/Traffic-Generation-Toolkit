@@ -777,6 +777,196 @@ def test_pcap_roundtrip() -> None:
     check(n == len(frames), f"pcap record count {n} != {len(frames)}")
 
 
+def _l4(frame: bytes):
+    """(ip_proto, src_ip, dst_ip, sport, dport, l4_bytes) of an IPv4 frame."""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    if frame[off - 2:off] != b"\x08\x00":
+        return None
+    ihl = (frame[off] & 0x0F) * 4
+    l4 = frame[off + ihl:]
+    sport, dport = struct.unpack("!HH", l4[:4])
+    return (frame[off + 9], ".".join(map(str, frame[off + 12:off + 16])),
+            ".".join(map(str, frame[off + 16:off + 20])), sport, dport, l4)
+
+
+def test_udp_replies_return_to_the_request_port() -> None:
+    from tgt import incidents
+    ep = Endpoints()
+    builders = {"dns": protocols.dns_flow, "ntp": protocols.ntp_flow,
+                "bacnet": protocols.bacnet_flow}
+    for k in ("dga-dns", "dns-tunnel", "tristation"):
+        builders[k] = incidents.ATTACKS[k][0]
+    for key, build in builders.items():
+        frames = [_l4(f) for f in build(ep, 4)]
+        for req, rsp in zip(frames[0::2], frames[1::2]):
+            check(rsp[1] == req[2] and rsp[2] == req[1],
+                  f"{key}: reply not addressed back to the client")
+            check((rsp[3], rsp[4]) == (req[4], req[3]),
+                  f"{key}: reply {rsp[3]}->{rsp[4]} does not answer "
+                  f"request {req[3]}->{req[4]}")
+
+
+def test_tcp_syn_has_zero_ack() -> None:
+    from tgt import enterprise
+    syns = 0
+    for _, f in enterprise.get("industrial-site").build(1):
+        t = _l4(f)
+        if t and t[0] == P.IPPROTO_TCP and t[5][13] == P.SYN:
+            syns += 1
+            check(struct.unpack("!I", t[5][8:12])[0] == 0,
+                  "bare SYN carries a non-zero acknowledgement number")
+    check(syns > 0, "no SYNs found")
+
+
+def test_bacnet_readproperty_complexack() -> None:
+    frames = [_l4(f)[5][8:] for f in protocols.bacnet_flow(Endpoints(), 3)]
+    invokes = set()
+    for req, ack in zip(frames[0::2], frames[1::2]):
+        r, a = req[6:], ack[6:]               # past BVLC (4) + NPDU (2)
+        check(req[5] == 0x04, "bacnet: request NPDU not expecting a reply")
+        check(r[0] == 0x00 and r[3] == 0x0C and r[4] == 0x0C,
+              "bacnet: request is not Confirmed-REQ ReadProperty(objectId)")
+        check(a[0] == 0x30 and a[2] == 0x0C, "bacnet: reply is not ComplexACK")
+        check(a[1] == r[2], "bacnet: ComplexACK invoke ID != request's")
+        check(a[-1] == 0x3F, "bacnet: ComplexACK value not closed")
+        invokes.add(r[2])
+    check(len(invokes) == 3, "bacnet: invoke ID does not vary")
+
+
+def test_iec104_command_sequence_numbers() -> None:
+    from tgt import incidents
+    ep = Endpoints()
+    sent = {True: 0, False: 0}        # I-frames sent by client / server
+    for f in incidents.iec104_command(ep, 4):
+        t = _l4(f)
+        seg = t[5]
+        data = seg[(seg[12] >> 4) * 4:]
+        from_client = t[1] == ep.client_ip
+        while len(data) >= 6 and data[0] == 0x68:
+            c1, c2 = struct.unpack("<HH", data[2:6])
+            if not c1 & 1:                                 # I-format
+                check(c1 >> 1 == sent[from_client],
+                      f"iec104: N(S) {c1 >> 1} != {sent[from_client]}")
+                check(c2 >> 1 == sent[not from_client],
+                      f"iec104: N(R) {c2 >> 1} != {sent[not from_client]}")
+                sent[from_client] += 1
+            elif c1 & 3 == 1:                              # S-format
+                check(c2 >> 1 == sent[not from_client], "iec104: S-frame N(R)")
+            data = data[2 + data[1]:]
+    check(sent[True] == 4 and sent[False] == 8,
+          f"iec104: unexpected I-frame counts {sent}")
+
+
+def test_industroyer_c2_is_outbound() -> None:
+    from tgt import incidents
+    inc = incidents.get("industroyer")
+    c2 = inc.host("INDUSTROYER-C2")
+    for _, f in inc.build(1):
+        t = _l4(f)
+        if t and t[0] == P.IPPROTO_TCP and t[5][13] == P.SYN and c2.ip in t[1:3]:
+            check(t[2] == c2.ip and t[4] == 80,
+                  "industroyer: C2 connection not initiated by the inside host")
+            return
+    _failures.append("industroyer: no C2 SYN found")
+
+
+def test_modbus_writes_are_a_minority() -> None:
+    fcs = []
+    for f in protocols.modbus_flow(Endpoints(), 16):
+        t = _l4(f)
+        seg = t[5]
+        pdu = seg[(seg[12] >> 4) * 4:]
+        if t[4] == 502 and len(pdu) >= 8:
+            fcs.append(pdu[7])
+    check(fcs.count(0x06) == 2 and fcs.count(0x03) == 14,
+          f"modbus: expected 2 FC6 writes in 16 requests, got {fcs}")
+    resp = [f for f in protocols.modbus_flow(Endpoints(), 5)]
+    pay = [_l4(f)[5][20:] for f in resp]
+    w = [p for p in pay if len(p) > 7 and p[7] == 0x06]
+    check(len(w) == 2 and w[0] == w[1], "modbus: FC6 response is not an echo")
+    from tgt import incidents
+    check("download" not in incidents.ATTACKS["s7-control"][1],
+          "s7-control still claims a program download")
+
+
+def test_dhcp_dora_ntp_and_dns_realism() -> None:
+    from tgt import enterprise
+    ep = Endpoints(meta={"nbname": "WS42"})
+    frames = protocols.dhcp_flow(ep, 2)
+    types = []
+    for f in frames:
+        t = _l4(f)
+        body = t[5][8:]
+        opts, k = {}, 240
+        while k < len(body) and body[k] != 0xFF:
+            opts[body[k]] = body[k + 2:k + 2 + body[k + 1]]
+            k += 2 + body[k + 1]
+        types.append(opts[53][0])
+        if opts[53][0] in (1, 3) and body[12:16] == bytes(4):  # DORA broadcast
+            check(f[:6] == b"\xff" * 6 and t[1:5] == ("0.0.0.0",
+                  "255.255.255.255", 68, 67), "dhcp: Discover/Request not broadcast")
+            check(opts.get(12) == b"WS42" and 61 in opts and 50 in opts and
+                  55 in opts and opts.get(60) == b"MSFT 5.0",
+                  "dhcp: request lacks options 12/61/50/55/60")
+        if opts[53][0] in (2, 5):
+            check(body[16:20] == P.ip_to_bytes(ep.client_ip),
+                  "dhcp: Offer/ACK without yiaddr")
+            check(all(o in opts for o in (54, 51, 1, 3, 6)),
+                  "dhcp: Offer/ACK lacks options 54/51/1/3/6")
+    check(types == [1, 2, 3, 5, 3, 5], f"dhcp: not DORA + renewal: {types}")
+    xids = {f[-300:][4:8] for f in frames}
+    check(len(xids) == 2, "dhcp: xid does not vary per transaction")
+    # NTP: stratum 2, origin echoes the client's transmit time, real era
+    req, rsp = (_l4(f)[5][8:] for f in protocols.ntp_flow(Endpoints(), 1))
+    check(rsp[1] == 2, "ntp: server not stratum 2")
+    check(rsp[24:32] == req[40:48], "ntp: origin != client transmit")
+    check(struct.unpack("!I", rsp[40:44])[0] > 3900000000,
+          "ntp: transmit timestamp not a real date")
+    # DNS: an env resolves the real inventory names to their real IPs
+    env = enterprise.get("it-org")
+    ips = {f"{h.name.lower()}.{enterprise.DNS_DOMAIN}": h.ip for h in env.hosts}
+    seen = 0
+    for proto, f in env.build(5):
+        t = _l4(f)
+        if proto == "dns" and t[3] == 53:
+            msg, k, labels = t[5][8:], 12, []
+            while msg[k]:
+                labels.append(msg[k + 1:k + 1 + msg[k]].decode())
+                k += 1 + msg[k]
+            name = ".".join(labels)
+            check(name in ips and msg[-4:] == P.ip_to_bytes(ips[name]),
+                  f"dns: {name} not answered with its inventory IP")
+            seen += 1
+    check(seen > 0, "dns: no responses in it-org")
+
+
+def test_tshark_dns_responses_matched() -> None:
+    """Optional: with tshark on PATH, every DNS response in an industrial-site
+    cycle (plus the incident DNS builders) is paired with its query."""
+    import shutil
+    import subprocess
+    from tgt import enterprise, incidents
+    if not shutil.which("tshark"):
+        _skipped.append("test_tshark_dns_responses_matched")
+        return
+    frames = [f for _, f in enterprise.get("industrial-site").build(3)]
+    for k in ("dga-dns", "dns-tunnel"):
+        frames += incidents.ATTACKS[k][0](Endpoints(), 3)
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/dns.pcap"
+        with PcapWriter(path) as w:
+            for f in frames:
+                w.write(f)
+
+        def count(flt):
+            return len(subprocess.run(["tshark", "-r", path, "-Y", flt],
+                                      capture_output=True, text=True
+                                      ).stdout.splitlines())
+        total = count("dns.flags.response == 1")
+        check(total > 0 and count("dns.response_to") == total,
+              "tshark: DNS responses not matched to their queries")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
