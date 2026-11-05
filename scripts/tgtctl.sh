@@ -85,14 +85,19 @@ install_deps() {
     # Optional: install the `tgt` command onto PATH (pure-stdlib, no build deps).
     if command -v pip3 >/dev/null 2>&1; then
         info "installing the 'tgt' command (pip install -e) ..."
-        pip3 install -e "$REPO_ROOT" 2>/dev/null && ok "'tgt' command available" \
-            || warn "pip install skipped — use '$PY -m tgt' instead"
+        if pip3 install -e "$REPO_ROOT" 2>/dev/null; then
+            ok "'tgt' command available"
+        else
+            warn "pip install skipped — use '$PY -m tgt' instead"
+        fi
     else
         warn "pip3 not found — run TGT with: $PY -m tgt"
     fi
-    "$PY" -m tests.selftest >/dev/null 2>&1 \
-        && ok "self-test passed — packet builders verified" \
-        || warn "self-test could not run (check $PY and repo path)"
+    if "$PY" "$REPO_ROOT/tests/selftest.py" >/dev/null 2>&1; then
+        ok "self-test passed — packet builders verified"
+    else
+        warn "self-test could not run (check $PY and repo path)"
+    fi
 }
 
 # --- config -----------------------------------------------------------------
@@ -134,6 +139,11 @@ write_unit() {
 Description=TGT — Traffic Generation Toolkit (SPAN test traffic)
 Documentation=file://$REPO_ROOT/README.md
 After=network.target
+# A persistent failure (e.g. the interface cannot be created) gives up after 5
+# quick restarts instead of looping every few seconds forever; once fixed:
+#   systemctl reset-failed tgt.service && systemctl start tgt.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -144,9 +154,11 @@ WorkingDirectory=$REPO_ROOT
 ExecStartPre=/bin/sh -c 'ip link show "\$TGT_IFACE" >/dev/null 2>&1 || { ip link add "\$TGT_IFACE" type veth peer name "\$TGT_IFACE-mon" && ip link set "\$TGT_IFACE" up && ip link set "\$TGT_IFACE-mon" up; }'
 # Self-contained: cd into the repo and set PYTHONPATH inline so the tgt package
 # resolves even if the WorkingDirectory/Environment directives above are ignored.
-ExecStart=/bin/sh -c 'cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT" exec $PY -m tgt run --iface "\$TGT_IFACE" \$TGT_RUN_ARGS'
+# The config is sourced by sh (its values are shell-quoted) and TGT_RUN_ARGS is
+# a shell-quoted argument list, expanded with eval so quoted paths survive.
+ExecStart=/bin/sh -c '. "$CONF_FILE" && cd "$REPO_ROOT" && eval "set -- \$\$TGT_RUN_ARGS" && PYTHONPATH="$REPO_ROOT" exec $PY -m tgt run --iface "\$\$TGT_IFACE" "\$\$@"'
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 # Least privilege: only the caps raw packet I/O actually needs.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
@@ -171,13 +183,23 @@ daemon_start() {
     . "$CONF_FILE"
     ensure_veth "${TGT_IFACE:-tgt0}"
     info "starting TGT daemon (logs: $LOG_FILE)"
-    PYTHONPATH="$REPO_ROOT" nohup "$PY" -m tgt run \
-        --iface "${TGT_IFACE:-tgt0}" ${TGT_RUN_ARGS:-} \
-        >>"$LOG_FILE" 2>&1 &
+    # TGT_RUN_ARGS is a shell-quoted argument list (the TUI writes it with
+    # shlex); eval re-splits it so quoted paths with spaces stay one argument.
+    eval "daemon_exec ${TGT_RUN_ARGS:-}"
     echo $! > "$PID_FILE"
     sleep 1
-    daemon_running && ok "started (pid $(cat "$PID_FILE"))" \
-        || die "failed to start — see $LOG_FILE"
+    if daemon_running; then
+        ok "started (pid $(cat "$PID_FILE"))"
+    else
+        die "failed to start — see $LOG_FILE"
+    fi
+}
+
+# Launch `tgt run` in the background with the given extra arguments.
+daemon_exec() {
+    PYTHONPATH="$REPO_ROOT" nohup "$PY" -m tgt run \
+        --iface "${TGT_IFACE:-tgt0}" "$@" \
+        >>"$LOG_FILE" 2>&1 &
 }
 
 daemon_stop() {

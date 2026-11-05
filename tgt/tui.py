@@ -215,7 +215,8 @@ class UI:
             sprinkle=self.sprinkle_list() or None,
             sprinkle_random=self.sprinkle_on and self.sprinkle_random,
             sprinkle_ratio=self.sprinkle_ratio if self.sprinkle_on else 0.0,
-            span=self.span)
+            span=self.span, pcap=self.pcap, once=not self.loop,
+            client_ip=self.ep.client_ip, server_ip=self.ep.server_ip)
 
     def start_stop(self):
         if self.running():
