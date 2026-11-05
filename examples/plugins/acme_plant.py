@@ -19,7 +19,7 @@ It registers, through the :mod:`tgt.plugins` API:
 * scenario ``acme-iiot`` — CoAP sensors + MQTT telemetry;
 * device model ``acme-sx1`` — the Acme SX-1 smart sensor;
 * environment ``acme-plant`` — from ``acme-plant.json`` next to this file;
-* attack ``coap-put`` (category ``ot-write``) and incident
+* attack ``coap-put`` (category ``ot-write``, ATT&CK T0855) and incident
   ``acme-valve-tamper`` that uses it;
 * score map ``acme-siem`` — an alert map for ``tgt score --alert-map``.
 """
@@ -121,7 +121,8 @@ plugins.register_device_model(DeviceModel(
 
 plugins.register_attack(
     "coap-put", coap_put, "Unauthorized CoAP PUT to an actuator",
-    category="ot-write", protocol="coap", service="coap")
+    category="ot-write", protocol="coap", service="coap",
+    techniques=["T0855"])
 
 plugins.register_incident(Incident(
     "acme-valve-tamper", "Acme Valve Tamper", "OT", "2026",

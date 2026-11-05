@@ -30,7 +30,7 @@ Homepage = "https://example.local/tgt"
 packages = ["tgt"]
 
 [tool.setuptools.package-data]
-tgt = ["scoremaps/*.json", "envs/*.json", "envs/*.toml", "envs/sites/*.json",
+tgt = ["attack_ics.json", "scoremaps/*.json", "envs/*.json", "envs/*.toml", "envs/sites/*.json",
        "campaigns/*.json", "campaigns/*.toml",
        "envs/sites/*.toml"]
 

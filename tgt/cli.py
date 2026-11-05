@@ -66,7 +66,7 @@ def cmd_list(args) -> int:
         if e.legacy_hosts():
             leg = ", ".join(f"{h.name} ({h.fp.label})" for h in e.legacy_hosts())
             print(f"    at-risk: {leg}")
-    from . import incidents
+    from . import incidents, techniques
     print("\nIncidents (famous attacks — detection-test traffic; use with "
           "--incident):")
     incs = incidents.all_incidents()
@@ -78,6 +78,17 @@ def cmd_list(args) -> int:
         protos, extra = ", ".join(inc.protocols()), ", ".join(inc.attack_only())
         print(f"    protocols: {protos}{' + ' if protos and extra else ''}{extra}")
         print(f"    signals: {'; '.join(inc.indicators())}")
+        tids = techniques.for_incident(inc.key)
+        if tids:
+            print(f"    techniques: {', '.join(tids)}")
+    used = sorted({t for inc in incs for t in techniques.for_incident(inc.key)})
+    if used:
+        print("\nATT&CK techniques the incidents show (ICS T08xx, "
+              "Enterprise T1xxx; tgt/attack_ics.json):")
+        for line in _columns([(t, techniques.name(t),
+                               f"[{', '.join(techniques.tactics(t))}]")
+                              for t in used], (9, 48)):
+            print(f"  {line}")
     from . import plugins
     if plugins.LOADED or plugins.ERRORS:
         print("\nPlugins (TGT_PLUGIN_PATH, ~/.config/tgt/plugins):")
@@ -637,6 +648,12 @@ def cmd_inventory(args) -> int:
               file=sys.stderr)
     else:
         write(env, sys.stdout, sprinkle)
+    if sprinkle and args.format != "json":     # JSON carries them inline
+        from . import techniques
+        for k in sprinkle:
+            print(f"sprinkle {k}: ATT&CK "
+                  f"{', '.join(techniques.for_incident(k)) or '(none)'}",
+                  file=sys.stderr)
     return 0
 
 

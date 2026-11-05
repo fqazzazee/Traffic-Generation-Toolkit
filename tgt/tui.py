@@ -30,7 +30,8 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
-from . import enterprise, incidents, net, protocols, scenarios, service
+from . import (enterprise, incidents, net, protocols, scenarios, service,
+               techniques)
 from .config import RunConfig
 from .engine import Engine
 from .packet import Endpoints
@@ -1247,7 +1248,8 @@ def _preset_items(ui: UI) -> list:
         items += [it for it in envs if it[0] == grp]
     items += [("Incidents", ("i", x.key), f"{x.key:16} {x.name} ({x.year})",
                f"Protocols: {_proto_summary(x.protocols(), x.attack_only())}"
-               f"\n{x.desc}  Signals: {'; '.join(x.indicators())}")
+               f"\n{x.desc}  Signals: {'; '.join(x.indicators())}"
+               f"  ATT&CK: {', '.join(techniques.for_incident(x.key))}")
               for x in incidents.all_incidents()]
     items += [("Replay", ("r", None), "replay a pcap file…",
                "Send the frames of an existing capture (pcap or pcapng) "
@@ -1378,7 +1380,8 @@ def _act_sprinkle(stdscr, ui: UI, step: int):
 def _variant_items() -> list:
     return [(x.category, x.key, f"{x.key:14} {x.name} ({x.year})",
              f"Protocols: {_proto_summary(x.protocols(), x.attack_only())}"
-             f"\n{x.desc}  Signals: {'; '.join(x.indicators())}")
+             f"\n{x.desc}  Signals: {'; '.join(x.indicators())}"
+             f"  ATT&CK: {', '.join(techniques.for_incident(x.key))}")
             for x in incidents.all_incidents()]
 
 
