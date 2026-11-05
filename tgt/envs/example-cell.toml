@@ -1,0 +1,72 @@
+# TOML env-file example (Python 3.11+; same schema as the JSON files).
+# tgt run --env-file tgt/envs/example-cell.toml --pcap cell.pcap --once --rate 0
+key = "example-cell"
+name = "Example Siemens Cell (TOML)"
+category = "OT"
+description = "One supervisory VLAN and one Siemens S7 cell behind a Moxa switch, flat-network misconfiguration enabled."
+
+[options]
+flat = true                     # both subnets share VLAN 100: no L2 separation
+default_snmp_community = true   # polls use public / private
+
+[[segments]]
+name = "OPS"
+vlan = 100
+subnet = "172.20.0.0/24"
+zone = "OT-SUPERVISORY"
+
+[[segments]]
+name = "CELL-S7"
+vlan = 120
+subnet = "172.20.2.0/24"
+zone = "OT-CELL"
+
+[[hosts]]
+name = "SCADA01"
+ip = "172.20.0.10"
+role = "scada"
+os = "win10"
+
+[[hosts]]
+name = "NMS01"
+ip = "172.20.0.20"
+role = "nms"
+os = "linux"
+
+[[hosts]]
+name = "HMI-S7"
+ip = "172.20.2.10"
+role = "hmi"
+os = "win7"
+
+[[hosts]]
+name = "PLC-S7-{n}"
+count = 3
+ip_start = "172.20.2.21"
+model = "siemens-cpu-315-2pndp"
+
+[[hosts]]
+name = "SW-S7"
+ip = "172.20.2.2"
+model = "moxa-eds-508a"
+
+[[flows]]
+from = "HMI-S7"
+to = "role:plc@CELL-S7"
+proto = "s7comm"
+period = "1s±5%"
+
+[[flows]]
+from = "SCADA01"
+to = "role:plc"
+proto = "s7-id"
+
+[[flows]]
+from = "role:switch"
+proto = "lldp"
+
+[[flows]]
+client = "NMS01"
+server = "SW-S7"
+proto = "snmp"
+period = "5m"

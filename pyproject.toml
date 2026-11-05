@@ -29,5 +29,8 @@ Homepage = "https://example.local/tgt"
 [tool.setuptools]
 packages = ["tgt"]
 
+[tool.setuptools.package-data]
+tgt = ["envs/*.json", "envs/*.toml"]
+
 [tool.setuptools.dynamic]
 version = { attr = "tgt.__version__" }
