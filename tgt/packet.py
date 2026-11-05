@@ -9,6 +9,7 @@ DPI engines (Zeek, Suricata, Claroty CTD, …) key on stay easy to read and twea
 """
 from __future__ import annotations
 
+import functools
 import struct
 from dataclasses import dataclass, field
 
@@ -35,8 +36,10 @@ URG = 0x20
 # ---------------------------------------------------------------------------
 # Address helpers
 # ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=4096)
 def mac_to_bytes(mac: str) -> bytes:
-    """"aa:bb:cc:dd:ee:ff" -> b'\\xaa\\xbb...'."""
+    """"aa:bb:cc:dd:ee:ff" -> b'\\xaa\\xbb...' (cached: a build converts
+    the same few addresses for every frame)."""
     parts = mac.replace("-", ":").split(":")
     if len(parts) != 6:
         raise ValueError(f"invalid MAC address: {mac!r}")
@@ -44,9 +47,15 @@ def mac_to_bytes(mac: str) -> bytes:
 
 
 def bytes_to_mac(b: bytes) -> str:
+    return _mac_str(bytes(b))
+
+
+@functools.lru_cache(maxsize=4096)
+def _mac_str(b: bytes) -> str:
     return ":".join(f"{x:02x}" for x in b)
 
 
+@functools.lru_cache(maxsize=4096)
 def ip_to_bytes(ip: str) -> bytes:
     parts = ip.split(".")
     if len(parts) != 4:
@@ -58,11 +67,13 @@ def checksum16(data: bytes) -> int:
     """Standard Internet 16-bit one's-complement checksum (RFC 1071)."""
     if len(data) & 1:
         data += b"\x00"
-    total = 0
-    for i in range(0, len(data), 2):
-        total += (data[i] << 8) | data[i + 1]
-    total = (total & 0xFFFF) + (total >> 16)
-    total = (total & 0xFFFF) + (total >> 16)
+    # the one's-complement sum of the 16-bit words is the data read as one
+    # big-endian integer modulo 0xFFFF (0xFFFF, not 0, for a non-zero
+    # multiple) — one C-level bignum op instead of a per-word loop
+    v = int.from_bytes(data, "big")
+    total = v % 0xFFFF
+    if total == 0 and v:
+        total = 0xFFFF
     return (~total) & 0xFFFF
 
 
