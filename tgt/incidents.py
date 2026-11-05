@@ -144,8 +144,8 @@ def log4shell(ep: Endpoints, count: int) -> List[bytes]:
 
 
 def s7_control(ep: Endpoints, count: int) -> List[bytes]:
-    """S7comm (102) PLC control — STOP CPU + program download (Stuxnet-style
-    manipulation of a Siemens PLC, not just read/monitor)."""
+    """S7comm (102) PLC control — PLC STOP jobs naming the "P_PROGRAM" service
+    (Stuxnet-style manipulation of a Siemens PLC, not just read/monitor)."""
     exchanges = _s7_connect()                        # COTP + Setup Comm first
     for i in range(count):
         ref = i + 1
@@ -313,7 +313,7 @@ ATTACKS: Dict[str, Tuple[AttackBuilder, str]] = {
     "dga-dns": (dga_dns, "IOC / DGA domain lookups"),
     "telnet-brute": (telnet_brute, "Telnet default-credential brute force"),
     "log4shell": (log4shell, "JNDI lookup in HTTP (CVE-2021-44228)"),
-    "s7-control": (s7_control, "S7comm PLC STOP + program download"),
+    "s7-control": (s7_control, "S7comm PLC STOP (P_PROGRAM) commands"),
     "iec104-command": (iec104_command, "IEC-104 breaker control commands"),
     "tristation": (tristation, "TriStation writes to a Triconex SIS"),
     "dns-tunnel": (dns_tunnel, "DNS tunneling / exfil over long TXT queries"),
@@ -616,7 +616,7 @@ _reg(Incident("log4shell", "Log4Shell", "IT", "2021",
 # ---- OT incidents ----------------------------------------------------------
 _reg(Incident("stuxnet", "Stuxnet", "OT", "2010",
     "Sabotage of Siemens S7 PLCs at Natanz: SMBv1 propagation and S7comm "
-    "PLC STOP + malicious program download from a compromised engineering WS.",
+    "PLC STOP commands from a compromised engineering WS.",
     [_h("STEP7-ENGWS", "172.16.2.50", "eng", "win7"),
      _h("WINCC-SCADA", "172.16.2.51", "scada", "winxp"),
      _h("PLC-S7-417", "172.16.2.21", "plc", "siemens", OUI_SIEMENS,

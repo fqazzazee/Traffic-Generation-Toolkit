@@ -176,11 +176,20 @@ def _cpf(*items: tuple[int, bytes]) -> bytes:
 # OT / ICS protocols
 # ===========================================================================
 def modbus_flow(ep: Endpoints, count: int) -> List[bytes]:
-    """Modbus/TCP (502): Read Holding Registers + Write Single Register."""
+    """Modbus/TCP (502): Read Holding Registers polling, with an occasional
+    Write Single Register (FC 6, echoed back) setpoint update — one request in
+    eight, the fourth of each eight."""
     exchanges = []
     for i in range(count):
         tid = (i + 1) & 0xFFFF
         unit = 1
+        if i % 8 == 3:
+            # Write Single Register (FC 0x06): setpoint register 40101; the
+            # normal response echoes the request exactly
+            req = struct.pack("!HHHBBHH", tid, 0, 6, unit, 0x06, 100,
+                              (0x0200 + i) & 0xFFFF)
+            exchanges.append((req, req))
+            continue
         # Read Holding Registers (FC 0x03): start=0, qty=10
         req = struct.pack("!HHHBB HH", tid, 0, 6, unit, 0x03, 0, 10)
         # Response: 10 registers (20 bytes) of sample values

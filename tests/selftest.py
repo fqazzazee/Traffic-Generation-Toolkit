@@ -616,7 +616,7 @@ def test_incident_signatures_present() -> None:
     check(b"avsvmcloud.com" in blob("sunburst"), "sunburst: no DGA domain")
     check(b"jndi:ldap" in blob("log4shell"), "log4shell: no JNDI string")
     check(b"TRISTATION" in blob("triton"), "triton: no TriStation payload")
-    check(b"P_PROGRAM" in blob("stuxnet"), "stuxnet: no S7 program download")
+    check(b"P_PROGRAM" in blob("stuxnet"), "stuxnet: no S7 PLC STOP (P_PROGRAM)")
     check(b"NT LM 0.12" in blob("notpetya"), "notpetya: no SMBv1 signature")
     check(b"mstshash=" in blob("colonial"), "colonial: no RDP mstshash cookie")
     check(b"cdn.darkside-c2.example" in blob("colonial"),
