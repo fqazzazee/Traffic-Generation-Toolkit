@@ -1,0 +1,31 @@
+{
+  "_comment": "Example alert map: which columns hold the alert time, source/destination (IP or asset name), title and vendor category, and regexes (case-insensitive, searched in the title, then the vendor category; first match wins) that map vendor alert names onto TGT's generic event categories. Edit the regexes to your product's alert names.",
+  "format": "csv",
+  "columns": {
+    "time": ["time", "timestamp", "Time", "Date", "Detected", "created_at"],
+    "src": ["src", "source", "src_ip", "Source", "Source IP", "ip_src"],
+    "dst": ["dst", "destination", "dst_ip", "Destination", "Destination IP", "ip_dst"],
+    "title": ["title", "Title", "name", "Alert", "Description", "type_name"],
+    "category": ["category", "Category", "type", "Type"]
+  },
+  "categories": {
+    "new (asset|device|node)|asset (was )?(discovered|added)": "new-asset",
+    "(asset|device|node).*(offline|disconnected|stopped communicating)": "asset-offline",
+    "ip (address )?change": "ip-change",
+    "firmware (change|update|download)": "firmware-change",
+    "(program|logic|project|code) (download|upload|change)|online edit": "plc-program",
+    "(mode|state) change|plc (stop|run)|controller (stop|start)": "plc-mode-change",
+    "(write|set ?point|force) (command|request|value)|modbus write|ot write": "ot-write",
+    "new protocol": "new-protocol",
+    "new (conversation|communication|link|connection)": "new-conversation",
+    "cross[- ]zone|zone (violation|policy)|purdue": "cross-zone",
+    "scan|sweep|enumerat|reconnaissance": "scan",
+    "c2|command and control|beacon|callback": "c2",
+    "exploit|vulnerability attempt|eternalblue|ms17-010": "exploit-attempt",
+    "lateral|psexec|remote service|pass[- ]the[- ]hash": "lateral-movement",
+    "remote access|rdp|vnc|teamviewer": "remote-access",
+    "legacy os|obsolete|end[- ]of[- ]life|windows (xp|2003|7)": "legacy-os",
+    "default (credential|password)": "default-credentials",
+    "clear ?text (credential|password)|plaintext password": "cleartext-credentials"
+  }
+}
