@@ -213,9 +213,21 @@ def cmd_run(args) -> int:
         print(f"unknown environment: {env}. Try 'tgt list'.", file=sys.stderr)
         return 2
     span = getattr(args, "span", "access")
-    if span != "access" and not env:
-        print("--span core needs --env (segments come from the modeled "
-              "environment).", file=sys.stderr)
+    remap_env = getattr(args, "remap_env", None)
+    if remap_env and remap_env not in enterprise.ENVIRONMENTS:
+        print(f"unknown environment for --remap-env: {remap_env}. Try "
+              "'tgt list'.", file=sys.stderr)
+        return 2
+    if (remap_env or getattr(args, "remap_report", None)) and not replay:
+        print("--remap-env/--remap-report map a --replay capture onto an "
+              "environment.", file=sys.stderr)
+        return 2
+    if getattr(args, "remap_report", None) and not remap_env:
+        print("--remap-report needs --remap-env.", file=sys.stderr)
+        return 2
+    if span != "access" and not (env or remap_env):
+        print("--span core needs --env or --remap-env (segments come from "
+              "the modeled environment).", file=sys.stderr)
         return 2
     if incident and incident not in incidents.INCIDENTS:
         print(f"unknown incident: {incident}. Try 'tgt list'.", file=sys.stderr)
@@ -292,6 +304,8 @@ def cmd_run(args) -> int:
         replay_tsresol=tsresol,
         remap_ip=remaps[0], remap_subnet=remaps[1], remap_mac=remaps[2],
         replay_vlan=args.vlan if replay else None,
+        remap_env=remap_env if replay else None,
+        remap_seed=getattr(args, "seed", None) if remap_env else None,
     )
     if cfg.speed <= 0:
         print("--speed must be > 0.", file=sys.stderr)
@@ -305,10 +319,26 @@ def cmd_run(args) -> int:
         from .replay import rewriter_for
         from .rewrite import RewriteError
         try:
-            rewriter_for(cfg)
+            rw = rewriter_for(cfg)
         except RewriteError as e:
             print(str(e), file=sys.stderr)
             return 2
+        except (OSError, pcapread.PcapError) as e:
+            print(f"cannot profile {replay}: {e}", file=sys.stderr)
+            return 2
+        plan = getattr(rw, "plan", None)
+        if plan is not None:
+            print(plan.describe())
+            for line in plan.table():
+                print(f"  {line}")
+            if getattr(args, "remap_report", None):
+                try:
+                    plan.write_report(args.remap_report)
+                except OSError as e:
+                    print(f"cannot write {args.remap_report}: {e}",
+                          file=sys.stderr)
+                    return 2
+                print(f"  mapping -> {args.remap_report}")
     return _run_engine(cfg, args)
 
 
@@ -748,13 +778,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="override the pcapng timestamp resolution: us, ns, "
                         "ms or ticks per second")
     r.add_argument("--remap-ip", action="append", metavar="OLD=NEW[,..]",
-                   help="replay: rewrite IPv4 addresses (IP + ARP, "
-                        "checksums recomputed); repeatable")
+                   help="replay: rewrite IPv4/IPv6 addresses (IP, ARP, "
+                        "NDP; checksums recomputed); repeatable")
     r.add_argument("--remap-subnet", action="append", metavar="A/N=B/N[,..]",
-                   help="replay: move a subnet, keeping host bits "
-                        "(e.g. 192.168.1.0/24=10.100.10.0/24)")
+                   help="replay: move an IPv4/IPv6 subnet, keeping host "
+                        "bits (e.g. 192.168.1.0/24=10.100.10.0/24)")
     r.add_argument("--remap-mac", action="append", metavar="OLD=NEW[,..]",
-                   help="replay: rewrite MAC addresses (Ethernet + ARP)")
+                   help="replay: rewrite MAC addresses (Ethernet, ARP, NDP "
+                        "options, EUI-64 IPv6 interface ids)")
+    r.add_argument("--remap-env", metavar="ENV",
+                   help="replay: map the capture's internal hosts onto "
+                        "environment ENV by role (IP, MAC and segment "
+                        "VLAN; --span picks the capture point, --seed the "
+                        "tie-breaks); recorded in the manifest")
+    r.add_argument("--remap-report", metavar="FILE",
+                   help="with --remap-env: write the host mapping as JSON")
     r.add_argument("--iface", "-i",
                    help="interface(s) to send on (needs root); a,b,c sends "
                         "the same frames to each (fan-out)")
