@@ -88,6 +88,23 @@ name, role or ``zone:external``, never by a name glob or ``@SEGMENT``);
 their traffic egresses through the internal host's gateway, DNS answers their
 ``fqdn`` and ``tgt inventory`` lists them under ``external``, not as assets.
 
+**field_devices[]** — devices with no IP of their own behind a gateway host:
+serial slaves on a device server's line, LoRaWAN sensors heard by a LoRa
+gateway. ``{"name", "behind": HOST, "via"?: PROTO, "port"?: 1-32,
+"address"?: N, "protocol"?, "model"?, "vendor"?, "product"?, "role"?,
+"firmware"?, "serial"?, "count"?, "start"?}``. ``via`` is the protocol the
+gateway is reached with — ``modbus-rtu-tcp`` (default; raw TCP 4000+port),
+``dnp3-serial`` (raw TCP 4000+port), ``realcom`` (Moxa RealCOM 950/966 +
+port-1, ``protocol`` ``modbus-rtu`` or ``dnp3``), ``modbus`` (a Modbus TCP ->
+RTU gateway: unit id = slave address) or ``lorawan-udp`` (the gateway is the
+flow's client; ``address`` is the DevAddr, a number or hex string). Devices
+of one gateway reached the same way share one serial ``port`` (an RS-485
+drop) and need distinct addresses; ``count`` numbers the name template and
+the addresses up from ``address``. The flows to (LoRa: from) the gateway
+poll them; ``tgt inventory`` lists them as assets with ``behind`` set and no
+IP/MAC, which a passive monitor cannot discover as IP assets (``tgt score``
+leaves them out of the discovery population, like hosts hidden by NAT).
+
 **options** — ``arp`` (default true: start-of-cycle ARP for gateway and
 peers), ``flat`` (one VLAN for every segment), ``dual_homed`` (list of
 ``{"host": NAME, "ip": IP, "mac"?: MAC, "flows"?: [[SERVER, PROTO], ...]}``),
@@ -114,7 +131,10 @@ ZONES = ("IT", "DMZ", "OT-SUPERVISORY", "OT-CELL")
 CATEGORIES = ("IT", "OT", "mixed")
 _TOP_KEYS = {"key", "name", "category", "description", "options", "segments",
              "hosts", "flows", "findings",
-             "external"}
+             "external", "field_devices"}
+_FIELD_KEYS = {"name", "behind", "via", "port", "address", "protocol",
+               "model", "vendor", "product", "role", "firmware", "serial",
+               "count", "start"}
 _SEG_KEYS = {"name", "vlan", "subnet", "zone", "gateway", "gateway_mac", "nat",
              "wan_rtt_ms"}
 _NAT_KEYS = {"outside_ip", "outside_mac", "local"}
@@ -335,6 +355,8 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
             for c in pairs:
                 timing[c] = dict(t)
 
+    fdevs = _field_devices(cx, doc.get("field_devices", []), where,
+                           {h.name for h in hosts})
     options = _options(cx, doc.get("options", {}), "options", where, segments)
     findings = [_finding(cx, f, f"findings[{i}]", where, conv)
                 for i, f in enumerate(cx.list(doc.get("findings", []),
@@ -346,7 +368,8 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
     try:
         env = Environment(key, name, category, desc, hosts, conv, segments,
                           options, host_meta, timing,
-                          findings=findings, external=external)
+                          findings=findings, external=external,
+                          field_devices=fdevs)
     except ValueError as e:
         raise EnvFileError(f"{source}: {e}") from None
     env.source = source             # type: ignore[attr-defined]
@@ -429,6 +452,85 @@ def _finding(cx: _Ctx, raw: Any, path: str, where: Dict[str, str],
                              "proto": f["proto"]})
     if not out["hosts"] and not out["flows"]:
         raise cx.err(path, "a finding needs 'hosts' and/or 'flows'")
+    return out
+
+
+def _field_devices(cx: _Ctx, raw: Any, where: Dict[str, str],
+                   internal: set) -> List[Dict[str, Any]]:
+    """``field_devices[]``: devices without an IP behind a gateway host,
+    normalised (``count`` expanded, catalog identity filled in)."""
+    from . import protocols_iiot as iiot
+    out: List[Dict[str, Any]] = []
+    seen: Dict[tuple, str] = {}
+    port_of: Dict[tuple, int] = {}
+    for i, d in enumerate(cx.list(raw, "field_devices")):
+        path = f"field_devices[{i}]"
+        d = cx.obj(d, path, _FIELD_KEYS, ("name", "behind"))
+        gw = cx.str(d["behind"], f"{path}.behind")
+        if gw not in internal:
+            raise cx.err(f"{path}.behind", f"no host named {gw!r}")
+        via = d.get("via", "modbus-rtu-tcp")
+        if via not in iiot.VIA:
+            raise cx.err(f"{path}.via", f"{via!r} is not one of "
+                         f"{', '.join(iiot.VIA)}")
+        proto = d.get("protocol", iiot.VIA[via])
+        if proto not in iiot.FIELD_PROTOCOLS or (
+                via != "realcom" and proto != iiot.VIA[via]) or (
+                via == "realcom" and proto == "lorawan"):
+            raise cx.err(f"{path}.protocol", f"{proto!r} cannot be reached "
+                         f"via {via}")
+        port = cx.int(d.get("port", 1), f"{path}.port", 1, 32)
+        if port_of.setdefault((gw, via), port) != port:
+            raise cx.err(f"{path}.port", f"{gw}'s {via} devices share one "
+                         f"serial line (port {port_of[(gw, via)]})")
+        lo, hi = iiot.ADDRESS_RANGE[proto]
+        addr = d.get("address", 1)
+        if isinstance(addr, str):           # a DevAddr in hex
+            try:
+                addr = int(addr, 16)
+            except ValueError:
+                raise cx.err(f"{path}.address", f"not a hex address: "
+                             f"{addr!r}") from None
+        addr = cx.int(addr, f"{path}.address", lo, hi)
+        model = d.get("model", "")
+        dev = None
+        if model:
+            dev = devices.find(cx.str(model, f"{path}.model"))
+            if dev is None:
+                raise cx.err(f"{path}.model", f"unknown device model "
+                             f"{model!r} (see tgt/devices.py CATALOG)")
+        role = d.get("role") or (dev and _ROLE_OF_TYPE.get(dev.device_type)) \
+            or (dev.device_type if dev else "field-device")
+        count = cx.int(d.get("count", 1), f"{path}.count", 1, 247)
+        start = cx.int(d.get("start", 1), f"{path}.start", 0, 1 << 20)
+        tpl = cx.str(d["name"], f"{path}.name")
+        for k in range(count):
+            try:
+                name = tpl.format(n=start + k) if count > 1 else tpl
+            except (KeyError, IndexError, ValueError) as e:
+                raise cx.err(f"{path}.name", f"bad name template {tpl!r}: "
+                             f"{e!r}") from None
+            if name in where or any(x["name"] == name for x in out):
+                raise cx.err(f"{path}.name", f"duplicate name {name!r}")
+            a = addr + k
+            if a > hi:
+                raise cx.err(f"{path}.count", f"address {a} past {hi}")
+            if (gw, via, a) in seen:
+                raise cx.err(f"{path}.address", f"{gw} {via} address {a} "
+                             f"already used by {seen[(gw, via, a)]}")
+            seen[(gw, via, a)] = name
+            fd = {"name": name, "behind": gw, "via": via, "port": port,
+                  "address": a, "protocol": proto, "model": model,
+                  "vendor": d.get("vendor", dev.vendor if dev else ""),
+                  "product": d.get("product", dev.product if dev else ""),
+                  "role": cx.str(role, f"{path}.role"),
+                  "firmware": d.get("firmware", devices.pick_firmware(
+                      dev, name) if dev else ""),
+                  "serial": d.get("serial", devices.make_serial(
+                      dev, name) if dev else "")}
+            for key in ("vendor", "product", "firmware", "serial"):
+                cx.str(fd[key], f"{path}.{key}", allow_empty=True)
+            out.append(fd)
     return out
 
 
@@ -783,6 +885,8 @@ def to_dict(env: Environment) -> Dict[str, Any]:
     doc["flows"] = flows
     if env.findings:
         doc["findings"] = copy.deepcopy(env.findings)
+    if env.field_devices:
+        doc["field_devices"] = copy.deepcopy(env.field_devices)
     return doc
 
 

@@ -302,6 +302,9 @@ def _apply(doc: Dict, spec: Dict, prev_env, offline: Set[str],
         doc["hosts"] = [h for h in doc["hosts"] if h.get("name") != name]
         doc["flows"] = [f for f in doc["flows"]
                         if name not in (f.get("client"), f.get("server"))]
+        if doc.get("field_devices"):     # the serial / LoRa devices behind it
+            doc["field_devices"] = [d for d in doc["field_devices"]
+                                    if d.get("behind") != name]
         offline.discard(name)
     for i, s in enumerate(spec.get("set") or ()):
         p = f"{path}.set[{i}]"

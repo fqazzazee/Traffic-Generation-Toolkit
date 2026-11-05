@@ -531,6 +531,15 @@ class Environment:
     a vendor's remote-service portal): conversations may name them, their
     frames egress via the internal host's gateway like EDR beacons, and the
     inventory lists them as external, not as assets.
+
+    ``field_devices`` lists devices with no IP of their own that sit behind
+    a gateway host — serial slaves on a device server's RS-485 drop, LoRaWAN
+    sensors heard by a LoRa gateway (``{"name", "behind": HOST, "via":
+    PROTO, "port", "address", "protocol", "model", "vendor", "product",
+    "role", "firmware", "serial"}``, see :mod:`tgt.protocols_iiot`). The
+    gateway's flows over ``via`` poll them; the inventory lists them as
+    known assets ``behind`` the gateway that are not observable as IP
+    assets.
     """
     key: str
     name: str
@@ -544,6 +553,7 @@ class Environment:
     timing: Dict[Conversation, Dict[str, Any]] = field(default_factory=dict)
     findings: List[Dict[str, Any]] = field(default_factory=list)
     external: List[Host] = field(default_factory=list)
+    field_devices: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # what was declared, before options rewrite it (env export uses this)
@@ -894,6 +904,10 @@ class Environment:
             own.update(self.host_meta.get(client.name, {}).get("server", {}))
             return {f"client_{k}": v for k, v in own.items()
                     if k.startswith(proto + "_")}
+        from . import protocols_iiot
+        if proto in protocols_iiot.GATEWAY_PROTOCOLS:
+            # serial slaves / LoRaWAN sensors behind a gateway, Moxa search
+            return protocols_iiot.gateway_meta(self, proto, client, server)
         return {}
 
     def _agent_meta(self, proto: str, agent: Host) -> dict:
