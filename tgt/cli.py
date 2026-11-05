@@ -182,14 +182,30 @@ def cmd_run(args) -> int:
         iface=args.iface, pcap_path=args.pcap,
         rate=args.rate, count=args.count, duration=args.duration,
         messages=args.messages, loop=not args.once, endpoints=ep,
+        seed=getattr(args, "seed", None),
+        manifest_path=getattr(args, "manifest", None),
+        clock=getattr(args, "clock", "wall"),
+        start_time=getattr(args, "start_time", None),
     )
     if not cfg.iface and not cfg.pcap_path:
         print("nothing to do: specify --iface to send and/or --pcap to write a "
               "file.", file=sys.stderr)
         return 2
+    if cfg.start_time:
+        from .manifest import parse_iso
+        try:
+            parse_iso(cfg.start_time)
+        except ValueError:
+            print(f"bad --start-time {cfg.start_time!r}: use ISO-8601, e.g. "
+                  "2026-11-05T14:00:00Z", file=sys.stderr)
+            return 2
+    if cfg.seed is None:                # chosen now so it is printed + logged
+        from .engine import new_seed
+        cfg.seed = new_seed()
 
     print(f"TGT run: {cfg.summary()}", flush=True)
-    eng = Engine(cfg, on_log=lambda m: print(f"  [engine] {m}", flush=True))
+    eng = Engine(cfg, on_log=lambda m: print(f"  [engine] {m}", flush=True),
+                 argv=getattr(args, "argv", None))
     # SIGTERM (systemctl/podman stop, timeout) and SIGHUP stop the engine like
     # Ctrl-C does, so the pcap is flushed + closed and the summary printed.
     caught: list[int] = []
@@ -391,12 +407,27 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--server-mac", default="02:00:00:00:00:02")
     r.add_argument("--server-ip", default="10.10.10.20")
     r.add_argument("--vlan", type=int, default=None, help="802.1Q VLAN id")
+    r.add_argument("--seed", type=int, default=None,
+                   help="run seed: same seed + options = identical frames "
+                        "every cycle (default: random, printed)")
+    r.add_argument("--manifest", metavar="FILE",
+                   help="write the run manifest (JSON ground truth: seed, "
+                        "inventory, first/last seen, flows, attack events); "
+                        "rewritten every ~10 s and on exit")
+    r.add_argument("--clock", choices=["wall", "synthetic"], default="wall",
+                   help="pcap/manifest timestamps: wall = real send time; "
+                        "synthetic = --start-time + n/--rate (pcap-only runs "
+                        "then skip real-time pacing)")
+    r.add_argument("--start-time", metavar="ISO",
+                   help="synthetic clock start, e.g. 2026-11-05T14:00:00Z "
+                        "(default: now)")
     return p
 
 
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    args.argv = list(sys.argv[1:] if argv is None else argv)
     if args.command in (None, "tui"):
         # SIGTERM/SIGHUP exit cleanly (curses restores the terminal) — and
         # at all when running as PID 1 in a container

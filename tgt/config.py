@@ -27,6 +27,10 @@ class RunConfig:
     messages: int = 5                    # protocol exchanges per built flow cycle
     loop: bool = True                    # rebuild + resend flows continuously
     endpoints: Endpoints = field(default_factory=Endpoints)
+    seed: Optional[int] = None           # run seed: reproduces every cycle (None = random)
+    manifest_path: Optional[str] = None  # write the run manifest (JSON ground truth) here
+    clock: str = "wall"                  # pcap/manifest timestamps: wall | synthetic
+    start_time: Optional[str] = None     # synthetic clock start (ISO-8601 UTC)
 
     def summary(self) -> str:
         target = self.iface or "(pcap only)"
@@ -46,5 +50,6 @@ class RunConfig:
             variants = "random" if self.sprinkle_random else ",".join(self.sprinkle)
             ratio = f"@{self.sprinkle_ratio:.0%}" if self.sprinkle_ratio else ""
             what += f" +malware[{variants}{ratio}]"
+        seed = "" if self.seed is None else f" seed={self.seed}"
         return (f"{what} iface={target} "
-                f"rate={self.rate}pps {stop} loop={self.loop}")
+                f"rate={self.rate}pps {stop} loop={self.loop}{seed}")

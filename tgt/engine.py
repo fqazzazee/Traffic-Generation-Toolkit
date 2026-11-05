@@ -7,10 +7,11 @@ monitor).
 """
 from __future__ import annotations
 
+import random
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from . import protocols
 from .config import RunConfig
@@ -32,6 +33,8 @@ class Stats:
     running: bool = False
     finished: bool = False
     cycle_frames: int = 0          # frames in one built (or replayed) cycle
+    cycles: int = 0                # cycles started
+    seed: Optional[int] = None     # run seed (reproduces every cycle)
     per_profile: dict = field(default_factory=dict)
 
     @property
@@ -51,20 +54,42 @@ class Stats:
         return (self.bytes * 8 / 1e6) / e if e > 0 else 0.0
 
 
-def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
+# A built frame: (profile/attack key, frame bytes, source label) — the source
+# is "baseline", "incident:<key>" or "sprinkle:<incident>".
+Tagged = Tuple[str, bytes, str]
+
+
+def build_batch(cfg: RunConfig, seed: Optional[int] = None, cycle: int = 0,
+                sport_stride: int = 0) -> List[tuple[str, bytes]]:
     """Build one interleaved cycle of frames tagged with their profile key.
 
     The base is a scenario/environment/incident/protocol mix; any ``sprinkle``
     incidents are then spread thinly through it so the malware rides on top of
-    otherwise-normal traffic.
+    otherwise-normal traffic. See :func:`build_cycle` for ``seed``/``cycle``.
     """
-    base = _build_base(cfg)
+    return [(k, f) for k, f, _ in build_cycle(cfg, seed, cycle, sport_stride)]
+
+
+def build_cycle(cfg: RunConfig, seed: Optional[int] = None, cycle: int = 0,
+                sport_stride: int = 0) -> List[Tagged]:
+    """Cycle ``cycle`` of a run as (key, frame, source) triples.
+
+    Each cycle is fresh — new ephemeral ports (advancing by ``sport_stride``
+    per cycle), random TCP ISNs, continuing app-level counters, drifting
+    process values — yet a pure function of ``(cfg, seed, cycle)``: the same
+    seed rebuilds identical frames. ``seed`` defaults to ``cfg.seed``; with
+    neither set every build is different.
+    """
+    if seed is None:
+        seed = cfg.seed
+    rng = protocols.begin_build(seed, cycle, sport_stride).rng
+    src = f"incident:{cfg.incident}" if cfg.incident else "baseline"
+    base: List[Tagged] = [(k, f, src) for k, f in _build_base(cfg)]
     if cfg.sprinkle or cfg.sprinkle_random:
         from . import incidents
-        import random
         pool = [k for k in cfg.sprinkle if k in incidents.INCIDENTS]
         if cfg.sprinkle_random:
-            pool = [random.choice(pool or list(incidents.INCIDENTS))]
+            pool = [rng.choice(pool or list(incidents.INCIDENTS))]
         if not pool:
             return base
 
@@ -81,11 +106,14 @@ def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
 
         def cycle(i):
             inc = incidents.get(pool[i % len(pool)])
+            label = f"sprinkle:{inc.key}"
             if tagged:              # ride on the env's VLANs/trunk directly
-                return inc.build_on(cfg.sprinkle_messages, env, span=cfg.span)
-            mapping = inc.map_onto(env)   # re-address only (base is untagged)
-            return inc.build(cfg.sprinkle_messages,
-                             resolve=lambda n, m=mapping: m.get(n) or inc.host(n))
+                built = inc.build_on(cfg.sprinkle_messages, env, span=cfg.span)
+            else:
+                mapping = inc.map_onto(env)   # re-address only (base untagged)
+                built = inc.build(cfg.sprinkle_messages, resolve=lambda n,
+                                  m=mapping: m.get(n) or inc.host(n))
+            return [(k, f, label) for k, f in built]
 
         r = min(max(cfg.sprinkle_ratio, 0.0), 0.9)
         if r > 0 and base:
@@ -101,8 +129,35 @@ def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
                 extras = [first]
         else:                               # natural minority: one cycle per variant
             extras = [cycle(i) for i in range(len(pool))]
-        base = _sprinkle(base, extras, randomize=cfg.sprinkle_random)
+        base = _sprinkle(base, extras, randomize=cfg.sprinkle_random, rng=rng)
     return base
+
+
+def sport_stride(used: int) -> int:
+    """Per-cycle advance of the source-port allocator for a cycle that used
+    ``used`` ports: headroom for cycles that vary in size (random sprinkle),
+    rounded to 64."""
+    return -(-(used * 5 // 4 + 32) // 64) * 64
+
+
+class CycleBuilder:
+    """Builds cycle N of a run — a pure function of ``(cfg, seed, N)``.
+
+    The source-port stride comes from cycle 0's port use, so ports advance
+    across cycles without 4-tuple reuse until the ephemeral range wraps.
+    """
+
+    def __init__(self, cfg: RunConfig, seed: Optional[int]):
+        self.cfg, self.seed = cfg, seed
+        self.stride: Optional[int] = None
+
+    def build(self, cycle: int) -> List[Tagged]:
+        if self.stride is None:
+            first = build_cycle(self.cfg, self.seed, 0)
+            self.stride = sport_stride(protocols.build_context().sports_used)
+            if cycle == 0:
+                return first
+        return build_cycle(self.cfg, self.seed, cycle, self.stride)
 
 
 def _build_base(cfg: RunConfig) -> List[tuple[str, bytes]]:
@@ -128,9 +183,8 @@ def _build_base(cfg: RunConfig) -> List[tuple[str, bytes]]:
     return batch
 
 
-def _sprinkle(base: List[tuple[str, bytes]],
-              extras: List[List[tuple[str, bytes]]],
-              randomize: bool = False) -> List[tuple[str, bytes]]:
+def _sprinkle(base: list, extras: List[list], randomize: bool = False,
+              rng: Optional[random.Random] = None) -> list:
     """Spread `extras` frames through `base` (evenly, or jittered when random).
 
     Malware frames keep their relative order (so each attack's session stays
@@ -144,11 +198,11 @@ def _sprinkle(base: List[tuple[str, bytes]],
     merged: List[tuple[str, bytes]] = []
     ei = 0
     if randomize:
-        import random
+        roll = (rng or random).random
         prob = len(flat) / len(base)
         for item in base:
             merged.append(item)
-            if ei < len(flat) and random.random() < prob:
+            if ei < len(flat) and roll() < prob:
                 merged.append(flat[ei])
                 ei += 1
     else:
@@ -176,9 +230,14 @@ def replay_offsets(timestamps: List[float],
 
 
 class Engine:
+    # manifest rewrite period (seconds of wall time)
+    MANIFEST_INTERVAL = 10.0
+
     def __init__(self, cfg: RunConfig,
-                 on_log: Optional[Callable[[str], None]] = None):
+                 on_log: Optional[Callable[[str], None]] = None,
+                 argv: Optional[List[str]] = None):
         self.cfg = cfg
+        self.argv = list(argv or [])
         self.stats = Stats()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -214,8 +273,13 @@ class Engine:
         cfg = self.cfg
         sender: Optional[RawSender] = None
         pcap: Optional[PcapWriter] = None
+        recorder = None
+        pool = None
         self.stats.running = True
         self.stats.started = time.perf_counter()
+        seed = cfg.seed if cfg.seed is not None else new_seed()
+        self.stats.seed = seed
+        synthetic = cfg.clock == "synthetic"
         try:
             if cfg.iface:
                 sender = RawSender(cfg.iface)
@@ -232,34 +296,58 @@ class Engine:
             if cfg.pcap_path:
                 pcap = PcapWriter(cfg.pcap_path)
                 self.log(f"writing pcap -> {cfg.pcap_path}")
+            # synthetic clock: frame i is stamped start + i/rate (1 ms apart at
+            # --rate 0); with nothing to send there is no reason to pace
+            t0 = (parse_start(cfg.start_time) if synthetic else 0.0)
+            step = 1.0 / cfg.rate if cfg.rate and cfg.rate > 0 else 0.001
+            pace = not (synthetic and sender is None)
+            if cfg.manifest_path:
+                from .manifest import Recorder
+                recorder = Recorder(cfg, seed, self.argv, cfg.clock)
+                self.log(f"manifest -> {cfg.manifest_path}")
+            last_manifest = time.monotonic()
 
-            limiter = RateLimiter(cfg.rate)
+            limiter = RateLimiter(cfg.rate if pace else 0)
             offsets = None      # realtime replay: send time of each frame
+            builder = None
             if cfg.replay_path:
                 from . import pcapread
                 frames_ts = pcapread.read_frames(cfg.replay_path)
-                batch = [("replay", f) for _, f in frames_ts]
-                if cfg.replay_realtime and len(frames_ts) > 1:
+                batch = [("replay", f, "replay") for _, f in frames_ts]
+                if cfg.replay_realtime and len(frames_ts) > 1 and pace:
                     offsets = replay_offsets([t for t, _ in frames_ts])
                 self.log(f"replaying {len(batch)} packets from {cfg.replay_path}"
                          + (" (original timing)" if offsets else
                             f" @ {cfg.rate}pps"))
             else:
-                batch = build_batch(cfg)
+                builder = CycleBuilder(cfg, seed)
+                tb = time.perf_counter()
+                batch = builder.build(0)
                 what = (f"incident {cfg.incident}" if cfg.incident else
                         f"env {cfg.env}" if cfg.env else ", ".join(cfg.profiles))
                 if cfg.sprinkle_random:
                     what += " + malware:random"
                 elif cfg.sprinkle:
                     what += f" + malware:{','.join(cfg.sprinkle)}"
-                self.log(f"built {len(batch)} frames/cycle for [{what}]")
+                self.log(f"built {len(batch)} frames/cycle for [{what}] in "
+                         f"{time.perf_counter() - tb:.2f}s (seed {seed})")
             self.stats.cycle_frames = len(batch)
 
+            cycle = 0
             while not self._stop.is_set():
+                self.stats.cycles = cycle + 1
+                # each cycle is rebuilt fresh (new ports/ISNs/counters/values);
+                # the next one is built in the background while this one sends
+                nxt = None
+                if builder is not None and cfg.loop:
+                    if pool is None:
+                        from concurrent.futures import ThreadPoolExecutor
+                        pool = ThreadPoolExecutor(1, "tgt-build")
+                    nxt = pool.submit(builder.build, cycle + 1)
                 # realtime replay is scheduled against absolute target times
                 # from the cycle start, so per-packet overhead never accumulates
                 cycle_start = time.perf_counter()
-                for idx, (key, frame) in enumerate(batch):
+                for idx, (key, frame, source) in enumerate(batch):
                     if self._stop.is_set():
                         break
                     if offsets is not None:
@@ -279,32 +367,66 @@ class Engine:
                     # only frames that really left (or are file-only) count and
                     # land in the pcap, so the pcap stays ground truth
                     if sent:
+                        ts = (t0 + self.stats.packets * step if synthetic
+                              else time.time())
                         if pcap is not None:
-                            pcap.write(frame)
+                            pcap.write(frame, ts=ts)
+                        if recorder is not None:
+                            recorder.observe(ts, key, frame, source)
                         self.stats.packets += 1
                         self.stats.bytes += len(frame)
                         self.stats.per_profile[key] = \
                             self.stats.per_profile.get(key, 0) + 1
+                    if (recorder is not None and time.monotonic()
+                            - last_manifest >= self.MANIFEST_INTERVAL):
+                        last_manifest = time.monotonic()
+                        self._write_manifest(recorder)
 
                     # --count bounds attempts, so a dead interface still ends
                     if cfg.count and (self.stats.packets
                                       + self.stats.errors) >= cfg.count:
                         self._stop.set()
                         break
-                    if cfg.duration and self.stats.elapsed >= cfg.duration:
+                    elapsed = (self.stats.packets * step if not pace
+                               else self.stats.elapsed)
+                    if cfg.duration and elapsed >= cfg.duration:
                         self._stop.set()
                         break
-                if not cfg.loop:
+                if not cfg.loop or self._stop.is_set():
                     break
-                # random mode: re-roll the variant + placement for the next cycle
-                if cfg.sprinkle_random and offsets is None and not self._stop.is_set():
-                    batch = build_batch(cfg)
+                cycle += 1
+                if nxt is not None:
+                    batch = nxt.result()
         finally:
+            if pool is not None:
+                pool.shutdown(wait=False)
             if sender is not None:
                 sender.close()
             if pcap is not None:
                 pcap.close()
+            if recorder is not None:
+                self._write_manifest(recorder)
             self.stats.running = False
             self.stats.finished = True
             self.log(f"done: {self.stats.packets} pkts, "
                      f"{self.stats.bytes} bytes, {self.stats.errors} errors")
+
+    def _write_manifest(self, recorder) -> None:
+        try:
+            recorder.write(self.cfg.manifest_path, self.stats)
+        except OSError as e:
+            self.log(f"cannot write manifest {self.cfg.manifest_path}: {e}")
+
+
+def new_seed() -> int:
+    """A fresh random run seed (logged + recorded so the run can be redone)."""
+    return random.SystemRandom().randrange(1 << 32)
+
+
+def parse_start(text: Optional[str]) -> float:
+    """--start-time for the synthetic clock (ISO-8601; default: now, whole
+    seconds)."""
+    if not text:
+        return float(int(time.time()))
+    from .manifest import parse_iso
+    return parse_iso(text)
