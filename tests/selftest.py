@@ -3624,6 +3624,434 @@ def test_tshark_ot_identity_matches_inventory() -> None:
           <= set(eng.split()), "tshark: S7 upload/download not seen")
 
 
+# ---- time model: timed scheduler, persistent sessions, campaigns (#39 #56) --
+def _timed_run(d: str, name: str, **kw) -> tuple:
+    """A synthetic-clock timed run -> (records [(ts, frame)], manifest)."""
+    import json
+    from tgt.engine import Engine
+    cfg = RunConfig(**dict(dict(schedule="timed", clock="synthetic",
+                                start_time="2026-11-02T08:00:00Z", rate=0,
+                                seed=11), **kw))
+    cfg.pcap_path = os.path.join(d, name + ".pcap")
+    cfg.manifest_path = os.path.join(d, name + ".json")
+    eng = Engine(cfg)
+    eng.start()
+    eng.join(120)
+    check(not eng.is_alive(), f"timed run {name} did not finish")
+    with open(cfg.manifest_path) as fh:
+        return _pcap_records(cfg.pcap_path), json.load(fh)
+
+
+def _tcp_rows(records, port: int) -> list:
+    """(ts, src ip, dst ip, sport, dport, flags, seq, ack, payload len) of
+    every TCP segment to/from ``port``."""
+    out = []
+    for ts, f in records:
+        off = 18 if f[12:14] == b"\x81\x00" else 14
+        if f[off - 2:off] != b"\x08\x00" or f[off + 9] != P.IPPROTO_TCP:
+            continue
+        ihl = (f[off] & 15) * 4
+        tot = struct.unpack("!H", f[off + 2:off + 4])[0]
+        l4 = off + ihl
+        sp, dp, seq, ack = struct.unpack("!HHII", f[l4:l4 + 12])
+        if port not in (sp, dp):
+            continue
+        doff = (f[l4 + 12] >> 4) * 4
+        out.append((ts, ".".join(map(str, f[off + 12:off + 16])),
+                    ".".join(map(str, f[off + 16:off + 20])), sp, dp,
+                    f[l4 + 13], seq, ack, tot - ihl - doff))
+    return out
+
+
+def test_timed_parse_duration_and_tables() -> None:
+    from tgt import timing
+    for text, want in (("90", 90), ("500ms", 0.5), ("30m", 1800),
+                       ("4h", 14400), ("7d", 604800), ("1h30m", 5400),
+                       (12, 12)):
+        check(timing.parse_duration(text) == want, f"duration {text!r}")
+    for bad in ("", "4x", "h", "10 parsecs"):
+        try:
+            timing.parse_duration(bad)
+            check(False, f"duration {bad!r} accepted")
+        except ValueError:
+            pass
+    # every registered protocol has a sane table row (or the default)
+    for key in protocols.PROFILES:
+        lo, hi, jit, n, cls = timing.spec(key)
+        check(0 < lo <= hi and 0 <= jit < 1 and n >= 1 and cls in (
+            "ot", "infra", "office", "eng", "operator"), f"timing {key}")
+    for prof, classes in timing.DAY_PROFILES.items():
+        for cls, (wd, we) in classes.items():
+            check(len(wd) == 24 and len(we) == 24, f"{prof}/{cls} hours")
+    # a conversation's period is stable and env-file timing wins
+    from tgt import enterprise, envfile
+    env = enterprise.get("ot-plant")
+    conv = next(c for c in env.conversations if c[2] == "modbus")
+    a = timing.conversation_timing(env, conv)
+    check(a == timing.conversation_timing(env, conv)
+          and 0.5 <= a["period"] <= 2.0, f"modbus period {a}")
+    doc = envfile.to_dict(env)
+    for f in doc["flows"]:
+        if (f["client"], f["server"], f["proto"]) == conv:
+            f["period"], f["jitter"] = "250ms", "10%"
+    env2 = envfile.from_dict(doc)
+    check(timing.conversation_timing(env2, conv) ==
+          {"period": 0.25, "jitter": 0.1}, "env-file period/jitter ignored")
+
+
+def test_timed_persistent_table_matches_builders() -> None:
+    """Each PERSISTENT entry's setup/teardown counts cut the builder's
+    session at the right places: polls grow with count, the first exchange
+    opens TCP (SYN), the last closes it (FIN)."""
+    from tgt import enterprise, schedule, timing
+    site = enterprise.get("industrial-site")
+    eps = {}
+    for c, s, p in site.conversations:
+        eps.setdefault(p, site.conv_endpoints(site.host(c), site.host(s), p))
+    for proto, (setup, teardown, _) in timing.PERSISTENT.items():
+        ep = eps.get(proto) or Endpoints()
+        cm = P.mac_to_bytes(ep.client_mac)
+        n = []
+        for k in (3, 6):
+            protocols.begin_build(1, 1)
+            g = schedule.exchanges(protocols.get(proto).build(ep, k), cm)
+            n.append(len(g))
+            if protocols.get(proto).transport == "tcp" or proto == "enip-io":
+                first = schedule.view(g[0][0], cm)
+                check(first[5] and first[1] == schedule.SYN,
+                      f"{proto}: first exchange is not the handshake")
+            if teardown:
+                last = [schedule.view(f, cm)[1] for f in g[-1]]
+                check(any(x & schedule.FIN for x in last),
+                      f"{proto}: last exchange does not close")
+        check(n[0] > setup + teardown and n[1] > n[0],
+              f"{proto}: {n} exchanges for 3/6 polls (setup {setup}, "
+              f"teardown {teardown})")
+
+
+def test_timed_periods_rtt_and_persistent_sessions() -> None:
+    from tgt import enterprise, timing
+    env = enterprise.get("ot-plant")
+    with tempfile.TemporaryDirectory() as d:
+        recs, m = _timed_run(d, "plant", env="ot-plant", duration=600.0)
+    check(len(recs) > 5000, f"timed ot-plant 10 min: {len(recs)} frames")
+    t0 = recs[0][0]
+    check(recs[-1][0] - t0 > 590 and all(
+        b[0] >= a[0] for a, b in zip(recs, recs[1:])),
+        "timed pcap does not span 10 minutes in time order")
+    for _, f in recs[:3000]:
+        verify_ip_l4(f, "timed")
+    # Modbus: one connection per poller, polls every period (+-5 %)
+    rows = _tcp_rows(recs, 502)
+    hosts = {h.ip: h.name for h in env.hosts}
+    by_pair = {}
+    for r in rows:
+        key = (r[1], r[2]) if r[4] == 502 else (r[2], r[1])
+        by_pair.setdefault(key, []).append(r)
+    check(len(by_pair) == 2, f"modbus pollers: {sorted(by_pair)}")
+    for (cip, sip), rs in by_pair.items():
+        syns = [r for r in rs if r[5] == P.SYN]
+        reqs = [r for r in rs if r[8] > 0 and r[4] == 502]
+        ports = {r[3] if r[4] == 502 else r[4] for r in rs}
+        check(len(syns) == 1 and len(ports) == 1,
+              f"modbus {cip}->{sip}: {len(syns)} SYNs, ports {sorted(ports)}")
+        check(len(reqs) > 250, f"modbus {cip}->{sip}: {len(reqs)} polls")
+        # client byte stream is contiguous across chunks (no gaps/overlap)
+        for a, b in zip(reqs, reqs[1:]):
+            if b[6] != (a[6] + a[8]) & 0xFFFFFFFF:
+                check(False, f"modbus {cip}->{sip}: seq gap {a[6]}+{a[8]} "
+                             f"-> {b[6]}")
+                break
+        gaps = sorted(b[0] - a[0] for a, b in zip(reqs, reqs[1:]))
+        want = timing.conversation_timing(
+            env, (hosts[cip], hosts[sip], "modbus"))["period"]
+        med = gaps[len(gaps) // 2]
+        check(abs(med - want) / want < 0.05,
+              f"modbus {cip}->{sip}: median poll gap {med:.3f}s, "
+              f"period {want:.3f}s")
+        fl = next(f for f in m["flows_seen"] if f["protocol"] == "modbus"
+                  and f["client"] == f"ot-plant:{hosts[cip]}")
+        check(abs(fl["period_s"] - want) / want < 0.05
+              and fl["jitter"] < 0.05 and fl["occurrences"] > 250,
+              f"manifest modbus period {fl}")
+    # RTT: switched < routed (to the same PLC) < WAN (EDR cloud)
+    def resp_gap(rs):
+        out, last = [], None
+        for r in rs:
+            if r[8] > 0 and r[4] == 502:
+                last = r
+            elif r[8] > 0 and r[3] == 502 and last is not None:
+                out.append(r[0] - last[0])
+                last = None
+        return sorted(out)[len(out) // 2]
+    same = {k: v for k, v in by_pair.items()
+            if env.segment_of(env.host(hosts[k[0]])) is
+            env.segment_of(env.host(hosts[k[1]]))}
+    routed = {k: v for k, v in by_pair.items() if k not in same}
+    check(same and routed, "need a switched and a routed Modbus poller")
+    s_rtt = resp_gap(next(iter(same.values())))
+    r_rtt = resp_gap(next(iter(routed.values())))
+    hs = [r for r in _tcp_rows(recs, 443)
+          if r[5] in (P.SYN, P.SYN | P.ACK)]
+    wan = []
+    for a, b in zip(hs, hs[1:]):
+        if a[5] == P.SYN and b[5] == P.SYN | P.ACK and a[3] == b[4] and \
+                not b[1].startswith("172.16."):
+            wan.append(b[0] - a[0])
+    w_rtt = sorted(wan)[len(wan) // 2] if wan else 0
+    check(s_rtt < r_rtt < w_rtt and w_rtt >= 0.02,
+          f"RTT ordering switched {s_rtt:.5f} < routed {r_rtt:.5f} < WAN "
+          f"{w_rtt:.5f}")
+    # the inventory carries each flow's nominal period
+    inv = {(f["client"], f["server"], f["protocol"]): f
+           for f in m["inventory"]["flows"]}
+    check(all("period_s" in f for f in inv.values()), "inventory period_s")
+
+
+def test_timed_seed_determinism_and_cycle_default() -> None:
+    from tgt import cli
+    with tempfile.TemporaryDirectory() as d:
+        a, ma = _timed_run(d, "a", env="it-org", duration=120.0,
+                           sprinkle=["wannacry"])
+        b, mb = _timed_run(d, "b", env="it-org", duration=120.0,
+                           sprinkle=["wannacry"])
+        c, _ = _timed_run(d, "c", env="it-org", duration=120.0, seed=12,
+                          sprinkle=["wannacry"])
+    check(a == b and len(a) > 1000, "timed: same seed, different pcaps")
+    check(ma["flows_seen"] == mb["flows_seen"]
+          and ma["events"] == mb["events"], "timed: manifests differ")
+    check(a != c, "timed: different seeds give identical pcaps")
+    check(any(e["source"] == "sprinkle:wannacry" for e in ma["events"]),
+          "timed sprinkle: no attack events")
+    ns = cli.build_parser().parse_args(["run", "-e", "it-org", "--pcap", "x"])
+    check(ns.schedule == "cycle" and ns.rate is None and ns.speed == 1.0,
+          "cycle must stay the default schedule")
+    ns = cli.build_parser().parse_args(
+        ["run", "-e", "it-org", "--schedule", "timed", "--duration", "7d",
+         "--speed", "60", "--day-profile", "shift", "--min-period", "2s"])
+    check(ns.duration == 604800 and ns.min_period == 2 and ns.speed == 60,
+          "timed CLI flags")
+
+
+def test_timed_day_profile_shapes_volume() -> None:
+    from tgt import enterprise, schedule, timing
+    env = enterprise.get("it-org")
+    office = [s for s in schedule.env_streams(env)
+              if s.cls == "office" and s.key in ("dns", "https")][:6]
+    ot = schedule.profile_streams(["modbus"], Endpoints())
+    check(len(office) == 6, "it-org office streams")
+    # Mon 2026-11-02 00:00 UTC .. Sun 2026-11-08: weekday vs weekend, hour
+    sch = schedule.Scheduler(5, 1793577600.0, "shift")
+    for s in office + ot:
+        s.period = 300.0 if s.key != "modbus" else 60.0
+    sch.load(office + ot, 0.0, initial=True)
+    hours = {}
+    for t, _, key, _, _, occ in sch.run(6 * 86400.0):
+        if occ:
+            h = int(t // 3600)
+            hours.setdefault(key == "modbus", {}).setdefault(h, 0)
+            hours[key == "modbus"][h] += 1
+    off, mb = hours.get(False, {}), hours.get(True, {})
+
+    def tot(d, days, hrs):
+        return sum(d.get(24 * day + h, 0) for day in days for h in hrs)
+    night = tot(off, range(5), range(0, 5))
+    morning = tot(off, range(5), range(8, 12))
+    lunch = tot(off, range(5), [12])
+    weekend = tot(off, [5], range(8, 12))
+    check(morning > 8 * max(night, 1) and lunch < morning / 4 * 0.8
+          and weekend < morning / 5 / 5,
+          f"shift profile: night {night}, 08-12 {morning}, lunch {lunch}, "
+          f"weekend 08-12 {weekend}")
+    logon = tot(off, range(5), [7])
+    check(logon > morning / 4 * 1.5, f"no 07:00 logon peak: {logon}")
+    mb_day, mb_night = tot(mb, range(5), range(8, 12)), \
+        tot(mb, range(5), range(0, 4))
+    check(abs(mb_day - mb_night) <= 0.05 * mb_day,
+          f"OT polling not steady: {mb_day} vs {mb_night}")
+    check(timing.factor("shift", "ot", 1793577600.0) == 1.0, "ot factor")
+
+
+def test_campaign_plans_events_and_validation() -> None:
+    from tgt import campaign
+    plans = campaign.packaged()
+    check(len(plans) >= 3, f"example campaigns: {plans}")
+    for p in plans:
+        plan = campaign.load(p)
+        phases = campaign.build(plan)
+        check(not campaign.validate(phases),
+              f"{p}: {campaign.validate(phases)}")
+    ph = campaign.build(campaign.load(campaign.find("baseline-then-change")))
+    cats = [[e["category"] for e in p.events] for p in ph]
+    check(cats == [[], ["new-asset"], ["firmware-change"],
+                   ["new-asset", "cross-zone"],
+                   ["asset-offline", "asset-offline"]],
+          f"baseline-then-change events {cats}")
+    check(ph[2].diff["changed"] == [{
+        "asset_id": "industrial-site:PLC-PK2", "name": "PLC-PK2",
+        "field": "firmware", "old": "20.055", "new": "20.058"}],
+        f"firmware diff {ph[2].diff['changed']}")
+    check("industrial-site:PLC-UT2" in ph[4].diff["offline"]
+          and "industrial-site:LAPTOP-VENDOR" in ph[4].diff["removed"],
+          "offline/removed diff")
+    drift = campaign.build(campaign.load(campaign.find("ot-plant-drift")))
+    check([e["category"] for p in drift for e in p.events] ==
+          ["asset-change", "ip-change", "new-conversation", "asset-offline"],
+          "ot-plant-drift events")
+    # validation: a phase too short for the conversations it changes
+    short = campaign.Plan({"env": "ot-plant", "phases": [
+        {"name": "b", "duration": "10m"},
+        {"name": "c", "duration": "5m",
+         "set": [{"host": "PLC-RW1", "firmware": "20.056"}]}]}, "t.json")
+    probs = campaign.validate(campaign.build(short))
+    check(len(probs) == 2 and "enip-" in probs[0], f"validation {probs}")
+    for bad, msg in (
+            ({"env": "ot-plant", "phases": []}, "phases"),
+            ({"env": "nope", "phases": [{"duration": 1}]}, "unknown"),
+            ({"env": "ot-plant", "phases": [{"duration": "1h",
+                                             "frobnicate": 1}]}, "frobnicate"),
+            ({"env": "ot-plant", "phases": [{"duration": "1h", "set": [
+                {"host": "NOPE", "ip": "172.16.1.99"}]}]}, "NOPE"),
+            ({"env": "ot-plant", "phases": [{"duration": "1h", "add_host": [
+                {"name": "X", "ip": "8.8.8.8", "role": "ws",
+                 "os": "win10"}]}]}, "8.8.8.8")):
+        try:
+            campaign.build(campaign.Plan(bad, "t.json"))
+            check(False, f"bad plan accepted: {bad}")
+        except campaign.CampaignError as e:
+            check(msg in str(e), f"bad plan message {e}")
+
+
+def test_campaign_run_manifest_and_score() -> None:
+    import json
+    import subprocess
+    from tgt import campaign
+    plan = {"env": "ot-plant", "seed": 3, "phases": [
+        {"name": "baseline", "duration": "4m"},
+        {"name": "arrive", "duration": "3m",
+         "add_host": [{"name": "LAPTOP-X", "ip": "172.16.0.77", "role": "ws",
+                       "os": "win10", "mac": "3c:52:82:4a:10:96"}],
+         "add_flow": [{"client": "LAPTOP-X", "server": "PLC-S7-1",
+                       "proto": "s7comm"},
+                      {"client": "ENGWS01", "server": "PLC-S7-2",
+                       "proto": "modbus"},
+                      {"client": "PLC-RW1", "server": "PLC-S7-1",
+                       "proto": "s7comm"}]},
+        {"name": "changes", "duration": "3m",
+         "set": [{"host": "PLC-RW1", "firmware": "20.056"},
+                 {"host": "PLC-S7-1", "ip": "172.16.2.41"}]},
+        {"name": "gone", "duration": "3m", "offline": ["PLC-RW2"],
+         "sprinkle": ["triton"]}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "plan.json")
+        with open(path, "w") as f:
+            json.dump(plan, f)
+        check(campaign.validate(campaign.build(campaign.load(path))),
+              "4-minute phases should fail validation")
+        recs, m = _timed_run(d, "camp", env="ot-plant", campaign=path,
+                             seed=3)
+        ph = {p["id"]: p for p in m["phases"]}
+        check([p["name"] for p in m["phases"]] ==
+              ["baseline", "arrive", "changes", "gone"]
+              and ph["p2"]["start"] == "2026-11-02T08:04:00.000000Z"
+              and ph["p4"]["end"] == "2026-11-02T08:13:00.000000Z"
+              and sum(p["packets"] for p in m["phases"]) == m["packets"],
+              f"campaign phases {[(p['id'], p['start'], p['end']) for p in m['phases']]}")
+        ev = {}
+        for e in m["events"]:
+            ev.setdefault(e["category"], []).append(e)
+        for cat in ("new-asset", "new-conversation", "firmware-change",
+                    "ip-change", "asset-offline", "cross-zone"):
+            check(cat in ev, f"campaign: no {cat} event")
+        check(any(e["source"] == "sprinkle:triton" for e in m["events"]),
+              "campaign: no sprinkle event in the last phase")
+        na = next(e for e in ev["new-asset"]
+                  if e["source"].startswith("campaign:"))
+        check(na["hosts"] == ["ot-plant:LAPTOP-X"]
+              and na["t_start"] == ph["p2"]["start"]
+              and na["t_end"] == ph["p2"]["end"]
+              and m["first_seen"].get("ot-plant:LAPTOP-X", "") >=
+              ph["p2"]["start"], f"new-asset event {na}")
+        ipc = ev["ip-change"][0]
+        check(ipc["src"] == "172.16.2.41" and ipc["dst"] == "172.16.2.21",
+              f"ip-change {ipc}")
+        inv = {h["name"]: h for h in m["inventory"]["hosts"]}
+        check("LAPTOP-X" in inv and inv["LAPTOP-X"]["phases"] ==
+              ["p2", "p3", "p4"] and inv["PLC-RW2"]["online_phases"] ==
+              ["p1", "p2", "p3"] and inv["PLC-S7-1"]["ip_history"] ==
+              ["172.16.2.21", "172.16.2.41"], "campaign union inventory")
+        # the offline PLC is silent; its pollers retry with SYNs
+        gone = P.mac_to_bytes(inv["PLC-RW2"]["mac"])
+        t_off = recs[0][0] + 600
+        late = [f for ts, f in recs if ts > t_off + 1 and f[6:12] == gone]
+        check(not late, f"offline PLC-RW2 sent {len(late)} frames")
+        rw2 = inv["PLC-RW2"]["ip"]
+        retries = [r for r in _tcp_rows(recs, 44818)
+                   if r[0] > t_off and r[2] == rw2 and r[5] == P.SYN]
+        check(len(retries) >= 3, f"no SYN retries to PLC-RW2: {retries}")
+        # announcements: gratuitous ARP on arrival and IP change
+        garp = {(ts, f[32:36]) for ts, f in recs
+                if f[12:14] == b"\x81\x00" and f[16:18] == b"\x08\x06"
+                and f[32:36] == f[42:46] and f[24:26] == b"\x00\x01"}
+        for ip, t in (("172.16.0.77", 240), ("172.16.2.41", 420)):
+            check(any(abs(ts - recs[0][0] - t) < 5 and a == P.ip_to_bytes(ip)
+                      for ts, a in garp), f"no gratuitous ARP for {ip}")
+        # tgt score runs against the campaign manifest
+        alerts = os.path.join(d, "alerts.csv")
+        assets = os.path.join(d, "assets.csv")
+        with open(alerts, "w") as f:
+            f.write("time,src,dst,title,category\n")
+            f.write(f"{na['t_start'][:19]}Z,172.16.0.77,,New Asset Detected,"
+                    "Asset\n")
+            f.write(f"{ipc['t_start'][:19]}Z,172.16.2.41,,IP Address Change,"
+                    "Asset\n")
+        with open(assets, "w") as f:
+            f.write("name,ip,mac\n")
+            for h in m["inventory"]["hosts"]:
+                f.write(f"{h['name']},{h['ip']},{h['mac']}\n")
+        p = _cli(["score", "--manifest", os.path.join(d, "camp.json"),
+                  "--assets", assets, "--map", "generic", "--alerts", alerts,
+                  "--alert-map", "alerts-generic", "--json",
+                  os.path.join(d, "s.json")])
+        out, _ = p.communicate(timeout=60)
+        check(p.returncode == 0, f"tgt score on campaign rc={p.returncode} "
+                                 f"{out[-300:]}")
+        with open(os.path.join(d, "s.json")) as f:
+            r = json.load(f)
+        det = r["detections"]["per_category"]
+        check(det.get("new-asset", {}).get("detected") == 1
+              and det.get("ip-change", {}).get("detected") == 1
+              and r["discovery"]["recall"] > 0.9,
+              f"score on campaign: {det} recall {r['discovery']['recall']}")
+        if shutil_which("tshark"):
+            out = subprocess.run(
+                ["tshark", "-r", os.path.join(d, "camp.pcap"), "-q", "-z",
+                 "expert,warn"], capture_output=True, text=True).stdout
+            bad = [ln for ln in out.splitlines() if any(
+                w in ln for w in ("Malformed", "retransmission", "Duplicate",
+                                  "out-of-order", "not captured",
+                                  "Bad checksum", "incorrect"))]
+            check(not bad, f"tshark campaign: {bad[:3]}")
+
+
+def test_build_run_args_timed_flags() -> None:
+    import shlex
+    from tgt import cli, service
+    args = service.build_run_args(
+        None, [], 0, 5, env="industrial-site", seed=42,
+        manifest="/var/lib/tgt/run manifest.json", schedule="timed",
+        speed=60, day_profile="shift", min_period=1.0, duration=86400)
+    ns = cli.build_parser().parse_args(["run"] + shlex.split(args))
+    check(ns.seed == 42 and ns.manifest == "/var/lib/tgt/run manifest.json"
+          and ns.schedule == "timed" and ns.speed == 60
+          and ns.day_profile == "shift" and ns.min_period == 1.0
+          and ns.duration == 86400 and ns.rate == 0,
+          f"build_run_args timed round trip: {args}")
+    plain = service.build_run_args(None, ["modbus"], 20, 5)
+    check("--schedule" not in plain and "--seed" not in plain,
+          f"cycle args grew: {plain}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
