@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (roadmap v3)
+## 2.1.0 — 2026-11-05
 
 ### Evaluating a monitor
 - **`tgt bench`**: packaged seeded suites (`quick`, `standard`) of a learning baseline, an
