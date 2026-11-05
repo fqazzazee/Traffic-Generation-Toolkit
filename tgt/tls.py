@@ -147,11 +147,25 @@ def issuer_for(cn: str) -> Tuple[Tuple[str, str], ...]:
     return ISSUERS["letsencrypt"]
 
 
+SERVER_AUTH, CLIENT_AUTH = "1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2"
+
+
 def certificate(cn: str, rnd: Optional[_Rand] = None,
-                issuer: Optional[Tuple[Tuple[str, str], ...]] = None) -> bytes:
+                issuer: Optional[Tuple[Tuple[str, str], ...]] = None,
+                subject: Optional[Tuple[Tuple[str, str], ...]] = None,
+                san: Tuple[Tuple[int, str], ...] = (),
+                eku: Tuple[str, ...] = (SERVER_AUTH,),
+                key_usage: bytes = b"\x05\xa0",
+                extra: Tuple[bytes, ...] = ()) -> bytes:
     """A syntactically valid X.509 v3 server certificate (DER) for ``cn``:
     RSA-2048 key, SAN = ``cn``, serverAuth EKU. The signature is random bytes
-    (nobody verifies it); everything else parses like a real leaf cert."""
+    (nobody verifies it); everything else parses like a real leaf cert.
+
+    For other leaf kinds: ``subject`` (RDN pairs, default ``CN=cn``),
+    ``san`` ((GeneralName tag, value) pairs, default ``dNSName cn``), ``eku``
+    OIDs (e.g. :data:`CLIENT_AUTH` for a TLS client certificate),
+    ``key_usage`` (BIT STRING content) and ``extra`` DER-encoded extensions
+    appended after the standard four (a role extension, ...)."""
     rnd = rnd or _Rand("cert", cn)
     issuer = issuer or issuer_for(cn)
     serial = int.from_bytes(rnd.bytes(16), "big") >> 1 | 1 << 120
@@ -164,17 +178,18 @@ def certificate(cn: str, rnd: Optional[_Rand] = None,
     modulus = int.from_bytes(rnd.bytes(256), "big") | (1 << 2047) | 1
     spki = _seq(_seq(_oid("1.2.840.113549.1.1.1"), b"\x05\x00"),
                 _der(0x03, b"\x00" + _seq(_int(modulus), _int(65537))))
-    san = _seq(_der(0x82, cn.encode()))
+    san = _seq(*(_der(tag, v.encode()) for tag, v in (san or ((0x82, cn),))))
     exts = _seq(
         _seq(_oid("2.5.29.15"), _der(0x01, b"\xff"),            # keyUsage
-             _der(0x04, _der(0x03, b"\x05\xa0"))),   # digitalSig, keyEnc
+             _der(0x04, _der(0x03, key_usage))),     # digitalSig, keyEnc
         _seq(_oid("2.5.29.37"),                                # extKeyUsage
-             _der(0x04, _seq(_oid("1.3.6.1.5.5.7.3.1")))),     # serverAuth
+             _der(0x04, _seq(*(_oid(o) for o in eku)))),       # serverAuth
         _seq(_oid("2.5.29.17"), _der(0x04, san)),              # subjectAltName
         _seq(_oid("2.5.29.19"), _der(0x04, _seq())),           # CA:FALSE
-    )
+        *extra)
     tbs = _seq(_der(0xA0, _int(2)), _int(serial), _SHA256_RSA, _name(issuer),
-               _seq(nb, na), _name((("CN", cn),)), spki, _der(0xA3, exts))
+               _seq(nb, na), _name(subject or (("CN", cn),)), spki,
+               _der(0xA3, exts))
     return _seq(tbs, _SHA256_RSA, _der(0x03, b"\x00" + rnd.bytes(256)))
 
 
@@ -506,23 +521,72 @@ def _choose(t: ClientTemplate, o: dict, srv: ServerProfile):
     return version, cs
 
 
-def session(t: ClientTemplate, srv: ServerProfile, sni: str, count: int,
-            seed: tuple, cert_cn: str = "") -> Tuple[List[Tuple[bytes, bytes]], int]:
-    """One TLS connection as (client payload, server payload) exchanges, plus
-    how many leading exchanges are the handshake (sent back to back; the
-    application exchanges after them are separated by idle time)."""
+@dataclass
+class Channel:
+    """The negotiated session after a handshake: protocol version, cipher
+    suite and the connection's byte stream, so callers can add encrypted
+    records sized for their own plaintext (``None`` cipher = refused)."""
+    version: int
+    cs: Optional[int]
+    rnd: _Rand
+
+    @property
+    def record_version(self) -> int:
+        return 0x0303 if self.version == 0x0304 else self.version
+
+    def sealed(self, n: int) -> bytes:
+        """Ciphertext (record body) of an ``n``-byte plaintext."""
+        return _sealed(self.cs, self.version, n, self.rnd)
+
+    def record(self, n: int) -> bytes:
+        """One application_data record carrying ``n`` plaintext bytes."""
+        return _record(23, self.record_version, self.sealed(n))
+
+    def close_notify(self) -> bytes:
+        """An encrypted close_notify alert (TLS 1.3 hides it in an
+        application_data record)."""
+        if self.version == 0x0304:
+            return _record(23, 0x0303, self.sealed(2))
+        return _record(21, self.version, self.sealed(2))
+
+
+def _cert_request(version: int, issuer: Tuple[Tuple[str, str], ...]) -> bytes:
+    """CertificateRequest (TLS 1.0-1.2): RSA / ECDSA signing certificates,
+    the accepted signature algorithms (1.2) and the issuing CA's name."""
+    body = _u8(b"\x01\x40")
+    if version >= 0x0303:
+        body += _u16(_list16((0x0401, 0x0501, 0x0601, 0x0403, 0x0503, 0x0603,
+                              0x0804, 0x0805, 0x0806)))
+    return _hs(13, body + _u16(_u16(_name(issuer))))
+
+
+def handshake(t: ClientTemplate, srv: ServerProfile, sni: str, seed: tuple,
+              cert_cn: str = "", server_cert: bytes = b"",
+              client_cert: bytes = b""
+              ) -> Tuple[List[Tuple[bytes, bytes]], Channel]:
+    """The handshake of one TLS connection as (client payload, server
+    payload) exchanges, and the :class:`Channel` it negotiates.
+
+    ``server_cert`` replaces the certificate built for ``cert_cn`` / ``sni``;
+    a ``client_cert`` makes it mutually authenticated — the server asks for a
+    certificate (CertificateRequest) and the client answers with Certificate
+    + CertificateVerify (in clear before TLS 1.3, encrypted in 1.3). A
+    refused client gets a fatal alert (one exchange, ``Channel.cs`` None).
+    TLS 1.3 takes two exchanges (ClientHello / server flight, client
+    Finished / session tickets), earlier versions two as well (hello /
+    certificate flight, key exchange + Finished both ways)."""
     rnd = _Rand("tls", *seed)
     hello, o = client_hello(t, sni if "server_name" in t.exts else "", rnd)
     version, cs = _choose(t, o, srv)
     if cs is None:                         # fatal alert, connection closes
         desc = 70 if version < srv.min_version else 40
         return [(hello, _alert(t.record if version < 0x0301 else version,
-                               desc))], 1
+                               desc))], Channel(version, None, rnd)
     srand = rnd.bytes(32)
     if srv.max_version >= 0x0304 and version < 0x0304:
         srand = srand[:24] + _DOWNGRADE[version]
     cn = cert_cn or sni
-    cert = certificate(cn, _Rand("cert", cn))
+    cert = server_cert or certificate(cn, _Rand("cert", cn))
     alpn = o["alpn"][0] if o["alpn"] and "alpn" in o["exts"] else ""
     exchanges: List[Tuple[bytes, bytes]] = []
     if version == 0x0304:
@@ -535,68 +599,245 @@ def session(t: ClientTemplate, srv: ServerProfile, sni: str, count: int,
         hlen = _TLS13[cs]
         ee = 4 + 2 + (len(_ext(16, _u16(_u8(alpn.encode())))) if alpn else 0)
         inner = ee + (4 + 1 + 3 + 3 + len(cert) + 2) + (4 + 4 + 256) + 4 + hlen
+        if client_cert:                    # CertificateRequest: sigalgs ext
+            inner += 4 + 1 + 2 + 4 + 2 + 2 * 8
         ccs = _record(20, 0x0303, b"\x01") if o["sid"] else b""
         flight = (_record(22, 0x0303, sh) + ccs +
                   _record(23, 0x0303, _sealed(cs, version, inner, rnd)))
         exchanges.append((hello, flight))
-        fin = ccs + _record(23, 0x0303, _sealed(cs, version, 4 + hlen, rnd))
+        cfin = 4 + hlen
+        if client_cert:                    # Certificate + CertificateVerify
+            cfin += (4 + 1 + 3 + 3 + len(client_cert) + 2) + (4 + 4 + 256)
+        fin = ccs + _record(23, 0x0303, _sealed(cs, version, cfin, rnd))
         tickets = b"".join(_record(23, 0x0303, _sealed(cs, version, 233, rnd))
                            for _ in range(2 if srv.tickets else 0))
-        hs_count, first = 1, (fin, tickets)
-    else:
-        rec_v = version
-        sexts = b""
-        if o["exts"]:
-            if "renegotiation_info" in o["exts"] or 0x00FF in o["ciphers"]:
-                sexts += _ext(0xFF01, b"\x00")
-            if "extended_master_secret" in o["exts"]:
-                sexts += _ext(23, b"")
-            if cs in _ECDHE and "ec_point_formats" in o["exts"]:
-                sexts += _ext(11, _u8(b"\x00"))
-            if "session_ticket" in o["exts"] and srv.tickets:
-                sexts += _ext(35, b"")
-            if alpn:
-                sexts += _ext(16, _u16(_u8(alpn.encode())))
-        sh = _hs(2, struct.pack("!H", version) + srand + _u8(rnd.bytes(32)) +
-                 struct.pack("!HB", cs, 0) + (_u16(sexts) if o["exts"] else b""))
-        certs = _hs(11, _u24(_u24(cert)))
-        sig = (struct.pack("!H", 0x0401) if version >= 0x0303 else b"") + \
-            _u16(rnd.bytes(256))
-        if cs in _ECDHE:
-            group = next((gr for gr in (0x001D, 0x0017, 0x0018)
-                          if gr in o["groups"]), 0x0017)
-            pub = rnd.bytes(32) if group == 0x001D else b"\x04" + rnd.bytes(64)
-            ske = _hs(12, struct.pack("!BH", 3, group) + _u8(pub) + sig)
-            cke = _hs(16, _u8(rnd.bytes(32) if group == 0x001D
-                              else b"\x04" + rnd.bytes(64)))
-        elif cs in _DHE:
-            p = b"\xff" * 8 + rnd.bytes(240) + b"\xff" * 8
-            ske = _hs(12, _u16(p) + _u16(b"\x02") + _u16(rnd.bytes(256)) + sig)
-            cke = _hs(16, _u16(rnd.bytes(256)))
-        else:                                   # RSA key transport
-            ske = b""
-            pms = rnd.bytes(256)
-            cke = _hs(16, pms if version == 0x0300 else _u16(pms))
-        flight = b"".join(_record(22, rec_v, m)
-                          for m in (sh, certs, ske, _hs(14, b"")) if m)
-        exchanges.append((hello, flight))
-        fin_len = 4 + (36 if version == 0x0300 else 12)
-        ccs = _record(20, rec_v, b"\x01")
-        cfin = (_record(22, rec_v, cke) + ccs +
-                _record(22, rec_v, _sealed(cs, version, fin_len, rnd)))
-        nst = b""
+        exchanges.append((fin, tickets))
+        return exchanges, Channel(version, cs, rnd)
+    rec_v = version
+    sexts = b""
+    if o["exts"]:
+        if "renegotiation_info" in o["exts"] or 0x00FF in o["ciphers"]:
+            sexts += _ext(0xFF01, b"\x00")
+        if "extended_master_secret" in o["exts"]:
+            sexts += _ext(23, b"")
+        if cs in _ECDHE and "ec_point_formats" in o["exts"]:
+            sexts += _ext(11, _u8(b"\x00"))
         if "session_ticket" in o["exts"] and srv.tickets:
-            nst = _record(22, rec_v, _hs(4, struct.pack("!I", 7200) +
-                                         _u16(rnd.bytes(192))))
-        sfin = nst + ccs + _record(22, rec_v, _sealed(cs, version, fin_len, rnd))
-        exchanges.append((cfin, sfin))
-        hs_count, first = 2, (b"", b"")
+            sexts += _ext(35, b"")
+        if alpn:
+            sexts += _ext(16, _u16(_u8(alpn.encode())))
+    sh = _hs(2, struct.pack("!H", version) + srand + _u8(rnd.bytes(32)) +
+             struct.pack("!HB", cs, 0) + (_u16(sexts) if o["exts"] else b""))
+    certs = _hs(11, _u24(_u24(cert)))
+    sig = (struct.pack("!H", 0x0401) if version >= 0x0303 else b"") + \
+        _u16(rnd.bytes(256))
+    if cs in _ECDHE:
+        group = next((gr for gr in (0x001D, 0x0017, 0x0018)
+                      if gr in o["groups"]), 0x0017)
+        pub = rnd.bytes(32) if group == 0x001D else b"\x04" + rnd.bytes(64)
+        ske = _hs(12, struct.pack("!BH", 3, group) + _u8(pub) + sig)
+        cke = _hs(16, _u8(rnd.bytes(32) if group == 0x001D
+                          else b"\x04" + rnd.bytes(64)))
+    elif cs in _DHE:
+        p = b"\xff" * 8 + rnd.bytes(240) + b"\xff" * 8
+        ske = _hs(12, _u16(p) + _u16(b"\x02") + _u16(rnd.bytes(256)) + sig)
+        cke = _hs(16, _u16(rnd.bytes(256)))
+    else:                                   # RSA key transport
+        ske = b""
+        pms = rnd.bytes(256)
+        cke = _hs(16, pms if version == 0x0300 else _u16(pms))
+    creq = _cert_request(version, issuer_for(cn)) if client_cert else b""
+    flight = b"".join(_record(22, rec_v, m)
+                      for m in (sh, certs, ske, creq, _hs(14, b"")) if m)
+    exchanges.append((hello, flight))
+    fin_len = 4 + (36 if version == 0x0300 else 12)
+    ccs = _record(20, rec_v, b"\x01")
+    ccert = cverify = b""
+    if client_cert:
+        ccert = _record(22, rec_v, _hs(11, _u24(_u24(client_cert))))
+        cverify = _record(22, rec_v, _hs(15, (struct.pack("!H", 0x0401)
+                                              if version >= 0x0303 else b"") +
+                                         _u16(rnd.bytes(256))))
+    cfin = (ccert + _record(22, rec_v, cke) + cverify + ccs +
+            _record(22, rec_v, _sealed(cs, version, fin_len, rnd)))
+    nst = b""
+    if "session_ticket" in o["exts"] and srv.tickets:
+        nst = _record(22, rec_v, _hs(4, struct.pack("!I", 7200) +
+                                     _u16(rnd.bytes(192))))
+    sfin = nst + ccs + _record(22, rec_v, _sealed(cs, version, fin_len, rnd))
+    exchanges.append((cfin, sfin))
+    return exchanges, Channel(version, cs, rnd)
+
+
+def session(t: ClientTemplate, srv: ServerProfile, sni: str, count: int,
+            seed: tuple, cert_cn: str = "") -> Tuple[List[Tuple[bytes, bytes]], int]:
+    """One TLS connection as (client payload, server payload) exchanges, plus
+    how many leading exchanges are the handshake (sent back to back; the
+    application exchanges after them are separated by idle time). TLS 1.3's
+    client Finished and the session tickets ride with the first request and
+    response."""
+    exchanges, ch = handshake(t, srv, sni, seed, cert_cn)
+    if ch.cs is None:
+        return exchanges, 1
+    first = (b"", b"")
+    if ch.version == 0x0304:
+        first = exchanges.pop()
+    hs_count = len(exchanges)
     for i in range(count):
-        req = _record(23, 0x0303 if version == 0x0304 else version,
-                      _sealed(cs, version, rnd.int(*t.upload), rnd))
-        rsp = _record(23, 0x0303 if version == 0x0304 else version,
-                      _sealed(cs, version, rnd.int(*t.download), rnd))
-        if i == 0 and version == 0x0304:
+        req = ch.record(ch.rnd.int(*t.upload))
+        rsp = ch.record(ch.rnd.int(*t.download))
+        if i == 0:
             req, rsp = first[0] + req, first[1] + rsp
         exchanges.append((req, rsp))
     return exchanges, hs_count
+
+
+# ---------------------------------------------------------------------------
+# DTLS 1.2 (RFC 6347) — the same handshake over datagrams
+# ---------------------------------------------------------------------------
+DTLS12, DTLS10 = 0xFEFD, 0xFEFF
+
+# An embedded / OpenSSL DTLS 1.2 client (CIP Security class-1 I/O
+# originators): TLS 1.2 suites, no SNI / ALPN / TLS 1.3 extensions, the
+# first records stamped DTLS 1.0 as OpenSSL does until the version is agreed.
+DTLS_CLIENT = ClientTemplate(
+    "openssl-dtls", "OpenSSL DTLS 1.2 client", DTLS12,
+    (0xC02B, 0xC02F, 0xC02C, 0xC030, 0xC023, 0xC027, 0xC009, 0xC013, 0xC00A,
+     0xC014, 0x009C, 0x009D, 0x003C, 0x002F, 0x0035, 0x00FF),
+    ("ec_point_formats", "supported_groups", "extended_master_secret",
+     "signature_algorithms"),
+    record=DTLS10, groups=(0x001D, 0x0017, 0x0018),
+    sigalgs=(0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
+             0x0601),
+    sid_len=0)
+
+
+def _dtls_record(ctype: int, version: int, epoch: int, seq: int,
+                 body: bytes) -> bytes:
+    return struct.pack("!BHH", ctype, version, epoch) + \
+        seq.to_bytes(6, "big") + _u16(body)
+
+
+def _dtls_fragments(mtype: int, mseq: int, body: bytes,
+                    room: int) -> List[bytes]:
+    """A handshake message as DTLS fragments of at most ``room`` bytes
+    (12-byte header: type, length, message_seq, fragment offset/length)."""
+    out, off = [], 0
+    while True:
+        frag = body[off:off + room]
+        out.append(struct.pack("!B", mtype) + len(body).to_bytes(3, "big") +
+                   struct.pack("!H", mseq) + off.to_bytes(3, "big") +
+                   len(frag).to_bytes(3, "big") + frag)
+        off += len(frag)
+        if off >= len(body):
+            return out
+
+
+class DtlsChannel:
+    """Epoch-1 record protection after a DTLS handshake: each side's record
+    sequence numbers continue from ``seq`` (callers building a long-lived
+    association in chunks start each chunk further on)."""
+
+    def __init__(self, cs: Optional[int], rnd: _Rand, seq: int = 1) -> None:
+        self.cs, self.rnd = cs, rnd
+        self.seq = {True: seq, False: seq}
+
+    def record(self, n: int, from_client: bool) -> bytes:
+        """One application_data record carrying ``n`` plaintext bytes."""
+        s = self.seq[from_client]
+        self.seq[from_client] = s + 1
+        return _dtls_record(23, DTLS12, 1, s & 0xFFFFFFFFFFFF,
+                            _sealed(self.cs, 0x0303, n, self.rnd))
+
+
+def dtls_handshake(t: ClientTemplate, srv: ServerProfile, seed: tuple,
+                   server_cert: bytes, client_cert: bytes = b"",
+                   mtu: int = 1400, app_seq: int = 1
+                   ) -> Tuple[List[Tuple[List[bytes], List[bytes]]],
+                              DtlsChannel]:
+    """A DTLS 1.2 handshake as (client datagrams, server datagrams)
+    exchanges: ClientHello / HelloVerifyRequest (stateless cookie),
+    ClientHello with the cookie / ServerHello + Certificate [+
+    ServerKeyExchange] [+ CertificateRequest] + ServerHelloDone, then the
+    client's [Certificate +] ClientKeyExchange [+ CertificateVerify] +
+    ChangeCipherSpec + Finished and the server's ChangeCipherSpec +
+    Finished. Records are packed into datagrams of at most ``mtu`` bytes and
+    handshake messages fragmented to fit. The channel's application records
+    start at sequence ``app_seq`` in epoch 1."""
+    rnd = _Rand("dtls", *seed)
+    rec, o = client_hello(t, "", rnd)
+    body = struct.pack("!H", DTLS12) + rec[9 + 2:]
+    cut = 2 + 32 + 1 + len(o["sid"])
+    cookie = rnd.bytes(20)
+    _, cs = _choose(t, o, srv)
+    cs = cs if cs is not None else 0x002F
+    seq = {True: 0, False: 0}
+    room = mtu - 13 - 12
+
+    def flight(side: bool, items) -> List[bytes]:
+        """(ctype, epoch, payload) records -> datagrams."""
+        grams: List[bytes] = []
+        cur = b""
+        for ctype, epoch, payload in items:
+            s = seq[side] if epoch == 0 else 0
+            if epoch == 0:
+                seq[side] += 1
+            hello = epoch == 0 and ctype == 22 and payload[:1] in (b"\x01",
+                                                                   b"\x03")
+            r = _dtls_record(ctype, DTLS10 if hello else DTLS12, epoch, s,
+                             payload)
+            if cur and len(cur) + len(r) > mtu:
+                grams.append(cur)
+                cur = b""
+            cur += r
+        return grams + ([cur] if cur else [])
+
+    def hs(mtype: int, mseq: int, msg: bytes):
+        return [(22, 0, f) for f in _dtls_fragments(mtype, mseq, msg, room)]
+
+    ch1 = hs(1, 0, body[:cut] + _u8(b"") + body[cut:])
+    hvr = hs(3, 0, struct.pack("!H", DTLS10) + _u8(cookie))
+    ch2 = hs(1, 1, body[:cut] + _u8(cookie) + body[cut:])
+    exchanges = [(flight(True, ch1), flight(False, hvr))]
+    sexts = b""
+    if 0x00FF in o["ciphers"]:
+        sexts += _ext(0xFF01, b"\x00")
+    if "extended_master_secret" in o["exts"]:
+        sexts += _ext(23, b"")
+    if cs in _ECDHE:
+        sexts += _ext(11, _u8(b"\x00"))
+    sh = struct.pack("!H", DTLS12) + rnd.bytes(32) + _u8(rnd.bytes(32)) + \
+        struct.pack("!HB", cs, 0) + _u16(sexts)
+    sig = struct.pack("!H", 0x0401) + _u16(rnd.bytes(256))
+    msgs = [(2, sh), (11, _u24(_u24(server_cert)))]
+    if cs in _ECDHE:
+        group = next((gr for gr in (0x001D, 0x0017, 0x0018)
+                      if gr in o["groups"]), 0x0017)
+        pub = rnd.bytes(32) if group == 0x001D else b"\x04" + rnd.bytes(64)
+        msgs.append((12, struct.pack("!BH", 3, group) + _u8(pub) + sig))
+        cke = _u8(rnd.bytes(32) if group == 0x001D else
+                  b"\x04" + rnd.bytes(64))
+    else:                                   # RSA key transport
+        cke = _u16(rnd.bytes(256))
+    if client_cert:
+        msgs.append((13, _cert_request(0x0303, ISSUERS["corp"])[4:]))
+    msgs.append((14, b""))
+    srecs = []
+    for k, (mtype, msg) in enumerate(msgs):
+        srecs += hs(mtype, 1 + k, msg)
+    exchanges.append((flight(True, ch2), flight(False, srecs)))
+    crecs, mseq = [], 2
+    if client_cert:
+        crecs += hs(11, mseq, _u24(_u24(client_cert)))
+        mseq += 1
+    crecs += hs(16, mseq, cke)
+    mseq += 1
+    if client_cert:
+        crecs += hs(15, mseq, struct.pack("!H", 0x0401) + _u16(rnd.bytes(256)))
+        mseq += 1
+    # Finished: the first epoch-1 record (sequence 0), encrypted
+    fin = 12 + 12                           # header + verify_data
+    crecs += [(20, 0, b"\x01"), (22, 1, _sealed(cs, 0x0303, fin, rnd))]
+    srecs = [(20, 0, b"\x01"), (22, 1, _sealed(cs, 0x0303, fin, rnd))]
+    exchanges.append((flight(True, crecs), flight(False, srecs)))
+    return exchanges, DtlsChannel(cs, rnd, app_seq)
