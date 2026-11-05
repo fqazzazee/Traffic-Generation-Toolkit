@@ -50,7 +50,7 @@ import importlib.util
 import os
 import sys
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 API_VERSION = 1
 
@@ -249,15 +249,23 @@ def register_env_file(path: str, *, replace: bool = False):
 
 def register_attack(key: str, build: Callable, desc: str, *, category: str,
                     protocol: Optional[str] = None,
-                    service: Optional[str] = None, replace: bool = False):
+                    service: Optional[str] = None, replace: bool = False,
+                    techniques: Sequence[str] = ()):
     """An attack builder ``build(ep, count) -> [frames]`` for incident flows.
     ``category`` is the vendor-neutral manifest category (``scan``,
     ``exploit-attempt``, ``c2``, ``ot-write``, ``plc-program`` ...),
     ``protocol`` the registry protocol the traffic is (None = attack-only),
     ``service`` what the victim must serve for an incident to map onto an
-    environment host (None = nothing, like a scan)."""
-    from . import incidents, manifest
+    environment host (None = nothing, like a scan), ``techniques`` the
+    MITRE ATT&CK IDs the traffic shows (each must be in
+    ``tgt/attack_ics.json``; see :mod:`tgt.techniques`)."""
+    from . import incidents, manifest, techniques as tech
+    bad = [t for t in techniques if t not in tech.load()]
+    if bad:
+        raise PluginError(f"attack {key!r}: unknown technique(s) "
+                          f"{', '.join(bad)} (see tgt/attack_ics.json)")
     _put("attack", incidents.ATTACKS, key, (build, desc), replace)
+    _put("", tech.ATTACK_TECHNIQUES, key, tuple(techniques), True)
     _put("", incidents.ATTACK_PROTOCOLS, key, protocol, True)
     _put("", incidents._ATTACK_SERVICE, key, service, True)
     _put("", manifest.ATTACK_CATEGORY, key, category, True)
