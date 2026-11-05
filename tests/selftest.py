@@ -329,18 +329,24 @@ def test_tshark_dissects_every_builder() -> None:
     # the site cycle gets its own capture: its ARP would otherwise flag the
     # default Endpoints() addresses as duplicates of real site hosts
     layers, expert = [], ""
+    # builders stock tshark needs extra options for get their own capture
+    # (_TSHARK_OWN, W5-C); _TSHARK_OPTS apply to every capture
+    own = [(k, [groups.pop(k)], _TSHARK_OWN[k]) for k in list(groups)
+           if k in _TSHARK_OWN]
     with tempfile.TemporaryDirectory() as d:
-        for name, chunk in (("all", list(groups.values())), ("site", [site])):
+        for name, chunk, extra in [("all", list(groups.values()), []),
+                                   ("site", [site], [])] + own:
             path = f"{d}/{name}.pcap"
             with PcapWriter(path) as w:
                 for frames in chunk:
                     for f in frames:
                         w.write(f)
+            opts = ["tshark"] + _TSHARK_OPTS + extra + ["-r", path]
             layers += subprocess.run(
-                ["tshark", "-r", path, "-T", "fields", "-e", "frame.protocols"],
+                opts + ["-T", "fields", "-e", "frame.protocols"],
                 capture_output=True, text=True).stdout.splitlines()
             expert += subprocess.run(
-                ["tshark", "-r", path, "-q", "-z", "expert,warn"],
+                opts + ["-q", "-z", "expert,warn"],
                 capture_output=True, text=True).stdout
     seen = {x for line in layers for x in line.split(":")}
     for key, layer in list(dissects.items()) + [("smb1", "smb")]:
@@ -8032,6 +8038,533 @@ def test_w5d_tshark_gateways_decode_as() -> None:
                              capture_output=True, text=True).stdout
         check("Warnings" not in exp and "Errors" not in exp,
               f"tshark: iiot-retrofit: {exp.strip()[:300]}")
+
+# ---------------------------------------------------------------------------
+# W5-C: secure OT protocol variants and their observability (#66)
+# ---------------------------------------------------------------------------
+_DISSECTS_AS.update({
+    "enip-tls": "tls", "enip-dtls": "dtls", "s7plus-tls": "cotp",
+    "opcua-sign-encrypt": "opcua", "iec104-tls": "tls", "dnp3-tls": "tls",
+    "modbus-sec": "tls",
+})
+# Stock tshark has no dissector for the Modbus/TCP Security role extension
+# (OID 1.3.6.1.4.1.50316.802.1) in a client certificate; mapped to its
+# UTF8String syntax it decodes, else BER flags "Dissector for OID not
+# implemented" (an Undecoded warning about Wireshark, not the frame).
+_TSHARK_OPTS = ["-o", 'uat:oid:"1.3.6.1.4.1.50316.802.1","modbus-role",'
+                '"UTF8String"']
+# TLS records in COTP data TPDUs (S7-1500 secure PG/HMI communication) trip
+# stock tshark's SES-over-COTP heuristic, which then reports the TLS bytes
+# as malformed session PDUs; such a capture is read without it.
+_TSHARK_OWN = {"s7plus-tls": ["--disable-heuristic", "ses_cotp"]}
+_W5C_EP = {"sni": "plc-a.corp.local", "tls_client_cn": "hmi-a.corp.local",
+           "tls_client": "chrome", "mbsec_role": "Engineer",
+           "host": "PLC-A", "nbname": "HMI-A"}
+
+
+def _tls_records(data: bytes) -> list:
+    """(content type, version, body) of each TLS record in a byte stream."""
+    out, i = [], 0
+    while i + 5 <= len(data):
+        ct, ver, n = struct.unpack_from("!BHH", data, i)
+        out.append((ct, ver, data[i + 5:i + 5 + n]))
+        i += 5 + n
+    check(i == len(data), "TLS stream does not end on a record boundary")
+    return out
+
+
+def _tls_hs_types(records) -> list:
+    """Handshake message types readable in clear (whole records only)."""
+    out = []
+    for ct, _, body in records:
+        if ct != 22:
+            continue
+        j, got = 0, []
+        while j + 4 <= len(body):
+            got.append(body[j])
+            j += 4 + int.from_bytes(body[j + 1:j + 4], "big")
+        if j == len(body):
+            out += got
+    return out
+
+
+def _ch_exts(body: bytes, dtls: bool = False) -> list:
+    """Extension types of a ClientHello handshake message."""
+    i = 4 + (8 if dtls else 0) + 2 + 32
+    i += 1 + body[i]                                   # session id
+    if dtls:
+        i += 1 + body[i]                               # cookie
+    i += 2 + struct.unpack_from("!H", body, i)[0]      # cipher suites
+    i += 1 + body[i]                                   # compression
+    end = i + 2 + struct.unpack_from("!H", body, i)[0]
+    i += 2
+    out = []
+    while i < end:
+        t, n = struct.unpack_from("!HH", body, i)
+        out.append(t)
+        i += 4 + n
+    return out
+
+
+def _cotp_data(msg: bytes) -> bytes:
+    """Concatenated COTP DT user data of the TPKTs in one message."""
+    out, i = b"", 0
+    while i < len(msg):
+        n = struct.unpack_from("!H", msg, i + 2)[0]
+        tp = msg[i + 4:i + n]
+        check(msg[i] == 3 and tp[1] == 0xF0 and n <= 4 + 1024,
+              "s7plus-tls: not a COTP DT TPDU within the 1024 TPDU size")
+        out += tp[3:]
+        i += n
+    return out
+
+
+def test_w5c_secure_tls_handshakes() -> None:
+    """TLS variants on their ports: mutual-auth TLS 1.2 (no SNI / ALPN),
+    certificates naming both hosts, the Modbus role in the client
+    certificate, one record per plaintext message sized plaintext + suite
+    overhead, close_notify both ways; S7 secure communication: CR/CC and
+    InitSsl in clear, TLS 1.3 in COTP with only the hellos readable."""
+    from tgt import protocols_sec as S
+    from tgt import tls
+    ep = Endpoints(meta=dict(_W5C_EP))
+    for key, port in (("enip-tls", 2221), ("iec104-tls", 19998),
+                      ("dnp3-tls", 19999), ("modbus-sec", 802)):
+        protocols.begin_build(3, 0)
+        frames = protocols.get(key).build(ep, 5)
+        ports = {_l4(f)[4] for f in frames if _l4(f)[1] == ep.client_ip}
+        check(ports == {port}, f"{key}: client -> ports {ports}")
+        msgs = S._messages(frames, ep)
+        c = b"".join(d for _, frm, d in msgs if frm)
+        s = b"".join(d for _, frm, d in msgs if not frm)
+        crec, srec = _tls_records(c), _tls_records(s)
+        exts = _ch_exts(crec[0][2])
+        check(0 not in exts and 16 not in exts,
+              f"{key}: ClientHello carries SNI / ALPN ({exts})")
+        check({2, 11, 13, 14} <= set(_tls_hs_types(srec)) and
+              {11, 15, 16} <= set(_tls_hs_types(crec)),
+              f"{key}: no mutual-auth TLS 1.2 handshake "
+              f"{_tls_hs_types(crec)} / {_tls_hs_types(srec)}")
+        check(srec[0][2][4:6] == b"\x03\x03" and
+              b"plc-a.corp.local" in s and b"hmi-a.corp.local" in c,
+              f"{key}: TLS 1.2 certificates do not name the hosts")
+        protocols.begin_build(3, 0)
+        plain = S._messages(protocols.get(S.PLAIN_OF[key]).build(ep, 5), ep)
+        for side, recs in ((True, crec), (False, srec)):
+            app = [len(b) for ct, _, b in recs if ct == 23]
+            want = [len(d) for _, frm, d in plain if frm == side]
+            check(len(app) == len(want) and
+                  all(24 <= a - w <= 64 for a, w in zip(app, want)),
+                  f"{key}: app records {app} vs plaintext {want}")
+            check(sum(ct == 21 for ct, _, _ in recs) == 1,
+                  f"{key}: close_notify missing")
+        if key == "modbus-sec":       # AES-128-GCM: nonce + tag exactly
+            app = [len(b) for ct, _, b in crec if ct == 23]
+            want = [len(d) for _, frm, d in plain if frm]
+            check(app == [w + 24 for w in want],
+                  f"modbus-sec: GCM record sizes {app} vs {want}")
+            check(tls._oid(S.MODBUS_ROLE_OID) + b"\x04\x0a\x0c\x08Engineer"
+                  in c, "modbus-sec: client certificate lacks the role")
+    # S7-1500: TLS 1.3 inside COTP after a cleartext InitSsl
+    protocols.begin_build(3, 0)
+    msgs = S._messages(protocols.get("s7plus-tls").build(ep, 4), ep)
+    cm = [d for _, frm, d in msgs if frm]
+    sm = [d for _, frm, d in msgs if not frm]
+    check(cm[0][5] == 0xE0 and sm[0][5] == 0xD0 and
+          cm[1][7:9] == b"\x72\x01" and cm[1][11:16] == b"\x31\x00\x00\x05"
+          b"\xb3", "s7plus-tls: COTP CR/CC + InitSsl not in clear")
+    crec = _tls_records(b"".join(_cotp_data(m) for m in cm[2:]))
+    srec = _tls_records(b"".join(_cotp_data(m) for m in sm[2:]))
+    check(crec[0][0] == 22 and 43 in _ch_exts(crec[0][2]) and
+          b"\x00\x2b\x00\x02\x03\x04" in srec[0][2],
+          "s7plus-tls: not a TLS 1.3 handshake")
+    check(_tls_hs_types(srec) == [2] and b"plc-a.corp.local" not in
+          b"".join(sm), "s7plus-tls: the certificate is readable")
+    check(all([ct for ct, _, _ in _tls_records(_cotp_data(m))][-1:] == [23]
+              for m in cm[3:]) and
+          sum(ct == 23 for ct, _, _ in crec) == len(cm) - 3,
+          "s7plus-tls: one record per S7CommPlus PDU")
+    # every variant: seeded builds reproduce, others differ
+    for key in S.PLAIN_OF:
+        out = []
+        for seed in (9, 9, 10):
+            protocols.begin_build(seed, 2)
+            out.append(protocols.get(key).build(ep, 3))
+        check(out[0] == out[1] and out[0] != out[2],
+              f"{key}: seeded build not reproducible")
+
+
+def test_w5c_opcua_sign_encrypt_and_dtls_wire() -> None:
+    """OPC UA SignAndEncrypt: OPN with the Basic256Sha256 policy, the
+    sender certificate and the SHA-1 thumbprint of the receiver's, RSA
+    block-sized bodies, symmetric chunks in AES blocks. CIP Security I/O:
+    DTLS 1.2 cookie exchange on 2221/udp, epoch-1 records whose sequence
+    numbers rise within a build and continue in the next."""
+    import hashlib
+    from tgt import protocols_sec as S
+    ep = Endpoints(meta=dict(_W5C_EP))
+    protocols.begin_build(4, 0)
+    msgs = S._messages(protocols.get("opcua-sign-encrypt").build(ep, 4), ep)
+    scert, ccert = S.opcua_certificates(ep)
+    protocols.begin_build(4, 0)
+    plain = S._messages(protocols.get("opcua").build(ep, 4), ep)
+    check([d[:3] for _, _, d in msgs] == [d[:3] for _, _, d in plain],
+          "opcua-sign-encrypt: chunk sequence differs from plaintext")
+    opn = 0
+    for _, frm, d in msgs:
+        check(struct.unpack_from("<I", d, 4)[0] == len(d),
+              "opcua-sign-encrypt: chunk size field")
+        if d[:3] == b"OPN":
+            opn += 1
+            i = 12
+            fields = []
+            for _ in range(3):
+                n = struct.unpack_from("<i", d, i)[0]
+                fields.append(d[i + 4:i + 4 + n])
+                i += 4 + n
+            pol, cert, thumb = fields
+            check(pol == S.B256SHA256 and
+                  cert == (ccert if frm else scert) and
+                  thumb == hashlib.sha1(scert if frm else ccert).digest()
+                  and (len(d) - i) % 256 == 0,
+                  "opcua-sign-encrypt: asymmetric security header")
+        elif d[:3] in (b"MSG", b"CLO"):
+            check((len(d) - 16) % 16 == 0 and len(d) >= 16 + 48,
+                  "opcua-sign-encrypt: symmetric chunk not AES-blocked")
+    check(opn == 2 and b"urn:HMI-A:UA:Client" in ccert and
+          b"plc-a.corp.local" in scert,
+          "opcua-sign-encrypt: OPN / application certificates")
+    seqs = []
+    for cyc in (0, 1):
+        protocols.begin_build(4, cyc)
+        frames = protocols.get("enip-dtls").build(ep, 4)
+        udp = [(_l4(f)[1] == ep.client_ip, _l4(f)) for f in frames
+               if _l4(f)[0] == P.IPPROTO_UDP]
+        check({(t[3], t[4]) for _, t in udp} == {(2221, 2221)},
+              "enip-dtls: DTLS not on 2221/udp")
+        tcp = {_l4(f)[4] for f in frames if _l4(f)[0] == P.IPPROTO_TCP
+               and _l4(f)[1] == ep.client_ip}
+        check(tcp == {2221}, f"enip-dtls: Forward_Open on {tcp}")
+        dg = [(frm, t[5][8:]) for frm, t in udp]
+        ch1, hvr, ch2 = dg[0][1], dg[1][1], dg[2][1]
+        check(ch1[:3] == b"\x16\xfe\xff" and ch1[13] == 1 and
+              hvr[13] == 3 and hvr[25:27] == b"\xfe\xff" and
+              ch2[13] == 1, "enip-dtls: ClientHello / HelloVerifyRequest")
+        cookie = hvr[28:28 + hvr[27]]
+        check(len(cookie) == 20 and 2 + 32 + 1 + 1 + 20 <= len(ch2) and
+              ch2[13 + 12 + 35:13 + 12 + 36 + 20] == b"\x14" + cookie,
+              "enip-dtls: second ClientHello does not echo the cookie")
+        app = [(frm, struct.unpack("!H", p[3:5])[0],
+                int.from_bytes(p[5:11], "big"))
+               for frm, p in dg if p[0] == 23]
+        check(len(app) == 8 and {e for _, e, _ in app} == {1},
+              f"enip-dtls: {len(app)} epoch-1 I/O records")
+        for side in (True, False):
+            s = [q for frm, _, q in app if frm == side]
+            check(s == sorted(s) and len(set(s)) == len(s),
+                  "enip-dtls: record sequence numbers do not rise")
+        seqs.append(max(q for _, _, q in app))
+        seqs.append(min(q for _, _, q in app))
+    check(seqs[3] > seqs[0], f"enip-dtls: sequence restarts per build {seqs}")
+
+
+def test_w5c_secure_persistent_cuts() -> None:
+    """Under the timed scheduler a secure session keeps its plaintext
+    shape: the PERSISTENT cuts leave as many polls as the plaintext cut,
+    every poll is application data only, the IEC 104 GI refresh is the
+    encrypted GI, and a long run opens one connection and one handshake
+    whose polls are plaintext-sized records."""
+    from tgt import protocols_sec as S
+    from tgt import schedule, timing
+    ep = Endpoints()
+    cm = P.mac_to_bytes(ep.client_mac)
+
+    def data(f: bytes) -> bytes:
+        frm, flags, plen, off, l4, tcp = schedule.view(f, cm)
+        start = l4 + ((f[l4 + 12] >> 4) * 4 if tcp else 8)
+        return f[start:start + plen]
+
+    for key, plain in S.PLAIN_OF.items():
+        ss, st, _ = timing.PERSISTENT[key]
+        ps, pt, _ = timing.PERSISTENT[plain]
+        check(timing.spec(key)[:3] == timing.spec(plain)[:3],
+              f"{key}: period differs from {plain}")
+        protocols.begin_build(2, 0)
+        g = schedule.exchanges(protocols.get(key).build(ep, 5), cm)
+        protocols.begin_build(2, 0)
+        pg = schedule.exchanges(protocols.get(plain).build(ep, 5), cm)
+        # a lone client message closing the plaintext polls (an IEC 104
+        # S-frame) shares the teardown exchange with the close_notify
+        lone = not any(schedule.view(f, cm)[2] > 0 and
+                       not schedule.view(f, cm)[0] for f in pg[-pt - 1])
+        diff = (len(pg) - ps - pt) - (len(g) - ss - st)
+        check(diff == 0 or (lone and diff == 1),
+              f"{key}: {len(g) - ss - st} polls vs {len(pg) - ps - pt}")
+        for grp in g[ss:len(g) - st]:
+            for f in grp:
+                d = data(f)
+                if not d:
+                    continue
+                ok = (d[:3] == b"MSG" if key == "opcua-sign-encrypt" else
+                      d[0] == 3 and d[7] == 0x17 if key == "s7plus-tls" else
+                      d[0] == 0x17)
+                check(ok, f"{key}: a poll is not application data")
+    gi = timing.REFRESH["iec104-tls"][1]
+    protocols.begin_build(2, 0)
+    g = schedule.exchanges(protocols.get("iec104-tls").build(ep, 5), cm)
+    protocols.begin_build(2, 0)
+    pg = schedule.exchanges(protocols.get("iec104").build(ep, 5), cm)
+    req = [len(data(f)) for f in g[gi] if schedule.view(f, cm)[0]
+           and data(f)]
+    preq = [len(data(f)) for f in pg[timing.REFRESH["iec104"][1]]
+            if schedule.view(f, cm)[0] and data(f)]
+    check(req == [n + 29 for n in preq],
+          f"iec104-tls: refresh exchange {req} is not the GI {preq}")
+    st = schedule.profile_streams(["modbus-sec"], ep)
+    st[0].period = 1.0
+    sch = schedule.Scheduler(5)
+    sch.load(st, 0.0, initial=True)
+    frames = [c[0] for _, _, _, c, _, _ in sch.run(600.0)]
+    syn = [f for f in frames if schedule.view(f, cm)[1] == 0x02]
+    hello = [f for f in frames if schedule.view(f, cm)[0] and
+             data(f)[:1] == b"\x16" and data(f)[5:6] == b"\x01"]
+    polls = {len(data(f)) for f in frames if schedule.view(f, cm)[0]
+             and data(f)[:1] == b"\x17"}
+    n = sum(1 for f in frames if schedule.view(f, cm)[0]
+            and data(f)[:1] == b"\x17")
+    check(len(syn) == 1 and len(hello) == 1 and n > 500 and
+          polls == {12 + 29},
+          f"modbus-sec timed: {len(syn)} SYN, {len(hello)} hellos, {n} "
+          f"polls sized {polls}")
+
+
+def _w5c_doc() -> dict:
+    return {"key": "t-sec", "segments": [
+        {"name": "C", "vlan": 10, "subnet": "10.9.0.0/24",
+         "zone": "OT-CELL"}],
+        "hosts": [
+            {"name": "HMI-1", "ip": "10.9.0.10", "role": "hmi",
+             "os": "win10"},
+            {"name": "ENG-1", "ip": "10.9.0.11", "role": "eng",
+             "os": "win10"},
+            {"name": "PLC-L8", "ip": "10.9.0.20",
+             "model": "rockwell-1756-l83e", "firmware": "33.011"},
+            {"name": "PLC-L8B", "ip": "10.9.0.23",
+             "model": "rockwell-1756-l83e", "firmware": "34.011"},
+            {"name": "PLC-S7", "ip": "10.9.0.21",
+             "model": "siemens-cpu-1516-3pndp", "firmware": "V3.1.1"},
+            {"name": "PLC-S7R", "ip": "10.9.0.24",
+             "model": "siemens-cpu-1515r-2pn"},
+            {"name": "RTU-1", "ip": "10.9.0.22", "role": "rtu",
+             "os": "linux", "meta": {"secure": True}}] +
+        [{"name": f"SW{i}", "ip": f"10.9.0.{30 + i}", "role": "ws",
+          "os": "win10"} for i in range(4)],
+        "flows": [
+            {"from": "HMI-1", "to": "PLC-L8", "proto": "enip",
+             "secure": True},
+            {"client": "ENG-1", "server": "PLC-L8", "proto": "enip"},
+            {"client": "PLC-L8", "server": "PLC-L8B", "proto": "enip-io",
+             "secure": True},
+            {"client": "HMI-1", "server": "PLC-S7", "proto": "s7plus",
+             "secure": True},
+            {"client": "HMI-1", "server": "PLC-S7", "proto": "opcua",
+             "secure": True},
+            {"client": "ENG-1", "server": "PLC-S7R", "proto": "s7plus-tls"},
+            {"client": "HMI-1", "server": "RTU-1", "proto": "modbus"},
+            {"client": "HMI-1", "server": "RTU-1", "proto": "dnp3",
+             "secure": False},
+            {"client": "HMI-1", "server": "RTU-1", "proto": "iec104"},
+            {"client": "HMI-1", "server": "RTU-1", "proto": "ntp"}]}
+
+
+def test_w5c_env_file_secure_opt_in() -> None:
+    """Env files select the secure variant per flow ("secure": true) or per
+    server (meta "secure": true, a flow's "secure": false wins), the
+    catalog rejects devices that cannot (model or firmware), export
+    round-trips, and the flows build with checksums intact."""
+    import copy
+    from tgt import envfile
+    env = envfile.from_dict(_w5c_doc(), "s.json")
+    want = {("HMI-1", "PLC-L8", "enip-tls"), ("ENG-1", "PLC-L8", "enip"),
+            ("PLC-L8", "PLC-L8B", "enip-dtls"),
+            ("HMI-1", "PLC-S7", "s7plus-tls"),
+            ("HMI-1", "PLC-S7", "opcua-sign-encrypt"),
+            ("ENG-1", "PLC-S7R", "s7plus-tls"),
+            ("HMI-1", "RTU-1", "modbus-sec"), ("HMI-1", "RTU-1", "dnp3"),
+            ("HMI-1", "RTU-1", "iec104-tls"), ("HMI-1", "RTU-1", "ntp")}
+    check(set(env.conversations) == want,
+          f"secure opt-in: {set(env.conversations) ^ want}")
+    again = envfile.from_dict(envfile.to_dict(env), "x.json")
+    check(again.conversations == env.conversations,
+          "secure opt-in: export does not round-trip")
+    batch = env.build(1)
+    for _, f in batch:
+        verify_ip_l4(f, "t-sec")
+    mb = b"".join(f for k, f in batch if k == "modbus-sec")
+    check(b"hmi-1.corp.local" in mb and b"Operator" in mb and
+          b"rtu-1.corp.local" in mb,
+          "modbus-sec: client / server certificate names, HMI role")
+    bad = [
+        ("flows", 0, {"from": "HMI-1", "to": "PLC-L8", "proto": "https",
+                      "secure": True}, "no secure variant"),
+        ("hosts", 4, {"name": "PLC-S7", "ip": "10.9.0.21",
+                      "model": "siemens-cpu-1516-3pndp",
+                      "firmware": "V2.8.3"}, "does not support"),
+        ("hosts", 2, {"name": "PLC-L8", "ip": "10.9.0.20",
+                      "model": "rockwell-1756-l71"}, "does not support"),
+        ("flows", 0, {"client": "HMI-1", "server": "PLC-L8",
+                      "proto": "enip", "secure": "yes"}, "secure"),
+    ]
+    for where, i, val, msg in bad:
+        doc = copy.deepcopy(_w5c_doc())
+        doc[where][i] = val
+        try:
+            envfile.from_dict(doc, "bad.json")
+            check(False, f"secure opt-in accepted {val}")
+        except envfile.EnvFileError as e:
+            check(msg in str(e), f"secure opt-in error {e}")
+
+
+def test_w5c_inventory_observability_and_score() -> None:
+    """Encrypted payloads hide what the plaintext protocol would carry:
+    certificates still name the hosts on TLS / DTLS 1.2 and OPC UA, not on
+    TLS 1.3; flows state their encryption; a perfect export still scores
+    100 %."""
+    from tgt import envfile, inventory, score
+    env = envfile.from_dict(_w5c_doc(), "s.json")
+    doc = inventory.to_json(env)
+    rows = {h["name"]: h for h in doc["hosts"]}
+
+    def ev(host, field):
+        return rows[host]["observability"][field]["evidence"]
+
+    check(ev("PLC-S7R", "fqdn") == [] and ev("PLC-S7", "fqdn") ==
+          ["opcua-sign-encrypt"],
+          "TLS 1.3 certificate counted as observable")
+    check(ev("PLC-L8", "fqdn") == ["enip-dtls", "enip-tls"] and
+          ev("HMI-1", "fqdn") == ["enip-tls", "iec104-tls", "modbus-sec",
+                                  "opcua-sign-encrypt"],
+          f"TLS 1.2 certificates: {ev('PLC-L8', 'fqdn')} "
+          f"{ev('HMI-1', 'fqdn')}")
+    for h in ("PLC-L8", "PLC-S7", "PLC-S7R"):
+        check(not rows[h]["observability"]["firmware"]["observable"],
+              f"{h}: firmware observable through an encrypted session")
+    enc = {(f["client"], f["server"], f["protocol"]): f.get("encryption")
+           for f in doc["flows"]}
+    check(enc[("HMI-1", "PLC-S7", "s7plus-tls")] == "tls1.3" and
+          enc[("PLC-L8", "PLC-L8B", "enip-dtls")] == "dtls1.2" and
+          enc[("ENG-1", "PLC-L8", "enip")] is None,
+          "inventory flows: encryption")
+    check({e["protocol"]: e["certificates"]
+           for e in rows["PLC-S7"]["encrypted"]} ==
+          {"s7plus-tls": "encrypted", "opcua-sign-encrypt": "clear"},
+          "inventory host: encrypted protocols")
+    mapping = score.load_json_spec("generic", "map")
+    with tempfile.TemporaryDirectory() as d:
+        truth = score.Truth(doc, env.key)
+        path = os.path.join(d, "x.csv")
+        score.write_perfect_export(truth, path)
+        rows_, info = score.read_export(path, mapping)
+        res = score.score(truth, rows_, info)
+    acc = [res["fields"][f]["observable"]["accuracy"] for f in score.FIELDS]
+    check(res["discovery"]["recall"] == 1.0 and
+          all(a in (None, 1.0) for a in acc) and
+          res["protocols"]["precision"] == 1.0 and
+          res["protocols"]["recall"] == 1.0,
+          f"secure env self-score: {res['discovery']} {acc}")
+    check(score.norm_protocol("enip-tls 2221/tcp") == "cip-security" ==
+          score.norm_protocol("CIP Security") and
+          score.norm_protocol("s7plus-tls") == "s7comm",
+          "score: secure protocol aliases")
+
+
+def test_w5c_pharma_mixes_secure_and_plaintext() -> None:
+    """pharma-batch: HMIs on CIP Security, controller-to-controller DTLS
+    I/O and OPC UA SignAndEncrypt next to plaintext CIP / OPC UA / class-1
+    I/O; the controllers' identity stays observable through cleartext List
+    Identity, the HMIs' names only through their client certificates."""
+    from tgt import enterprise, envfile, inventory
+    envfile.load_user_envs(warn=lambda m: None, force=True)
+    env = enterprise.ENVIRONMENTS.get("pharma-batch")
+    check(env is not None, "pharma-batch not loaded")
+    if env is None:
+        return
+    protos = {p for _, _, p in env.conversations}
+    check({"enip-tls", "enip-dtls", "opcua-sign-encrypt", "enip", "opcua",
+           "enip-io"} <= protos, f"pharma-batch protocols {protos}")
+    rows = {h["name"]: h for h in inventory.to_json(env)["hosts"]}
+    ob = rows["PLC-GRAN-01"]["observability"]
+    check(ob["firmware"]["evidence"] == ["enip-id"] and
+          rows["OPS-HMI01"]["observability"]["fqdn"]["evidence"] ==
+          ["enip-tls"], "pharma-batch observability")
+    batch = env.build(1)
+    to = {(_l4(f)[0], _l4(f)[4]) for k, f in batch
+          if k in ("enip-tls", "enip-dtls") and _l4(f)}
+    check((P.IPPROTO_TCP, 2221) in to and (P.IPPROTO_UDP, 2221) in to,
+          f"pharma-batch: secure CIP not on 2221 ({to})")
+
+
+def test_w5c_tshark_secure_variants() -> None:
+    """Optional: every secure builder decodes with no tshark warning or
+    error — TLS 1.2 mutual handshakes, DTLS with HelloVerifyRequest, OPC UA
+    asymmetric headers, the Modbus role as a UTF8String — and the S7
+    TLS 1.3 stream, lifted out of its COTP TPDUs, decodes as TLS 1.3."""
+    import subprocess
+    from tgt import protocols_sec as S
+    if not shutil_which("tshark"):
+        _skipped.append("test_w5c_tshark_secure_variants")
+        return
+    ep = Endpoints(meta=dict(_W5C_EP))
+    fields = {"enip-tls": ("tls.handshake.type", {"1", "2", "11", "13",
+                                                  "14", "15", "16"}),
+              "modbus-sec": ("x509sat.UTF8String", {"Engineer"}),
+              "enip-dtls": ("dtls.handshake.type", {"1", "3", "13", "15"}),
+              "opcua-sign-encrypt": ("opcua.security.spu",
+                                     {S.B256SHA256.decode()})}
+
+    def run(path, extra, *args):
+        return subprocess.run(["tshark"] + _TSHARK_OPTS + extra +
+                              ["-r", path] + list(args),
+                              capture_output=True, text=True).stdout
+
+    with tempfile.TemporaryDirectory() as d:
+        for key in S.PLAIN_OF:
+            protocols.begin_build(6, 0)
+            frames = protocols.get(key).build(ep, 4)
+            path = os.path.join(d, key + ".pcap")
+            with PcapWriter(path) as w:
+                for f in frames:
+                    w.write(f)
+            extra = _TSHARK_OWN.get(key, [])
+            ex = run(path, extra, "-q", "-z", "expert,warn")
+            bad = [ln.strip() for ln in ex.splitlines()
+                   if ln.strip()[:1].isdigit()]
+            check("Errors (" not in ex and not bad,
+                  f"tshark {key}: {bad[:3]}")
+            if key in fields:
+                fld, want = fields[key]
+                got = {v for ln in run(path, extra, "-T", "fields", "-e",
+                                       fld).split()
+                       for v in ln.split(",")}
+                check(want <= got, f"tshark {key}: {fld} {got}")
+            if key != "s7plus-tls":
+                continue
+            msgs = S._messages(frames, ep)
+            pairs = S._pairs([(frm, _cotp_data(m))
+                              for _, frm, m in msgs[4:]])
+            lifted = protocols._tcp_flow(ep, 40000, 443,
+                                         [tuple(p) for p in pairs])
+            path = os.path.join(d, "s7tls.pcap")
+            with PcapWriter(path) as w:
+                for f in lifted:
+                    w.write(f)
+            ex = run(path, [], "-q", "-z", "expert,warn")
+            vers = run(path, [], "-T", "fields", "-e",
+                       "tls.handshake.extensions.supported_version", "-e",
+                       "x509sat.uTF8String")
+            check("Errors (" not in ex and "0x0304" in vers and
+                  "corp.local" not in vers,
+                  f"s7plus-tls: lifted TLS stream {vers.split()[:4]}")
 
 
 def main() -> int:

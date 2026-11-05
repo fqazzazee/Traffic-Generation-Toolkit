@@ -540,7 +540,7 @@ def env_streams(env, span: str = "access", offline=(),
         ep = env.conv_endpoints(client, server, proto)
         tm = timing.conversation_timing(env, conv)
         lo, hi, jit, n, _ = timing.spec(proto)
-        if proto == "enip-io":
+        if proto in ("enip-io", "enip-dtls"):
             ep.meta["enip_rpi_us"] = int(round(tm["period"] * 1e6))
         cls = timing.activity_class(proto, client.role, server.role)
         out.append(Stream(
@@ -634,7 +634,7 @@ def profile_streams(profiles, ep: Endpoints) -> List[Stream]:
         lo, hi, jit, n, cls = timing.spec(key)
         e = Endpoints(**{**ep.__dict__, "meta": dict(ep.meta)})
         period = timing.pick(lo, hi, ep.client_ip, ep.server_ip, key)
-        if key == "enip-io":
+        if key in ("enip-io", "enip-dtls"):
             e.meta["enip_rpi_us"] = int(round(period * 1e6))
         out.append(Stream(("profile", key), key, "baseline",
                           protocols.get(key).build, e, (lambda f: [f]),
@@ -751,7 +751,7 @@ class Scheduler:
             s.bind(self.seed, gen)
             if s.period < self.min_period:
                 s.period = self.min_period
-                if s.key == "enip-io":
+                if s.key in ("enip-io", "enip-dtls"):
                     s.ep.meta["enip_rpi_us"] = int(s.period * 1e6)
             first = soon.get(sid)
             if first is None:

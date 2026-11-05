@@ -172,7 +172,19 @@ _PROTO_ALIASES = {
     "sparkplug": ["sparkplug", "sparkplug b", "sparkplugb"],
     "rdp": ["rdp", "ms-rdp", "ms-wbt-server"],
     "ssh": ["ssh"],
+    # secure OT variants (tgt.protocols_sec)
+    "cip-security": ["cip-security", "cip security", "enip-tls", "enip-dtls",
+                     "ethernet/ip over tls", "ethernet/ip over dtls",
+                     "enip/tls", "enip/dtls", "ethernet-ip-sec"],
+    "iec104-tls": ["iec104-tls", "iec-104-sec", "iec 104 tls",
+                   "iec 62351-3", "iec104s", "secure iec 104"],
+    "dnp3-tls": ["dnp3-tls", "dnp-sec", "dnp3 tls", "dnp3 over tls",
+                 "secure dnp3", "dnp3s"],
+    "modbus-sec": ["modbus-sec", "mbap-s", "modbus/tcp security",
+                   "modbus tcp security", "modbus-tls", "secure modbus"],
 }
+_PROTO_ALIASES["s7comm"] += ["s7plus-tls", "s7comm-plus tls"]
+_PROTO_ALIASES["opcua"] += ["opcua-sign-encrypt", "opc ua secure"]
 _PROTO_BY_KEY = {_key(a): canon for canon, al in _PROTO_ALIASES.items()
                  for a in al}
 

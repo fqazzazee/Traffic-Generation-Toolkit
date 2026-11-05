@@ -1496,3 +1496,4 @@ from . import protocols_util  # noqa: E402,F401  (registers SEL ASCII engineerin
 from . import protocols_site  # noqa: E402,F401  (registers MRP, DLR, DICOM, HL7…)
 from . import protocols_codesys  # noqa: E402,F401  (registers CODESYS V3)
 from . import protocols_iiot  # noqa: E402,F401  (registers RTU-over-TCP, LoRaWAN…)
+from . import protocols_sec  # noqa: E402,F401  (CIP Security, TLS/DTLS, UA)
