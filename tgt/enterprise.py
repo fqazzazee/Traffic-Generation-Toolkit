@@ -785,12 +785,7 @@ class Environment:
         streams: List[List[Tuple[str, List[bytes]]]] = []
         for cname, sname, proto in self.conversations:
             client, server = self.host(cname), self.host(sname)
-            ep = self._endpoints(client, server)
-            ep.meta.update(self._proto_meta(proto, client, server))
-            ep.meta.update(self.host_meta.get(sname, {}).get("server", {}))
-            ep.meta.update(self.host_meta.get(cname, {}).get("client", {}))
-            if proto == "cdp":      # native-VLAN TLV (frame itself is untagged)
-                ep.vlan = self.segment_of(server).vlan
+            ep = self.conv_endpoints(client, server, proto)
             frames = protocols.get(proto).build(ep, max(1, messages))
             streams.append([(proto, self._place(f, client, server, span))
                             for f in frames])
@@ -807,6 +802,18 @@ class Environment:
                     out.extend((proto, g) for g in stamp(group))
             i += 1
         return out
+
+    def conv_endpoints(self, client: Host, server: Host,
+                       proto: str) -> Endpoints:
+        """Endpoints (with protocol and per-host meta) of one conversation,
+        as :meth:`build` and the timed scheduler build it."""
+        ep = self._endpoints(client, server)
+        ep.meta.update(self._proto_meta(proto, client, server))
+        ep.meta.update(self.host_meta.get(server.name, {}).get("server", {}))
+        ep.meta.update(self.host_meta.get(client.name, {}).get("client", {}))
+        if proto == "cdp":      # native-VLAN TLV (frame itself is untagged)
+            ep.vlan = self.segment_of(server).vlan
+        return ep
 
     def _ip_id_stamper(self) -> Callable[[List[bytes]], List[bytes]]:
         """Windows and embedded stacks number every IP datagram a host sends

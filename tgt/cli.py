@@ -7,10 +7,12 @@
     tgt run ...              generate traffic (send and/or write pcap)
     tgt inventory -e ENV     export an environment's ground-truth asset list
     tgt env export ENV       write an environment as an env file (JSON)
+    tgt campaign PLAN        phased run: baseline, then changes (timed)
 """
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -209,6 +211,10 @@ def cmd_run(args) -> int:
             print(f"unknown protocol: {e}. Try 'tgt list'.", file=sys.stderr)
             return 2
 
+    schedule = getattr(args, "schedule", "cycle") or "cycle"
+    rate = args.rate
+    if rate is None:            # timed: the schedule paces, no cap by default
+        rate = 0.0 if schedule == "timed" else 20.0
     ep = Endpoints(
         client_mac=args.client_mac, client_ip=args.client_ip,
         server_mac=args.server_mac, server_ip=args.server_ip,
@@ -222,13 +228,30 @@ def cmd_run(args) -> int:
         replay_path=replay,
         replay_realtime=getattr(args, "replay_realtime", False),
         iface=args.iface, pcap_path=args.pcap,
-        rate=args.rate, count=args.count, duration=args.duration,
+        rate=rate, count=args.count, duration=args.duration,
         messages=args.messages, loop=not args.once, endpoints=ep,
         seed=getattr(args, "seed", None),
         manifest_path=getattr(args, "manifest", None),
         clock=getattr(args, "clock", "wall"),
         start_time=getattr(args, "start_time", None),
+        schedule=schedule, speed=getattr(args, "speed", 1.0),
+        day_profile=getattr(args, "day_profile", None),
+        min_period=getattr(args, "min_period", 0.0),
     )
+    if cfg.speed <= 0:
+        print("--speed must be > 0.", file=sys.stderr)
+        return 2
+    if schedule == "timed" and replay:
+        print("--schedule timed generates traffic; --replay keeps the "
+              "capture's own timing (use --replay-realtime).",
+              file=sys.stderr)
+        return 2
+    return _run_engine(cfg, args)
+
+
+def _run_engine(cfg: RunConfig, args) -> int:
+    """Validate the output/clock options of ``cfg``, run the engine to the
+    end (Ctrl-C / SIGTERM stop it cleanly) and print the summary."""
     if not cfg.iface and not cfg.pcap_path:
         print("nothing to do: specify --iface to send and/or --pcap to write a "
               "file.", file=sys.stderr)
@@ -290,12 +313,89 @@ def cmd_run(args) -> int:
     s = eng.stats
     print(f"summary: {s.packets} packets, {s.bytes} bytes, {s.errors} errors "
           f"in {s.elapsed:.1f}s")
+    if cfg.schedule == "timed":
+        print(f"  simulated {_fmt_span(s.sim_time)}"
+              + (f" ({s.packets / s.elapsed:,.0f} frames/s)"
+                 if s.elapsed > 0 else ""))
     if s.per_profile:
         for k, v in s.per_profile.items():
             print(f"  {k:10} {v}")
     if s.last_error:
         print(f"last error: {s.last_error}")
     return 0 if s.errors == 0 else 1
+
+
+def _fmt_span(sec: float) -> str:
+    d, rem = divmod(int(sec), 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    return (f"{d}d " if d else "") + f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def cmd_campaign(args) -> int:
+    """Run a phased campaign plan (see tgt.campaign) on the timed scheduler."""
+    from . import campaign, envfile
+    if args.list or not args.plan:
+        print("Example campaign plans (tgt/campaigns/):")
+        for p in campaign.packaged():
+            try:
+                plan = campaign.load(p)
+                print(f"  {os.path.basename(p):32} "
+                      f"{plan.env_key or plan.env_file}  "
+                      f"{len(plan.phases)} phases, "
+                      f"{_fmt_span(plan.duration)}")
+                if plan.description:
+                    print(f"    {plan.description}")
+            except campaign.CampaignError as e:
+                print(f"  {os.path.basename(p):32} (invalid: {e})")
+        return 0 if args.list else 2
+    path = campaign.find(args.plan)
+    try:
+        plan = campaign.load(path)
+        base = plan.base_env()
+        if plan.env_file:
+            envfile.register(base)
+        phases = campaign.build(plan)
+    except (campaign.CampaignError, envfile.EnvFileError) as e:
+        print(f"bad campaign plan: {e}", file=sys.stderr)
+        return 2
+    problems = campaign.validate(phases, args.min_period)
+    print(f"campaign {plan.name}: env {base.key}, {len(phases)} phases, "
+          f"{_fmt_span(plan.duration)} simulated")
+    for ph in phases:
+        ch = ", ".join(f"{k}={len(v) if isinstance(v, list) else v}"
+                       for k, v in ph.changes.items()) or "no changes"
+        print(f"  {ph.id} {ph.name:24} {_fmt_span(ph.duration):>12}  "
+              f"{ch}; {len(ph.events)} change events")
+    if problems:
+        for p in problems:
+            print(f"  {'warning' if args.force else 'error'}: {p}",
+                  file=sys.stderr)
+        if not args.force:
+            print("phases too short for fair learning; lengthen them or "
+                  "pass --force.", file=sys.stderr)
+            return 2
+    if args.check:
+        print("plan OK")
+        return 0
+    campaign.remember(path, phases)
+    seed = args.seed if args.seed is not None else plan.seed
+    if seed is None:
+        from .engine import new_seed
+        seed = new_seed()
+    rate = args.rate if args.rate is not None else 0.0
+    cfg = RunConfig(
+        env=base.key, span=plan.span, iface=args.iface, pcap_path=args.pcap,
+        rate=rate, count=args.count, duration=0.0,
+        sprinkle_messages=plan.sprinkle_messages, seed=seed,
+        manifest_path=args.manifest, clock=args.clock,
+        start_time=args.start_time or plan.start_time, schedule="timed",
+        speed=args.speed, day_profile=plan.day_profile,
+        min_period=args.min_period, campaign=path, force=args.force)
+    if cfg.speed <= 0:
+        print("--speed must be > 0.", file=sys.stderr)
+        return 2
+    return _run_engine(cfg, args)
 
 
 # Non-TTY stdout (service logs, pipes) gets one stats line this often.
@@ -461,12 +561,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="honor the pcap's original inter-packet timing")
     r.add_argument("--iface", "-i", help="interface to send on (needs root)")
     r.add_argument("--pcap", help="also/only write frames to this pcap file")
-    r.add_argument("--rate", type=float, default=20.0,
-                   help="packets per second (0 = as fast as possible)")
+    r.add_argument("--rate", type=float, default=None,
+                   help="packets per second (0 = as fast as possible; "
+                        "default 20). With --schedule timed: a cap only "
+                        "(default none)")
     r.add_argument("--count", type=int, default=0,
                    help="stop after N packets (0 = use --duration)")
-    r.add_argument("--duration", type=float, default=0.0,
-                   help="stop after N seconds (0 with count=0 = run forever)")
+    r.add_argument("--duration", type=_duration, default=0.0,
+                   help="stop after this long: seconds or 30m / 4h / 7d (0 "
+                        "with count=0 = run forever); simulated time with "
+                        "--schedule timed")
     r.add_argument("--messages", type=int, default=5,
                    help="protocol exchanges per built flow cycle")
     r.add_argument("--once", action="store_true",
@@ -490,7 +594,69 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--start-time", metavar="ISO",
                    help="synthetic clock start, e.g. 2026-11-05T14:00:00Z "
                         "(default: now)")
+    r.add_argument("--schedule", choices=["cycle", "timed"], default="cycle",
+                   help="cycle = every conversation once per batch at "
+                        "--rate (default); timed = each conversation on its "
+                        "own period with jitter, request/response RTT, "
+                        "persistent polling sessions (see tgt/timing.py)")
+    r.add_argument("--day-profile", choices=["flat", "shift"], default=None,
+                   help="timed: diurnal activity - shift = logons ~07:00, "
+                        "lunch dip, backups ~02:00, quiet weekends, OT "
+                        "polling steady (default: the env's, else flat)")
+    _timed_args(r)
+
+    pc = sub.add_parser("campaign", help="run a phased campaign plan "
+                        "(baseline, then changes) on the timed scheduler")
+    pc.add_argument("plan", nargs="?",
+                    help="plan file (JSON, or TOML on 3.11+) or the name of "
+                         "an example in tgt/campaigns/")
+    pc.add_argument("--list", action="store_true",
+                    help="list the example plans")
+    pc.add_argument("--check", action="store_true",
+                    help="validate the plan and print its phases; send "
+                         "nothing")
+    pc.add_argument("--force", action="store_true",
+                    help="run even if a phase is shorter than 3x the "
+                         "slowest period its change involves")
+    pc.add_argument("--iface", "-i", help="interface to send on (needs root)")
+    pc.add_argument("--pcap", help="also/only write frames to this pcap")
+    pc.add_argument("--manifest", metavar="FILE",
+                    help="write the run manifest (phases, inventory diffs, "
+                         "change events)")
+    pc.add_argument("--clock", choices=["wall", "synthetic"], default="wall",
+                    help="wall = real time (compress with --speed); "
+                         "synthetic = simulated timestamps, as fast as "
+                         "possible for a pcap-only run")
+    pc.add_argument("--start-time", metavar="ISO",
+                    help="synthetic clock start (default: the plan's, else "
+                         "now)")
+    pc.add_argument("--seed", type=int, default=None,
+                    help="run seed (default: the plan's, else random)")
+    pc.add_argument("--rate", type=float, default=None,
+                    help="packet-rate cap (default: none)")
+    pc.add_argument("--count", type=int, default=0,
+                    help="stop after N packets")
+    _timed_args(pc)
     return p
+
+
+def _duration(text: str) -> float:
+    from .timing import parse_duration
+    try:
+        return parse_duration(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _timed_args(p) -> None:
+    p.add_argument("--speed", type=float, default=1.0, metavar="X",
+                   help="timed + wall clock: run X times faster than real "
+                        "time (e.g. 60 = an hour per minute)")
+    p.add_argument("--min-period", type=_duration, default=0.0,
+                   metavar="SECONDS",
+                   help="timed: no conversation recurs faster than this "
+                        "(thins fast pollers / cyclic I/O for long "
+                        "synthetic captures)")
 
 
 def main(argv=None) -> int:
@@ -511,7 +677,7 @@ def main(argv=None) -> int:
     return {
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,
         "inventory": cmd_inventory,
-        "score": cmd_score,
+        "score": cmd_score, "campaign": cmd_campaign,
     }[args.command](args)
 
 

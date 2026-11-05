@@ -116,6 +116,12 @@ class Recorder:
         self.last_seen: Dict[str, float] = {}
         self.flows: Dict[tuple, list] = {}
         self.events: Dict[tuple, list] = {}
+        # timed schedule: per flow [last occurrence, intervals, sum, sum sq]
+        self.occ: Dict[tuple, list] = {}
+        # campaign: one record per phase + the change events
+        self.phase_log: List[Dict] = []
+        self.change_events: List[Dict] = []
+        self.plan = None
 
     # -- index of who talks to whom ---------------------------------------
     def _aid(self, host) -> str:
@@ -210,7 +216,11 @@ class Recorder:
         ekey = fkey if source.startswith(("sprinkle:", "incident:")) else None
         return src_aid, fkey, ekey, rec
 
-    def observe(self, ts: float, key: str, frame: bytes, source: str) -> None:
+    def observe(self, ts: float, key: str, frame: bytes, source: str,
+                occ: bool = False) -> None:
+        """Account one sent frame; ``occ`` marks the first frame of a timed
+        stream's occurrence (a poll, a beacon...), from which each flow's
+        observed period and jitter are measured."""
         if self.first_ts is None:
             self.first_ts = ts
         self.last_ts = ts
@@ -237,6 +247,16 @@ class Recorder:
         else:
             fl[1] = ts
             fl[2] += 1
+        if occ:
+            st = self.occ.get(fkey)
+            if st is None:
+                self.occ[fkey] = [ts, 0, 0.0, 0.0]
+            else:
+                d = ts - st[0]
+                st[0] = ts
+                st[1] += 1
+                st[2] += d
+                st[3] += d * d
         if ekey is not None:
             ev = self.events.get(ekey)
             if ev is None:
@@ -258,6 +278,15 @@ class Recorder:
                    "source": source}
             if key in self.attack_desc:
                 row["attack"] = key
+            st = self.occ.get((c, s, key, source))
+            if st is not None:
+                row["occurrences"] = st[1] + 1
+                if st[1]:
+                    mean = st[2] / st[1]
+                    var = max(st[3] / st[1] - mean * mean, 0.0)
+                    row["period_s"] = round(mean, 6)
+                    row["jitter"] = round(var ** 0.5 / mean, 4) if mean \
+                        else 0.0
             flows.append(row)
         events = []
         for (c, s, key, source), (t0, t1, n, rec) in self.events.items():
@@ -279,8 +308,22 @@ class Recorder:
                     "detail": "host not in the inventory, introduced by "
                               f"sprinkle: {', '.join(incs)}",
                     "source": f"sprinkle:{incs[0]}"})
+        for ce in self.change_events:
+            events.append(dict({"id": f"e{len(events) + 1}"}, **{
+                k: (iso(v) if k in ("t_start", "t_end") else v)
+                for k, v in ce.items()}))
         packets = self.packets
-        return {
+        phases = [{"id": "main", "start": iso(self.first_ts),
+                   "end": iso(self.last_ts), "packets": packets}]
+        if self.phase_log:
+            phases = []
+            for p in self.phase_log:
+                row = {k: v for k, v in p.items() if k != "_p0"}
+                row.update(start=iso(p["start"]), end=iso(p["end"]))
+                if p["end"] is None:
+                    row["packets"] = self.packets - p["_p0"]
+                phases.append(row)
+        doc = {
             "schema": SCHEMA,
             "tool": {"name": "tgt", "version": __version__, "git": self.git},
             "seed": self.seed,
@@ -301,10 +344,86 @@ class Recorder:
             "first_seen": {k: iso(v) for k, v in self.first_seen.items()},
             "last_seen": {k: iso(v) for k, v in self.last_seen.items()},
             "flows_seen": flows,
-            "phases": [{"id": "main", "start": iso(self.first_ts),
-                        "end": iso(self.last_ts), "packets": packets}],
+            "phases": phases,
             "events": events,
         }
+        if self.plan is not None:
+            doc["campaign"] = {"name": self.plan.name,
+                               "plan": self.plan.source,
+                               "description": self.plan.description}
+        return doc
+
+    # -- campaigns -------------------------------------------------------------
+    def campaign(self, phases, plan=None) -> None:
+        """Ground truth for a phased campaign: the inventory becomes the union
+        of every phase's hosts (each row tagged with the phases it is
+        present / online in) and phases + change events are recorded."""
+        from . import campaign as camp
+        self.plan = plan or (getattr(phases[0], "plan", None)
+                             if phases else None)
+        sprinkle = list(dict.fromkeys(k for ph in phases for k in ph.sprinkle))
+        self.sprinkle = sprinkle
+        env = camp.union_env(phases)
+        if env is not None:
+            from . import inventory
+            self.inventory = inventory.to_json(env, sprinkle)
+            present: Dict[str, List[str]] = {}
+            online: Dict[str, List[str]] = {}
+            ips: Dict[str, List[str]] = {}
+            for ph in phases:
+                for h in ph.env.hosts:
+                    present.setdefault(h.name, []).append(ph.id)
+                    if h.name not in ph.offline:
+                        online.setdefault(h.name, []).append(ph.id)
+                    seen = ips.setdefault(h.name, [])
+                    if h.ip not in seen:
+                        seen.append(h.ip)
+            for row in self.inventory.get("hosts", []):
+                n = row["name"]
+                row["phases"] = present.get(n, [])
+                row["online_phases"] = online.get(n, [])
+                if len(ips.get(n, [])) > 1:
+                    row["ip_history"] = ips[n]
+                self._host_row(row)
+            self.inventory["phases"] = [ph.id for ph in phases]
+
+    def _host_row(self, row) -> None:
+        aid = row.get("asset_id") or row["name"]
+        for ip in row.get("ip_history") or [row.get("ip")]:
+            if ip:
+                self.addr_aid.setdefault(ip, aid)
+
+    def begin_phase(self, ph, ts: float) -> None:
+        """Phase ``ph`` starts at ``ts``: index its environment and
+        sprinkles, record it and stamp its change events."""
+        if not self.plan and not self.phase_log and ph.id == "main":
+            return                       # plain timed run: one implicit phase
+        if ph.env is not None:
+            self.env = ph.env
+        self.sprinkle = list(ph.sprinkle)
+        self._cache.clear()
+        self._index()
+        self.phase_log.append({
+            "id": ph.id, "name": ph.name, "description": ph.description,
+            "start": ts, "end": None, "duration_s": ph.duration,
+            "packets": 0, "_p0": self.packets,
+            "changes": ph.changes, "inventory_diff": ph.diff,
+            "offline": sorted(f"{self.env.key}:{n}" for n in ph.offline)
+            if self.env is not None else [],
+            "sprinkle": list(ph.sprinkle)})
+        for e in ph.events:
+            self.change_events.append(dict(e, t_start=ts, t_end=None,
+                                           phase=ph.id))
+
+    def end_phase(self, ts: Optional[float]) -> None:
+        if not self.phase_log or self.phase_log[-1]["end"] is not None:
+            return
+        p = self.phase_log[-1]
+        p["end"] = ts if ts is not None else self.last_ts
+        p["packets"] = self.packets - p["_p0"]
+        for e in self.change_events:
+            if e["phase"] == p["id"] and e["t_end"] is None:
+                e["t_end"] = p["end"]
 
     def write(self, path: str, stats=None) -> None:
         """Write atomically (temp file + rename) so readers never see a
