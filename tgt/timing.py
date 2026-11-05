@@ -71,6 +71,10 @@ PERIODS: Dict[str, Tuple[float, float, float, int, str]] = {
     "s7-eng": (1200.0, 3600.0, 0.50, 1, "eng"),
     "enip-eng": (1200.0, 3600.0, 0.50, 1, "eng"),
     "pn-dcp-set": (3600.0, 7200.0, 0.50, 1, "eng"),
+    # CODESYS online session (login, project info, 6 monitoring reads) and
+    # the gateway's network scan: daytime engineering activity
+    "codesys": (1800.0, 5400.0, 0.50, 6, "eng"),
+    "codesys-disc": (1800.0, 7200.0, 0.50, 1, "eng"),
     "modbus-write": (300.0, 1800.0, 0.50, 1, "operator"),
     "dnp3-time": (3600.0, 3600.0, 0.02, 1, "infra"),
     "iec104-time": (3600.0, 3600.0, 0.02, 1, "infra"),
