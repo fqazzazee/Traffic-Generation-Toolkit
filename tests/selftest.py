@@ -1,15 +1,23 @@
 """Dependency-free self-test — validates packet construction end to end.
 
 Run on the target host to confirm TGT builds correct frames before you rely on
-it:  ``python3 -m tests.selftest``  (exit 0 = all good).
+it:  ``python3 tests/selftest.py`` or ``python3 -m tests.selftest``
+(exit 0 = all good).
 """
 from __future__ import annotations
 
+import os
 import struct
 import sys
 import tempfile
 
-from tgt import packet as P
+# `python3 tests/selftest.py` from the repo root puts tests/ (not the repo) on
+# sys.path; add the repo so `import tgt` works without PYTHONPATH.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+from tgt import packet as P  # noqa: E402
 from tgt import protocols, scenarios
 from tgt.config import RunConfig
 from tgt.engine import build_batch
@@ -775,6 +783,287 @@ def test_pcap_roundtrip() -> None:
         n += 1
     check(off == len(data), "pcap did not parse cleanly to EOF")
     check(n == len(frames), f"pcap record count {n} != {len(frames)}")
+
+
+# -- engine / ops robustness ------------------------------------------------
+def _pcap_records(path: str) -> list:
+    from tgt import pcapread
+    try:
+        return pcapread.read_frames(path, wrap=False)
+    except (OSError, pcapread.PcapError):
+        return []
+
+
+def _run_engine(cfg, timeout: float = 10.0):
+    from tgt.engine import Engine
+    eng = Engine(cfg)
+    eng.start()
+    eng.join(timeout)
+    return eng
+
+
+def test_engine_loop_count_duration_stop() -> None:
+    import time
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        # --count: exactly N frames, all of them in the pcap
+        path = os.path.join(d, "count.pcap")
+        eng = _run_engine(RunConfig(profiles=["modbus", "dnp3"], rate=0,
+                                    count=37, pcap_path=path))
+        check(not eng.is_alive(), "engine: count run did not finish")
+        check(eng.stats.packets == 37, f"engine: count gave {eng.stats.packets}")
+        check(len(_pcap_records(path)) == 37, "engine: count pcap != 37 frames")
+        check(eng.stats.finished and not eng.stats.running,
+              "engine: stats not marked finished")
+        # --duration: stops on time
+        path = os.path.join(d, "dur.pcap")
+        t0 = time.perf_counter()
+        eng = _run_engine(RunConfig(profiles=["modbus"], rate=200,
+                                    duration=0.3, pcap_path=path))
+        took = time.perf_counter() - t0
+        check(not eng.is_alive() and 0.25 <= took < 1.5,
+              f"engine: duration=0.3 took {took:.2f}s")
+        check(len(_pcap_records(path)) == eng.stats.packets > 0,
+              "engine: duration pcap != packets")
+        # stop(): prompt even at a very slow rate (5 s between frames)
+        path = os.path.join(d, "stop.pcap")
+        eng = Engine(RunConfig(profiles=["modbus"], rate=0.2, pcap_path=path))
+        eng.start()
+        time.sleep(0.2)
+        t0 = time.perf_counter()
+        eng.stop()
+        eng.join(3)
+        took = time.perf_counter() - t0
+        check(not eng.is_alive() and took < 1.0,
+              f"engine: stop() at 0.2pps took {took:.2f}s")
+        check(len(_pcap_records(path)) == eng.stats.packets,
+              "engine: stopped pcap != packets")
+        # --once: a single cycle
+        path = os.path.join(d, "once.pcap")
+        eng = _run_engine(RunConfig(profiles=["modbus"], rate=0, loop=False,
+                                    pcap_path=path))
+        check(eng.stats.packets == eng.stats.cycle_frames > 0,
+              "engine: --once did not send exactly one cycle")
+
+
+def test_engine_failed_sends_not_counted_or_written() -> None:
+    from tgt import engine as E
+
+    class FlakySender:                      # every 3rd send fails
+        def __init__(self, iface):
+            self.n = 0
+
+        def open(self):
+            pass
+
+        def send(self, frame):
+            self.n += 1
+            if self.n % 3 == 0:
+                raise OSError(100, "Network is down")
+            return len(frame)
+
+        def close(self):
+            pass
+
+    real = E.RawSender
+    E.RawSender = FlakySender
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "flaky.pcap")
+            eng = _run_engine(RunConfig(profiles=["modbus"], rate=0, count=30,
+                                        iface="fake0", pcap_path=path))
+            recs = _pcap_records(path)
+    finally:
+        E.RawSender = real
+    st = eng.stats
+    check(st.errors == 10 and st.packets == 20,
+          f"failed sends: packets={st.packets} errors={st.errors} "
+          "(want 20 sent + 10 errors)")
+    check(len(recs) == st.packets,
+          "failed sends: pcap holds frames that never left")
+    check(sum(st.per_profile.values()) == st.packets,
+          "failed sends: per-profile counts include failures")
+    check("Network is down" in st.last_error, "failed sends: last_error unset")
+
+
+def test_replay_realtime_keeps_original_timing() -> None:
+    import time
+    from tgt.engine import replay_offsets
+    check(replay_offsets([10.0, 10.5, 10.4, 30.0]) == [0.0, 0.5, 0.5, 5.5],
+          "replay_offsets: gaps not clamped to [0, 5]")
+    frame = protocols.dns_flow(Endpoints(), 1)[0]
+    span, n = 0.6, 1200                     # 0.5 ms gaps: drift would show
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "src.pcap")
+        with PcapWriter(src) as w:
+            for i in range(n):
+                w.write(frame, ts=1000.0 + span * i / (n - 1))
+        out = os.path.join(d, "out.pcap")
+        t0 = time.perf_counter()
+        eng = _run_engine(RunConfig(replay_path=src, replay_realtime=True,
+                                    loop=False, pcap_path=out))
+        took = time.perf_counter() - t0
+    check(eng.stats.packets == n, "realtime replay: lost packets")
+    check(span * 0.95 <= took <= span + 0.25,
+          f"realtime replay of a {span}s capture took {took:.2f}s")
+
+
+def test_rate_limiter_accuracy() -> None:
+    import threading
+    import time
+    from tgt.sender import RateLimiter
+    rl = RateLimiter(200)
+    t0 = time.perf_counter()
+    for _ in range(40):                     # 40 slots @ 200 pps = 0.2 s
+        rl.wait()
+    took = time.perf_counter() - t0
+    check(0.17 <= took <= 0.35, f"RateLimiter 200pps x40 took {took:.3f}s")
+    check(RateLimiter(0).interval == 0, "RateLimiter(0) should not pace")
+    stop = threading.Event()
+    stop.set()
+    rl = RateLimiter(0.5)                   # 2 s slot, but stop is set
+    t0 = time.perf_counter()
+    rl.wait(stop)
+    check(time.perf_counter() - t0 < 0.2, "RateLimiter.wait ignores stop")
+
+
+def _cli(args: list):
+    import subprocess
+    env = dict(os.environ, PYTHONPATH=_REPO)
+    return subprocess.Popen([sys.executable, "-m", "tgt"] + args, cwd=_REPO,
+                            env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, universal_newlines=True)
+
+
+def test_cli_run_pcap_count_end_to_end() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "cli.pcap")
+        p = _cli(["run", "-p", "modbus,s7comm", "--pcap", path,
+                  "--count", "25", "--rate", "0"])
+        out, _ = p.communicate(timeout=30)
+        recs = _pcap_records(path)
+    check(p.returncode == 0, f"cli run: rc={p.returncode}: {out[-300:]}")
+    check(len(recs) == 25, f"cli run: pcap has {len(recs)} frames, not 25")
+    check("summary: 25 packets" in out, "cli run: no summary line")
+    check("\r" not in out, "cli run: \\r progress line on a non-TTY stdout")
+
+
+def test_cli_sigterm_flushes_pcap() -> None:
+    import signal
+    import time
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "term.pcap")
+        p = _cli(["run", "-s", "ot-baseline", "--rate", "100",
+                  "--pcap", path])
+        time.sleep(1.2)
+        p.send_signal(signal.SIGTERM)
+        out, _ = p.communicate(timeout=10)
+        recs = _pcap_records(path)
+    check(p.returncode == 0, f"SIGTERM: rc={p.returncode}: {out[-300:]}")
+    check(len(recs) > 20, f"SIGTERM: pcap has {len(recs)} frames")
+    check("stopping on SIGTERM" in out and "summary:" in out,
+          "SIGTERM: no clean stop / summary")
+
+
+def test_pcapread_byte_orders_and_nanos() -> None:
+    from tgt import pcapread
+    frame = protocols.modbus_flow(Endpoints(), 1)[0]
+
+    def pcap(endian: str, magic: int, linktype: int, recs) -> bytes:
+        out = struct.pack(endian + "IHHiIII", magic, 2, 4, 0, 0, 65535,
+                          linktype)
+        for sec, frac, data in recs:
+            out += struct.pack(endian + "IIII", sec, frac, len(data),
+                               len(data)) + data
+        return out
+
+    sll = struct.pack("!HHH8sH", 0, 1, 6, b"\x02" * 8, P.ETH_P_IP) + frame[14:]
+    cases = [
+        ("big-endian usec", ">", 0xA1B2C3D4, 1, 500000, 1.5, frame),
+        ("little-endian usec", "<", 0xA1B2C3D4, 1, 250000, 1.25, frame),
+        ("big-endian nsec", ">", 0xA1B23C4D, 1, 500000000, 1.5, frame),
+        ("little-endian nsec", "<", 0xA1B23C4D, 1, 125000000, 1.125, frame),
+        ("little-endian SLL", "<", 0xA1B2C3D4, 113, 0, 1.0, sll),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        for label, endian, magic, lt, frac, want_ts, data in cases:
+            path = os.path.join(d, "t.pcap")
+            with open(path, "wb") as fh:
+                fh.write(pcap(endian, magic, lt, [(1, frac, data),
+                                                  (2, frac, data)]))
+            try:
+                got = pcapread.read_frames(path)
+            except pcapread.PcapError as e:
+                check(False, f"pcapread {label}: {e}")
+                continue
+            check(len(got) == 2, f"pcapread {label}: {len(got)} records")
+            check(abs(got[0][0] - want_ts) < 1e-6,
+                  f"pcapread {label}: ts {got[0][0]} != {want_ts}")
+            check(got[0][1][12:] == frame[12:],
+                  f"pcapread {label}: frame payload changed")
+
+
+def test_build_run_args_round_trip() -> None:
+    import shlex
+    import shutil
+    import subprocess
+    from tgt import cli, service
+    with tempfile.TemporaryDirectory() as d:
+        evil = os.path.join(d, "my caps", "it's $(touch PWNED) `x`.pcap")
+        out = os.path.join(d, "out dir", "o.pcap")
+        args = service.build_run_args(
+            None, [], 37.5, 7, replay=evil, replay_realtime=True, pcap=out,
+            once=True, client_ip="192.0.2.1", server_ip="192.0.2.2")
+        ns = cli.build_parser().parse_args(["run"] + shlex.split(args))
+        check(ns.replay == evil and ns.replay_realtime and ns.pcap == out
+              and ns.once and ns.rate == 37.5 and ns.messages == 7
+              and ns.client_ip == "192.0.2.1" and ns.server_ip == "192.0.2.2",
+              f"build_run_args round trip lost options: {args}")
+        args2 = service.build_run_args(
+            "ot-baseline", ["modbus"], 50, 5, sprinkle=["wannacry", "triton"],
+            sprinkle_ratio=0.05, client_ip="10.10.10.10")
+        ns = cli.build_parser().parse_args(["run"] + shlex.split(args2))
+        check(ns.scenario == "ot-baseline"
+              and ns.sprinkle == ["wannacry,triton"]
+              and ns.sprinkle_ratio == 0.05 and not ns.once
+              and ns.pcap is None and ns.client_ip == "10.10.10.10",
+              f"build_run_args scenario round trip: {args2}")
+        check("--client-ip" not in args2, "default client IP should be omitted")
+        # the config file is shell-sourced: values must stay data
+        conf = os.path.join(d, "etc tgt", "tgt.conf")
+        ok, msg = service.write_config("tgt0", args, path=conf)
+        check(ok, f"write_config: {msg}")
+        rc = service.read_config(conf)
+        check(rc.get("TGT_IFACE") == "tgt0" and rc.get("TGT_RUN_ARGS") == args,
+              "read_config does not undo write_config quoting")
+        sh = shutil.which("sh")
+        if sh:      # what tgtctl.sh / the systemd unit do with the file
+            r = subprocess.run(
+                [sh, "-c", '. "$1" && eval "set -- $TGT_RUN_ARGS" && '
+                 'printf "%s\\n" "$TGT_IFACE" "$@"', "sh", conf],
+                cwd=d, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=10)
+            got = r.stdout.splitlines()
+            check(r.returncode == 0 and got == ["tgt0"] + shlex.split(args),
+                  f"sourced config argv mismatch: {got} {r.stderr}")
+            check(not os.path.exists(os.path.join(d, "PWNED")),
+                  "sourcing the config executed a $(...) in a value")
+
+
+def test_version_single_source() -> None:
+    import re
+    import tgt
+    from tgt import cli
+    check(cli.VERSION == tgt.__version__, "cli VERSION != tgt.__version__")
+    try:
+        with open(os.path.join(_REPO, "pyproject.toml")) as fh:
+            toml = fh.read()
+    except OSError:
+        return                              # installed without the sdist
+    check(not re.search(r'^version\s*=\s*"', toml, re.M)
+          and 'dynamic = ["version"]' in toml
+          and 'attr = "tgt.__version__"' in toml,
+          "pyproject.toml must take its version from tgt.__version__")
 
 
 def main() -> int:

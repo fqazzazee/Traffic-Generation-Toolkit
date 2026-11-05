@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgt-toolkit"
-version = "1.5.0"
+dynamic = ["version"]   # single source: tgt/__init__.py __version__
 description = "Traffic Generation Toolkit — OT/ICS + IT test traffic onto a virtual interface for SPAN-ingestion testing (e.g. Claroty CTD)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -28,3 +28,6 @@ Homepage = "https://example.local/tgt"
 
 [tool.setuptools]
 packages = ["tgt"]
+
+[tool.setuptools.dynamic]
+version = { attr = "tgt.__version__" }
