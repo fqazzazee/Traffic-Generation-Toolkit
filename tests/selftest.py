@@ -1085,8 +1085,10 @@ def test_modbus_writes_are_a_minority() -> None:
         pdu = seg[(seg[12] >> 4) * 4:]
         if t[4] == 502 and len(pdu) >= 8:
             fcs.append(pdu[7])
-    check(fcs.count(0x06) == 2 and fcs.count(0x03) == 14,
-          f"modbus: expected 2 FC6 writes in 16 requests, got {fcs}")
+    check(fcs.count(0x06) == 2 and fcs.count(0x03) == 8
+          and {fcs.count(fc) for fc in (0x01, 0x02, 0x04)} == {2},
+          f"modbus: expected 2 FC6 writes, 8 FC3 and 2 each of FC1/2/4 in "
+          f"16 requests, got {fcs}")
     resp = [f for f in protocols.modbus_flow(Endpoints(), 5)]
     pay = [_l4(f)[5][20:] for f in resp]
     w = [p for p in pay if len(p) > 7 and p[7] == 0x06]
