@@ -38,6 +38,48 @@ SCENARIOS = {
         ["http", "dns", "ntp", "icmp", "arp"],
         "Non-OT traffic only — useful to confirm the sensor separates IT from "
         "OT and does not misclassify."),
+    "substation": Scenario(
+        "substation", "IEC 61850 Substation",
+        ["goose", "sv", "mms", "ptp", "iec104", "dnp3"],
+        "Station bus + process bus: GOOSE trips, 9-2LE sampled values, MMS "
+        "client/server with IED identity, PTP time, and IEC 104 / DNP3 "
+        "telecontrol to the SCADA gateway. GOOSE/SV/PTP are link-local."),
+    "profinet-cell": Scenario(
+        "profinet-cell", "PROFINET Cell",
+        ["pn-dcp", "pn-dcp-set", "pn-rt", "s7comm", "s7-id"],
+        "Siemens PROFINET cell: DCP Identify discovery, a DCP Set (IP / "
+        "NameOfStation change), cyclic RT IO data and S7 engineering "
+        "access. DCP/RT are raw Layer 2."),
+    "infra": Scenario(
+        "infra", "Network Infrastructure",
+        ["snmp", "snmpv3", "lldp", "cdp", "syslog", "mdns", "ssdp", "llmnr",
+         "nbns"],
+        "Management and discovery chatter — SNMP polling/traps, LLDP/CDP "
+        "neighbour adverts, syslog and mDNS/SSDP/LLMNR/NBNS name queries — "
+        "to drive asset enrichment (sysDescr, model, firmware, host names)."),
+    "iiot": Scenario(
+        "iiot", "IIoT / Edge Messaging",
+        ["mqtt", "sparkplug", "opcua"],
+        "MQTT telemetry and Sparkplug B edge-node birth/data/death alongside "
+        "OPC UA — IIoT and cloud-edge visibility."),
+    "remote-access": Scenario(
+        "remote-access", "Remote Access",
+        ["ssh", "rdp", "vnc", "telnet"],
+        "Administrative remote sessions: SSH (per-side KEXINIT / HASSH), RDP "
+        "with NLA over TLS, VNC to an HMI and a cleartext Telnet login — to "
+        "exercise remote-access inventory and insecure-protocol findings."),
+    "firmware-update": Scenario(
+        "firmware-update", "Firmware Update",
+        ["ftp", "tftp", "http-fw"],
+        "Device maintenance: FTP config backup + firmware upload (cleartext "
+        "login), TFTP image fetch / config backup and an HTTP firmware "
+        "upload — the file-transfer events a monitor should flag."),
+    "multi-vendor-ot": Scenario(
+        "multi-vendor-ot", "Multi-Vendor OT",
+        ["s7plus", "fins", "slmp", "hart-ip", "srtp", "enip", "modbus"],
+        "Engineering / HMI traffic across vendors: Siemens S7CommPlus, Omron "
+        "FINS, Mitsubishi SLMP, HART-IP, GE SRTP, EtherNet/IP and Modbus — "
+        "vendor coverage for protocol classification and asset identity."),
 }
 
 

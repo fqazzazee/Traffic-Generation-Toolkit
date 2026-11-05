@@ -1,0 +1,14 @@
+Name,IP,MAC,VLAN,Vendor,Model,Firmware,Serial,OS,Protocols,First Seen
+DC01,10.10.10.10,00:50:56:00:10:0A,10,VMware,,,,Windows Server 2019,"Kerberos, LDAP, NTP, TLS",2026-11-05 14:00:20
+WS20,10.10.20.20,,20,Microsoft,,,,Windows 10 Pro,"DNS, HTTP, TLS, SMB, NetBIOS",2026-11-05 14:01:00
+HMI-PK1,10.100.10.10,,,Siemens,,,,Linux,EtherNet/IP,
+PLC-PK1,10.100.10.21,00-1D-9C-00-70-21,110,Rockwell Automation,1756-L83E/B,30.011,9b6bd709,,"CIP, EtherNet/IP, NTP, Modbus",2026-11-05 14:00:12
+PLC-PK1 (2),10.100.10.21,,110,Rockwell Automation,1756-L83E,30.011,,,,
+PLC-PR4,10.100.20.24,000E.8C00.8024,120,Siemens AG,6ES7 151-8AB01-0AB0,V3.2.6,,,S7Comm,2026-11-05 14:02:00
+METER_UT1,,,,Schneider Electric,PM5560,2.7.4,,,,
+Triconex,172.16.3.10,00:80:F4:03:88:0C,,Schneider Electric,Triconex 3008 MP,,,,TriStation,2026-11-05 14:10:40
+Cisco HSRP,10.100.10.1,00:00:0C:07:AC:6E,110,Cisco,,,,,HSRP,
+,,00:00:0c:07:ac:0a,10,Cisco,,,,,,
+ts01-lanner-lion.cloudsink.net,18.158.187.80,,,,,,,,TLS,
+Unknown,10.100.10.99,02:00:00:00:00:99,110,,,,,,Modbus,
+RTU-104,10.100.50.30,,150,Siemens,SICAM A8000,,,,IEC 104,

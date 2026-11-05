@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    name: selftest (Python ${{ matrix.python }})
+    # setup-python has no 3.9 build for ubuntu-latest (26.04); keep the
+    # oldest supported Python covered on 24.04
+    runs-on: ${{ matrix.python == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+
+      # tshark lets the dissection / expert-info groups run instead of skip.
+      - name: Install tshark
+        timeout-minutes: 6
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" \
+            | sudo debconf-set-selections
+          # 26.04's sudo ignores -E, so pass the frontend explicitly
+          apt="sudo env DEBIAN_FRONTEND=noninteractive"
+          # Ubuntu 24.04 ships tshark 4.2, whose GOOSE/MMS dissectors trip an
+          # internal assertion; the wireshark-dev stable PPA has a current
+          # one. 26.04 ships 4.6 already, and adding the PPA there has hung
+          # (key fetch), so only 24.04 gets it — bounded, distro tshark if not.
+          . /etc/os-release
+          if [ "$VERSION_ID" = "24.04" ]; then
+            timeout 120 $apt add-apt-repository -y ppa:wireshark-dev/stable \
+              || echo "::warning::wireshark PPA unavailable; using distro tshark"
+          fi
+          $apt apt-get update -qq
+          $apt apt-get install -y -qq --no-install-recommends tshark
+          tshark --version | head -n 1
+
+      - name: Self-test (from the repo root, no PYTHONPATH)
+        run: python tests/selftest.py
+
+      - name: Self-test as a module
+        run: python -m tests.selftest
+
+      - name: Install and check the CLI entry point
+        run: |
+          python -m pip install --quiet .
+          cd "$RUNNER_TEMP"
+          tgt --version
+          test "$(tgt --version)" = "tgt $(python -c 'import tgt; print(tgt.__version__)')"
+          tgt run -p modbus --count 10 --rate 0 --pcap ci.pcap
+          # stdin: Ubuntu 26.04 runners confine tshark's own file opens
+          # ("You don't have permission to read the file")
+          tshark -r - -q -z io,stat,0 < ci.pcap
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck --version | head -n 2
+          shellcheck scripts/*.sh docker-entrypoint.sh

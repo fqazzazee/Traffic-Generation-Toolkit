@@ -18,4 +18,8 @@ if command -v ip >/dev/null 2>&1; then
     fi
 fi
 
+# exec: python3 becomes PID 1 and receives `podman/docker stop`'s SIGTERM
+# directly. `tgt run` installs a SIGTERM handler (PID 1 ignores signals that
+# have none), so it stops cleanly, closes any --pcap and prints the summary.
+# `--init` (tini as PID 1) also works and additionally reaps stray zombies.
 exec python3 -m tgt "$@"

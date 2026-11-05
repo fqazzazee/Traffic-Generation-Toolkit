@@ -1,0 +1,23 @@
+{
+  "name": "ot-plant-drift",
+  "description": "Small OT plant over two shifts: baseline, an I/O module swapped for a new model, a PLC re-addressed, a new engineering conversation, the old HMI decommissioned.",
+  "env": "ot-plant",
+  "start_time": "2026-11-03T05:00:00Z",
+  "seed": 4242,
+  "day_profile": "shift",
+  "phases": [
+    {"name": "baseline", "duration": "3h"},
+    {"name": "module-swap", "duration": "90m",
+     "description": "the ET 200S head PLC-S7-2 (IM151-8) is replaced by an S7-1500 CPU: new model, firmware and serial in its SZL",
+     "set": [{"host": "PLC-S7-2", "model": "siemens-cpu-1516-3pndp"}]},
+    {"name": "ip-change", "duration": "90m",
+     "description": "PLC-RW2 is moved to a new address in the same cell; it announces itself with gratuitous ARPs and its pollers reconnect",
+     "set": [{"host": "PLC-RW2", "ip": "172.16.1.32"}]},
+    {"name": "new-conversation", "duration": "90m",
+     "description": "the SCADA server starts polling PLC-RW2 over CIP (supervisory -> cell)",
+     "add_flow": [{"client": "SCADA01", "server": "PLC-RW2", "proto": "enip"}]},
+    {"name": "decommission", "duration": "90m",
+     "description": "the Windows 2000 HMI is switched off for good",
+     "remove_host": ["HMI-2000"]}
+  ]
+}

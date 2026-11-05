@@ -27,6 +27,26 @@ class RunConfig:
     messages: int = 5                    # protocol exchanges per built flow cycle
     loop: bool = True                    # rebuild + resend flows continuously
     endpoints: Endpoints = field(default_factory=Endpoints)
+    seed: Optional[int] = None           # run seed: reproduces every cycle (None = random)
+    manifest_path: Optional[str] = None  # write the run manifest (JSON ground truth) here
+    clock: str = "wall"                  # pcap/manifest timestamps: wall | synthetic
+    start_time: Optional[str] = None     # synthetic clock start (ISO-8601 UTC)
+    # time model: "cycle" = every conversation once per batch at --rate;
+    # "timed" = each conversation on its own period/jitter/RTT (tgt.schedule)
+    schedule: str = "cycle"
+    speed: float = 1.0                   # timed + wall clock: time compression
+    day_profile: Optional[str] = None    # timed: flat | shift (diurnal activity)
+    min_period: float = 0.0              # timed: floor every period (volume knob)
+    campaign: Optional[str] = None       # timed: phased campaign plan file
+    force: bool = False                  # campaign: skip phase-length checks
+    # replay (tgt.replay / tgt.rewrite)
+    replay_speed: float = 0.0            # >0: capture timing / this factor
+    replay_loop: int = 0                 # passes over the file (0 = until stopped)
+    replay_tsresol: Optional[float] = None  # override pcapng ticks per second
+    remap_ip: List[str] = field(default_factory=list)      # "old=new[,..]"
+    remap_subnet: List[str] = field(default_factory=list)  # "a/n=b/n[,..]"
+    remap_mac: List[str] = field(default_factory=list)     # "old=new[,..]"
+    replay_vlan: Optional[int] = None    # retag replayed frames (0 = untag)
 
     def summary(self) -> str:
         target = self.iface or "(pcap only)"
@@ -34,6 +54,8 @@ class RunConfig:
                 f"duration={self.duration}s" if self.duration else "until stopped")
         if self.replay_path:
             what = f"replay={self.replay_path}"
+            if self.replay_speed:
+                what += f" speed=x{self.replay_speed:g}"
         elif self.incident:
             what = f"incident={self.incident}"
         elif self.env:
@@ -46,5 +68,16 @@ class RunConfig:
             variants = "random" if self.sprinkle_random else ",".join(self.sprinkle)
             ratio = f"@{self.sprinkle_ratio:.0%}" if self.sprinkle_ratio else ""
             what += f" +malware[{variants}{ratio}]"
+        seed = "" if self.seed is None else f" seed={self.seed}"
+        if self.campaign:
+            what = f"campaign={self.campaign} {what}"
+        if self.schedule == "timed":
+            timed = " schedule=timed"
+            if self.speed != 1.0:
+                timed += f" speed={self.speed:g}x"
+            if self.day_profile:
+                timed += f" day-profile={self.day_profile}"
+            cap = f"rate-cap={self.rate:g}pps" if self.rate else "rate-cap=none"
+            return f"{what} iface={target} {cap} {stop}{timed}{seed}"
         return (f"{what} iface={target} "
-                f"rate={self.rate}pps {stop} loop={self.loop}")
+                f"rate={self.rate}pps {stop} loop={self.loop}{seed}")

@@ -1,0 +1,27 @@
+{
+  "_comment": "Generic asset-export map for tgt score. Each column entry may be one header name or a list of candidates (first present wins, case-insensitive). Also reads 'tgt inventory -f csv' output. Copy and edit for your product.",
+  "format": "csv",
+  "columns": {
+    "ip": ["ip", "ip_address", "ip address", "ips", "address", "ipv4"],
+    "mac": ["mac", "mac_address", "mac address", "macs"],
+    "vlan": ["vlan", "vlan_id", "vlans"],
+    "name": ["name", "hostname", "host", "asset", "asset name"],
+    "vendor": ["vendor", "manufacturer", "vendor_name"],
+    "model": ["model", "product", "product_name", "model_name"],
+    "firmware": ["firmware", "firmware_version", "fw", "version"],
+    "serial": ["serial", "serial_number", "serial number"],
+    "os": ["os", "operating_system", "operating system", "os_name"],
+    "protocols": ["protocols", "protocol", "services"],
+    "first_seen": ["first_seen", "first seen", "created", "created_at"]
+  },
+  "split": {"protocols": ";"},
+  "normalize": {
+    "vendor": {
+      "Rockwell Automation": "Rockwell",
+      "Allen-Bradley": "Rockwell",
+      "Allen Bradley": "Rockwell",
+      "Schweitzer Engineering Laboratories": "SEL",
+      "Johnson Controls International": "Johnson Controls"
+    }
+  }
+}

@@ -20,11 +20,13 @@ in :mod:`tgt.protocols`, driving them between arbitrary host pairs.
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import protocols
-from .packet import Endpoints, bytes_to_mac, mac_to_bytes, rewrite_l2
+from . import devices, protocols, stacks, tls
+from .packet import (ETH_P_ARP, Endpoints, arp, bytes_to_mac, ethernet,
+                     frame_ips, mac_to_bytes, rewrite_ips, rewrite_l2,
+                     set_ip_id)
 
 # Vendor OUIs — an analyser also fingerprints assets by MAC prefix.
 OUI_WIN = "00:50:56"        # VMware-hosted Windows/Linux
@@ -36,12 +38,12 @@ OUI_JCI = "00:10:8d"        # Johnson Controls (Metasys BMS)
 OUI_TRIDIUM = "00:01:f0"    # Tridium (Niagara JACE)
 OUI_SEL = "00:30:a7"        # Schweitzer Engineering Laboratories
 
-OUI_VENDORS: Dict[str, str] = {
-    OUI_WIN: "VMware", OUI_ROCKWELL: "Rockwell Automation",
-    OUI_SIEMENS: "Siemens", OUI_DELL: "Dell", OUI_SCHNEIDER: "Schneider Electric",
-    OUI_JCI: "Johnson Controls", OUI_TRIDIUM: "Tridium",
-    OUI_SEL: "Schweitzer Engineering Laboratories",
-}
+# OUI -> vendor and the embedded-device OUIs now come from the device catalog
+# (tgt.devices); these names stay for modules that import them.
+OUI_VENDORS: Dict[str, str] = devices.OUI_VENDORS
+
+# DNS domain every modeled host is named in (what SNI / LDAP carry)
+DOMAIN = "corp.local"
 
 
 @dataclass
@@ -91,7 +93,40 @@ FINGERPRINTS: Dict[str, OSFingerprint] = {
     "sel": OSFingerprint("sel", "SEL device firmware", 64,
         smb="none", dhcp_vendor="",
         risk="Electrical asset — DNP3 without Secure Authentication"),
+    # managed switches (network infrastructure)
+    "ios": OSFingerprint("ios", "Cisco IOS / IOS XE", 255,
+        smb="none", dhcp_vendor="",
+        risk="Network device — SNMP/CDP expose model + firmware"),
+    "hios": OSFingerprint("hios", "Hirschmann HiOS", 64,
+        smb="none", dhcp_vendor="",
+        risk="Network device — SNMP/LLDP expose model + firmware"),
+    "moxa": OSFingerprint("moxa", "Moxa switch firmware", 64,
+        smb="none", dhcp_vendor="",
+        risk="Network device — SNMP/LLDP expose model + firmware"),
+    # vendor firmware without a dedicated fingerprint: IEDs, flow computers,
+    # analyzers, medical devices, robots (RTOS) and cellular / VSAT routers,
+    # panel HMIs, cameras, PDUs (Linux-based)
+    "linux-embedded": OSFingerprint("linux-embedded", "Embedded Linux", 64,
+        smb="none", dhcp_vendor="udhcp 1.36.1",
+        risk="Appliance / edge firmware — vendor-patched only, no EDR agent; "
+             "exposed management services"),
+    "rtos": OSFingerprint("rtos", "Embedded RTOS firmware", 64,
+        smb="none", dhcp_vendor="",
+        risk="Embedded device — vendor-patched only, no EDR agent; "
+             "cleartext OT protocols"),
 }
+
+# Older fingerprint keys still accepted (env files, Host(os=...)); a host
+# carries the canonical key.
+OS_ALIASES: Dict[str, str] = {
+    "embedded": "rtos",
+    "embedded-linux": "linux-embedded",
+}
+
+
+def os_key(key: str) -> str:
+    """The canonical OS-fingerprint key for ``key`` (see OS_ALIASES)."""
+    return OS_ALIASES.get(key, key)
 
 
 @dataclass
@@ -103,10 +138,54 @@ class Host:
     os: str            # fingerprint key
     vendor: str = ""
     product: str = ""  # OT: model / order number
+    # Device-catalog identity (tgt.devices). Left empty, ``model`` resolves
+    # from ``product`` (embedded devices) or the OS fingerprint (general-
+    # purpose hosts), and firmware/serial are picked deterministically from
+    # the host name, so the same host always reports the same values.
+    model: str = ""
+    firmware: str = ""
+    serial: str = ""
+    modules: Tuple[devices.Module, ...] = ()
+    fqdn: str = ""
+
+    def __post_init__(self) -> None:
+        self.os = os_key(self.os)
+        if not self.model:
+            self.model = devices.resolve(self.product) or (
+                "" if self.vendor else devices.os_default(self.os))
+        dev = self.device
+        if dev is not None:
+            self.firmware = self.firmware or devices.pick_firmware(dev, self.name)
+            self.serial = self.serial or devices.make_serial(dev, self.name)
+            self.modules = self.modules or dev.modules
+        self.fqdn = self.fqdn or f"{self.name.lower()}.{DOMAIN}"
 
     @property
     def fp(self) -> OSFingerprint:
         return FINGERPRINTS[self.os]
+
+    @property
+    def device(self) -> Optional[devices.DeviceModel]:
+        """This host's catalog entry, or ``None`` if it has no model."""
+        return devices.find(self.model)
+
+    @property
+    def embedded(self) -> bool:
+        """An embedded OT device (PLC/RTU/relay/drive/meter/BMS firmware) —
+        by catalog model, else by its vendor MAC OUI."""
+        dev = self.device
+        if dev is not None:
+            return dev.embedded
+        return self.mac[:8].lower() in devices.EMBEDDED_OUIS
+
+    @property
+    def stack(self) -> str:
+        """TCP/IP stack fingerprint (:mod:`tgt.stacks` key): the catalog
+        model's hint, else the OS fingerprint's family."""
+        dev = self.device
+        if dev is not None and dev.stack:
+            return dev.stack
+        return stacks.for_os(self.os)
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +216,10 @@ CROWDSTRIKE_CLOUD_IPS = [
 
 # Falcon runs on modern Windows (Win7 SP1+ / Server 2012+) and Linux servers;
 # the EOL Win2000/XP hosts and embedded OT devices (PLC/RTU/relay/drive/meter
-# and BACnet/JACE firmware, identified by their vendor MAC OUI) cannot, so they
+# and BACnet/JACE firmware, identified by their tgt.devices model) cannot, so they
 # stay deliberately uncovered — a gap an analyser should flag.
 EDR_OS = {"win7", "win10", "win2012", "win2019", "linux"}
-_EMBEDDED_OUIS = {OUI_ROCKWELL, OUI_SIEMENS, OUI_SCHNEIDER, OUI_JCI,
-                  OUI_TRIDIUM, OUI_SEL}
+_EMBEDDED_OUIS = devices.EMBEDDED_OUIS     # compatibility alias
 
 
 def _cs_cloud_host(ip: str, fqdn: str) -> Host:
@@ -149,7 +227,7 @@ def _cs_cloud_host(ip: str, fqdn: str) -> Host:
     is cosmetic (``place`` rewrites it to the gateway as it egresses)."""
     o = [int(x) for x in ip.split(".")]
     return Host(f"CS-FALCON-{ip}", ip, "02:00:5c:%02x:%02x:%02x" % tuple(o[1:]),
-                "edr", "linux", "CrowdStrike", fqdn)
+                "edr", "linux", "CrowdStrike", fqdn, fqdn=fqdn)
 
 
 @dataclass(frozen=True)
@@ -158,22 +236,57 @@ class Segment:
 
     ``gateway`` is the segment's SVI on the core L3 switch. Its MAC is the HSRP
     virtual MAC for group = VLAN (0000.0c07.acXX), which is what hosts ARP for.
+
+    ``options`` (not part of equality/hash) holds per-segment knobs:
+
+    * ``gateway_mac``: the gateway's MAC when it is not the HSRP virtual MAC
+      (e.g. a remote site's cellular router).
+    * ``nat``: ``{"outside_ip": IP, "outside_mac"?: MAC, "local"?: bool}`` —
+      the segment is a remote site behind a NAT router whose outside (WAN)
+      address is ``outside_ip``; see :meth:`Environment.place`.
+    * ``wan_rtt_ms``: round-trip latency of the WAN link that reaches this
+      segment (a hint for the time model; see :meth:`Environment.rtt_ms`).
     """
     name: str
     vlan: int
     subnet: str        # CIDR, e.g. "10.20.10.0/24"
     zone: str          # IT | DMZ (L3.5) | OT-SUPERVISORY (L3) | OT-CELL (L1-2)
     gateway: str       # default-gateway IP
+    options: Dict[str, Any] = field(default_factory=dict, compare=False,
+                                    hash=False)
 
     @property
     def gateway_mac(self) -> str:
-        return f"00:00:0c:07:ac:{self.vlan & 0xFF:02x}"
+        return (self.options.get("gateway_mac") or
+                f"00:00:0c:07:ac:{self.vlan & 0xFF:02x}")
+
+    @property
+    def nat(self) -> Optional[Dict[str, Any]]:
+        """The segment's NAT spec (``options["nat"]``), or ``None``."""
+        return self.options.get("nat") or None
 
     def contains(self, ip: str) -> bool:
         return ipaddress.ip_address(ip) in ipaddress.ip_network(self.subnet)
 
 
 SPAN_VIEWS = ("access", "core")
+
+# DNS suffix of every modeled host (matches the TLS SNI / LDAP names)
+DNS_DOMAIN = "corp.local"
+# Purdue level by zone for general-purpose hosts (OT-CELL splits L1/L2 by role)
+_ZONE_LEVEL = {"IT": "4", "DMZ": "3.5", "OT-SUPERVISORY": "3"}
+_FIELD_ROLES = {"plc", "drive", "meter", "relay", "rtu"}
+
+
+def _ot_addressing(client: "Host", server: "Host") -> dict:
+    """Per-device OT protocol addresses, derived from the IPs so every device
+    differs: the BACnet device instance (third octet * 1000 + host octet,
+    e.g. 10.100.40.21 -> 40021) and the DNP3 link addresses (each side's
+    host octet: master = client, outstation = server)."""
+    s3, s4 = (int(x) for x in server.ip.split(".")[2:])
+    return {"bacnet_instance": s3 * 1000 + s4,
+            "dnp3_master": int(client.ip.rsplit(".", 1)[1]),
+            "dnp3_outstation": s4}
 
 
 # A conversation: client drives `proto` toward server.
@@ -182,6 +295,39 @@ Conversation = Tuple[str, str, str]   # (client_name, server_name, proto_key)
 
 def _mac(oui: str, n: int) -> str:
     return f"{oui}:{(n >> 16) & 0xFF:02x}:{(n >> 8) & 0xFF:02x}:{n & 0xFF:02x}"
+
+
+# ---------------------------------------------------------------------------
+# Managed network infrastructure: switches announce themselves (LLDP, plus
+# CDP on Cisco), answer the NMS's SNMP polls and log to its syslog collector
+# ---------------------------------------------------------------------------
+_SWITCH_OS = {"cisco-c9300-48p": "ios", "cisco-ie-4000-8gt4g-e": "ios",
+              "hirschmann-rsp35": "hios", "moxa-eds-508a": "moxa"}
+
+
+def _switch_host(name: str, ip: str, model: str, n: int) -> Host:
+    """A managed switch at ``ip`` (its management SVI) with a burned-in MAC
+    from its catalog model's first OUI."""
+    dev = devices.get(model)
+    return Host(name, ip, _mac(dev.ouis[0], n), "switch", _SWITCH_OS[model],
+                dev.vendor, dev.product, model=model)
+
+
+def _infra_conversations(switches: List[str], nms: str,
+                         hosts: List[Host]) -> List[Conversation]:
+    """LLDP (+ CDP on Cisco) self-announcements, NMS SNMP polls and syslog
+    for each switch in ``switches`` (missing names are skipped)."""
+    by = {x.name: x for x in hosts}
+    conv: List[Conversation] = []
+    for sw in switches:
+        h = by.get(sw)
+        if h is None:
+            continue
+        conv.append((sw, sw, "lldp"))
+        if h.os == "ios":
+            conv.append((sw, sw, "cdp"))
+        conv += [(nms, sw, "snmp"), (sw, nms, "syslog")]
+    return conv
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +350,10 @@ def _it_hosts() -> List[Host]:
     for i, os_ in enumerate(user_os, start=20):
         h.append(Host(f"WS{i:02d}", f"10.20.20.{i}", _mac(OUI_WIN, 0x200 + i),
                       "ws", os_))
+    # network management + the core/access switches it watches
+    h.append(Host("NMS01", "10.20.10.30", _mac(OUI_WIN, 0x130), "nms", "linux"))
+    h.append(_switch_host("CORE-SW01", "10.20.10.2", "cisco-c9300-48p", 0x1002))
+    h.append(_switch_host("ACC-SW01", "10.20.20.2", "cisco-c9300-48p", 0x2002))
     return h
 
 
@@ -244,6 +394,7 @@ def _it_conversations(hosts: List[Host]) -> List[Conversation]:
         ("WEB01", "SQL01", "https"), ("MAIL01", "DC01", "ldap"),
         ("BACKUP01", "FILE01", "smb"), ("FS-LEGACY", "DC01", "smb"),
     ]
+    conv += _infra_conversations(["CORE-SW01", "ACC-SW01"], "NMS01", hosts)
     return [c for c in conv if c[0] in by and c[1] in by]
 
 
@@ -276,6 +427,13 @@ def _ot_hosts() -> List[Host]:
         Host("PLC-S7-2", "172.16.2.22", _mac(OUI_SIEMENS, 0x22), "plc",
              "siemens", "Siemens", "6ES7 151-8AB01-0AB0"),
     ]
+    # OT network management + an industrial switch per segment
+    h += [
+        Host("OT-NMS", "172.16.0.40", _mac(OUI_WIN, 0x305), "nms", "linux"),
+        _switch_host("OT-SW01", "172.16.0.2", "cisco-ie-4000-8gt4g-e", 0x0002),
+        _switch_host("SW-CELL-RW", "172.16.1.2", "hirschmann-rsp35", 0x0102),
+        _switch_host("SW-CELL-S7", "172.16.2.2", "moxa-eds-508a", 0x0202),
+    ]
     return h
 
 
@@ -307,7 +465,14 @@ def _ot_conversations(hosts: List[Host]) -> List[Conversation]:
         ("HMI-2000", "HISTORIAN", "smb"), ("HMI-2000", "SCADA01", "http"),
         # supervisory IT chatter
         ("SCADA01", "HISTORIAN", "https"), ("ENGWS01", "HISTORIAN", "dns"),
+        # RSLinx-style browse from the cell HMI; engineering baseline:
+        # controller mode/program reads, S7 block upload + planned download
+        ("HMI-RW", "PLC-RW1", "enip-list"), ("HMI-RW", "PLC-RW2", "enip-list"),
+        ("ENGWS01", "PLC-RW1", "enip-eng"), ("ENGWS01", "PLC-RW2", "enip-eng"),
+        ("ENGWS01", "PLC-S7-1", "s7-eng"), ("ENGWS01", "PLC-S7-2", "s7-eng"),
     ]
+    conv += _infra_conversations(["OT-SW01", "SW-CELL-RW", "SW-CELL-S7"],
+                                 "OT-NMS", hosts)
     return [c for c in conv if c[0] in by and c[1] in by]
 
 
@@ -316,6 +481,57 @@ def _ot_conversations(hosts: List[Host]) -> List[Conversation]:
 # ---------------------------------------------------------------------------
 @dataclass
 class Environment:
+    """A modeled organization.
+
+    ``options`` holds topology switches and misconfiguration knobs (all
+    optional; built-ins leave them off unless noted):
+
+    * ``arp`` (default ``True``): each cycle starts with every host ARPing
+      for its gateway (HSRP virtual MAC answers) and for the same-segment
+      peers it talks to, plus an occasional gratuitous ARP.
+    * ``flat``: no segmentation — every segment rides the first segment's
+      VLAN (one broadcast domain, subnets multinetted on one SVI).
+    * ``dual_homed``: list of ``{"host": NAME, "ip": IP, "mac": MAC?,
+      "flows": [[SERVER, PROTO], ...]?}`` — the host gets a second NIC (a
+      twin asset ``NAME/nic2`` with the same name/FQDN/model/serial) in the
+      segment holding ``IP``, announcing itself and running ``flows``.
+    * ``snmp_community``: the v1/v2c community every SNMP poll uses
+      (default ``"n0c-r3ad"``); ``default_snmp_community: true`` sets it to
+      ``"public"`` (write-capable devices answer ``"private"``) — the
+      cleartext-credential finding a monitor should raise.
+
+    ``host_meta`` maps a host name to ``{"server": {...}, "client": {...}}``
+    endpoint-meta overrides applied when the host is that side of a flow.
+    ``timing`` maps a conversation to its optional ``period`` / ``jitter``
+    (parsed from env files, kept for a time model; not yet used by build).
+
+    ``findings`` lists the deliberately planted issues a monitor should flag
+    (``{"id", "title", "severity"?, "category"?, "hosts": [...],
+    "flows": [{"client", "server", "proto"}, ...], "detail"?}``), carried
+    into ``tgt inventory`` JSON as ground truth.
+
+    Remote sites behind NAT: a segment whose ``options["nat"]`` is set (see
+    :class:`Segment`) sits behind a router whose outside address is
+    ``outside_ip``. Frames between such a host and anything outside its site
+    are seen as the HQ SPAN sees them — the remote host's address translated
+    to ``outside_ip`` (static port forwarding inbound, port-preserving
+    source NAT outbound; TCP/UDP checksums recomputed, TTL -1 for the router
+    hop on the way out) and its MAC replaced by the router's
+    (``outside_mac``, else the MAC of the host that owns ``outside_ip``, else
+    the segment's ``gateway_mac``). The translated endpoint is placed in the
+    segment that holds ``outside_ip`` (a WAN transit VLAN at HQ), or, when no
+    segment does (a carrier / internet address), reaches the HQ peer through
+    its gateway like any foreign host. Segments sharing an ``outside_ip``
+    form one site and talk untranslated. Frames that never leave the site
+    (its LAN traffic, ARP, broadcasts) are invisible from HQ and dropped,
+    unless ``local: true`` keeps them on the site VLAN as a site-side sensor
+    would see them.
+
+    ``external`` lists endpoints outside every segment (a cloud MQTT broker,
+    a vendor's remote-service portal): conversations may name them, their
+    frames egress via the internal host's gateway like EDR beacons, and the
+    inventory lists them as external, not as assets.
+    """
     key: str
     name: str
     category: str      # IT | OT | mixed
@@ -323,10 +539,20 @@ class Environment:
     hosts: List[Host]
     conversations: List[Conversation]
     segments: List[Segment]
+    options: Dict[str, Any] = field(default_factory=dict)
+    host_meta: Dict[str, Dict[str, Dict[str, Any]]] = field(default_factory=dict)
+    timing: Dict[Conversation, Dict[str, Any]] = field(default_factory=dict)
+    findings: List[Dict[str, Any]] = field(default_factory=list)
+    external: List[Host] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # what was declared, before options rewrite it (env export uses this)
+        self.spec = (list(self.hosts), list(self.conversations),
+                     list(self.segments))
+        self._alias: Dict[str, str] = {}       # second-NIC twin -> host name
+        self._apply_options()
         vlans = [s.vlan for s in self.segments]
-        if len(set(vlans)) != len(vlans):
+        if len(set(vlans)) != len(vlans) and not self.options.get("flat"):
             raise ValueError(f"{self.key}: duplicate VLAN in {vlans}")
         for s in self.segments:
             if not s.contains(s.gateway):
@@ -339,42 +565,203 @@ class Environment:
                 raise ValueError(f"{self.key}: host {h.name} ({h.ip}) is in "
                                  f"{len(hit)} segments, expected 1")
             self._seg[h.name] = hit[0]
+        self._ext: Dict[str, Host] = {}
+        for h in self.external:
+            if h.name in self._seg or h.name in self._ext:
+                raise ValueError(f"{self.key}: external {h.name} duplicates "
+                                 "a host name")
+            if any(s.contains(h.ip) for s in self.segments):
+                raise ValueError(f"{self.key}: external {h.name} ({h.ip}) is "
+                                 "inside a segment")
+            self._ext[h.name] = h
         for c, sv, proto in self.conversations:
-            if (protocols.get(proto).transport == "l2"
-                    and self._seg[c] is not self._seg[sv]):
-                raise ValueError(f"{self.key}: {proto} is L2-only but "
+            for n in (c, sv):
+                if n not in self._seg and n not in self._ext:
+                    raise ValueError(f"{self.key}: conversation {c} -> {sv} "
+                                     f"({proto}) names unknown host {n}")
+            if (protocols.get(proto).link_local
+                    and (self._seg.get(c) is None
+                         or self._seg.get(c) is not self._seg.get(sv))):
+                raise ValueError(f"{self.key}: {proto} is link-local but "
                                  f"{c} -> {sv} crosses segments")
+        self._init_nat()
+
+    # -- remote sites behind NAT ------------------------------------------
+    def _init_nat(self) -> None:
+        """Resolve each NAT segment's outside address, MAC and segment."""
+        self._nat: Dict[str, Dict[str, Any]] = {}
+        self._nat_twins: Dict[Tuple[str, str], Host] = {}
+        nat_segs = [s for s in self.segments if s.nat]
+        for s in nat_segs:
+            nat = s.nat or {}
+            out = str(nat.get("outside_ip", ""))
+            try:
+                ipaddress.IPv4Address(out)
+            except ValueError:
+                raise ValueError(f"{self.key}: segment {s.name}: nat needs an "
+                                 f"IPv4 outside_ip, got {out!r}") from None
+            inside = [x for x in nat_segs if x.contains(out)]
+            if inside:
+                raise ValueError(f"{self.key}: segment {s.name}: nat "
+                                 f"outside_ip {out} is inside NAT segment "
+                                 f"{inside[0].name}")
+            outseg = next((x for x in self.segments if x.contains(out)), None)
+            owner = next((h for h in self.hosts if h.ip == out), None)
+            mac = (nat.get("outside_mac") or (owner.mac if owner else "")
+                   or s.gateway_mac).lower()
+            self._nat[s.name] = {"outside_ip": out, "outside_mac": mac,
+                                 "outside_seg": outseg,
+                                 "local": bool(nat.get("local", False)),
+                                 "site": out}
+
+    def nat_of(self, host: Host) -> Optional[Dict[str, Any]]:
+        """The resolved NAT spec of ``host``'s segment (``None`` when it is
+        not behind NAT, or not in this environment)."""
+        if not self._nat:
+            return None
+        seg = self._seg.get(host.name)
+        if seg is None or not seg.contains(host.ip):
+            return None
+        return self._nat.get(seg.name)
+
+    def _nat_twin(self, host: Host, nat: Dict[str, Any]) -> Host:
+        """``host`` as seen from outside its NAT site."""
+        key = (host.name, nat["site"])
+        twin = self._nat_twins.get(key)
+        if twin is None:
+            twin = self._nat_twins[key] = replace(
+                host, ip=nat["outside_ip"], mac=nat["outside_mac"])
+        return twin
+
+    def nat_view(self, a: Host, b: Host) -> Tuple[Host, Host]:
+        """The two ends of an ``a`` <-> ``b`` flow as the wire outside any
+        NAT site shows them (translated hosts carry the outside IP/MAC)."""
+        na, nb = self.nat_of(a), self.nat_of(b)
+        if (na is None and nb is None) or (
+                na is not None and nb is not None
+                and na["site"] == nb["site"]):
+            return a, b
+        return (self._nat_twin(a, na) if na else a,
+                self._nat_twin(b, nb) if nb else b)
+
+    def gateway_mac(self, seg: Segment) -> str:
+        """MAC that answers for ``seg``'s gateway: its ``gateway_mac``
+        option, else (a NAT site) the NAT router's, else the HSRP MAC."""
+        if not seg.options.get("gateway_mac") and seg.name in self._nat:
+            return self._nat[seg.name]["outside_mac"]
+        return seg.gateway_mac
+
+    def nat_address(self, host: Host) -> str:
+        """The address ``host`` appears as outside its site ("" if none)."""
+        nat = self.nat_of(host)
+        return nat["outside_ip"] if nat else ""
+
+    def hidden(self, host: Host) -> bool:
+        """True when ``host``'s own LAN frames are not on the capture (it is
+        behind NAT without ``local: true``)."""
+        nat = self.nat_of(host)
+        return nat is not None and not nat["local"]
+
+    def rtt_ms(self, a: Host, b: Host) -> float:
+        """WAN round-trip hint for an ``a`` <-> ``b`` flow: the
+        ``wan_rtt_ms`` of each end's segment the path leaves (0 within one
+        segment or one NAT site). A time model can stretch request/response
+        gaps by it."""
+        sa, sb = self._seg.get(a.name), self._seg.get(b.name)
+        if sa is sb:
+            return 0.0
+        na, nb = self.nat_of(a), self.nat_of(b)
+        if na is not None and nb is not None and na["site"] == nb["site"]:
+            return 0.0
+        return float(sum((s.options.get("wan_rtt_ms") or 0)
+                         for s in (sa, sb) if s is not None))
+
+    def _apply_options(self) -> None:
+        """Rewrite segments/hosts/conversations for the topology knobs."""
+        opts = self.options
+        if opts.get("flat") and self.segments:
+            vlan = self.segments[0].vlan
+            self.segments = [replace(s, vlan=vlan) for s in self.segments]
+        twins: List[Host] = []
+        conv: List[Conversation] = []
+        for d in opts.get("dual_homed") or ():
+            base = next((h for h in self.hosts if h.name == d["host"]), None)
+            if base is None:
+                raise ValueError(f"{self.key}: dual_homed host {d['host']!r} "
+                                 "is not in the environment")
+            mac = d.get("mac") or "%s:%02x:%s" % (
+                base.mac[:8], int(base.mac[9:11], 16) ^ 0x80, base.mac[12:])
+            twin = Host(f"{base.name}/nic2", d["ip"], mac, base.role, base.os,
+                        base.vendor, base.product, model=base.model,
+                        firmware=base.firmware, serial=base.serial,
+                        modules=base.modules, fqdn=base.fqdn)
+            twins.append(twin)
+            self._alias[twin.name] = base.name
+            conv.append((twin.name, twin.name, "netbios"))
+            conv += [(twin.name, sv, p) for sv, p in d.get("flows") or ()]
+        if twins:
+            self.hosts = list(self.hosts) + twins
+            self.conversations = list(self.conversations) + conv
+
+    @property
+    def arp_enabled(self) -> bool:
+        return bool(self.options.get("arp", True))
+
+    def snmp_community(self, server: Host) -> str:
+        """The community an SNMP poll of ``server`` carries."""
+        if self.options.get("default_snmp_community"):
+            dev = server.device
+            return "private" if dev is not None and dev.device_type == "switch" \
+                else "public"
+        return str(self.options.get("snmp_community", "n0c-r3ad"))
 
     def host(self, name: str) -> Host:
-        return next(h for h in self.hosts if h.name == name)
+        """A host (or an ``external`` endpoint) by name."""
+        for h in self.hosts:
+            if h.name == name:
+                return h
+        return self._ext[name]
+
+    def is_external(self, name: str) -> bool:
+        return name in self._ext
 
     def segment_of(self, host: Host) -> Segment:
         return self._seg[host.name]
 
     def _endpoints(self, client: Host, server: Host) -> Endpoints:
+        dflt_cip = devices.get("rockwell-1756-l71").identity["cip"]
+        dflt_s7 = devices.get("siemens-cpu-315-2pndp").identity["s7"]
         meta = {
             "ua": client.fp.ua,
             "smb": client.fp.smb if client.fp.smb != "none" else "smb2",
-            "dhcp_vendor": client.fp.dhcp_vendor or "MSFT 5.0",
-            "nbname": client.name,
-            "host": server.name,
-            "sni": f"{server.name.lower()}.corp.local",
+            "dhcp_vendor": client.fp.dhcp_vendor,   # "" = no option 60
+            "nbname": self._alias.get(client.name, client.name),
+            "host": self._alias.get(server.name, server.name),
+            "sni": server.fqdn,
             "realm": "CORP.LOCAL",
             "dn": f"CN={client.name},DC=corp,DC=local",
-            "product": server.product or "1756-L71/B LOGIX5571",
+            "product": server.product or dflt_cip["product_name"],
             "device_type": 0x02 if server.role == "drive" else 0x0E,  # CIP
-            "order": server.product or "6ES7 315-2EH14-0AB0",
+            "order": server.product or dflt_s7["order"],
             "server": "Microsoft-IIS/10.0" if server.os.startswith("win") else "Apache",
+            "tls_client": tls.client_for(client.os, client.role),
+            "tls_server": tls.server_for(server.os, server.embedded),
         }
+        # the server's own identity: CIP vendor/product code/revision/serial,
+        # S7 firmware + serial — so each device reports its own values
+        meta.update(devices.identity_meta(server.device, server.firmware,
+                                          server.serial, server.name))
+        meta.update(_ot_addressing(client, server))
         # Built untagged, host to host; _place() puts each frame on its VLAN.
         return Endpoints(
             client_mac=client.mac, client_ip=client.ip,
             server_mac=server.mac, server_ip=server.ip,
-            ttl_client=client.fp.ttl, ttl_server=server.fp.ttl, meta=meta)
+            ttl_client=client.fp.ttl, ttl_server=server.fp.ttl, meta=meta,
+            stack_client=client.stack, stack_server=server.stack)
 
     def _place(self, frame: bytes, client: Host, server: Host,
                span: str) -> List[bytes]:
-        return self.place(frame, client, server, span, self.segment_of)
+        return self.place(frame, client, server, span, self.segment_or_none)
 
     def place(self, frame: bytes, client: Host, server: Host, span: str,
               seg_of) -> List[bytes]:
@@ -388,13 +775,58 @@ class Environment:
         follows on the receiver's VLAN with TTL-1. When exactly one side is
         foreign the frame is tagged with the internal host's VLAN and reaches
         it via that segment's gateway MAC; when both are foreign it is left
-        untouched.
+        untouched. A frame that crosses a NAT site boundary is translated
+        first (see the class docstring); one that stays inside a NAT site is
+        dropped (``[]``) unless the site is ``local``.
         """
         from_client = frame[6:12] == mac_to_bytes(client.mac)
         src, dst = (client, server) if from_client else (server, client)
+        if self._nat:
+            ns, nd = self.nat_of(src), self.nat_of(dst)
+            if ns is not None or nd is not None:
+                inside = ns is not None and (
+                    frame[0] & 0x01 or (nd is not None
+                                        and nd["site"] == ns["site"]))
+                if inside:              # never leaves the remote site
+                    if not ns["local"]:
+                        return []
+                elif not (frame[0] & 0x01):
+                    frame, src, dst, seg_of = self._nat_translate(
+                        frame, src, dst, ns, nd, seg_of)
+        return self._route(frame, src, dst, span, seg_of)
+
+    def _nat_translate(self, frame: bytes, src: Host, dst: Host,
+                       ns: Optional[Dict[str, Any]],
+                       nd: Optional[Dict[str, Any]], seg_of):
+        """Rewrite a frame crossing NAT site boundaries: inside addresses
+        become the site's outside IP/MAC; returns the frame, the translated
+        ends and a ``seg_of`` that places them where the outside IP lives."""
+        s2 = self._nat_twin(src, ns) if ns else src
+        d2 = self._nat_twin(dst, nd) if nd else dst
+        frame = rewrite_ips(frame, s2.ip if ns else None,
+                            d2.ip if nd else None, ttl_delta=-1 if ns else 0)
+        frame = rewrite_l2(frame, s2.mac, d2.mac, None)
+
+        def seg2(h: Host):
+            if ns is not None and h is s2:
+                return ns["outside_seg"]
+            if nd is not None and h is d2:
+                return nd["outside_seg"]
+            return seg_of(h)
+        return frame, s2, d2, seg2
+
+    def _route(self, frame: bytes, src: Host, dst: Host, span: str,
+               seg_of) -> List[bytes]:
+        """Placement of a frame from ``src`` to ``dst`` (see :meth:`place`)."""
         sseg, dseg = seg_of(src), seg_of(dst)
         if sseg is None and dseg is None:
             return [frame]
+        if frame[0] & 0x01 and sseg is not None:
+            # L2 broadcast / multicast (DHCP Discover, LLDP, PTP, GOOSE, mDNS):
+            # stays in the sender's VLAN — never routed, no gateway MAC, no
+            # TTL decrement
+            return [rewrite_l2(frame, bytes_to_mac(frame[6:12]),
+                               bytes_to_mac(frame[0:6]), sseg.vlan)]
         if sseg is dseg:
             return [rewrite_l2(frame, bytes_to_mac(frame[6:12]),
                                bytes_to_mac(frame[0:6]), sseg.vlan)]
@@ -411,16 +843,130 @@ class Environment:
                                   ttl=frame[14 + 8] - 1))
         return out
 
+    def _proto_meta(self, proto: str, client: Host, server: Host) -> dict:
+        """Per-protocol endpoint meta that needs the inventory: DNS resolves
+        the real names of the hosts the client talks to, DHCP leases from the
+        client's own segment (relayed by its gateway when the server is
+        elsewhere)."""
+        if proto == "dns":
+            peers: List[Host] = []
+            for c, sv, _ in self.conversations:
+                h = self.host(sv)
+                if c == client.name and sv != c and h not in peers:
+                    peers.append(h)
+            # internet names first: a client resolves its cloud endpoint
+            # before connecting, whatever the message count
+            peers.sort(key=lambda h: h.name not in self._ext)
+            return {"dns_names": [(h.fqdn if h.name in self._ext else
+                                   f"{h.name.lower()}.{DNS_DOMAIN}", h.ip)
+                                  for h in peers or [server]]}
+        if proto in ("bacnet-id", "enip-list"):
+            # discovery broadcast to the client's subnet when the device
+            # shares it; a routed device is browsed by unicast
+            seg = self.segment_of(client)
+            same = self.segment_or_none(server) is seg
+            return {"bcast": str(ipaddress.ip_network(seg.subnet)
+                                 .broadcast_address) if same else ""}
+        if proto == "netbios":
+            # B-node broadcasts to the announcer's own subnet; the host
+            # announcement states its OS version
+            seg = self.segment_of(client)
+            return {"bcast": str(ipaddress.ip_network(seg.subnet)
+                                 .broadcast_address), "nb_os": client.os}
+        if proto == "dhcp":
+            seg = self.segment_of(client)
+            meta = {"dhcp_router": seg.gateway, "dhcp_domain": DNS_DOMAIN,
+                    "dhcp_mask": str(ipaddress.ip_network(seg.subnet).netmask)}
+            if self.segment_or_none(server) is not seg:
+                meta["dhcp_relay"] = seg.gateway
+            return meta
+        if proto in ("snmp", "snmpv3", "lldp", "cdp"):
+            return self._agent_meta(proto, server)
+        if proto == "syslog":
+            dev = client.device
+            if dev is not None and dev.device_type == "switch":
+                return {"syslog_format": "3164"}
+        if proto in ("dicom", "hl7"):
+            # the SCU / sending application states its own identity: its
+            # catalog values and env-file meta, under a "client_" prefix
+            own = devices.identity_meta(client.device, client.firmware,
+                                        client.serial, client.name)
+            own.update(self.host_meta.get(client.name, {}).get("server", {}))
+            return {f"client_{k}": v for k, v in own.items()
+                    if k.startswith(proto + "_")}
+        return {}
+
+    def _agent_meta(self, proto: str, agent: Host) -> dict:
+        """SNMP agent / LLDP / CDP identity of ``agent`` from its catalog
+        banners (sysDescr, sysObjectID, CDP platform) and placement."""
+        name = self._alias.get(agent.name, agent.name)
+        meta: Dict[str, Any] = {"snmp_sysname": name, "lldp_sysname": name,
+                                "cdp_device_id": name,
+                                "snmp_syslocation": f"{self.name}, "
+                                f"{self.segment_of(agent).name}"}
+        if proto == "snmp":
+            meta["snmp_community"] = self.snmp_community(agent)
+        dev = agent.device
+        if dev is None:
+            return meta
+        for key in ("snmp_sysdescr", "snmp_sysobjectid", "cdp_platform"):
+            val = devices.banner(dev, key, name, agent.firmware, agent.serial)
+            if val:
+                meta[key] = val
+        if "snmp_sysdescr" in meta:
+            meta["lldp_sysdescr"] = meta["cdp_software"] = meta["snmp_sysdescr"]
+        return meta
+
+    def _arp_frames(self) -> List[bytes]:
+        """Start-of-cycle address resolution, on each host's own VLAN: every
+        host ARPs for its gateway (answered from the HSRP virtual MAC) and
+        for each same-segment peer it opens IP flows to; DHCP clients and
+        every eighth host also send a gratuitous ARP."""
+        if not self.arp_enabled:
+            return []
+        arp_build = protocols.get("arp").build
+        peers: Dict[str, List[str]] = {h.name: [] for h in self.hosts}
+        dhcp = set()
+        for c, sv, proto in self.conversations:
+            if proto == "dhcp":
+                dhcp.add(c)
+            if (c != sv and c in peers
+                    and protocols.get(proto).transport != "l2"
+                    and self._seg.get(c) is self._seg.get(sv)
+                    and sv not in peers[c]):
+                peers[c].append(sv)
+        out: List[bytes] = []
+        for i, h in enumerate(self.hosts):
+            if self.hidden(h):          # behind NAT: not on this capture
+                continue
+            seg = self.segment_of(h)
+            gw = Endpoints(client_mac=h.mac, client_ip=h.ip,
+                           server_mac=self.gateway_mac(seg),
+                           server_ip=seg.gateway,
+                           vlan=seg.vlan)
+            out += arp_build(gw, 1)
+            if h.name in dhcp or i % 8 == 0:
+                out.append(ethernet("ff:ff:ff:ff:ff:ff", h.mac, ETH_P_ARP,
+                                    arp(1, h.mac, h.ip, "00:00:00:00:00:00",
+                                        h.ip), vlan=seg.vlan))
+            for name in peers[h.name]:
+                peer = self.host(name)
+                ep = Endpoints(client_mac=h.mac, client_ip=h.ip,
+                               server_mac=peer.mac, server_ip=peer.ip)
+                for f in arp_build(ep, 1):
+                    out += self._place(f, h, peer, "access")
+        return out
+
     def segment_or_none(self, host: Host):
         """Like :meth:`segment_of`, but ``None`` for a host not in this env."""
         return self._seg.get(host.name)
 
     def edr_hosts(self) -> List[Host]:
         """Windows and Linux hosts that run a Falcon sensor. Excludes the EOL
-        XP/2000 Windows and embedded OT devices (by vendor MAC OUI), which
-        can't — so they stay uncovered."""
-        return [h for h in self.hosts if h.os in EDR_OS
-                and h.mac[:8].lower() not in _EMBEDDED_OUIS]
+        XP/2000 Windows and embedded OT devices (by catalog model, else
+        vendor MAC OUI), which can't — so they stay uncovered."""
+        return [h for h in self.hosts if h.os in EDR_OS and not h.embedded
+                and h.name not in self._alias]     # one sensor per machine
 
     def _edr_endpoints(self, win: Host, cloud: Host) -> Endpoints:
         return Endpoints(
@@ -428,7 +974,9 @@ class Environment:
             server_mac=cloud.mac, server_ip=cloud.ip,
             ttl_client=win.fp.ttl, ttl_server=64,
             meta={"sni": cloud.product, "domain": cloud.product,
-                  "nbname": win.name, "ua": win.fp.ua})
+                  "nbname": win.name, "ua": win.fp.ua,
+                  "tls_client": "falcon", "tls_server": "openssl"},
+            stack_client=win.stack, stack_server="linux")
 
     def _edr_streams(self, messages: int,
                      span: str) -> List[List[Tuple[str, List[bytes]]]]:
@@ -437,29 +985,36 @@ class Environment:
         gateway (like any internet-bound flow). Beacons spread across the EU-1
         cloud IP pool; a representative host also exercises the upload / download
         / API FQDNs so all of them appear on the wire."""
-        fleet = self.edr_hosts()
-        if not fleet:
-            return []
-        ips, fq = CROWDSTRIKE_CLOUD_IPS, CROWDSTRIKE_FQDNS
-
         def flow(host: Host, ip: str, fqdn: str, n: int):
             cloud = _cs_cloud_host(ip, fqdn)
             ep = self._edr_endpoints(host, cloud)
             frames = protocols.get("edr").build(ep, max(1, n))
-            return [("edr", self.place(f, host, cloud, span, self.segment_or_none))
-                    for f in frames]
+            placed = [("edr", self.place(f, host, cloud, span,
+                                         self.segment_or_none))
+                      for f in frames]
+            return [p for p in placed if p[1]]
 
+        return [flow(h, ip, fqdn, messages if bulk else 1)
+                for h, ip, fqdn, bulk in self.edr_plan()]
+
+    def edr_plan(self) -> List[Tuple[Host, str, str, bool]]:
+        """Who beacons where: (host, cloud IP, FQDN, bulk) per Falcon flow;
+        ``bulk`` flows carry ``messages`` exchanges, the rest one beacon."""
+        fleet = self.edr_hosts()
+        if not fleet:
+            return []
+        ips, fq = CROWDSTRIKE_CLOUD_IPS, CROWDSTRIKE_FQDNS
         # a low-and-slow beacon per host on the sensor channel, spread over the
         # cloud IP pool so the whole published egress set appears
-        streams = [flow(h, ips[i % len(ips)], fq["ts"], 1)
-                   for i, h in enumerate(fleet)]
+        plan = [(h, ips[i % len(ips)], fq["ts"], False)
+                for i, h in enumerate(fleet)]
         # one host also uploads telemetry, pulls content and hits the API
         anchor = next((h for h in fleet
                        if h.role in ("hist", "file", "dc", "scada")), fleet[0])
-        streams += [flow(anchor, ips[-1], fq["up"], messages),
-                    flow(anchor, ips[-2], fq["down"], messages),
-                    flow(anchor, ips[-3], fq["api"], 1)]
-        return streams
+        plan += [(anchor, ips[-1], fq["up"], True),
+                 (anchor, ips[-2], fq["down"], True),
+                 (anchor, ips[-3], fq["api"], False)]
+        return plan
 
     def build(self, messages: int, span: str = "access",
               edr: bool = True) -> List[Tuple[str, bytes]]:
@@ -477,21 +1032,57 @@ class Environment:
         streams: List[List[Tuple[str, List[bytes]]]] = []
         for cname, sname, proto in self.conversations:
             client, server = self.host(cname), self.host(sname)
-            ep = self._endpoints(client, server)
+            ep = self.conv_endpoints(client, server, proto)
             frames = protocols.get(proto).build(ep, max(1, messages))
-            streams.append([(proto, self._place(f, client, server, span))
-                            for f in frames])
+            placed = [(proto, self._place(f, client, server, span))
+                      for f in frames]
+            streams.append([p for p in placed if p[1]])   # NAT may hide
         if edr:
             streams += self._edr_streams(messages, span)
-        out: List[Tuple[str, bytes]] = []
+        # each cycle opens with address resolution, as after a cache flush
+        out: List[Tuple[str, bytes]] = [("arp", f) for f in self._arp_frames()]
+        stamp = self._ip_id_stamper()
         i = 0
         while any(i < len(s) for s in streams):
             for s in streams:
                 if i < len(s):
                     proto, group = s[i]
-                    out.extend((proto, g) for g in group)
+                    out.extend((proto, g) for g in stamp(group))
             i += 1
         return out
+
+    def conv_endpoints(self, client: Host, server: Host,
+                       proto: str) -> Endpoints:
+        """Endpoints (with protocol and per-host meta) of one conversation,
+        as :meth:`build` and the timed scheduler build it."""
+        ep = self._endpoints(client, server)
+        ep.meta.update(self._proto_meta(proto, client, server))
+        ep.meta.update(self.host_meta.get(server.name, {}).get("server", {}))
+        ep.meta.update(self.host_meta.get(client.name, {}).get("client", {}))
+        if proto == "cdp":      # native-VLAN TLV (frame itself is untagged)
+            ep.vlan = self.segment_of(server).vlan
+        return ep
+
+    def _ip_id_stamper(self) -> Callable[[List[bytes]], List[bytes]]:
+        """Windows and embedded stacks number every IP datagram a host sends
+        from one counter, so a host's IP IDs rise in wire order across all its
+        flows. Returns a function that re-stamps one frame group (a frame and
+        its routed copy keep the same ID)."""
+        by_ip = {h.ip: h for h in self.hosts
+                 if stacks.get(h.stack).ipid == "host"}
+        counters: Dict[str, int] = {}
+
+        def stamp(group: List[bytes]) -> List[bytes]:
+            ips = frame_ips(group[0])
+            host = by_ip.get(ips[0]) if ips else None
+            if host is None:
+                return group
+            n = counters.get(host.ip)
+            if n is None:
+                n = stacks.hash_int(host.name, "ipid", bits=16)
+            counters[host.ip] = (n + 1) & 0xFFFF
+            return [set_ip_id(g, n) for g in group]
+        return stamp
 
     def protocols(self) -> List[str]:
         """Protocols this environment's conversations use, in registry order
@@ -499,7 +1090,21 @@ class Environment:
         used = {proto for _, _, proto in self.conversations}
         if self.edr_hosts():
             used.add("edr")
+        if self.arp_enabled and self.hosts:
+            used.add("arp")
         return [k for k in protocols.PROFILES if k in used]
+
+    def purdue_level(self, host: Host) -> str:
+        """Purdue level ("0".."4", "3.5" = IT/OT DMZ): fixed by the catalog
+        model for embedded devices, else by where the host sits."""
+        dev = host.device
+        if (dev is not None and dev.purdue_level
+                and dev.device_type != "switch"):   # a switch: where it sits
+            return dev.purdue_level
+        zone = self.segment_of(host).zone
+        if zone == "OT-CELL":
+            return "1" if host.role in _FIELD_ROLES else "2"
+        return _ZONE_LEVEL.get(zone, "")
 
     def legacy_hosts(self) -> List[Host]:
         return [h for h in self.hosts if h.fp.legacy]
@@ -515,16 +1120,49 @@ class Environment:
                 f"{len(self.conversations)} conversations; {leg} legacy/at-risk")
 
 
+def _dmz_hosts() -> List[Host]:
+    """The IT/OT DMZ (L3.5) that joins the IT org to the OT plant."""
+    return [
+        Host("HIST-REP", "10.20.50.10", _mac(OUI_WIN, 0x500), "hist", "win2019"),
+        Host("JUMP01", "10.20.50.11", _mac(OUI_WIN, 0x501), "jump", "win2019"),
+        Host("PATCH01", "10.20.50.12", _mac(OUI_WIN, 0x502), "patch", "win2019"),
+        _switch_host("DMZ-SW01", "10.20.50.2", "cisco-c9300-48p", 0x5002),
+    ]
+
+
 def _mixed_hosts() -> List[Host]:
-    return _it_hosts() + _ot_hosts()
+    return _it_hosts() + _ot_hosts() + _dmz_hosts()
 
 
 def _mixed_segments() -> List[Segment]:
-    return _it_segments() + _ot_segments()
+    return _it_segments() + _ot_segments() + [
+        Segment("IT-OT-DMZ", 50, "10.20.50.0/24", "DMZ", "10.20.50.1")]
+
+
+# enterprise-mixed's one deliberate IT -> OT flow that bypasses the DMZ: an
+# office PC with the PLC programming suite going online with a cell PLC
+MIXED_DMZ_BYPASS: Conversation = ("WS31", "PLC-RW1", "enip")
 
 
 def _mixed_conversations(hosts: List[Host]) -> List[Conversation]:
-    return _it_conversations(hosts) + _ot_conversations(hosts)
+    by = {x.name: x for x in hosts}
+    conv = _it_conversations(hosts) + _ot_conversations(hosts)
+    dmz: List[Conversation] = [
+        # IT -> DMZ: users read the historian replica, admins reach the jump
+        # host; the DMZ uses the IT domain and patches via the IT proxy
+        ("WS21", "HIST-REP", "https"), ("WS22", "HIST-REP", "https"),
+        ("WS20", "JUMP01", "https"), ("JUMP01", "DC01", "kerberos"),
+        ("JUMP01", "DNS01", "dns"), ("PATCH01", "PROXY01", "http"),
+        # OT <-> DMZ: historian replication out, supervised remote access in,
+        # patches and AV pulled from the DMZ
+        ("HISTORIAN", "HIST-REP", "https"), ("JUMP01", "ENGWS01", "https"),
+        ("JUMP01", "ENGWS01", "smb"), ("SCADA01", "PATCH01", "http"),
+        ("ENGWS01", "PATCH01", "http"), ("HISTORIAN", "PATCH01", "http"),
+        MIXED_DMZ_BYPASS,
+    ]
+    conv += [c for c in dmz if c[0] in by and c[1] in by]
+    conv += _infra_conversations(["DMZ-SW01"], "NMS01", hosts)
+    return conv
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +1275,30 @@ def _site_hosts() -> List[Host]:
             "relay", "sel", "SEL", prod)
     add("RTU-104", "10.100.50.30", OUI_SIEMENS, 0xB030, "rtu", "siemens",
         "Siemens", "SICAM A8000 CP-8050")
+
+    # Network management (corporate + OT) and a managed switch per segment
+    add("NMS01", "10.10.10.18", OUI_WIN, 0x1018, "nms", "linux")
+    add("OT-NMS", "10.100.0.17", OUI_WIN, 0x6017, "nms", "linux")
+    for name, ip, model in _SITE_SWITCHES:
+        h.append(_switch_host(name, ip, model,
+                              int(ip.split(".")[2]) << 8 | 0x02))
     return h
+
+
+# (name, management IP, catalog model): Catalysts on the corporate side and
+# DMZ, Cisco IE in operations/packaging, Hirschmann in process/substation,
+# Moxa in utilities/BMS
+_SITE_SWITCHES = [
+    ("CORE-SW01", "10.10.10.2", "cisco-c9300-48p"),
+    ("ACC-SW01", "10.10.20.2", "cisco-c9300-48p"),
+    ("DMZ-SW01", "10.10.50.2", "cisco-c9300-48p"),
+    ("OT-CORE01", "10.100.0.2", "cisco-ie-4000-8gt4g-e"),
+    ("SW-PK", "10.100.10.2", "cisco-ie-4000-8gt4g-e"),
+    ("SW-PR", "10.100.20.2", "hirschmann-rsp35"),
+    ("SW-UT", "10.100.30.2", "moxa-eds-508a"),
+    ("SW-BMS", "10.100.40.2", "moxa-eds-508a"),
+    ("SW-SUB", "10.100.50.2", "hirschmann-rsp35"),
+]
 
 
 def _site_conversations(hosts: List[Host]) -> List[Conversation]:
@@ -706,7 +1367,47 @@ def _site_conversations(hosts: List[Host]) -> List[Conversation]:
     # Policy violation an analyser should flag: an IT laptop polling a
     # utilities meter directly (L4 -> L1), bypassing the DMZ.
     conv.append(("WS-CONTRACTOR", "METER-UT1", "modbus"))
+    # network management: the corporate NMS watches IT + DMZ switches, the
+    # OT NMS the plant's
+    conv += _infra_conversations(["CORE-SW01", "ACC-SW01", "DMZ-SW01"],
+                                 "NMS01", hosts)
+    conv += _infra_conversations([n for n, ip, _ in _SITE_SWITCHES
+                                  if ip.startswith("10.100.")], "OT-NMS", hosts)
+    conv += _site_identity_conversations(named)
     return [c for c in conv if c[0] in by and c[1] in by]
+
+
+def _site_identity_conversations(named) -> List[Conversation]:
+    """Every embedded device states its identity in its own protocol, and the
+    engineering / operations baseline runs from the hosts that own it."""
+    conv: List[Conversation] = []
+    # Packaging: RSLinx browse from the line HMI, Studio 5000 going online
+    # from ENG01, and class-1 I/O between each PLC and its PowerFlexes
+    for plc in named("PLC-PK"):
+        conv += [("HMI-PK1", plc, "enip-list"), ("ENG01", plc, "enip-eng")]
+    for i, drv in enumerate(named("DRV-PK")):
+        conv.append((f"PLC-PK{i % 4 + 1}", drv, "enip-io"))
+    # Process: TIA Portal block list / upload / planned download from ENG02
+    for plc in named("PLC-PR"):
+        conv.append(("ENG02", plc, "s7-eng"))
+    # Utilities: Modbus device ID from engineering + the power-monitoring
+    # historian; the operator HMI writes setpoints
+    for plc in named("PLC-UT"):
+        conv += [("ENG01", plc, "modbus-id"), ("HMI-UT1", plc, "modbus-write")]
+    for m in named("METER-UT"):
+        conv.append(("HIST01", m, "modbus-id"))
+    # BMS: the JACE discovers its controllers; the supervisor reads the JACE
+    for ahu in named("BAC-AHU"):
+        conv.append(("BMS-JACE", ahu, "bacnet-id"))
+    conv.append(("BMS-SUP", "BMS-JACE", "bacnet-id"))
+    # Substation: DNP3 device attributes, SCADA time sync, RTU via SNMP
+    for r in named("RELAY"):
+        conv.append(("RTAC01", r, "dnp3-id"))
+    conv += [("SCADA02", "RTAC01", "dnp3-id"),
+             ("SCADA02", "RTAC01", "dnp3-time"),
+             ("SCADA02", "RTU-104", "iec104-time"),
+             ("SCADA02", "RTU-104", "snmp")]
+    return conv
 
 
 ENVIRONMENTS: Dict[str, Environment] = {}
@@ -729,8 +1430,10 @@ _reg_env("ot-plant", "OT Plant", "OT",
          "Windows XP/2000 HMIs with vendor-identity and fingerprint traffic.",
          _ot_hosts, _ot_conversations, _ot_segments)
 _reg_env("enterprise-mixed", "Mixed IT + OT Site", "mixed",
-         "The full site: the IT organization and the OT plant together — the "
-         "realistic converged network an analyser sees at an industrial site.",
+         "The full site: the IT organization and the OT plant joined through "
+         "an IT/OT DMZ (historian replica, jump host, patch server) — the "
+         "realistic converged network an analyser sees at an industrial site, "
+         "with one office PC reaching a PLC directly.",
          _mixed_hosts, _mixed_conversations, _mixed_segments)
 _reg_env("industrial-site", "Industrial Site", "mixed",
          "A large Purdue-model plant: corporate IT, an IT/OT DMZ, L3 site "
@@ -738,6 +1441,10 @@ _reg_env("industrial-site", "Industrial Site", "mixed",
          "utilities, a BACnet BMS and an SEL/DNP3 substation, across 9 "
          "VLANs, plus one IT laptop talking straight to the plant floor.",
          _site_hosts, _site_conversations, _site_segments)
+
+# the environments defined in code (env files and packaged sites register
+# later, through tgt.envfile.register)
+BUILTIN_KEYS = frozenset(ENVIRONMENTS)
 
 
 def get(key: str) -> Environment:

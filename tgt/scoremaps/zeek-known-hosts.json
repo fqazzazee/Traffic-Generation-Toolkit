@@ -1,0 +1,8 @@
+{
+  "_comment": "Zeek known_hosts.log (TSV or JSON) as the asset export: IP + first-seen time only, so only discovery, precision and time-to-discover are scored. Zeek has no VLAN/MAC here; enable the 'known-hosts-with-mac' style packages and add their columns if you need more.",
+  "format": "zeek",
+  "columns": {
+    "ip": "host",
+    "first_seen": "ts"
+  }
+}

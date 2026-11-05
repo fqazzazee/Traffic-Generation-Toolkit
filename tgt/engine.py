@@ -7,10 +7,12 @@ monitor).
 """
 from __future__ import annotations
 
+import collections
+import random
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from . import protocols
 from .config import RunConfig
@@ -32,7 +34,19 @@ class Stats:
     running: bool = False
     finished: bool = False
     cycle_frames: int = 0          # frames in one built (or replayed) cycle
+    cycles: int = 0                # cycles started
+    seed: Optional[int] = None     # run seed (reproduces every cycle)
+    sim_time: float = 0.0          # timed schedule: simulated seconds sent
     per_profile: dict = field(default_factory=dict)
+    # per send interface (--iface a,b): packets, bytes, errors, last_error
+    per_iface: dict = field(default_factory=dict)
+    # (time, packets, bytes) samples taken by readers for the rolling rate
+    _samples: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=4096), repr=False,
+        compare=False)
+
+    # seconds the rolling rate (rolling() / recent_pps) averages over
+    WINDOW = 5.0
 
     @property
     def elapsed(self) -> float:
@@ -50,21 +64,77 @@ class Stats:
         e = self.elapsed
         return (self.bytes * 8 / 1e6) / e if e > 0 else 0.0
 
+    def rolling(self, window: Optional[float] = None,
+                now: Optional[float] = None) -> Tuple[float, float]:
+        """(pps, Mb/s) over about the last ``window`` seconds (default
+        :data:`WINDOW`), so a stall shows as a drop instead of vanishing into
+        the lifetime average (:attr:`pps`). Sampled on read: a monitor that
+        calls this every frame gets a smooth rate; until a second sample
+        exists it is the lifetime average."""
+        window = self.WINDOW if window is None else window
+        now = time.perf_counter() if now is None else now
+        s = self._samples
+        s.append((now, self.packets, self.bytes))
+        # keep one sample at least ``window`` old as the baseline
+        try:
+            while len(s) > 2 and now - s[1][0] >= window:
+                s.popleft()
+            t0, p0, b0 = s[0]
+        except IndexError:              # another reader trimmed it
+            return self.pps, self.mbps
+        dt = now - t0
+        if dt < min(0.5, window) or not self.started:
+            return self.pps, self.mbps
+        return ((self.packets - p0) / dt,
+                (self.bytes - b0) * 8 / 1e6 / dt)
 
-def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
+    @property
+    def recent_pps(self) -> float:
+        return self.rolling()[0]
+
+
+# A built frame: (profile/attack key, frame bytes, source label) — the source
+# is "baseline", "incident:<key>" or "sprinkle:<incident>".
+Tagged = Tuple[str, bytes, str]
+
+
+def build_batch(cfg: RunConfig, seed: Optional[int] = None, cycle: int = 0,
+                sport_stride: int = 0) -> List[tuple[str, bytes]]:
     """Build one interleaved cycle of frames tagged with their profile key.
 
     The base is a scenario/environment/incident/protocol mix; any ``sprinkle``
     incidents are then spread thinly through it so the malware rides on top of
-    otherwise-normal traffic.
+    otherwise-normal traffic. See :func:`build_cycle` for ``seed``/``cycle``.
     """
-    base = _build_base(cfg)
+    return [(k, f) for k, f, _ in build_cycle(cfg, seed, cycle, sport_stride)]
+
+
+def build_cycle(cfg: RunConfig, seed: Optional[int] = None, cycle: int = 0,
+                sport_stride: int = 0) -> List[Tagged]:
+    """Cycle ``cycle`` of a run as (key, frame, source) triples.
+
+    Each cycle is fresh — new ephemeral ports (advancing by ``sport_stride``
+    per cycle), random TCP ISNs, continuing app-level counters, drifting
+    process values — yet a pure function of ``(cfg, seed, cycle)``: the same
+    seed rebuilds identical frames. ``seed`` defaults to ``cfg.seed``; with
+    neither set every build is different.
+    """
+    if seed is None:
+        seed = cfg.seed
+    with protocols.BUILD_LOCK:      # one build at a time (see isolated_build)
+        return _build_cycle(cfg, seed, cycle, sport_stride)
+
+
+def _build_cycle(cfg: RunConfig, seed: Optional[int], cycle: int,
+                 sport_stride: int) -> List[Tagged]:
+    rng = protocols.begin_build(seed, cycle, sport_stride).rng
+    src = f"incident:{cfg.incident}" if cfg.incident else "baseline"
+    base: List[Tagged] = [(k, f, src) for k, f in _build_base(cfg)]
     if cfg.sprinkle or cfg.sprinkle_random:
         from . import incidents
-        import random
         pool = [k for k in cfg.sprinkle if k in incidents.INCIDENTS]
         if cfg.sprinkle_random:
-            pool = [random.choice(pool or list(incidents.INCIDENTS))]
+            pool = [rng.choice(pool or list(incidents.INCIDENTS))]
         if not pool:
             return base
 
@@ -81,11 +151,14 @@ def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
 
         def cycle(i):
             inc = incidents.get(pool[i % len(pool)])
+            label = f"sprinkle:{inc.key}"
             if tagged:              # ride on the env's VLANs/trunk directly
-                return inc.build_on(cfg.sprinkle_messages, env, span=cfg.span)
-            mapping = inc.map_onto(env)   # re-address only (base is untagged)
-            return inc.build(cfg.sprinkle_messages,
-                             resolve=lambda n, m=mapping: m.get(n) or inc.host(n))
+                built = inc.build_on(cfg.sprinkle_messages, env, span=cfg.span)
+            else:
+                mapping = inc.map_onto(env)   # re-address only (base untagged)
+                built = inc.build(cfg.sprinkle_messages, resolve=lambda n,
+                                  m=mapping: m.get(n) or inc.host(n))
+            return [(k, f, label) for k, f in built]
 
         r = min(max(cfg.sprinkle_ratio, 0.0), 0.9)
         if r > 0 and base:
@@ -101,8 +174,37 @@ def build_batch(cfg: RunConfig) -> List[tuple[str, bytes]]:
                 extras = [first]
         else:                               # natural minority: one cycle per variant
             extras = [cycle(i) for i in range(len(pool))]
-        base = _sprinkle(base, extras, randomize=cfg.sprinkle_random)
+        base = _sprinkle(base, extras, randomize=cfg.sprinkle_random, rng=rng)
     return base
+
+
+def sport_stride(used: int) -> int:
+    """Per-cycle advance of the source-port allocator for a cycle that used
+    ``used`` ports: headroom for cycles that vary in size (random sprinkle),
+    rounded to 64."""
+    return -(-(used * 5 // 4 + 32) // 64) * 64
+
+
+class CycleBuilder:
+    """Builds cycle N of a run — a pure function of ``(cfg, seed, N)``.
+
+    The source-port stride comes from cycle 0's port use, so ports advance
+    across cycles without 4-tuple reuse until the ephemeral range wraps.
+    """
+
+    def __init__(self, cfg: RunConfig, seed: Optional[int]):
+        self.cfg, self.seed = cfg, seed
+        self.stride: Optional[int] = None
+
+    def build(self, cycle: int) -> List[Tagged]:
+        if self.stride is None:
+            with protocols.BUILD_LOCK:
+                first = build_cycle(self.cfg, self.seed, 0)
+                self.stride = sport_stride(
+                    protocols.build_context().sports_used)
+            if cycle == 0:
+                return first
+        return build_cycle(self.cfg, self.seed, cycle, self.stride)
 
 
 def _build_base(cfg: RunConfig) -> List[tuple[str, bytes]]:
@@ -128,9 +230,8 @@ def _build_base(cfg: RunConfig) -> List[tuple[str, bytes]]:
     return batch
 
 
-def _sprinkle(base: List[tuple[str, bytes]],
-              extras: List[List[tuple[str, bytes]]],
-              randomize: bool = False) -> List[tuple[str, bytes]]:
+def _sprinkle(base: list, extras: List[list], randomize: bool = False,
+              rng: Optional[random.Random] = None) -> list:
     """Spread `extras` frames through `base` (evenly, or jittered when random).
 
     Malware frames keep their relative order (so each attack's session stays
@@ -144,11 +245,11 @@ def _sprinkle(base: List[tuple[str, bytes]],
     merged: List[tuple[str, bytes]] = []
     ei = 0
     if randomize:
-        import random
+        roll = (rng or random).random
         prob = len(flat) / len(base)
         for item in base:
             merged.append(item)
-            if ei < len(flat) and random.random() < prob:
+            if ei < len(flat) and roll() < prob:
                 merged.append(flat[ei])
                 ei += 1
     else:
@@ -163,13 +264,26 @@ def _sprinkle(base: List[tuple[str, bytes]],
 
 
 class Engine:
+    # manifest rewrite period (seconds of wall time)
+    MANIFEST_INTERVAL = 10.0
+
     def __init__(self, cfg: RunConfig,
-                 on_log: Optional[Callable[[str], None]] = None):
+                 on_log: Optional[Callable[[str], None]] = None,
+                 argv: Optional[List[str]] = None):
         self.cfg = cfg
+        self.argv = list(argv or [])
         self.stats = Stats()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._on_log = on_log or (lambda m: None)
+        # live control (pause/resume, rate, timed injection) — see
+        # tgt.control / the --api server in tgt.api
+        from .control import RunControl
+        self.control = RunControl(self)
+        self.record = False         # keep a manifest Recorder even without a path
+        self.recorder = None
+        self.limiter: Optional[RateLimiter] = None
+        self.env_now = None         # timed: the phase's environment
 
     def log(self, msg: str) -> None:
         self._on_log(msg)
@@ -189,18 +303,34 @@ class Engine:
         return bool(self._thread and self._thread.is_alive())
 
     # -- internal ----------------------------------------------------------
+    def _sleep_until(self, target: float) -> None:
+        """Sleep until ``perf_counter() >= target``; wakes early on stop()."""
+        delay = target - time.perf_counter()
+        if delay > 0.05:
+            self._stop.wait(delay)
+        elif delay > 0:
+            time.sleep(delay)
+
     def _run(self) -> None:
         cfg = self.cfg
         sender: Optional[RawSender] = None
         pcap: Optional[PcapWriter] = None
+        recorder = None
+        pool = None
         self.stats.running = True
         self.stats.started = time.perf_counter()
+        seed = cfg.seed if cfg.seed is not None else new_seed()
+        self.stats.seed = seed
+        synthetic = cfg.clock == "synthetic"
         try:
             if cfg.iface:
                 sender = RawSender(cfg.iface)
                 try:
                     sender.open()
+                    self.stats.per_iface = getattr(sender, "counters", {})
                     self.log(f"raw socket bound to {cfg.iface}")
+                    for bad in getattr(sender, "open_errors", ()):
+                        self.log(f"interface down, retrying: {bad}")
                 except OSError as e:
                     self.log(f"cannot open raw socket on {cfg.iface}: {e}")
                     if not cfg.pcap_path:
@@ -211,69 +341,265 @@ class Engine:
             if cfg.pcap_path:
                 pcap = PcapWriter(cfg.pcap_path)
                 self.log(f"writing pcap -> {cfg.pcap_path}")
+            # synthetic clock: frame i is stamped start + i/rate (1 ms apart at
+            # --rate 0); with nothing to send there is no reason to pace
+            t0 = (parse_start(cfg.start_time) if synthetic else 0.0)
+            step = 1.0 / cfg.rate if cfg.rate and cfg.rate > 0 else 0.001
+            pace = not (synthetic and sender is None)
+            if cfg.manifest_path or self.record:
+                from .manifest import Recorder
+                recorder = self.recorder = Recorder(cfg, seed, self.argv,
+                                                    cfg.clock)
+                if cfg.manifest_path:
+                    self.log(f"manifest -> {cfg.manifest_path}")
+            last_manifest = time.monotonic()
+            if cfg.schedule == "timed" and not cfg.replay_path:
+                self._run_timed(sender, pcap, recorder, seed, synthetic, pace)
+                return
 
-            limiter = RateLimiter(cfg.rate)
-            delays = None
+            limiter = RateLimiter(cfg.rate if pace else 0)
+            self.limiter = limiter if pace else None
+            builder = None
             if cfg.replay_path:
-                from . import pcapread
-                frames_ts = pcapread.read_frames(cfg.replay_path)
-                batch = [("replay", f) for _, f in frames_ts]
-                if cfg.replay_realtime and len(frames_ts) > 1:
-                    delays = [0.0] + [frames_ts[i][0] - frames_ts[i - 1][0]
-                                      for i in range(1, len(frames_ts))]
-                self.log(f"replaying {len(batch)} packets from {cfg.replay_path}"
-                         + (" (original timing)" if delays else
-                            f" @ {cfg.rate}pps"))
+                # streamed from disk (pcap or pcapng), rewritten on the fly;
+                # with --replay-realtime/--replay-speed it keeps its own time
+                from .replay import ReplaySource
+                batch = ReplaySource(cfg, stop=self._stop, paced=pace)
+                if batch.realtime:
+                    limiter, self.limiter = RateLimiter(0), None
+                self.log(batch.describe())
             else:
-                batch = build_batch(cfg)
+                builder = CycleBuilder(cfg, seed)
+                tb = time.perf_counter()
+                batch = builder.build(0)
                 what = (f"incident {cfg.incident}" if cfg.incident else
                         f"env {cfg.env}" if cfg.env else ", ".join(cfg.profiles))
                 if cfg.sprinkle_random:
                     what += " + malware:random"
                 elif cfg.sprinkle:
                     what += f" + malware:{','.join(cfg.sprinkle)}"
-                self.log(f"built {len(batch)} frames/cycle for [{what}]")
+                self.log(f"built {len(batch)} frames/cycle for [{what}] in "
+                         f"{time.perf_counter() - tb:.2f}s (seed {seed})")
             self.stats.cycle_frames = len(batch)
 
+            cycle = 0
             while not self._stop.is_set():
-                for idx, (key, frame) in enumerate(batch):
+                self.stats.cycles = cycle + 1
+                # each cycle is rebuilt fresh (new ports/ISNs/counters/values);
+                # the next one is built in the background while this one sends
+                nxt = None
+                if builder is not None and cfg.loop:
+                    if pool is None:
+                        from concurrent.futures import ThreadPoolExecutor
+                        pool = ThreadPoolExecutor(1, "tgt-build")
+                    nxt = pool.submit(builder.build, cycle + 1)
+                for idx, (key, frame, source) in self.control.feed(
+                        batch, self._stop):
                     if self._stop.is_set():
                         break
-                    if delays is not None:
-                        if delays[idx] > 0:
-                            time.sleep(min(delays[idx], 5.0))
-                    else:
-                        limiter.wait()
+                    limiter.wait(self._stop)
+                    # a pause that began while this frame waited holds it
+                    if not self.control.gate(self._stop):
+                        break
+                    sent = True
                     if sender is not None:
                         try:
                             sender.send(frame)
                         except OSError as e:
+                            sent = False
                             self.stats.errors += 1
                             self.stats.last_error = str(e)
-                    if pcap is not None:
-                        pcap.write(frame)
-                    self.stats.packets += 1
-                    self.stats.bytes += len(frame)
-                    self.stats.per_profile[key] = \
-                        self.stats.per_profile.get(key, 0) + 1
+                    # only frames that really left (or are file-only) count and
+                    # land in the pcap, so the pcap stays ground truth
+                    if sent:
+                        ts = (t0 + self.stats.packets * step if synthetic
+                              else time.time())
+                        if pcap is not None:
+                            pcap.write(frame, ts=ts)
+                        if recorder is not None:
+                            recorder.observe(ts, key, frame, source)
+                        self.stats.packets += 1
+                        self.stats.bytes += len(frame)
+                        self.stats.per_profile[key] = \
+                            self.stats.per_profile.get(key, 0) + 1
+                    if (recorder is not None and time.monotonic()
+                            - last_manifest >= self.MANIFEST_INTERVAL):
+                        last_manifest = time.monotonic()
+                        self._write_manifest(recorder)
 
-                    if cfg.count and self.stats.packets >= cfg.count:
+                    # --count bounds attempts, so a dead interface still ends
+                    if cfg.count and (self.stats.packets
+                                      + self.stats.errors) >= cfg.count:
                         self._stop.set()
                         break
-                    if cfg.duration and self.stats.elapsed >= cfg.duration:
+                    # time spent paused does not count toward --duration
+                    elapsed = (self.stats.packets * step if not pace
+                               else self.stats.elapsed
+                               - self.control.paused_for())
+                    if cfg.duration and elapsed >= cfg.duration:
                         self._stop.set()
                         break
-                if not cfg.loop:
+                if not cfg.loop or self._stop.is_set():
                     break
-                # random mode: re-roll the variant + placement for the next cycle
-                if cfg.sprinkle_random and delays is None and not self._stop.is_set():
-                    batch = build_batch(cfg)
+                cycle += 1
+                if nxt is not None:
+                    batch = nxt.result()
         finally:
+            if pool is not None:
+                pool.shutdown(wait=False)
+            self.control.close()
             if sender is not None:
                 sender.close()
             if pcap is not None:
                 pcap.close()
+            if recorder is not None:
+                self._write_manifest(recorder)
             self.stats.running = False
             self.stats.finished = True
             self.log(f"done: {self.stats.packets} pkts, "
                      f"{self.stats.bytes} bytes, {self.stats.errors} errors")
+
+    def _run_timed(self, sender, pcap, recorder, seed: int, synthetic: bool,
+                   pace: bool) -> None:
+        """The timed scheduler: phases (one, or a campaign's) of streams on
+        their own periods, frames sent at their scheduled time — real time
+        (``speed`` compressed) when pacing, else as fast as possible with
+        synthetic timestamps. ``rate`` only caps the packet rate."""
+        from . import campaign, schedule
+        cfg = self.cfg
+        tb = time.perf_counter()
+        phases = campaign.phases_for(cfg)
+        wall_epoch = time.time()
+        epoch0 = parse_start(cfg.start_time) if synthetic else wall_epoch
+        speed = cfg.speed if cfg.speed and cfg.speed > 0 else 1.0
+        sched = schedule.Scheduler(seed, epoch0, cfg.day_profile,
+                                   phases[0].utc_offset if phases else 0.0,
+                                   min_period=cfg.min_period)
+        # --sprinkle-ratio: sprinkle streams' periods follow the target
+        # fraction of wire frames (schedule.Scheduler._ratio_interval)
+        sched.ratio = min(max(cfg.sprinkle_ratio or 0.0, 0.0), 0.9)
+        if recorder is not None and cfg.campaign:
+            recorder.campaign(phases)
+        wall0 = time.perf_counter()
+
+        def ts_of(t: float) -> float:
+            return epoch0 + (t if synthetic else t / speed)
+
+        t = 0.0
+        last_manifest = time.monotonic()
+        for i, ph in enumerate(phases):
+            if self._stop.is_set():
+                break
+            self.stats.cycles = i + 1
+            self.env_now = ph.env           # injections address onto it
+            streams = campaign.phase_streams(ph, cfg)
+            sched.day_profile = ph.day_profile or cfg.day_profile
+            started, _ = sched.load(streams, t, ph.hosts, initial=(i == 0),
+                                    soon=ph.soon)
+            for delay, key, frames in ph.inject:
+                sched.inject(t + delay, key, frames)
+            if i == 0:
+                self.log(f"timed schedule: {len(started)} streams for "
+                         f"[{ph.label}] in {time.perf_counter() - tb:.2f}s "
+                         f"(seed {seed})")
+            elif cfg.campaign:
+                self.log(f"phase {ph.id} '{ph.name}': {len(started)} new "
+                         f"streams, {len(ph.events)} change events")
+            if recorder is not None:
+                # paced wall clock: the real start (pauses and startup
+                # included), like end_phase
+                recorder.begin_phase(ph, ts_of(t) if synthetic or not pace
+                                     else time.time())
+            cap = ph.rate if ph.rate is not None else cfg.rate
+            limiter = RateLimiter(cap if pace and cap and cap > 0 else 0)
+            self.limiter = limiter if pace else None     # /rate adjusts it
+            # a plain timed run's --duration is its one phase's duration
+            # (campaign.phases_for)
+            t_end = t + ph.duration if ph.duration else float("inf")
+            ft = t
+            # the control API gates this stream (pause) and splices injected
+            # incident frames in after the scheduled ones (tgt.control)
+            for _, item in self.control.feed(sched.run(t_end), self._stop):
+                if len(item) == 3:               # injected: (key, frame, src)
+                    key, frame, source = item
+                    copies, occ = [frame], False
+                else:
+                    ft, _, key, copies, source, occ = item
+                if self._stop.is_set():
+                    break
+                if pace:
+                    # a pause shifts the schedule instead of bursting the
+                    # backlog on resume (tgt.control.RunControl.paused_total)
+                    self._sleep_until(wall0 + self.control.paused_total
+                                      + ft / speed)
+                    if limiter.interval:
+                        limiter.wait(self._stop)
+                    # a pause that began during the sleep holds this frame
+                    if not self.control.gate(self._stop):
+                        break
+                for frame in copies:
+                    sent = True
+                    if sender is not None:
+                        try:
+                            sender.send(frame)
+                        except OSError as e:
+                            sent = False
+                            self.stats.errors += 1
+                            self.stats.last_error = str(e)
+                    if sent:
+                        ts = epoch0 + ft if synthetic else time.time()
+                        if pcap is not None:
+                            pcap.write(frame, ts=ts)
+                        if recorder is not None:
+                            recorder.observe(ts, key, frame, source, occ)
+                            occ = False
+                        self.stats.packets += 1
+                        self.stats.bytes += len(frame)
+                        self.stats.per_profile[key] = \
+                            self.stats.per_profile.get(key, 0) + 1
+                    if cfg.count and (self.stats.packets
+                                      + self.stats.errors) >= cfg.count:
+                        self._stop.set()
+                        break
+                self.stats.sim_time = ft
+                if (recorder is not None and time.monotonic()
+                        - last_manifest >= self.MANIFEST_INTERVAL):
+                    last_manifest = time.monotonic()
+                    self._write_manifest(recorder)
+            if self._stop.is_set():
+                if recorder is not None:
+                    recorder.end_phase(None)
+                break
+            t = t_end
+            if t == float("inf"):
+                break
+            self.stats.sim_time = t
+            if recorder is not None:
+                recorder.end_phase(ts_of(t) if synthetic or not pace
+                                   else time.time())
+            if pace:
+                self._sleep_until(wall0 + self.control.paused_total
+                                  + t / speed)
+        self.stats.cycles = max(self.stats.cycles, 1)
+
+    def _write_manifest(self, recorder) -> None:
+        if not self.cfg.manifest_path:
+            return
+        try:
+            recorder.write(self.cfg.manifest_path, self.stats)
+        except OSError as e:
+            self.log(f"cannot write manifest {self.cfg.manifest_path}: {e}")
+
+
+def new_seed() -> int:
+    """A fresh random run seed (logged + recorded so the run can be redone)."""
+    return random.SystemRandom().randrange(1 << 32)
+
+
+def parse_start(text: Optional[str]) -> float:
+    """--start-time for the synthetic clock (ISO-8601; default: now, whole
+    seconds)."""
+    if not text:
+        return float(int(time.time()))
+    from .manifest import parse_iso
+    return parse_iso(text)

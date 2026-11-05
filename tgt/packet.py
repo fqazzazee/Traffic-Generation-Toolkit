@@ -9,6 +9,7 @@ DPI engines (Zeek, Suricata, Claroty CTD, …) key on stay easy to read and twea
 """
 from __future__ import annotations
 
+import functools
 import struct
 from dataclasses import dataclass, field
 
@@ -35,8 +36,10 @@ URG = 0x20
 # ---------------------------------------------------------------------------
 # Address helpers
 # ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=4096)
 def mac_to_bytes(mac: str) -> bytes:
-    """"aa:bb:cc:dd:ee:ff" -> b'\\xaa\\xbb...'."""
+    """"aa:bb:cc:dd:ee:ff" -> b'\\xaa\\xbb...' (cached: a build converts
+    the same few addresses for every frame)."""
     parts = mac.replace("-", ":").split(":")
     if len(parts) != 6:
         raise ValueError(f"invalid MAC address: {mac!r}")
@@ -44,9 +47,15 @@ def mac_to_bytes(mac: str) -> bytes:
 
 
 def bytes_to_mac(b: bytes) -> str:
+    return _mac_str(bytes(b))
+
+
+@functools.lru_cache(maxsize=4096)
+def _mac_str(b: bytes) -> str:
     return ":".join(f"{x:02x}" for x in b)
 
 
+@functools.lru_cache(maxsize=4096)
 def ip_to_bytes(ip: str) -> bytes:
     parts = ip.split(".")
     if len(parts) != 4:
@@ -58,11 +67,13 @@ def checksum16(data: bytes) -> int:
     """Standard Internet 16-bit one's-complement checksum (RFC 1071)."""
     if len(data) & 1:
         data += b"\x00"
-    total = 0
-    for i in range(0, len(data), 2):
-        total += (data[i] << 8) | data[i + 1]
-    total = (total & 0xFFFF) + (total >> 16)
-    total = (total & 0xFFFF) + (total >> 16)
+    # the one's-complement sum of the 16-bit words is the data read as one
+    # big-endian integer modulo 0xFFFF (0xFFFF, not 0, for a non-zero
+    # multiple) — one C-level bignum op instead of a per-word loop
+    v = int.from_bytes(data, "big")
+    total = v % 0xFFFF
+    if total == 0 and v:
+        total = 0xFFFF
     return (~total) & 0xFFFF
 
 
@@ -80,11 +91,12 @@ def ethernet(dst_mac: str, src_mac: str, ethertype: int, payload: bytes,
 
 
 def ipv4(src_ip: str, dst_ip: str, proto: int, payload: bytes,
-         ttl: int = 64, ident: int = 0, dscp: int = 0) -> bytes:
+         ttl: int = 64, ident: int = 0, dscp: int = 0,
+         df: bool = True) -> bytes:
     ver_ihl = (4 << 4) | 5
     tos = (dscp & 0x3F) << 2
     total_len = 20 + len(payload)
-    flags_frag = 0x4000  # Don't Fragment
+    flags_frag = 0x4000 if df else 0  # Don't Fragment
     header = struct.pack(
         "!BBHHHBBH4s4s",
         ver_ihl, tos, total_len, ident & 0xFFFF, flags_frag,
@@ -102,13 +114,16 @@ def _l4_checksum(src_ip: str, dst_ip: str, proto: int, segment: bytes) -> int:
 
 
 def tcp(src_ip: str, dst_ip: str, sport: int, dport: int, seq: int, ack: int,
-        flags: int, payload: bytes = b"", window: int = 8192) -> bytes:
-    data_off = (5 << 4)  # 5 * 4 = 20 byte header, no options
+        flags: int, payload: bytes = b"", window: int = 8192,
+        options: bytes = b"") -> bytes:
+    if len(options) % 4:                 # pad options to a 32-bit boundary
+        options += b"\x00" * (4 - len(options) % 4)
+    data_off = (5 + len(options) // 4) << 4
     seg = struct.pack(
         "!HHIIBBHHH",
         sport, dport, seq & 0xFFFFFFFF, ack & 0xFFFFFFFF,
-        data_off, flags, window, 0, 0,
-    ) + payload
+        data_off, flags, window & 0xFFFF, 0, 0,
+    ) + options + payload
     chk = _l4_checksum(src_ip, dst_ip, IPPROTO_TCP, seg)
     seg = seg[:16] + struct.pack("!H", chk) + seg[18:]
     return seg
@@ -151,6 +166,8 @@ class Endpoints:
     ``ttl_client``/``ttl_server`` and ``meta`` let a flow carry an OS/device
     fingerprint (Windows TTL 128 vs Linux 64, HTTP User-Agent, SMB dialect,
     vendor strings) so an analyser can classify assets and flag legacy ones.
+    ``stack_client``/``stack_server`` name each side's TCP/IP stack
+    (:mod:`tgt.stacks`; "" = Windows client / port-typical server).
     """
     client_mac: str = "02:00:00:00:00:01"
     client_ip: str = "10.10.10.10"
@@ -160,10 +177,13 @@ class Endpoints:
     ttl_client: int = 64
     ttl_server: int = 64
     meta: dict = field(default_factory=dict)
+    stack_client: str = ""
+    stack_server: str = ""
 
 
 def ip_frame(ep: Endpoints, from_client: bool, proto: int, l4: bytes,
-             ttl: int | None = None, ident: int = 0) -> bytes:
+             ttl: int | None = None, ident: int = 0,
+             df: bool = True) -> bytes:
     if ttl is None:
         ttl = ep.ttl_client if from_client else ep.ttl_server
     if from_client:
@@ -172,7 +192,7 @@ def ip_frame(ep: Endpoints, from_client: bool, proto: int, l4: bytes,
     else:
         s_mac, d_mac, s_ip, d_ip = (ep.server_mac, ep.client_mac,
                                     ep.server_ip, ep.client_ip)
-    pkt = ipv4(s_ip, d_ip, proto, l4, ttl=ttl, ident=ident)
+    pkt = ipv4(s_ip, d_ip, proto, l4, ttl=ttl, ident=ident, df=df)
     return ethernet(d_mac, s_mac, ETH_P_IP, pkt, vlan=ep.vlan)
 
 
@@ -203,11 +223,16 @@ def rewrite_l2(frame: bytes, src_mac: str, dst_mac: str, vlan: int | None,
 
     New MACs, the other segment's 802.1Q tag and (for IPv4) a new TTL with the
     header checksum recomputed. TCP/UDP checksums do not cover the TTL, so the
-    L4 segment is carried over untouched.
+    L4 segment is carried over untouched. An incoming tag's priority (PCP) and
+    DEI bits are kept on the new tag — GOOSE / SV / PROFINET RT rely on them —
+    and a priority-tagged frame re-addressed with ``vlan=None`` stays
+    priority-tagged (VID 0).
     """
     etype = struct.unpack("!H", frame[12:14])[0]
     body = frame[14:]
+    prio = 0                                    # PCP + DEI (top 4 TCI bits)
     if etype == ETH_P_VLAN:
+        prio = struct.unpack("!H", frame[14:16])[0] & 0xF000
         etype = struct.unpack("!H", frame[16:18])[0]
         body = frame[18:]
     if etype == ETH_P_IP and ttl is not None and len(body) >= 20:
@@ -217,4 +242,59 @@ def rewrite_l2(frame: bytes, src_mac: str, dst_mac: str, vlan: int | None,
         hdr[10:12] = b"\x00\x00"
         hdr[10:12] = struct.pack("!H", checksum16(bytes(hdr)))
         body = bytes(hdr) + body[ihl:]
+    if prio:
+        return (mac_to_bytes(dst_mac) + mac_to_bytes(src_mac) +
+                struct.pack("!HHH", ETH_P_VLAN, prio | ((vlan or 0) & 0x0FFF),
+                            etype) + body)
     return ethernet(dst_mac, src_mac, etype, body, vlan=vlan)
+
+
+def set_ip_id(frame: bytes, ident: int) -> bytes:
+    """``frame`` with its IPv4 Identification set to ``ident`` (header
+    checksum recomputed; L4 checksums do not cover it). Non-IPv4 frames are
+    returned unchanged."""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    if frame[off - 2:off] != b"\x08\x00" or len(frame) < off + 20:
+        return frame
+    ihl = (frame[off] & 0x0F) * 4
+    hdr = bytearray(frame[off:off + ihl])
+    hdr[4:6] = struct.pack("!H", ident & 0xFFFF)
+    hdr[10:12] = b"\x00\x00"
+    hdr[10:12] = struct.pack("!H", checksum16(bytes(hdr)))
+    return frame[:off] + bytes(hdr) + frame[off + ihl:]
+
+
+def rewrite_ips(frame: bytes, src_ip: str | None = None,
+                dst_ip: str | None = None, ttl_delta: int = 0) -> bytes:
+    """``frame`` with its IPv4 source and/or destination replaced, as a NAT
+    router forwards it: the IP header checksum and the TCP/UDP checksum (whose
+    pseudo-header covers the addresses) are recomputed, and ``ttl_delta``
+    (e.g. -1 for the router hop) is applied to the TTL. Ethernet padding is
+    kept; non-IPv4 frames are returned unchanged."""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    if frame[off - 2:off] != b"\x08\x00" or len(frame) < off + 20:
+        return frame
+    ihl = (frame[off] & 0x0F) * 4
+    total = struct.unpack("!H", frame[off + 2:off + 4])[0]
+    hdr = bytearray(frame[off:off + ihl])
+    if src_ip:
+        hdr[12:16] = ip_to_bytes(src_ip)
+    if dst_ip:
+        hdr[16:20] = ip_to_bytes(dst_ip)
+    if ttl_delta:
+        hdr[8] = max(1, min(255, hdr[8] + ttl_delta))
+    hdr[10:12] = b"\x00\x00"
+    hdr[10:12] = struct.pack("!H", checksum16(bytes(hdr)))
+    l4 = bytearray(frame[off + ihl:off + total])
+    frag = struct.unpack("!H", bytes(hdr[6:8]))[0] & 0x1FFF
+    proto, s, d = hdr[9], hdr[12:16], hdr[16:20]
+    at = {IPPROTO_TCP: 16, IPPROTO_UDP: 6}.get(proto)
+    if at is not None and not frag and len(l4) >= at + 2 and \
+            (proto != IPPROTO_UDP or l4[6:8] != b"\x00\x00"):
+        l4[at:at + 2] = b"\x00\x00"
+        pseudo = bytes(s) + bytes(d) + struct.pack("!BBH", 0, proto, len(l4))
+        chk = checksum16(pseudo + bytes(l4))
+        if proto == IPPROTO_UDP and chk == 0:
+            chk = 0xFFFF
+        l4[at:at + 2] = struct.pack("!H", chk)
+    return frame[:off] + bytes(hdr) + bytes(l4) + frame[off + total:]
