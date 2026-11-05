@@ -696,8 +696,10 @@ _reg(Incident("sunburst", "SUNBURST (SolarWinds)", "IT", "2020",
         "domain": "avsvmcloud.com"})]))
 
 _reg(Incident("conficker", "Conficker", "IT", "2008",
-    "Worm exploiting MS08-067 over SMB (445) with a domain-generation "
-    "algorithm for C2 rendezvous.",
+    "Worm that spread via MS08-067 over SMB (445), with a domain-generation "
+    "algorithm for C2 rendezvous: 445/139 probe, DGA lookups, and the generic "
+    "SMBv1 exploit-attempt indicator (MS17-010-style; no MS08-067 "
+    "NetPathCanonicalize RPC is emitted).",
     [_h("CONFICKER-HOST", "10.20.20.77", "ws", "win2000"),
      _h("WS-LAB", "10.20.20.43", "ws", "winxp"),
      _h("DNS01", "10.20.10.12", "dns", "win2019")],
@@ -730,8 +732,10 @@ _reg(Incident("log4shell", "Log4Shell", "IT", "2021",
 
 # ---- OT incidents ----------------------------------------------------------
 _reg(Incident("stuxnet", "Stuxnet", "OT", "2010",
-    "Sabotage of Siemens S7 PLCs at Natanz: SMBv1 propagation and S7comm "
-    "PLC STOP + malicious program download from a compromised engineering WS.",
+    "Sabotage of Siemens S7 PLCs at Natanz: S7comm PLC STOP + malicious "
+    "program download from a compromised engineering WS. Its SMB spread "
+    "(MS08-067 / MS10-061) is stood in for by the generic SMBv1 "
+    "exploit-attempt indicator (MS17-010-style).",
     [_h("STEP7-ENGWS", "172.16.2.50", "eng", "win7"),
      _h("WINCC-SCADA", "172.16.2.51", "scada", "winxp"),
      _h("PLC-S7-417", "172.16.2.21", "plc", "siemens", OUI_SIEMENS,
@@ -765,7 +769,7 @@ _reg(Incident("triton", "TRITON / TRISIS", "OT", "2017",
 
 _reg(Incident("notpetya", "NotPetya", "IT", "2017",
     "Destructive worm (disguised as ransomware) spreading via the same SMBv1 "
-    "EternalBlue signature as WannaCry, with a 445 sweep across the subnet.",
+    "EternalBlue signature as WannaCry, after a 445/139 probe.",
     [_h("NOTPETYA-PATIENT0", "10.20.20.88", "ws", "win7"),
      _h("WS-ACCT", "10.20.20.45", "ws", "win10"),
      _h("WS-OPS", "10.20.20.46", "ws", "winxp"),
@@ -777,7 +781,8 @@ _reg(Incident("notpetya", "NotPetya", "IT", "2017",
 
 _reg(Incident("ryuk", "Ryuk Ransomware", "IT", "2019",
     "Human-operated ransomware: C2 beaconing from a loader, internal 445/3389 "
-    "scanning, then SMBv1 lateral movement across file and user hosts.",
+    "scanning, then SMB spread to file and user hosts, shown with the generic "
+    "SMBv1 exploit-attempt indicator (MS17-010-style).",
     [_h("RYUK-LOADER", "10.20.20.90", "ws", "win10"),
      _h("RYUK-C2", "198.51.100.40", "web", "linux"),
      _h("FILESRV01", "10.20.10.13", "file", "win2019"),
@@ -835,8 +840,9 @@ _reg(Incident("havex", "Havex / Dragonfly", "OT", "2014",
       {"scan_ports": [44818, 135, 502, 102, 4840]})]))
 
 _reg(Incident("ekans", "EKANS / Snake", "OT", "2020",
-    "ICS-aware ransomware: SMB lateral movement, then unauthorized Modbus "
-    "writes alongside the stopping of OT processes before encryption.",
+    "ICS-aware ransomware: SMB lateral movement to admin shares, then "
+    "unauthorized Modbus writes as a network-visible stand-in (EKANS itself "
+    "killed OT processes on hosts, which leaves no wire indicator).",
     [_h("EKANS-HOST", "172.16.0.42", "eng", "win10"),
      _h("HIST-OT", "172.16.0.12", "hist", "win2019"),
      _h("PLC-MB", "172.16.1.41", "plc", "schneider", OUI_SCHNEIDER,
