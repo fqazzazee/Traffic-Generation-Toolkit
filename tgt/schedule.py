@@ -116,6 +116,9 @@ class Connection:
         self.tsbase: Dict[bool, Optional[int]] = {True: None, False: None}
         self.tslast: Dict[bool, int] = {True: 0, False: 0}
         self.t0 = 0.0
+        # application sequence counters (IEC 104 APCI): side -> [next N(S),
+        # I-frames received]; see renumber_iec104
+        self.apci: Dict[bool, List[int]] = {True: [0, 0], False: [0, 0]}
 
     def rewrite(self, frame: bytes, t: float, cmac: bytes,
                 delta: Optional[Tuple[int, int]]) -> bytes:
@@ -189,6 +192,37 @@ class Connection:
                 (self.s_next - seq) & 0xFFFFFFFF)
 
 
+def renumber_iec104(conn: Connection, frame: bytes, cmac: bytes) -> bytes:
+    """IEC 104 send/receive sequence numbers continued on ``conn``: each
+    I-format APDU gets its side's next N(S) and N(R) = the I-frames that side
+    has received; an S-format APDU acknowledges them all (both counters wrap
+    at 2^15). A persistent connection is built in chunks, each of which
+    numbers from 0; this keeps the numbering continuous across them. The
+    TCP checksum is left for :meth:`Connection.rewrite`."""
+    frm, _, plen, _, l4, tcp = view(frame, cmac)
+    if not tcp or plen <= 0:
+        return frame
+    b = bytearray(frame)
+    p = l4 + (b[l4 + 12] >> 4) * 4
+    end = p + plen
+    me, peer = conn.apci[frm], conn.apci[not frm]
+    while p + 6 <= end and b[p] == 0x68:
+        if b[p + 2] & 1 == 0:                      # I-format
+            struct.pack_into("<HH", b, p + 2, me[0] << 1, me[1] << 1)
+            me[0] = (me[0] + 1) & 0x7FFF
+            peer[1] = (peer[1] + 1) & 0x7FFF
+        elif b[p + 2] & 3 == 1:                    # S-format
+            struct.pack_into("<H", b, p + 4, me[1] << 1)
+        p += 2 + b[p + 1]
+    return bytes(b)
+
+
+# per-protocol application-layer renumbering on persistent connections
+RENUMBER: Dict[str, Callable[[Connection, bytes, bytes], bytes]] = {
+    "iec104": renumber_iec104,
+}
+
+
 # ---------------------------------------------------------------------------
 # Streams
 # ---------------------------------------------------------------------------
@@ -238,6 +272,7 @@ class Stream:
         self.close: List[List[bytes]] = []
         self.lifetime = 0.0
         self.tuple: Optional[tuple] = None
+        self.refreshed = 0.0         # last setup-exchange refresh (REFRESH)
 
     # -- building ----------------------------------------------------------
     def bind(self, seed: int, gen: int = 0) -> None:
@@ -327,11 +362,14 @@ class Stream:
             else None
         delta = None
         first = True
+        renumber = RENUMBER.get(self.key) if conn is not None else None
         for f, dt in zip(frames, offs):
             if conn is not None:
                 if conn.c_next is not None and delta is None and \
                         view(f, self.cmac)[5]:
                     delta = conn.delta(f, self.cmac)
+                if renumber is not None:
+                    f = renumber(conn, f, self.cmac)
                 f = conn.rewrite(f, t + dt, self.cmac, delta)
             out.append((t + dt, self.place(f), first))
             first = False
@@ -363,6 +401,14 @@ class Stream:
             self.conn = None
             self.close = []
             return out
+        ref = timing.REFRESH.get(self.key)
+        if ref and self.conn is not None and t - self.refreshed >= ref[0]:
+            # a setup exchange that recurs on the open connection (IEC 104
+            # general interrogation): from a fresh build, in place of a poll
+            self.refreshed = t
+            groups = exchanges(self._build(1), self.cmac)
+            if len(groups) > ref[1]:
+                return list(groups[ref[1]])
         if not self.polls:
             frames = self._build(timing.CHUNK,
                                  sched if self.conn is None else None)
@@ -373,6 +419,7 @@ class Stream:
             self.close = groups[len(groups) - teardown:]
             if self.conn is None:
                 self.conn = Connection()
+                self.refreshed = t
                 self.tuple = _tuple(frames, self.cmac)
                 if sched is not None and self.tuple is not None:
                     sched.ports[self.tuple] = self

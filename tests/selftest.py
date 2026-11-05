@@ -5596,6 +5596,74 @@ def test_w4c_list_columns_aligned() -> None:
               f"tgt list: {title} columns misaligned")
 
 
+def _iec104_apdus(frames, cmac: bytes) -> list:
+    """(time, from client?, ctrl1, ctrl2, type id, cot) of every APDU."""
+    from tgt import schedule
+    out = []
+    for t, f in frames:
+        frm, _, plen, _, l4, tcp = schedule.view(f, cmac)
+        if not tcp or plen <= 0:
+            continue
+        p = l4 + (f[l4 + 12] >> 4) * 4
+        end = p + plen
+        while p + 6 <= end and f[p] == 0x68:
+            c1, c2 = struct.unpack_from("<HH", f, p + 2)
+            asdu = f[p + 1] > 4
+            out.append((t, frm, c1, c2, f[p + 6] if asdu else None,
+                        f[p + 8] & 0x3F if asdu else None))
+            p += 2 + f[p + 1]
+    return out
+
+
+def test_w4c_iec104_timed_gi_and_sequence() -> None:
+    """IEC 104 under the timed scheduler: one persistent connection, a
+    station interrogation at connect and then every REFRESH period (15 min),
+    and N(S)/N(R) that continue across the 256-poll build chunks."""
+    from tgt import schedule, timing
+    ep = Endpoints()
+    st = schedule.profile_streams(["iec104"], ep)
+    st[0].period = 2.0
+    sch = schedule.Scheduler(7)
+    sch.load(st, 0.0, initial=True)
+    frames = [(t, c[0]) for t, _, _, c, _, _ in sch.run(3700.0)]
+    apdus = _iec104_apdus(frames, P.mac_to_bytes(ep.client_mac))
+    gi = [a[0] for a in apdus if a[1] and a[4] == 100 and a[5] == 6]
+    per = timing.REFRESH["iec104"][0]
+    check(len(gi) == 5 and all(abs((b - a) - per) < 15
+                               for a, b in zip(gi, gi[1:])),
+          f"iec104: GI activations at {[round(x) for x in gi]}")
+    term = [a for a in apdus if not a[1] and a[4] == 100 and a[5] == 10]
+    check(len(term) == len(gi), "iec104: every GI terminated")
+    syn = [f for _, f in frames if schedule.view(
+        f, P.mac_to_bytes(ep.client_mac))[1] == 0x02]
+    check(len(syn) == 1, f"iec104: {len(syn)} connections")
+    nxt, rcv, bad = {True: 0, False: 0}, {True: 0, False: 0}, []
+    for t, frm, c1, c2, _, _ in apdus:
+        if c1 & 1 == 0:                              # I-format
+            if (c1 >> 1, c2 >> 1) != (nxt[frm], rcv[frm]):
+                bad.append((round(t, 1), frm, c1 >> 1, c2 >> 1))
+            nxt[frm] = (nxt[frm] + 1) & 0x7FFF
+            rcv[not frm] += 1
+        elif c1 & 3 == 1 and c2 >> 1 != rcv[frm]:   # S-format
+            bad.append((round(t, 1), frm, "S", c2 >> 1))
+    check(not bad and nxt[False] > 3 * timing.CHUNK,
+          f"iec104: sequence breaks {bad[:4]} (server N(S) {nxt[False]})")
+    # the counters wrap at 2^15
+    conn = schedule.Connection()
+    conn.apci = {True: [5, 0x7FFF], False: [0x7FFF, 5]}
+    srv = protocols._iec104_i(0, 0, b"\x0d\x01\x03\x00\x01\x00" + bytes(8))
+    sess = protocols._tcp_flow(ep, 40000, 2404,
+                               [(protocols._iec104_s(0), srv)])
+    f = next(x for x in sess if not schedule.view(
+        x, P.mac_to_bytes(ep.client_mac))[0] and schedule.view(
+        x, P.mac_to_bytes(ep.client_mac))[2] > 0)
+    out = schedule.renumber_iec104(conn, f, P.mac_to_bytes(ep.client_mac))
+    i = out.index(srv[:2])
+    check(struct.unpack_from("<HH", out, i + 2) == (0x7FFF << 1, 5 << 1)
+          and conn.apci[False][0] == 0 and conn.apci[True][1] == 0,
+          "iec104: N(S)/N(R) do not wrap at 2^15")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

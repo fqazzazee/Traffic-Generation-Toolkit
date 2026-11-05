@@ -153,6 +153,14 @@ PERSISTENT: Dict[str, Tuple[int, int, Tuple[float, float]]] = {
 # Polls built per builder call (a chunk) for a persistent session.
 CHUNK = 256
 
+# key: (period seconds, index of the setup exchange to repeat)
+#
+# A setup exchange that recurs on the open connection instead of a poll: the
+# IEC 104 master's station (general) interrogation, C_IC_NA_1, every 15 min.
+REFRESH: Dict[str, Tuple[float, int]] = {
+    "iec104": (900.0, 2),
+}
+
 # ---------------------------------------------------------------------------
 # Latency
 # ---------------------------------------------------------------------------
