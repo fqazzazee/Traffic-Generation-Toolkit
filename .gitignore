@@ -23,3 +23,6 @@ local-only/
 .idea/
 *.swp
 .DS_Store
+
+# Test fixtures (Zeek logs) are data, not runtime logs
+!tests/fixtures/**/*.log
