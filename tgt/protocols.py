@@ -1157,24 +1157,24 @@ def _reg(key, name, category, port, transport, build, desc):
 
 # OT / ICS
 _reg("modbus", "Modbus/TCP", "OT", "502", "tcp", modbus_flow,
-     "Read Holding Registers + Write Single Register polling")
+     "FC 3/4/1/2 polling, FC 6 setpoint writes, exception 0x83")
 _reg("dnp3", "DNP3", "OT", "20000", "tcp", dnp3_flow,
-     "CRC-valid link frames: class-0 READ + analog-input RESPONSE")
+     "Class 0/1/2/3 polls + unsolicited events, per-device addresses")
 _reg("enip", "EtherNet/IP + CIP", "OT", "44818", "tcp", enip_flow,
      "RegisterSession + SendRRData CIP Get_Attribute_Single polls")
 _reg("s7comm", "S7comm (Siemens)", "OT", "102", "tcp", s7comm_flow,
      "COTP connect, Setup Communication, Read Var job/ack_data")
 _reg("iec104", "IEC 60870-5-104", "OT", "2404", "tcp", iec104_flow,
-     "STARTDT, interrogation + M_ME_NC_1 floats, S-frame acks")
+     "STARTDT, interrogation, time-tagged spontaneous points, TESTFR")
 _reg("bacnet", "BACnet/IP", "OT", "47808", "udp", bacnet_flow,
      "ReadProperty on analog-input objects + ComplexACK replies")
 _reg("opcua", "OPC UA", "OT", "4840", "tcp", opcua_flow,
-     "Hello/Ack, OpenSecureChannel, ReadRequest/Response, Close")
+     "GetEndpoints, Create/ActivateSession, Read, CloseSession")
 # OT asset identity / fingerprint
 _reg("enip-id", "EtherNet/IP List Identity", "OT", "44818", "tcp",
-     enip_identity_flow, "Rockwell/Allen-Bradley vendor + product identity")
+     enip_identity_flow, "List Identity + Identity Get_Attribute_All")
 _reg("s7-id", "S7 SZL Identity", "OT", "102", "tcp", s7_identity_flow,
-     "Siemens module/order number (6ES7…) identification")
+     "SZL 0x0011/0x001C order no., firmware, serial; 0x0424 mode")
 # IT / infra
 _reg("arp", "ARP", "IT", "-", "l2", arp_flow,
      "who-has/is-at + gratuitous announcements")

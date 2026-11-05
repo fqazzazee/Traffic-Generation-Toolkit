@@ -560,25 +560,25 @@ def iec104_time_flow(ep: Endpoints, count: int) -> List[bytes]:
 # ===========================================================================
 # Registry (after the core OT profiles)
 # ===========================================================================
-_reg("modbus-id", "Modbus Device Identification", "OT", "502", "tcp",
+_reg("modbus-id", "Modbus Device ID", "OT", "502", "tcp",
      modbus_id_flow, "FC 43/14 Read Device ID: vendor, product code, "
      "revision, model")
-_reg("bacnet-id", "BACnet Device Identity", "OT", "47808", "udp",
+_reg("bacnet-id", "BACnet Device ID", "OT", "47808", "udp",
      bacnet_id_flow, "Who-Is/I-Am + ReadPropertyMultiple of the Device object "
      "(vendor, model, firmware)")
-_reg("enip-list", "EtherNet/IP Browse (UDP)", "OT", "44818", "udp",
+_reg("enip-list", "EtherNet/IP Browse", "OT", "44818", "udp",
      enip_list_flow, "RSLinx-style broadcast List Identity + unicast replies, "
      "List Services")
 _reg("enip-io", "CIP Implicit I/O", "OT", "2222", "udp", enip_io_flow,
      "Forward_Open + cyclic class-1 I/O on UDP 2222 + Forward_Close")
-_reg("dnp3-id", "DNP3 Device Attributes", "OT", "20000", "tcp", dnp3_id_flow,
+_reg("dnp3-id", "DNP3 Device Attrs", "OT", "20000", "tcp", dnp3_id_flow,
      "Group 0 reads: manufacturer, model, software version, serial")
 # Normal engineering / operations baseline
-_reg("s7-eng", "S7 Engineering (upload/download)", "OT", "102", "tcp",
+_reg("s7-eng", "S7 Engineering", "OT", "102", "tcp",
      s7_eng_flow, "Block list, OB1 upload, planned DB10 download + _INSE")
-_reg("enip-eng", "CIP Engineering Reads", "OT", "44818", "tcp", enip_eng_flow,
+_reg("enip-eng", "CIP Engineering", "OT", "44818", "tcp", enip_eng_flow,
      "Controller mode/status, program list and clock reads")
-_reg("modbus-write", "Modbus Operator Writes", "OT", "502", "tcp",
+_reg("modbus-write", "Modbus Operator Write", "OT", "502", "tcp",
      modbus_write_flow, "HMI setpoint/command writes: FC 16, FC 5, FC 15")
 _reg("dnp3-time", "DNP3 Time Sync", "OT", "20000", "tcp", dnp3_time_flow,
      "Delay Measure + g50v1 time write from the SCADA master")
