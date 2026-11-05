@@ -33,8 +33,12 @@ jobs:
           allow-prereleases: true
 
       # tshark lets the dissection / expert-info groups run instead of skip.
+      # Non-fatal: a stalled mirror must not fail CI. Without tshark the
+      # selftest skips its dissection groups (the other jobs still run them)
+      # and says so.
       - name: Install tshark
         timeout-minutes: 10
+        continue-on-error: true
         run: |
           echo "wireshark-common wireshark-common/install-setuid boolean false" \
             | timeout 60 sudo debconf-set-selections
@@ -77,7 +81,11 @@ jobs:
           tgt run -p modbus --count 10 --rate 0 --pcap ci.pcap
           # stdin: Ubuntu 26.04 runners confine tshark's own file opens
           # ("You don't have permission to read the file")
-          tshark -r - -q -z io,stat,0 < ci.pcap
+          if command -v tshark >/dev/null; then
+            tshark -r - -q -z io,stat,0 < ci.pcap
+          else
+            echo "::warning::tshark not installed on this runner; dissection checks skipped"
+          fi
 
   shellcheck:
     runs-on: ubuntu-latest
