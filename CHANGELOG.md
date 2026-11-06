@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+- The README is now a short overview for OT security practitioners: what TGT tests, a quick
+  start, the five-step evaluation and the packaged plants. The full reference moved to
+  `docs/` (evaluating, networks, protocols, attacks, usage, deployment), unchanged.
+
 ## 2.1.0 — 2026-11-05
 
 ### Evaluating a monitor

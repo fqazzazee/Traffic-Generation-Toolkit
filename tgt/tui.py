@@ -2167,7 +2167,7 @@ def _link_help(ui: UI) -> str:
                 "network namespace.")
     return ("Frames leave this interface for real. The sensor sees them only if "
             "a switch or hypervisor port mirror copies this port or VLAN to "
-            "its monitor port (README: 'Sensor on another machine or VM').")
+            "its monitor port (docs/deployment.md: 'Sensor on another machine or VM').")
 
 
 IFACE_FIELDS = [

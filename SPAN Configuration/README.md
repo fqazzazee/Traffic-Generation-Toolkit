@@ -21,7 +21,7 @@ only reaches for CLI/scripting where the GUI has no equivalent.
   on every VM restart) and plain upstream Xen; isolated private network (GUI-only)
   plus a required 3-phase CLI procedure even for the 2-VM case.
 
-See the main [README](../README.md#deployment) for how TGT itself attaches to whichever
+See the [deployment guide](../docs/deployment.md) for how TGT itself attaches to whichever
 bridge/subnet/port-group these docs set up.
 
 ## Ease-of-deployment comparison
