@@ -531,7 +531,8 @@ def _clear_bundle(out: str, suite: Suite) -> None:
         old = _read_json(os.path.join(out, "bench.json"), "bench index")
         rows = old.get("stages")
         ids |= {r["id"] for r in rows if isinstance(r, dict) and
-                re.fullmatch(r"[A-Za-z0-9_.-]+", str(r.get("id")))} \
+                isinstance(r.get("id"), str) and
+                re.fullmatch(r"[A-Za-z0-9_.-]+", r["id"])} \
             if isinstance(rows, list) else set()
     except (BenchError, AttributeError):  # missing or damaged index
         pass
@@ -559,13 +560,28 @@ def run(suite: Suite, out: str, iface: Optional[str] = None,
     """Play every stage of ``suite`` into the bundle directory ``out``."""
     from . import cli
     from .manifest import _git_sha, parse_iso
+    from .sender import check_rate
     index_path = os.path.join(out, "bench.json")
     if os.path.exists(index_path) and not overwrite:
         print(f"{out} already holds a bench bundle; pass --overwrite or "
               "choose another --out.", file=sys.stderr)
         return 2
-    os.makedirs(os.path.join(out, "stages"), exist_ok=True)
     clock = clock or ("wall" if iface else "synthetic")
+    # settle every option first: --overwrite must not cost a good bundle
+    t0 = None
+    try:
+        check_rate(rate)
+        if clock == "synthetic":
+            start = start_time or suite.start_time
+            t0 = parse_iso(start) if start else float(int(time.time()))
+    except (TypeError, ValueError) as e:
+        print(f"bench: invalid option: {e}", file=sys.stderr)
+        return 2
+    if t0 is not None and not 0 <= t0 <= 0xFFFFFFFF - suite.duration:
+        print("bench: --start-time: the run must stay within the classic "
+              "pcap range (1970-01-01 to 2106-02-07 UTC)", file=sys.stderr)
+        return 2
+    os.makedirs(os.path.join(out, "stages"), exist_ok=True)
     if pcap_dir is None and not iface:
         pcap_dir = os.path.join(out, "stages")
     if pcap_dir:
@@ -573,10 +589,6 @@ def run(suite: Suite, out: str, iface: Optional[str] = None,
     if overwrite:
         _clear_bundle(out, suite)
     mp = suite.min_period if min_period is None else min_period
-    t0 = None
-    if clock == "synthetic":
-        start = start_time or suite.start_time
-        t0 = parse_iso(start) if start else float(int(time.time()))
     index: Dict[str, Any] = {
         "schema": SCHEMA,
         "suite": {"name": suite.name, "description": suite.description,

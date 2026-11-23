@@ -284,7 +284,13 @@ def check(env, setup: Setup) -> None:
              for h in i.hosts}
     taken.update({s.nat["outside_ip"]: f"the NAT of {s.name}"
                   for s in env.segments if s.nat})
-    taken.update({h.ip: h.name for h in list(env.hosts) + list(env.external)})
+    # a declared edr endpoint is replaced by this setup, so its address is free
+    other = {n for c, s, p in env.conversations if p != "edr" for n in (c, s)}
+    replaced = {n for c, s, p in env.conversations if p == "edr"
+                for n in (c, s)} - other
+    taken.update({h.ip: h.name for h in env.hosts})
+    taken.update({h.ip: h.name for h in env.external
+                  if h.name not in replaced})
     path = "ips" if setup.profile.key == "custom" else "region"
     for ip in setup.region.ips:
         if ip in taken:
@@ -347,6 +353,10 @@ def cli_block(current: Optional[Dict[str, Any]], spec: Optional[str],
                 raise EdrError("", "profile 'custom' is defined by the "
                                "environment file's edr block, and this "
                                "environment has none")
+            own = str(base.get("region", "custom"))
+            if region and region != own:
+                raise EdrError("region", f"unknown region {region!r} for "
+                               f"profile 'custom' (its region is {own!r})")
             block = base
             block.pop("enabled", None)
         else:
