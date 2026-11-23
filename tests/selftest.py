@@ -8820,6 +8820,42 @@ def test_r22_control_close_finalizes_injections() -> None:
         check(len(eng.control.status()) == 1, "late injection recorded")
 
 
+def test_r22_control_inject_duplicate_blocked_during_start() -> None:
+    """While the engine moves an injection from pending to active, a second
+    injection of that incident is still refused."""
+    import types
+    from concurrent.futures import Future
+    from tgt.control import RunControl
+    eng = types.SimpleNamespace(cfg=RunConfig(profiles=["modbus"]),
+                                log=lambda m: None, recorder=None)
+    rc = RunControl(eng)
+    accepted = []
+
+    def probe():
+        try:
+            accepted.append(rc.inject("wannacry", 5, 0.5))
+        except ValueError:
+            pass
+
+    def submit(inj, n):
+        if n > 1:
+            probe()             # _start prefetches the next pass here
+        fut = Future()
+        fut.set_result([(0, b"x", inj.label)])
+        return fut
+    take = rc._take
+
+    def probing_take(inj, fut):
+        probe()
+        return take(inj, fut)
+    rc._submit, rc._take = submit, probing_take
+    rc.inject("wannacry", 5, 0.5)
+    rc._extras()                # submits pass 1
+    rc._extras()                # pending -> active
+    check(not accepted and len(rc.injections) == 1 and len(rc._active) == 1,
+          f"duplicate accepted during the move: {len(rc.injections)}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

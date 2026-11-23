@@ -261,7 +261,6 @@ class RunControl:
         rec = getattr(eng, "recorder", None)
         if rec is not None:
             rec.add_injection(inj.incident, inj.label, inj.record)
-        self._active[inj.id] = inj
         eng.log(f"injection {inj.id}: {inj.incident} for {inj.duration:g}s "
                 f"at {inj.ratio:.0%} ({len(frames)} frames/pass)")
 
@@ -287,7 +286,8 @@ class RunControl:
 
     def _finish(self, inj: Injection, failed: bool = False) -> None:
         inj.state = "failed" if failed else "done"
-        self._active.pop(inj.id, None)
+        with self._lock:
+            self._active.pop(inj.id, None)
         nxt = getattr(inj, "_next", None)
         if nxt is not None:
             nxt.cancel()
@@ -310,9 +310,11 @@ class RunControl:
                 continue
             if not fut.done():
                 continue                     # still building: next frame
-            with self._lock:
-                self._pending.remove(inj)
             frames = self._take(inj, fut)
+            with self._lock:        # one step, so inject() always sees it
+                self._pending.remove(inj)
+                if frames is not None:
+                    self._active[inj.id] = inj
             if frames is None:
                 inj._next = None
                 self._finish(inj, failed=True)
