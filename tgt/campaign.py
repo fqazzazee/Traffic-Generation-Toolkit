@@ -117,6 +117,16 @@ class Phase:
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
+def _check_rate(value: Any, path: str) -> None:
+    """A plan or phase ``rate``: a finite number >= 0 (null = not set)."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or \
+            not 0 <= value <= sys.float_info.max:
+        raise CampaignError(f"{path}: rate: expected a finite number >= 0, "
+                            f"got {value!r}")
+
+
 class Plan:
     def __init__(self, doc: Any, source: str = "<plan>") -> None:
         self.source = source
@@ -153,6 +163,7 @@ class Plan:
             raise CampaignError(f"{source}: span: {self.span!r} is not one "
                                 f"of {', '.join(enterprise.SPAN_VIEWS)}")
         self.rate = doc.get("rate")
+        _check_rate(self.rate, source)
         self.sprinkle_messages = int(doc.get("sprinkle_messages", 2))
         phases = doc.get("phases")
         if not isinstance(phases, list) or not phases:
@@ -176,6 +187,7 @@ class Plan:
                 raise CampaignError(f"{path}.duration: {e}") from None
             if dur <= 0:
                 raise CampaignError(f"{path}.duration: must be > 0")
+            _check_rate(p.get("rate"), path)
             if p.get("day_profile") and \
                     p["day_profile"] not in timing.DAY_PROFILES:
                 raise CampaignError(f"{path}.day_profile: unknown profile "

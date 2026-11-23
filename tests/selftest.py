@@ -8904,6 +8904,34 @@ def test_r22_engine_synthetic_clock_range() -> None:
               "out-of-range campaign wrote a pcap")
 
 
+def test_r22_engine_plan_rate_validated() -> None:
+    """Plan and phase rates must be finite, non-negative numbers."""
+    from tgt import campaign
+
+    def doc(plan=None, phase=None):
+        p = {"name": "a", "duration": 1}
+        if phase is not None:
+            p["rate"] = phase
+        d = {"env": "it-org", "phases": [p]}
+        if plan is not None:
+            d["rate"] = plan
+        return d
+    for bad in ("fast", -1, float("nan"), float("inf"), True, [5]):
+        for kw in ({"plan": bad}, {"phase": bad}):
+            try:
+                campaign.Plan(doc(**kw))
+                check(False, f"plan accepted rate {kw}")
+            except campaign.CampaignError as e:
+                check("rate" in str(e), f"rate error unclear: {e}")
+    for good in (0, 2, 2.5):
+        campaign.Plan(doc(plan=good, phase=good))
+    with tempfile.TemporaryDirectory() as d:
+        path = _r22_plan(d, rate="fast")
+        rc, out = _r22_cli(["campaign", path, "--force", "--pcap",
+                            os.path.join(d, "x.pcap")])
+        check(rc == 2 and "rate" in out, f"bad plan rate: rc={rc}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
