@@ -222,8 +222,10 @@ ensure_veth() {
 # True only for the pair ensure_veth creates: a veth whose peer is <name>-mon.
 is_tgt_veth() {
     link=$(ip -o -d link show "$1" 2>/dev/null) || return 1
+    # An alias is free text, so it must not be able to supply either match.
+    link=${link%%'\    alias '*}
     case "$link" in *": $1@$1-mon:"*) ;; *) return 1 ;; esac
-    case "$link" in *" veth "*) return 0 ;; *) return 1 ;; esac
+    case "$link" in *'\    veth '*) return 0 ;; *) return 1 ;; esac
 }
 
 # --- systemd path -----------------------------------------------------------

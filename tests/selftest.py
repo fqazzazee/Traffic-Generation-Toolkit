@@ -8907,6 +8907,29 @@ def test_r22_ops_entrypoint_splits_interfaces() -> None:
               f"entrypoint: no hand-off: {r.stdout}")
 
 
+def test_r22_ops_unregister_ignores_link_alias() -> None:
+    """A link alias is free text: one mentioning veth does not make a VLAN
+    on <name>-mon look like a TGT pair, and a real pair with an alias goes."""
+    head = "7: {0}@{0}-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:01"
+    links = {
+        "fake": head.format("fake") + " promiscuity 0 \\    vlan protocol "
+                "802.1Q id 7 addrgenmode eui64 \\    alias lab veth uplink",
+        "tgt0": head.format("tgt0") + " promiscuity 0 \\    veth addrgenmode "
+                "eui64 \\    alias traffic",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        _r22_ops_conf(box, ",".join(links))
+        for name, line in links.items():
+            with open(os.path.join(box["links"], name), "w") as fh:
+                fh.write(line + "\n")
+        rc, out, calls = _r22_ops_run(box, "unregister")
+        check(rc == 0, f"unregister rc={rc}: {out}")
+        check("ip link del fake" not in calls,
+              f"alias made a VLAN look like a TGT veth: {calls}")
+        check("ip link del tgt0" in calls, f"aliased veth kept: {calls}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
