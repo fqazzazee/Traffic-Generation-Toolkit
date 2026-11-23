@@ -42,6 +42,9 @@ class PcapWriter:
         if ts is None:
             ts = time.time()
         sec = int(ts)
+        if not 0 <= sec <= 0xFFFFFFFF:
+            raise ValueError(f"timestamp {ts} is outside the classic pcap "
+                             "range (1970-01-01 to 2106-02-07 UTC)")
         usec = int((ts - sec) * 1_000_000)
         self._fh.write(struct.pack("!IIII", sec, usec, len(frame), len(frame)))
         self._fh.write(frame)

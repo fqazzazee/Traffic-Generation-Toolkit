@@ -128,7 +128,7 @@ def service_state() -> ServiceState:
                 os.kill(pid, 0)
             except PermissionError:     # exists, owned by another user (root)
                 pass
-            except OSError:
+            except (OSError, OverflowError):    # gone, or not a real PID
                 continue
             return ServiceState(True, "daemon", "active", f"pid {pid}")
     if found:

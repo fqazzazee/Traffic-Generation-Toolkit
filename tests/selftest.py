@@ -8622,15 +8622,19 @@ def test_r22_engine_crash_reports_failure() -> None:
     """An exception in the engine thread is a failed run: counted, reported
     and a non-zero exit, with no thread traceback."""
     with tempfile.TemporaryDirectory() as d:
-        for extra in (["--pcap", os.path.join(d, "missing", "x.pcap")],
-                      ["--client-ip", "nope",
-                       "--pcap", os.path.join(d, "x.pcap")]):
-            rc, out = _r22_cli(["run", "-p", "modbus", "--count", "5",
-                                "--rate", "0"] + extra)
-            check(rc != 0, f"crashed run exited {rc}: {extra}")
-            check("Traceback" not in out, f"crash traceback: {extra}")
-            check("1 errors" in out and "last error:" in out,
-                  f"crash not reported: {extra}: {out[-200:]}")
+        extra = ["--pcap", os.path.join(d, "missing", "x.pcap")]
+        rc, out = _r22_cli(["run", "-p", "modbus", "--count", "5",
+                            "--rate", "0"] + extra)
+        check(rc != 0, f"crashed run exited {rc}: {extra}")
+        check("Traceback" not in out, f"crash traceback: {extra}")
+        check("1 errors" in out and "last error:" in out,
+              f"crash not reported: {extra}: {out[-200:]}")
+        # a bad address never reaches the engine: the CLI rejects it
+        rc, out = _r22_cli(["run", "-p", "modbus", "--count", "5", "--rate",
+                            "0", "--client-ip", "nope",
+                            "--pcap", os.path.join(d, "x.pcap")])
+        check(rc == 2 and "Traceback" not in out,
+              f"bad --client-ip: rc={rc}")
 
 
 def test_r22_engine_once_rejected_with_timed() -> None:
@@ -10234,6 +10238,87 @@ def test_r22_ops_logs_follow_live_daemon() -> None:
             rc, out, _ = _r22_ops_run(box, "logs")
             check(rc == 0 and log in out and other not in out,
                   f"logs with a live {pid_dir} daemon: rc={rc} {out}")
+
+
+def test_r22_residual_ctl_token_and_bad_replies() -> None:
+    """tgt ctl keeps its token off redirects and reports bad input cleanly."""
+    import contextlib
+    import http.server
+    import io
+    import threading
+    from tgt import api, cli, pcap, service
+    seen = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+    tport = target.server_address[1]
+
+    class Redirect(Target):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{tport}/status")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    class Odd(Target):
+        def do_GET(self):
+            body = b'{"injections": [{}], "interfaces": {"a": 1}, "uptime": "x"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    redirect = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    odd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Odd)
+    for s in (target, redirect, odd):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    try:
+        code, _ = api.request(f"127.0.0.1:{redirect.server_address[1]}",
+                              "GET", "/status", token="SECRET")
+        check(code == 302, f"redirect followed: {code}")
+        check(not seen, "bearer token sent to a redirect target")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["ctl", "--api",
+                           f"127.0.0.1:{odd.server_address[1]}", "status"])
+        check(rc == 2, f"odd status reply: rc={rc}")
+    finally:
+        for s in (target, redirect, odd):
+            s.shutdown()
+            s.server_close()
+    try:
+        api.request("http://[::1", "GET", "/status")
+        check(False, "malformed API address accepted")
+    except api.ApiError:
+        pass
+    with tempfile.TemporaryDirectory() as d:
+        pid = os.path.join(d, "tgt.pid")
+        with open(pid, "w") as f:
+            f.write("99999999999999999999")
+        saved = service.PID_PATHS, service._use_systemd, service._have_systemd
+        service.PID_PATHS = [pid]
+        service._use_systemd = service._have_systemd = lambda: False
+        try:
+            check(service.service_state().status == "inactive",
+                  "huge PID not treated as dead")
+        finally:
+            service.PID_PATHS, service._use_systemd, service._have_systemd = saved
+        with pcap.PcapWriter(os.path.join(d, "x.pcap")) as w:
+            try:
+                w.write(b"\x00" * 60, ts=2.0 ** 33)
+                check(False, "out-of-range pcap timestamp accepted")
+            except ValueError as e:
+                check("classic pcap" in str(e), f"pcap range error: {e}")
 
 
 def main() -> int:

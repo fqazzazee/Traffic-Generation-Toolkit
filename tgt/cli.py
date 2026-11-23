@@ -537,13 +537,19 @@ def cmd_ctl(args) -> int:
         print(f"wrote manifest to {args.output}", file=sys.stderr)
     elif args.json or what == "manifest" or code >= 300:
         print(json.dumps(doc, indent=1))
-    elif what == "status":
-        _print_status(doc)
-    elif what == "inject":
-        i = doc.get("injection", {})
-        print(f"injection {i.get('id')}: {i.get('incident')} for "
-              f"{i.get('duration')}s at {i.get('ratio', 0):.0%} "
-              f"({i.get('state')})")
+    elif what in ("status", "inject"):
+        try:
+            if what == "status":
+                _print_status(doc)
+            else:
+                i = doc.get("injection", {})
+                print(f"injection {i.get('id')}: {i.get('incident')} for "
+                      f"{i.get('duration')}s at {i.get('ratio', 0):.0%} "
+                      f"({i.get('state')})")
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
+            print(f"{args.api} sent an unexpected {what} reply: {e}",
+                  file=sys.stderr)
+            return 2
     else:
         print(json.dumps(doc))
     return 0 if code < 300 else 1
