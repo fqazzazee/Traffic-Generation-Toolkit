@@ -367,7 +367,7 @@ cmd_register() {
 
 cmd_start() {
     need_root
-    if have_systemd && [ ! -f "$UNIT_FILE" ] && daemon_running; then
+    if have_systemd && daemon_running; then
         warn "already running unmanaged (pid $(cat "$PID_FILE")); run '$0 stop', then start it under systemd"
         return 0
     fi
@@ -385,6 +385,7 @@ cmd_start() {
 cmd_stop() {
     need_root
     if use_systemd; then
+        if daemon_running; then daemon_stop; fi
         systemctl stop tgt.service && ok "service stopped"
     else
         daemon_stop
@@ -395,6 +396,7 @@ cmd_restart() {
     need_root
     if use_systemd; then
         service_preflight "$(unit_repo_root)" "$(unit_python)"
+        if daemon_running; then daemon_stop; fi
         systemctl restart tgt.service && ok "service restarted"
     else
         # Register first: a failed preflight must not cost the running daemon.

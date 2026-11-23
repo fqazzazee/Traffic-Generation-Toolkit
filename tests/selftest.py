@@ -11088,6 +11088,98 @@ def test_r22_score_flows_accept_real_companion_traffic() -> None:
           f"unexpected: {b['unexpected']}")
 
 
+def test_r22_final_bench_overwrite_keeps_bundle_on_bad_options() -> None:
+    """Invalid options leave the old bundle alone, and a damaged index with
+    mixed stage ids does not stop --overwrite from clearing it."""
+    import json
+    from tgt import bench
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "stages"))
+        idx, stage = (os.path.join(d, "bench.json"),
+                      os.path.join(d, "stages", "learn.manifest.json"))
+        for p in (idx, stage):
+            with open(p, "w") as f:
+                f.write("{}")
+        for bad in (["--start-time", "garbage"], ["--rate", "nan"],
+                    ["--start-time", "2200-01-01T00:00:00Z"]):
+            rc, out = _r22_cli(["bench", "run", "quick", "--out", d,
+                                "--overwrite"] + bad)
+            check(rc == 2 and "Traceback" not in out, f"{bad}: rc={rc}")
+            check(os.path.exists(idx) and os.path.exists(stage),
+                  f"{bad}: destroyed the existing bundle")
+        with open(idx, "w") as f:
+            json.dump({"stages": [{"id": 5}, {"id": "a"}]}, f)
+        bench._clear_bundle(d, bench.load(bench.find("quick")))
+        check(not os.path.exists(idx), "damaged index was not cleared")
+
+
+def test_r22_final_edr_replaced_endpoint_and_custom_region() -> None:
+    """A setup may reuse the address of a declared edr endpoint it replaces,
+    but not one another flow still uses; custom regions are not renamed."""
+    from tgt import edr, enterprise, envfile
+    base = enterprise.get("enterprise-mixed")
+    host = base.edr_hosts()[0]
+    other = next(h for h in base.hosts if h.name != host.name)
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-reuse"
+    doc["external"] = [{"name": "CS-EU", "ip": "18.158.187.80",
+                        "role": "broker", "os": "linux"}]
+    flows = list(doc["flows"]) + [
+        {"client": host.name, "server": "CS-EU", "proto": "edr"}]
+    env = envfile.from_dict(dict(doc, flows=flows), "reuse.json")
+    applied = edr.apply(env, {"profile": "crowdstrike", "region": "eu-1"})
+    check(applied.edr.region.key == "eu-1", "replaced endpoint blocked eu-1")
+    shared = envfile.from_dict(dict(doc, flows=flows + [
+        {"client": other.name, "server": "CS-EU", "proto": "https"}]),
+        "shared.json")
+    try:
+        edr.apply(shared, {"profile": "crowdstrike", "region": "eu-1"})
+        check(False, "address still used by another flow was accepted")
+    except edr.EdrError:
+        pass
+    check(edr.cli_block(_EDR_CUSTOM, "custom:lab-a", None)["region"] == "lab-a",
+          "custom's own region refused")
+    try:
+        edr.cli_block(_EDR_CUSTOM, "custom:lab-b", None)
+        check(False, "custom region was silently renamed")
+    except edr.EdrError:
+        pass
+
+
+def test_r22_final_ops_daemon_never_runs_beside_service() -> None:
+    """With a unit installed and a PID-file daemon live, start refuses to add
+    the service, while stop and restart take the daemon down too."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        _r22_ops_conf(box)
+        with open(box["unit"], "w") as fh:
+            fh.write(f"[Service]\nWorkingDirectory={box['repo']}\n"
+                     f"Environment=PYTHONPATH={box['repo']}\n"
+                     f"ExecStart={sys.executable} -m tgt run\n")
+        pid_file = os.path.join(box["root"], "run", "tgt.pid")
+        for cmd, verb in (("start", None), ("stop", "stop"),
+                          ("restart", "restart")):
+            open(box["log"], "w").close()
+            proc = subprocess.Popen(["sleep", "30"])
+            try:
+                with open(pid_file, "w") as fh:
+                    fh.write(f"{proc.pid}\n")
+                rc, out, calls = _r22_ops_run(box, cmd)
+                if verb is None:
+                    check("systemctl start" not in calls and
+                          proc.poll() is None,
+                          f"start ran beside the daemon: {calls} {out}")
+                else:
+                    proc.wait(timeout=10)
+                    check(f"systemctl {verb}" in calls,
+                          f"{cmd}: rc={rc} {calls} {out}")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -35,7 +35,7 @@
   the wire no longer count as missed, and SNMP traps, NetBIOS datagrams, server broadcasts
   and CIP setup sessions are no longer reported as unexpected flows.
 - **Bench**: an interrupted or failed run can no longer receive a PASS or reuse the previous
-  run's manifests.
+  run's manifests, and `--overwrite` with invalid options leaves the old bundle intact.
 - **Ground truth**: a reused IP is credited to its current owner in campaigns, and
   `--remap-env` no longer writes contradictory ARP when one MAC owns several IPs.
 - **Pacing**: `--duration` ends on time at low rates, live rate changes apply immediately and
@@ -43,9 +43,9 @@
 - **Control**: unfinished injections are closed when a run ends, duplicate injections can no
   longer race, and `tgt ctl` reports bad replies and addresses cleanly.
 - **Service**: `tgtctl` checks that the hardened service can read its files, deletes only veth
-  pairs it created, finds a root daemon's files without root, and no longer starts an
-  unmanaged daemon on systemd hosts. The container entrypoint accepts comma-separated
-  `TGT_IFACE`.
+  pairs it created, finds a root daemon's files without root, and no longer runs an
+  unmanaged daemon beside the systemd service. The container entrypoint accepts
+  comma-separated `TGT_IFACE`.
 - **CI**: fixed the intermittent rolling-rate test failure.
 
 ### Docs and tooling
