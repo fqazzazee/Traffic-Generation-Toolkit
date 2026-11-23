@@ -8597,6 +8597,119 @@ def test_review_injection_worker_ends_with_run() -> None:
           "injection worker outlived close() and clobbered the context")
 
 
+def _r22_ops_sandbox(d: str, systemd: bool = True) -> dict:
+    """A patched copy of tgtctl.sh whose system paths live under ``d`` and
+    whose ip/systemctl/journalctl/setpriv/id/tail are stubs: nothing here can
+    reach a real service or a host interface."""
+    import stat
+    root = os.path.join(d, "root")
+    for sub in ("etc", "run", "var/log", "tmp"):
+        os.makedirs(os.path.join(root, sub))
+    if systemd:
+        os.makedirs(os.path.join(root, "run/systemd/system"))
+        os.makedirs(os.path.join(root, "etc/systemd/system"))
+    repo, bin_dir, links = (os.path.join(d, n) for n in ("repo", "bin", "links"))
+    for p in (os.path.join(repo, "scripts"), os.path.join(repo, "tgt"),
+              bin_dir, links):
+        os.makedirs(p)
+    for name, body in (("__init__.py", ""), ("__main__.py", "raise SystemExit(0)\n")):
+        with open(os.path.join(repo, "tgt", name), "w") as fh:
+            fh.write(body)
+    with open(os.path.join(_REPO, "scripts", "tgtctl.sh")) as fh:
+        text = fh.read()
+    for path in ("/etc/", "/run", "/var/log", "/tmp/tgt"):
+        text = text.replace(path, root + path)
+    ctl = os.path.join(repo, "scripts", "tgtctl.sh")
+    with open(ctl, "w") as fh:
+        fh.write(text)
+    stubs = {
+        "id": 'echo "${STUB_UID:-0}"\n',
+        "systemctl": 'echo "systemctl $*" >> "$STUB_LOG"\n',
+        "journalctl": 'echo "journalctl $*" >> "$STUB_LOG"\n',
+        "tail": 'echo "tail $*"\n',
+        "ip": 'echo "ip $*" >> "$STUB_LOG"\n'
+              'for n; do :; done\n'
+              'case "$*" in\n'
+              '  "-o -d link show "*) [ -f "$STUB_LINKS/$n" ] && '
+              'cat "$STUB_LINKS/$n" ;;\n'
+              '  "link show "*) [ -f "$STUB_LINKS/$n" ] ;;\n'
+              'esac\n',
+        "setpriv": '[ -z "${STUB_SETPRIV_FAIL:-}" ] || exit 1\n'
+                   'while case "$1" in --*) true ;; *) false ;; esac; do '
+                   'shift; done\n'
+                   'for a in "$@"; do case "$a" in\n'
+                   '  "${STUB_DENY:-/nonexistent}"|"${STUB_DENY:-/nonexistent}"/*)'
+                   ' exit 1 ;;\n'
+                   'esac; done\n'
+                   'exec "$@"\n',
+    }
+    for name, body in stubs.items():
+        path = os.path.join(bin_dir, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n" + body)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+    log = os.path.join(d, "calls.log")
+    open(log, "w").close()
+    env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"],
+               STUB_LOG=log, STUB_LINKS=links, PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    return {"ctl": ctl, "env": env, "root": root, "repo": repo, "log": log,
+            "links": links, "bin": bin_dir,
+            "conf": os.path.join(root, "etc/tgt/tgt.conf"),
+            "unit": os.path.join(root, "etc/systemd/system/tgt.service")}
+
+
+def _r22_ops_run(box: dict, *args: str, **env: str):
+    import subprocess
+    r = subprocess.run(["sh", box["ctl"]] + list(args),
+                       env=dict(box["env"], **env), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True,
+                       timeout=30)
+    with open(box["log"]) as fh:
+        return r.returncode, r.stdout, fh.read()
+
+
+def _r22_ops_conf(box: dict, iface: str = "tgt0") -> None:
+    os.makedirs(os.path.dirname(box["conf"]), exist_ok=True)
+    with open(box["conf"], "w") as fh:
+        fh.write(f"TGT_IFACE={iface}\nTGT_RUN_ARGS=\n")
+
+
+def test_r22_ops_service_state_permission_means_running() -> None:
+    """EPERM from kill(pid, 0) proves the process exists, so a root daemon
+    reads as active to a non-root TUI. A stale first PID file does not hide
+    a live daemon recorded in the second."""
+    from tgt import service
+    saved = service._have_systemd, service.PID_PATHS, os.kill
+    with tempfile.TemporaryDirectory() as d:
+        first, second = os.path.join(d, "a.pid"), os.path.join(d, "b.pid")
+
+        def fake_kill(pid, sig):
+            if pid == 111:
+                raise PermissionError(1, "not permitted")
+            if pid == 222:
+                raise ProcessLookupError(3, "no such process")
+        try:
+            service._have_systemd = lambda: False
+            service.PID_PATHS = (first, second)
+            os.kill = fake_kill
+            with open(first, "w") as fh:
+                fh.write("111\n")
+            st = service.service_state()
+            check(st.status == "active" and st.detail == "pid 111",
+                  f"service_state on EPERM: {st}")
+            with open(first, "w") as fh:
+                fh.write("222\n")
+            st = service.service_state()
+            check(st.status == "inactive", f"service_state on ESRCH: {st}")
+            with open(second, "w") as fh:
+                fh.write("111\n")
+            st = service.service_state()
+            check(st.status == "active", f"stale PID file hid a daemon: {st}")
+        finally:
+            service._have_systemd, service.PID_PATHS, os.kill = saved
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

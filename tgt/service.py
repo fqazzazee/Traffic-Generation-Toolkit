@@ -109,14 +109,24 @@ def service_state() -> ServiceState:
         except Exception as e:  # noqa: BLE001
             return ServiceState(False, "systemd", "unknown", str(e))
     # daemon fallback: pid file
+    found = False
     for p in PID_PATHS:
         if os.path.exists(p):
+            found = True
             try:
-                pid = int(open(p).read().strip())
+                with open(p) as fh:
+                    pid = int(fh.read().strip())
+            except (ValueError, OSError):
+                continue
+            try:
                 os.kill(pid, 0)
-                return ServiceState(True, "daemon", "active", f"pid {pid}")
-            except (ValueError, ProcessLookupError, PermissionError, OSError):
-                return ServiceState(True, "daemon", "inactive")
+            except PermissionError:     # exists, owned by another user (root)
+                pass
+            except OSError:
+                continue
+            return ServiceState(True, "daemon", "active", f"pid {pid}")
+    if found:
+        return ServiceState(True, "daemon", "inactive")
     return ServiceState(False, "none", "not-installed")
 
 
