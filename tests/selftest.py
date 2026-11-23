@@ -8633,6 +8633,45 @@ def test_r22_evaluation_overwrite_never_certifies_stale() -> None:
         check(os.path.exists(mine), "--overwrite removed a foreign file")
 
 
+def test_r22_evaluation_verdict_needs_complete_bundle() -> None:
+    """A PASS needs a complete bundle: an interrupted run, a failed stage or
+    a stage missing from the index is incomplete, whatever the metrics."""
+    import json
+    from tgt import bench
+    suite = {"name": "tiny", "env": "ot-plant", "seed": 9,
+             "start_time": "2026-11-02T08:00:00Z",
+             "thresholds": {"discovery_recall": {"min": 0.1}}, "stages": [
+                 {"id": "one", "kind": "baseline", "duration": "1m"},
+                 {"id": "two", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path, b = os.path.join(d, "tiny.json"), os.path.join(d, "bundle")
+        with open(path, "w") as f:
+            json.dump(suite, f)
+        p = _cli(["bench", "run", path, "--out", b])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+        pe = os.path.join(d, "perfect")
+        bench.write_self_test(b, pe)
+        assets = os.path.join(pe, "assets.csv")
+        ip = os.path.join(b, "bench.json")
+        with open(ip) as f:
+            good = json.load(f)
+
+        def verdict(doc):
+            with open(ip, "w") as f:
+                json.dump(doc, f)
+            return bench.score_bundle(b, assets, "generic")[0]["verdict"]
+        check(verdict(good) == "pass", "complete bundle should pass")
+        check(verdict(dict(good, status="interrupted")) == "incomplete",
+              "interrupted bundle got a verdict")
+        rows = [dict(r) for r in good["stages"]]
+        rows[1]["status"] = "failed"
+        check(verdict(dict(good, stages=rows)) == "incomplete",
+              "failed stage got a verdict")
+        check(verdict(dict(good, stages=good["stages"][:1])) == "incomplete",
+              "bundle missing a suite stage got a verdict")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

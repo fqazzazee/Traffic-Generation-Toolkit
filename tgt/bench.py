@@ -742,6 +742,21 @@ def _field_accuracy(res: Dict[str, Any]) -> Tuple[Optional[float], int]:
     return _rate(sum(o["correct"] for o in obs), n), n
 
 
+def _bundle_complete(index: Dict[str, Any],
+                     stages: List[Tuple[str, Dict[str, Any]]]) -> bool:
+    """The run finished, and every stage of its suite completed and left a
+    manifest."""
+    if index.get("status") != "complete":
+        return False
+    rows = {r.get("id"): r for r in index.get("stages") or []}
+    doc = (index.get("suite") or {}).get("doc") or {}
+    want = [s.get("id") for s in doc.get("stages") or []] or list(rows)
+    have = {sid for sid, _ in stages}
+    return bool(want) and all(
+        i in have and (rows.get(i) or {}).get("status") == "complete"
+        for i in want)
+
+
 def scorecard(index: Dict[str, Any],
               stages: List[Tuple[str, Dict[str, Any]]],
               res: Dict[str, Any], label: Optional[str] = None,
@@ -837,7 +852,8 @@ def scorecard(index: Dict[str, Any],
                            "value": v, "pass": ok})
     verdict = None
     if checks:
-        verdict = "fail" if any(c["pass"] is False for c in checks) else \
+        verdict = "incomplete" if not _bundle_complete(index, stages) else \
+            "fail" if any(c["pass"] is False for c in checks) else \
             "incomplete" if any(c["pass"] is None for c in checks) else \
             "pass"
     return {
