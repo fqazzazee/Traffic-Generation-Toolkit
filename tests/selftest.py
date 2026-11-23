@@ -8926,6 +8926,52 @@ def test_r22_evaluation_reused_ip_credits_new_owner() -> None:
     check(not stale, f"flow index still credits PLC-RW1: {stale[:2]}")
 
 
+def test_r22_evaluation_remap_arp_macs_follow_ip() -> None:
+    """--remap-env: when one capture MAC owns two IPs, each ARP's sender and
+    target MACs are those of the host its IP maps to."""
+    from types import SimpleNamespace
+    from tgt import enterprise
+    from tgt.remapenv import EnvRewriter, HostProfile
+    env = enterprise.get("ot-plant")
+    a, b, c = env.hosts[:3]
+    shared, peer = "02:00:00:00:00:aa", "02:00:00:00:00:bb"
+    mapped = [(HostProfile(key=ip, ip=ip, mac=mac), h, env.segment_of(h), 1.0)
+              for ip, mac, h in (("10.9.0.1", shared, a),
+                                 ("10.9.0.2", shared, b),
+                                 ("10.9.0.3", peer, c))]
+    rw = EnvRewriter(SimpleNamespace(mapped=mapped, env=env, span="access",
+                                     describe=lambda: "remap"))
+    m, ip = P.mac_to_bytes, P.ip_to_bytes
+
+    def arp(op, emac, smac, sip, tmac, tip):
+        return (m(emac) + m(smac) + b"\x08\x06\x00\x01\x08\x00\x06\x04" +
+                struct.pack("!H", op) + m(smac) + ip(sip) + m(tmac) + ip(tip))
+
+    def fields(frame):
+        off = 18 if frame[12:14] == b"\x81\x00" else 14
+        return frame[:6], frame[6:12], frame[off + 8:off + 14], \
+            frame[off + 18:off + 24]
+    for sip, host in (("10.9.0.1", a), ("10.9.0.2", b)):
+        ed, es, sm, tm = fields(rw.apply_all(arp(2, peer, shared, sip, peer,
+                                                 "10.9.0.3"))[0])
+        want = m(host.mac)
+        check(es == want and sm == want and ed == m(c.mac) and
+              tm == m(c.mac), f"ARP reply from {sip}: sender {sm.hex()} / "
+                              f"eth {es.hex()}, want {want.hex()}")
+    for tip, host in (("10.9.0.1", a), ("10.9.0.2", b)):
+        ed, es, sm, tm = fields(rw.apply_all(arp(2, shared, peer, "10.9.0.3",
+                                                 shared, tip))[0])
+        want = m(host.mac)
+        check(ed == want and tm == want and sm == m(c.mac),
+              f"ARP reply to {tip}: target {tm.hex()} / eth {ed.hex()}, "
+              f"want {want.hex()}")
+    ed, _, sm, tm = fields(rw.apply_all(arp(1, "ff:ff:ff:ff:ff:ff", shared,
+                                            "10.9.0.1", "00:00:00:00:00:00",
+                                            "10.9.0.3"))[0])
+    check(ed == b"\xff" * 6 and tm == b"\0" * 6 and sm == m(a.mac),
+          "ARP request: broadcast and empty target MAC must stay")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

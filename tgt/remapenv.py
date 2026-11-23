@@ -792,6 +792,19 @@ class EnvRewriter(Rewriter):
         elif etype == 0x0806 and len(body) >= 28:
             S = self.by_ip.get(body[14:18]) or self.by_mac.get(smac)
             D = None if dmac[0] & 1 else self.by_mac.get(dmac)
+            if body[2:6] == b"\x08\x00\x06\x04":  # IPv4 over Ethernet
+                # one capture MAC can own several IPs: the IP names the host
+                sh = self.by_ip.get(body[14:18])
+                th = self.by_ip.get(body[24:28])
+                arp = bytearray(body)
+                if sh:
+                    arp[8:14] = P.mac_to_bytes(sh[0].mac)
+                if th and body[18:24] not in (b"\0" * 6, b"\xff" * 6):
+                    arp[18:24] = P.mac_to_bytes(th[0].mac)
+                body = bytes(arp)
+                f = f[:off] + body
+                if th and not dmac[0] & 1:
+                    D = th
         else:
             S = self.by_mac.get(smac)
             D = None if dmac[0] & 1 else self.by_mac.get(dmac)
