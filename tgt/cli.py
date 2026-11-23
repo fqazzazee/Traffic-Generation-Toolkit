@@ -327,6 +327,10 @@ def cmd_run(args) -> int:
               "capture's own timing (use --replay-realtime).",
               file=sys.stderr)
         return 2
+    if schedule == "timed" and args.once:
+        print("--once needs --schedule cycle: a timed run has no cycles; "
+              "bound it with --duration or --count.", file=sys.stderr)
+        return 2
     if replay:
         from .replay import rewriter_for
         from .rewrite import RewriteError

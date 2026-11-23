@@ -8630,6 +8630,22 @@ def test_r22_engine_crash_reports_failure() -> None:
                   f"crash not reported: {extra}: {out[-200:]}")
 
 
+def test_r22_engine_once_rejected_with_timed() -> None:
+    """--once has no meaning on the timed schedule, which would otherwise
+    run (and write) forever."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        try:
+            rc, out = _r22_cli(["run", "-p", "modbus", "--schedule", "timed",
+                                "--clock", "synthetic", "--once",
+                                "--pcap", pcap], timeout=5)
+        except Exception as e:  # noqa: BLE001 - subprocess timeout
+            check(False, f"--once with timed did not exit: {type(e).__name__}")
+            return
+        check(rc == 2 and "--once" in out, f"--once timed: rc={rc}")
+        check(not os.path.exists(pcap), "--once timed wrote a pcap")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
