@@ -8930,6 +8930,30 @@ def test_r22_ops_unregister_ignores_link_alias() -> None:
         check("ip link del tgt0" in calls, f"aliased veth kept: {calls}")
 
 
+def test_r22_ops_restart_keeps_daemon_when_preflight_fails() -> None:
+    """Moving an unmanaged daemon under systemd checks access first, so a
+    checkout the service cannot read leaves the daemon running."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        _r22_ops_conf(box)
+        pid_file = os.path.join(box["root"], "run", "tgt.pid")
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            with open(pid_file, "w") as fh:
+                fh.write(f"{proc.pid}\n")
+            rc, out, calls = _r22_ops_run(
+                box, "restart", STUB_DENY=os.path.join(box["repo"], "tgt"))
+            check(rc != 0 and "cannot access" in out,
+                  f"restart preflight: rc={rc} {out}")
+            check(proc.poll() is None and os.path.exists(pid_file),
+                  "restart stopped the daemon before a failed preflight")
+            check("systemctl" not in calls, f"systemctl used: {calls}")
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -384,6 +384,8 @@ cmd_restart() {
         service_preflight "$(unit_repo_root)"
         systemctl restart tgt.service && ok "service restarted"
     else
+        # Register first: a failed preflight must not cost the running daemon.
+        if have_systemd; then cmd_register; fi
         daemon_stop; cmd_start
     fi
 }
