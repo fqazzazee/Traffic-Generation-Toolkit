@@ -10383,6 +10383,91 @@ def test_r22_edr_catalogue() -> None:
               "generic hostnames are not RFC 2606 names under edr.example")
 
 
+def _edr_env(block, key: str = "ot-plant"):
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get(key))
+    if block is not None:
+        doc["edr"] = block
+    return envfile.from_dict(doc, "edr-test.json")
+
+
+_EDR_CUSTOM = {"profile": "custom", "vendor": "Acme", "region": "lab-a",
+               "fqdns": {"sensor": "s.acme.example", "upload": "u.acme.example",
+                         "download": "d.acme.example",
+                         "api": "m.acme.example"},
+               "ips": ["198.51.100.200", "198.51.100.201"]}
+
+
+def test_r22_edr_env_block() -> None:
+    from tgt import edr, enterprise, envfile
+    base = enterprise.get("ot-plant")
+    check("edr" not in envfile.to_dict(base), "export invents an edr block")
+    check(base.edr is None, "built-in env has an explicit EDR setup")
+    for block in ({"enabled": True, "profile": "crowdstrike",
+                   "region": "us-2"},
+                  {"profile": "generic"}, {"enabled": False}, _EDR_CUSTOM,
+                  {"profile": "crowdstrike", "proxy": base.hosts[0].name,
+                   "proxy_port": 3128}):
+        env = _edr_env(block)
+        doc = envfile.to_dict(env)
+        check(doc.get("edr") == block, f"export lost the block: {block}")
+        again = envfile.loads(envfile.dumps(doc), source="again.json")
+        check(envfile.to_dict(again) == doc, f"round trip differs: {block}")
+    check(base.edr is None, "applying a block changed the registered env")
+    cust = _edr_env(_EDR_CUSTOM).edr
+    check(cust.profile.vendor == "Acme" and cust.region.key == "lab-a"
+          and cust.region.ip_provenance == "documentation", "custom setup")
+    check(_edr_env({"profile": "crowdstrike"}).edr.region.key == "eu-1",
+          "crowdstrike default region")
+    bad = [
+        ({"profile": "nope"}, "edr.profile"),
+        ({"profile": "crowdstrike", "region": "mars"}, "edr.region"),
+        ({"profile": "crowdstrike", "proxy": "NO-SUCH"}, "edr.proxy"),
+        ({"profile": "crowdstrike", "proxy": base.hosts[0].name,
+          "proxy_port": 0}, "edr.proxy_port"),
+        ({"profile": "crowdstrike", "typo": 1}, "edr.typo"),
+        ({"enabled": "yes"}, "edr.enabled"),
+        ({"profile": "generic", "vendor": "X"}, "edr.vendor"),
+        ({"profile": "custom", "vendor": "X"}, "edr"),
+        (dict(_EDR_CUSTOM, ips=[]), "edr.ips"),
+        (dict(_EDR_CUSTOM, ips=["1.2.3"]), "edr.ips[0]"),
+        (dict(_EDR_CUSTOM, ips=["224.0.0.5"]), "edr.ips[0]"),
+        (dict(_EDR_CUSTOM, ips=[base.hosts[0].ip]), "edr.ips"),
+        (dict(_EDR_CUSTOM, fqdns={"sensor": "s.acme.example"}), "edr.fqdns"),
+        (dict(_EDR_CUSTOM, fqdns=dict(_EDR_CUSTOM["fqdns"], api="no spaces")),
+         "edr.fqdns.api"),
+        (dict(_EDR_CUSTOM, tls_client="nope"), "edr.tls_client"),
+        (dict(_EDR_CUSTOM, tls_client="schannel-2000"), "edr.tls_client"),
+        ("crowdstrike", "edr"),
+    ]
+    for block, where in bad:
+        try:
+            _edr_env(block)
+            check(False, f"accepted bad edr block {block}")
+        except envfile.EnvFileError as e:
+            check(f"edr-test.json: {where}" in str(e),
+                  f"bad block {block}: error {e}")
+    check(issubclass(edr.EdrError, ValueError), "EdrError type")
+
+
+def test_r22_edr_off_removes_declared_flows() -> None:
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    h = enterprise.get("ot-plant").edr_hosts()[0].name
+    doc["external"] = [{"name": "CLOUD", "ip": "203.0.113.90",
+                        "role": "broker", "os": "linux",
+                        "fqdn": "cloud.edr.example"}]
+    doc["flows"] = list(doc["flows"]) + [
+        {"client": h, "server": "CLOUD", "proto": "edr"}]
+    doc["edr"] = {"enabled": False}
+    env = envfile.from_dict(doc, "off.json")
+    check(not env.edr_hosts() and not env.edr_plan(), "off: sensors remain")
+    check(not any(k == "edr" for k, _ in env.build(1)), "off: edr on wire")
+    check("edr" not in env.protocols(), "off: edr advertised")
+    check(any(f["proto"] == "edr" for f in envfile.to_dict(env)["flows"]),
+          "off: export dropped the declared flow")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -536,6 +536,8 @@ class Environment:
     findings: List[Dict[str, Any]] = field(default_factory=list)
     external: List[Host] = field(default_factory=list)
     field_devices: List[Dict[str, Any]] = field(default_factory=list)
+    # an explicit EDR setup (tgt.edr.Setup); None = the default Falcon EU-1
+    edr: Any = None
 
     def __post_init__(self) -> None:
         # what was declared, before options rewrite it (env export uses this)
@@ -966,7 +968,10 @@ class Environment:
     def edr_hosts(self) -> List[Host]:
         """Windows and Linux hosts that run a Falcon sensor. Excludes the EOL
         XP/2000 Windows and embedded OT devices (by catalog model, else
-        vendor MAC OUI), which can't — so they stay uncovered."""
+        vendor MAC OUI), which can't — so they stay uncovered. Nobody runs
+        one with EDR switched off."""
+        if self.edr is not None and not self.edr.enabled:
+            return []
         return [h for h in self.hosts if h.os in EDR_OS and not h.embedded
                 and h.name not in self._alias]     # one sensor per machine
 

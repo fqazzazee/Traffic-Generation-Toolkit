@@ -19,7 +19,9 @@ path opens a connection to a vendor service.
 """
 from __future__ import annotations
 
+import copy
 import ipaddress
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -127,3 +129,184 @@ PROFILES: Dict[str, Profile] = {
             _doc_pool("192.0.2", 128), "documentation",
             {c: "unverified" for c in CHANNELS})}, "lab"),
 }
+
+
+# ---------------------------------------------------------------------------
+# The "edr" block (env file, CLI)
+# ---------------------------------------------------------------------------
+_BLOCK_KEYS = {"enabled", "profile", "region", "proxy", "proxy_port"}
+_CUSTOM_KEYS = {"vendor", "label", "fqdns", "ips", "tls_client"}
+_HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                       r"[a-z]([a-z0-9-]{0,61}[a-z0-9])?", re.I)
+
+
+class EdrError(ValueError):
+    """A bad EDR setting; ``path`` is the key inside the block."""
+
+    def __init__(self, path: str, msg: str) -> None:
+        super().__init__(f"{path}: {msg}" if path else msg)
+        self.path, self.msg = path, msg
+
+
+@dataclass(frozen=True)
+class Setup:
+    """An explicit EDR configuration, resolved. ``block`` is what the env
+    file holds and what an export writes back."""
+    enabled: bool
+    block: Dict[str, Any]
+    profile: Optional[Profile] = None
+    region: Optional[Region] = None
+    proxy: Optional[str] = None
+    proxy_port: int = DEFAULT_PROXY_PORT
+
+
+def _text(block: Dict[str, Any], key: str) -> str:
+    v = block[key]
+    if not isinstance(v, str) or not v:
+        raise EdrError(key, f"expected a non-empty string, got {v!r}")
+    return v
+
+
+def _custom_region(block: Dict[str, Any]) -> Region:
+    for k in ("vendor", "fqdns", "ips"):
+        if k not in block:
+            raise EdrError("", f"profile 'custom' needs {k!r}")
+    fqdns = block["fqdns"]
+    if not isinstance(fqdns, dict):
+        raise EdrError("fqdns", "expected an object of channel: hostname")
+    extra = sorted(set(fqdns) - set(CHANNELS))
+    if extra:
+        raise EdrError(f"fqdns.{extra[0]}", "unknown channel (allowed: "
+                       f"{', '.join(CHANNELS)})")
+    for c in CHANNELS:
+        if c not in fqdns:
+            raise EdrError("fqdns", f"missing channel {c!r}")
+        if not isinstance(fqdns[c], str) or not _HOSTNAME.fullmatch(fqdns[c]):
+            raise EdrError(f"fqdns.{c}", f"not a hostname: {fqdns[c]!r}")
+    ips = block["ips"]
+    if not isinstance(ips, list) or not ips:
+        raise EdrError("ips", "expected a non-empty list of IPv4 addresses")
+    for i, ip in enumerate(ips):
+        p = f"ips[{i}]"
+        try:
+            a = ipaddress.IPv4Address(ip)
+        except (ipaddress.AddressValueError, ValueError):
+            raise EdrError(p, f"not an IPv4 address: {ip!r}") from None
+        if (a.is_multicast or a.is_loopback or a.is_unspecified
+                or a.is_link_local or a.is_reserved):
+            raise EdrError(p, f"{ip} is not a unicast cloud address")
+        if ip in ips[:i]:
+            raise EdrError(p, f"duplicate address {ip}")
+    doc = all(any(ipaddress.ip_address(ip) in n for n in _RFC5737)
+              for ip in ips)
+    return Region(str(block.get("region", "custom")),
+                  {c: fqdns[c] for c in CHANNELS}, tuple(ips),
+                  "documentation" if doc else "published",
+                  {c: "unverified" for c in CHANNELS})
+
+
+def _custom_profile(block: Dict[str, Any]) -> Profile:
+    from . import tls
+    region = _custom_region(block)
+    vendor = _text(block, "vendor")
+    label = _text(block, "label") if "label" in block else f"{vendor} (custom)"
+    key = _text(block, "tls_client") if "tls_client" in block \
+        else "edr-generic"
+    tpl = tls.TEMPLATES.get(key)
+    if tpl is None:
+        raise EdrError("tls_client", f"{key!r} is not one of "
+                       f"{', '.join(sorted(tls.TEMPLATES))}")
+    if tls.handshake(tpl, tls.SERVERS["openssl"], "probe.edr.example",
+                     ("edr-probe",))[1].cs is None:
+        raise EdrError("tls_client", f"{key!r} cannot negotiate TLS with a "
+                       "current server")
+    return Profile("custom", label, vendor, key, {region.key: region},
+                   region.key)
+
+
+def resolve(raw: Any) -> Setup:
+    """Validate an ``edr`` block (everything that needs no environment)."""
+    if not isinstance(raw, dict):
+        raise EdrError("", "expected an object, got "
+                       f"{type(raw).__name__}")
+    extra = sorted(set(raw) - _BLOCK_KEYS - _CUSTOM_KEYS)
+    if extra:
+        raise EdrError(extra[0], "unknown key (allowed: "
+                       f"{', '.join(sorted(_BLOCK_KEYS | _CUSTOM_KEYS))})")
+    block = copy.deepcopy(raw)
+    enabled = block.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise EdrError("enabled", f"expected true or false, got {enabled!r}")
+    if not enabled:
+        return Setup(False, block)
+    key = _text(block, "profile") if "profile" in block else DEFAULT_PROFILE
+    if key == "custom":
+        profile = _custom_profile(block)
+    else:
+        if key not in PROFILES:
+            raise EdrError("profile", f"{key!r} is not one of "
+                           f"{', '.join(list(PROFILES) + ['custom'])}")
+        stray = sorted(set(block) & _CUSTOM_KEYS)
+        if stray:
+            raise EdrError(stray[0], "only valid with profile 'custom'")
+        profile = PROFILES[key]
+    rkey = _text(block, "region") if "region" in block \
+        else profile.default_region
+    if rkey not in profile.regions:
+        raise EdrError("region", f"{rkey!r} is not a region of {key} (use "
+                       f"{', '.join(profile.regions)})")
+    proxy = _text(block, "proxy") if "proxy" in block else None
+    port = block.get("proxy_port", DEFAULT_PROXY_PORT)
+    if isinstance(port, bool) or not isinstance(port, int) \
+            or not 1 <= port <= 65535:
+        raise EdrError("proxy_port",
+                       f"expected an integer 1..65535, got {port!r}")
+    if "proxy_port" in block and proxy is None:
+        raise EdrError("proxy_port", "needs 'proxy'")
+    return Setup(True, block, profile, profile.regions[rkey], proxy, port)
+
+
+def check(env, setup: Setup) -> None:
+    """Validate ``setup`` against an environment's hosts and segments."""
+    if not setup.enabled:
+        return
+    if setup.proxy is not None and \
+            not any(h.name == setup.proxy for h in env.hosts):
+        raise EdrError("proxy", f"no host named {setup.proxy!r} in "
+                       f"environment {env.key}")
+    taken = {h.ip: h.name for h in list(env.hosts) + list(env.external)}
+    path = "ips" if setup.profile.key == "custom" else "region"
+    for ip in setup.region.ips:
+        if ip in taken:
+            raise EdrError(path, f"cloud address {ip} is already used by "
+                           f"{taken[ip]}")
+        seg = next((s for s in env.segments if s.contains(ip)), None)
+        if seg is not None:
+            raise EdrError(path, f"cloud address {ip} is inside segment "
+                           f"{seg.name}")
+
+
+def apply(env, raw: Any):
+    """A view of ``env`` running the EDR setup ``raw``; ``env`` is unchanged.
+    With EDR off, declared ``edr`` flows are dropped as well."""
+    setup = resolve(raw)
+    check(env, setup)
+    new = copy.copy(env)
+    new.edr = setup
+    new._edr_cache = None
+    if not setup.enabled:
+        new.conversations = [c for c in env.conversations if c[2] != "edr"]
+    return new
+
+
+_APPLIED: Dict[Tuple[int, str], Tuple[Any, Any]] = {}
+
+
+def applied(env, raw: Any):
+    """:func:`apply`, one object per (environment, block): the engine, the
+    manifest and the scheduler then all see the same view."""
+    key = (id(env), json.dumps(raw, sort_keys=True))
+    hit = _APPLIED.get(key)
+    if hit is None:
+        hit = _APPLIED.setdefault(key, (env, apply(env, raw)))
+    return hit[1]

@@ -121,6 +121,12 @@ peers), ``flat`` (one VLAN for every segment), ``dual_homed`` (list of
 "public"/"private"), ``day_profile`` ("flat" | "shift": the timed
 scheduler's diurnal activity, see :mod:`tgt.timing`) and ``utc_offset``
 (site local time, hours east of UTC). See :class:`tgt.enterprise.Environment`.
+
+**edr** — the EDR traffic of the site (see :mod:`tgt.edr`, ``docs/edr.md``):
+``{"enabled"?: bool, "profile"?: crowdstrike|generic|custom, "region"?,
+"proxy"?: HOST, "proxy_port"?}``; profile ``custom`` also takes ``vendor``,
+``fqdns`` (``sensor``, ``upload``, ``download``, ``api``), ``ips`` and
+optional ``label`` and ``tls_client``.
 """
 from __future__ import annotations
 
@@ -133,14 +139,14 @@ import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import devices, enterprise, protocols
+from . import devices, edr, enterprise, protocols
 from .enterprise import Conversation, Environment, Host, Segment
 
 ZONES = ("IT", "DMZ", "OT-SUPERVISORY", "OT-CELL")
 CATEGORIES = ("IT", "OT", "mixed")
 _TOP_KEYS = {"key", "name", "category", "description", "options", "segments",
              "hosts", "flows", "findings",
-             "external", "field_devices"}
+             "external", "field_devices", "edr"}
 _FIELD_KEYS = {"name", "behind", "via", "port", "address", "protocol",
                "model", "vendor", "product", "role", "firmware", "serial",
                "count", "start"}
@@ -383,6 +389,11 @@ def from_dict(doc: Any, source: str = "<env>") -> Environment:
                           field_devices=fdevs)
     except ValueError as e:
         raise EnvFileError(f"{source}: {e}") from None
+    if "edr" in doc:
+        try:
+            env = edr.apply(env, doc["edr"])
+        except edr.EdrError as e:
+            raise cx.err(f"edr.{e.path}" if e.path else "edr", e.msg) from None
     env.source = source             # type: ignore[attr-defined]
     return env
 
@@ -935,6 +946,8 @@ def to_dict(env: Environment) -> Dict[str, Any]:
         doc["findings"] = copy.deepcopy(env.findings)
     if env.field_devices:
         doc["field_devices"] = copy.deepcopy(env.field_devices)
+    if env.edr is not None:
+        doc["edr"] = copy.deepcopy(env.edr.block)
     return doc
 
 
