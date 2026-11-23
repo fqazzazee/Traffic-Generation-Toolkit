@@ -8,6 +8,7 @@
     tgt inventory -e ENV     export an environment's ground-truth asset list
     tgt env export ENV       write an environment as an env file (JSON)
     tgt campaign PLAN        phased run: baseline, then changes (timed)
+    tgt edr list             EDR profiles, regions, hostnames and provenance
     tgt ctl ...              control a running "tgt run --api" (status, inject…)
     tgt bench ...            seeded evaluation suite -> bundle -> scorecard
 """
@@ -148,6 +149,38 @@ def cmd_env_export(args) -> int:
     return 0
 
 
+def cmd_edr(args) -> int:
+    from . import edr
+    print("\n".join(edr.describe()))
+    return 0
+
+
+def _edr_block(args, env):
+    """(ok, block) for --edr / --edr-proxy on ``env``; block None = unset."""
+    from . import edr
+    spec, proxy = getattr(args, "edr_spec", None), \
+        getattr(args, "edr_proxy", None)
+    if spec is None and proxy is None:
+        return True, None
+    try:
+        block = edr.cli_block(env.edr.block if env.edr is not None else None,
+                              spec, proxy)
+        edr.apply(env, block)
+    except edr.EdrError as e:
+        print(f"--edr: {e}", file=sys.stderr)
+        return False, None
+    return True, block
+
+
+def _add_edr_options(p) -> None:
+    p.add_argument("--edr", dest="edr_spec", metavar="PROFILE[:REGION]",
+                   help="EDR traffic profile and region, or 'off' (see 'tgt "
+                   "edr list'; needs an environment)")
+    p.add_argument("--edr-proxy", metavar="HOST",
+                   help="environment host the sensors reach the EDR cloud "
+                   "through (HTTP CONNECT)")
+
+
 def _load_env_file(path: str):
     """Load + register ``--env-file``; returns its key or None (reported)."""
     from . import envfile
@@ -224,6 +257,16 @@ def cmd_run(args) -> int:
     if env and env not in enterprise.ENVIRONMENTS:
         print(f"unknown environment: {env}. Try 'tgt list'.", file=sys.stderr)
         return 2
+    edr_block = None
+    if getattr(args, "edr_spec", None) is not None or \
+            getattr(args, "edr_proxy", None) is not None:
+        if not env or replay:
+            print("--edr/--edr-proxy shape a generated environment: use them "
+                  "with --env or --env-file, not --replay.", file=sys.stderr)
+            return 2
+        ok, edr_block = _edr_block(args, enterprise.get(env))
+        if not ok:
+            return 2
     span = getattr(args, "span", "access")
     remap_env = getattr(args, "remap_env", None)
     if remap_env and remap_env not in enterprise.ENVIRONMENTS:
@@ -297,7 +340,7 @@ def cmd_run(args) -> int:
         vlan=args.vlan,
     )
     cfg = RunConfig(
-        profiles=profs, env=env, span=span, incident=incident,
+        profiles=profs, env=env, edr=edr_block, span=span, incident=incident,
         sprinkle=sprinkle,
         sprinkle_ratio=max(0.0, getattr(args, "sprinkle_ratio", 0.0)),
         sprinkle_random=getattr(args, "sprinkle_random", False),
@@ -604,6 +647,12 @@ def cmd_campaign(args) -> int:
     try:
         plan = campaign.load(path)
         base = plan.base_env()
+        ok, edr_block = _edr_block(args, base)
+        if not ok:
+            return 2
+        if edr_block is not None:
+            plan.edr_block = edr_block
+            base = plan.base_env()
         if plan.env_file:
             envfile.register(base)
         phases = campaign.build(plan)
@@ -636,7 +685,8 @@ def cmd_campaign(args) -> int:
         seed = new_seed()
     rate = args.rate if args.rate is not None else 0.0
     cfg = RunConfig(
-        env=base.key, span=plan.span, iface=args.iface, pcap_path=args.pcap,
+        env=base.key, edr=edr_block, span=plan.span, iface=args.iface,
+        pcap_path=args.pcap,
         rate=rate, count=args.count, duration=0.0,
         sprinkle_messages=plan.sprinkle_messages, seed=seed,
         manifest_path=args.manifest, clock=args.clock,
@@ -781,6 +831,10 @@ def build_parser() -> argparse.ArgumentParser:
         "bench", help="play a fixed, seeded evaluation suite and score a "
                       "monitor on it (list, run, score, compare)"))
 
+    pd = sub.add_parser("edr", help="EDR traffic profiles")
+    pds = pd.add_subparsers(dest="edr_cmd", required=True)
+    pds.add_parser("list", help="profiles, regions, hostnames and provenance")
+
     pi = sub.add_parser("iface", help="manage virtual interfaces")
     isub = pi.add_subparsers(dest="iface_cmd", required=True)
     isub.add_parser("list", help="list interfaces")
@@ -809,6 +863,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="--env capture point: access = each frame once on its "
                         "sender's VLAN; core = also the routed copy on the "
                         "receiver's VLAN (gateway MAC, TTL-1)")
+    _add_edr_options(r)
     r.add_argument("--incident",
                    help="famous incident scenario, e.g. wannacry | stuxnet | "
                         "industroyer | triton (see 'tgt list')")
@@ -914,6 +969,7 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--force", action="store_true",
                     help="run even if a phase is shorter than 3x the "
                          "slowest period its change involves")
+    _add_edr_options(pc)
     pc.add_argument("--iface", "-i", help="interface to send on (needs root)")
     pc.add_argument("--pcap", help="also/only write frames to this pcap")
     pc.add_argument("--manifest", metavar="FILE",
@@ -1054,7 +1110,7 @@ def main(argv=None) -> int:
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,
         "inventory": cmd_inventory,
         "score": cmd_score, "campaign": cmd_campaign, "ctl": cmd_ctl,
-        "bench": cmd_bench,
+        "bench": cmd_bench, "edr": cmd_edr,
     }[args.command](args)
 
 

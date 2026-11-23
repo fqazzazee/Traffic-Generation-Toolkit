@@ -10321,6 +10321,700 @@ def test_r22_residual_ctl_token_and_bad_replies() -> None:
                 check("classic pcap" in str(e), f"pcap range error: {e}")
 
 
+def test_r22_edr_catalogue() -> None:
+    import ipaddress
+    from tgt import edr, enterprise, incidents, tls
+    check(sorted(edr.PROFILES) == ["crowdstrike", "generic"],
+          f"built-in EDR profiles: {sorted(edr.PROFILES)}")
+    cs = edr.PROFILES["crowdstrike"]
+    check(list(cs.regions) == ["us-1", "us-2", "eu-1", "us-gov-1"],
+          f"crowdstrike regions: {list(cs.regions)}")
+    check(cs.vendor == "CrowdStrike" and cs.tls_client == "falcon",
+          "crowdstrike vendor / TLS template")
+    want = {
+        "us-1": ("ts01-b.cloudsink.net", "lfoup01-b.cloudsink.net",
+                 "lfodown01-b.cloudsink.net", "api.crowdstrike.com"),
+        "us-2": ("ts01-gyr-maverick.cloudsink.net",
+                 "lfoup01-gyr-maverick.cloudsink.net",
+                 "lfodown01-gyr-maverick.cloudsink.net",
+                 "api.us-2.crowdstrike.com"),
+        "us-gov-1": ("ts01-laggar-gcw.cloudsink.net",
+                     "lfoup01-laggar-gcw.cloudsink.net",
+                     "lfodown01-laggar-gcw.cloudsink.net",
+                     "api.laggar.gcw.crowdstrike.com")}
+    for key, names in want.items():
+        got = tuple(cs.regions[key].fqdns[c] for c in edr.CHANNELS)
+        check(got == names, f"{key} hostnames: {got}")
+    eu = cs.regions["eu-1"]
+    fq = enterprise.CROWDSTRIKE_FQDNS
+    check((eu.fqdns["sensor"], eu.fqdns["upload"], eu.fqdns["download"],
+           eu.fqdns["api"]) == (fq["ts"], fq["up"], fq["down"], fq["api"]),
+          "eu-1 hostnames differ from CROWDSTRIKE_FQDNS")
+    check(list(eu.ips) == list(enterprise.CROWDSTRIKE_CLOUD_IPS),
+          "eu-1 IPs differ from CROWDSTRIKE_CLOUD_IPS (or their order)")
+    check(eu.ip_provenance == "published", "eu-1 IP provenance")
+    for key, reg in cs.regions.items():
+        check(reg.host_provenance["api"] == "vendor-docs",
+              f"{key}: API host provenance")
+        sensor = "unverified" if key == "us-gov-1" else "mirrored-docs"
+        for c in ("sensor", "upload", "download"):
+            check(reg.host_provenance[c] == sensor,
+                  f"{key}: {c} host provenance {reg.host_provenance[c]}")
+    doc = [ipaddress.ip_network(n) for n in
+           ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+    gen = edr.PROFILES["generic"]
+    check("crowdstrike" not in gen.tls_client and "falcon" not in gen.tls_client
+          and gen.tls_client in tls.TEMPLATES, "generic TLS template")
+    pools = [(k, r) for k, r in cs.regions.items() if k != "eu-1"] + \
+        list(gen.regions.items())
+    seen: set = set()
+    c2 = {h.ip for i in incidents.INCIDENTS.values() for h in i.hosts}
+    for key, reg in pools:
+        check(reg.ip_provenance == "documentation", f"{key}: IP provenance")
+        check(len(reg.ips) >= 3, f"{key}: pool too small")
+        for ip in reg.ips:
+            a = ipaddress.ip_address(ip)
+            check(any(a in n for n in doc), f"{key}: {ip} not RFC 5737")
+            check(ip not in seen, f"{key}: {ip} reused across regions")
+            check(ip not in c2, f"{key}: {ip} is an incident's address")
+            seen.add(ip)
+    for reg in gen.regions.values():
+        check(all(n.endswith(".edr.example") for n in reg.fqdns.values()),
+              "generic hostnames are not RFC 2606 names under edr.example")
+
+
+def _edr_env(block, key: str = "ot-plant"):
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get(key))
+    if block is not None:
+        doc["edr"] = block
+    return envfile.from_dict(doc, "edr-test.json")
+
+
+_EDR_CUSTOM = {"profile": "custom", "vendor": "Acme", "region": "lab-a",
+               "fqdns": {"sensor": "s.acme.example", "upload": "u.acme.example",
+                         "download": "d.acme.example",
+                         "api": "m.acme.example"},
+               "ips": ["198.51.100.200", "198.51.100.201"]}
+
+
+def test_r22_edr_env_block() -> None:
+    from tgt import edr, enterprise, envfile
+    base = enterprise.get("ot-plant")
+    check("edr" not in envfile.to_dict(base), "export invents an edr block")
+    check(base.edr is None, "built-in env has an explicit EDR setup")
+    for block in ({"enabled": True, "profile": "crowdstrike",
+                   "region": "us-2"},
+                  {"profile": "generic"}, {"enabled": False}, _EDR_CUSTOM,
+                  {"profile": "crowdstrike", "proxy": base.hosts[0].name,
+                   "proxy_port": 3128}):
+        env = _edr_env(block)
+        doc = envfile.to_dict(env)
+        check(doc.get("edr") == block, f"export lost the block: {block}")
+        again = envfile.loads(envfile.dumps(doc), source="again.json")
+        check(envfile.to_dict(again) == doc, f"round trip differs: {block}")
+    check(base.edr is None, "applying a block changed the registered env")
+    cust = _edr_env(_EDR_CUSTOM).edr
+    check(cust.profile.vendor == "Acme" and cust.region.key == "lab-a"
+          and cust.region.ip_provenance == "documentation", "custom setup")
+    check(_edr_env({"profile": "crowdstrike"}).edr.region.key == "eu-1",
+          "crowdstrike default region")
+    bad = [
+        ({"profile": "nope"}, "edr.profile"),
+        ({"profile": "crowdstrike", "region": "mars"}, "edr.region"),
+        ({"profile": "crowdstrike", "proxy": "NO-SUCH"}, "edr.proxy"),
+        ({"profile": "crowdstrike", "proxy": base.hosts[0].name,
+          "proxy_port": 0}, "edr.proxy_port"),
+        ({"profile": "crowdstrike", "typo": 1}, "edr.typo"),
+        ({"enabled": "yes"}, "edr.enabled"),
+        ({"profile": "generic", "vendor": "X"}, "edr.vendor"),
+        ({"profile": "custom", "vendor": "X"}, "edr"),
+        (dict(_EDR_CUSTOM, ips=[]), "edr.ips"),
+        (dict(_EDR_CUSTOM, ips=["1.2.3"]), "edr.ips[0]"),
+        (dict(_EDR_CUSTOM, ips=["224.0.0.5"]), "edr.ips[0]"),
+        (dict(_EDR_CUSTOM, ips=[base.hosts[0].ip]), "edr.ips"),
+        (dict(_EDR_CUSTOM, ips=["198.51.100.20"]), "edr.ips"),   # incident C2
+        (dict(_EDR_CUSTOM, fqdns={"sensor": "s.acme.example"}), "edr.fqdns"),
+        (dict(_EDR_CUSTOM, fqdns=dict(_EDR_CUSTOM["fqdns"], api="no spaces")),
+         "edr.fqdns.api"),
+        (dict(_EDR_CUSTOM, tls_client="nope"), "edr.tls_client"),
+        (dict(_EDR_CUSTOM, tls_client="schannel-2000"), "edr.tls_client"),
+        ("crowdstrike", "edr"),
+    ]
+    for block, where in bad:
+        try:
+            _edr_env(block)
+            check(False, f"accepted bad edr block {block}")
+        except envfile.EnvFileError as e:
+            check(f"edr-test.json: {where}" in str(e),
+                  f"bad block {block}: error {e}")
+    check(issubclass(edr.EdrError, ValueError), "EdrError type")
+
+
+def test_r22_edr_off_removes_declared_flows() -> None:
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    h = enterprise.get("ot-plant").edr_hosts()[0].name
+    doc["external"] = [{"name": "CLOUD", "ip": "203.0.113.90",
+                        "role": "broker", "os": "linux",
+                        "fqdn": "cloud.edr.example"}]
+    doc["flows"] = list(doc["flows"]) + [
+        {"client": h, "server": "CLOUD", "proto": "edr"}]
+    doc["edr"] = {"enabled": False}
+    env = envfile.from_dict(doc, "off.json")
+    check(not env.edr_hosts() and not env.edr_plan(), "off: sensors remain")
+    check(not any(k == "edr" for k, _ in env.build(1)), "off: edr on wire")
+    check("edr" not in env.protocols(), "off: edr advertised")
+    check(any(f["proto"] == "edr" for f in envfile.to_dict(env)["flows"]),
+          "off: export dropped the declared flow")
+
+
+def _edr_parse(frame: bytes):
+    """(src ip, dst ip, proto, sport, dport, L4 payload) or None."""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    if frame[off - 2:off] != b"\x08\x00":
+        return None
+    ihl = (frame[off] & 15) * 4
+    total = struct.unpack_from("!H", frame, off + 2)[0]
+    src = ".".join(map(str, frame[off + 12:off + 16]))
+    dst = ".".join(map(str, frame[off + 16:off + 20]))
+    proto, l4 = frame[off + 9], off + ihl
+    if proto == 6:
+        doff = (frame[l4 + 12] >> 4) * 4
+        data = frame[l4 + doff:off + total]
+    elif proto == 17:
+        data = frame[l4 + 8:off + total]
+    else:
+        return None
+    sp, dp = struct.unpack_from("!HH", frame, l4)
+    return src, dst, proto, sp, dp, data
+
+
+def _edr_dns_answers(frames) -> list:
+    """(resolver client ip, resolver ip, name, answer) of DNS responses."""
+    out = []
+    for f in frames:
+        p = _edr_parse(f)
+        if p is None or p[2] != 17 or p[3] != 53 or len(p[5]) < 16:
+            continue
+        d, i, labels = p[5], 12, []
+        while d[i]:
+            labels.append(d[i + 1:i + 1 + d[i]].decode())
+            i += 1 + d[i]
+        out.append((p[1], p[0], ".".join(labels),
+                    ".".join(map(str, d[-4:]))))
+    return out
+
+
+def _edr_wire(env, messages: int = 3):
+    protocols.begin_build(7, 0)
+    return [(k, f) for k, f in env.build(messages)]
+
+
+def test_r22_edr_channels_on_wire() -> None:
+    for block in ({"profile": "crowdstrike", "region": "us-2"},
+                  {"profile": "generic"}, _EDR_CUSTOM):
+        env = _edr_env(block, "enterprise-mixed")
+        reg, fleet = env.edr.region, env.edr_hosts()
+        wire = [f for k, f in _edr_wire(env) if k == "edr"]
+        parsed = [p for p in map(_edr_parse, wire) if p]
+        check(all(p[1] in reg.ips or p[0] in reg.ips for p in parsed),
+              f"{block}: edr frame outside the region's pool")
+        blob = b"".join(p[5] for p in parsed)
+        for c, name in reg.fqdns.items():
+            check(name.encode() in blob, f"{block}: {c} SNI {name} missing")
+        # certificates are presented for the requested name
+        for name in reg.fqdns.values():
+            check(blob.count(name.encode()) >= 2,
+                  f"{block}: no certificate naming {name}")
+        plan = env.edr_plan()
+        sensors = [x for x in plan if x[2] == reg.fqdns["sensor"]]
+        check(sorted(x[0].name for x in sensors) ==
+              sorted(h.name for h in fleet), f"{block}: one sensor per host")
+        check(len({x[1] for x in sensors}) == min(len(fleet), len(reg.ips)),
+              f"{block}: sensors not spread over the pool")
+        api = [x for x in plan if x[2] == reg.fqdns["api"]]
+        check(len(api) == 1, f"{block}: api from {len(api)} hosts")
+        bytes_of = {}
+        for x in plan:
+            cs = sum(len(p[5]) for p in parsed
+                     if p[0] == x[0].ip and p[1] == x[1])
+            sc = sum(len(p[5]) for p in parsed
+                     if p[1] == x[0].ip and p[0] == x[1])
+            bytes_of[x[2]] = bytes_of.get(x[2], (0, 0))
+            bytes_of[x[2]] = (bytes_of[x[2]][0] + cs, bytes_of[x[2]][1] + sc)
+        up, down = bytes_of[reg.fqdns["upload"]], bytes_of[reg.fqdns["download"]]
+        check(up[0] > up[1], f"{block}: upload not client-heavy {up}")
+        check(down[1] > down[0], f"{block}: download not server-heavy {down}")
+
+
+def test_r22_edr_dns_matches_connection() -> None:
+    env = _edr_env({"profile": "crowdstrike", "region": "us-1"},
+                   "enterprise-mixed")
+    frames = [f for _, f in _edr_wire(env)]
+    answers = _edr_dns_answers(frames)
+    resolved = {(c, n): a for c, _, n, a in answers}
+    for p in env.edr_paths():
+        if not p.dns:
+            continue
+        check(resolved.get((p.host.ip, p.fqdn)) == p.ip,
+              f"{p.host.name}: {p.fqdn} answer {resolved.get((p.host.ip, p.fqdn))}"
+              f" != {p.ip}")
+        ans = next((i for i, f in enumerate(frames)
+                    if _edr_dns_answers([f]) and
+                    _edr_dns_answers([f])[0][0] == p.host.ip and
+                    _edr_dns_answers([f])[0][2] == p.fqdn), None)
+        syn = next((i for i, f in enumerate(frames)
+                    if (_edr_parse(f) or ())[:2] == (p.host.ip, p.ip)), None)
+        check(ans is not None and syn is not None and ans < syn,
+              f"{p.host.name}: {p.channel} DNS answer not before connect")
+    check(any(p.dns for p in env.edr_paths()), "no host resolved anything")
+    # no DNS server in the environment: no invented resolver
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    doc["flows"] = [f for f in doc["flows"] if f["proto"] != "dns"]
+    for h in doc["hosts"]:
+        if h.get("role") == "dns":
+            h["role"] = "file"
+    doc["edr"] = {"profile": "generic"}
+    bare = envfile.from_dict(doc, "bare.json")
+    check(not any(p.dns for p in bare.edr_paths()),
+          "resolver invented for an environment without DNS")
+
+
+def _edr_proxy_env(key: str = "enterprise-mixed", block=None):
+    from tgt import enterprise
+    base = enterprise.get(key)
+    proxy = next((h for h in base.hosts if h.role == "proxy"),
+                 base.edr_hosts()[0])
+    env = _edr_env(dict(block or {"profile": "crowdstrike", "region": "us-2"},
+                        proxy=proxy.name), key)
+    return env, proxy
+
+
+def test_r22_edr_proxy_path() -> None:
+    env, proxy = _edr_proxy_env()
+    reg = env.edr.region
+    wire = _edr_wire(env)
+    parsed = [p for p in (_edr_parse(f) for k, f in wire if k == "edr") if p]
+    for h in env.edr_hosts():
+        if h.name == proxy.name:
+            continue
+        check(not any(h.ip in p[:2] and (p[0] in reg.ips or p[1] in reg.ips)
+                      for p in parsed), f"{h.name}: direct egress when proxied")
+    to_proxy = [p for p in parsed if p[1] == proxy.ip and p[4] == 8080]
+    connects = {p[5].split(b" ")[1].decode() for p in to_proxy
+                if p[5].startswith(b"CONNECT ")}
+    check(connects == {f"{n}:443" for n in reg.fqdns.values()},
+          f"CONNECT targets: {connects}")
+    check(any(p[0] == proxy.ip and p[3] == 8080 and
+              p[5].startswith(b"HTTP/1.1 200") for p in parsed),
+          "proxy never answered 200")
+    upstream = [p for p in parsed if p[0] == proxy.ip and p[1] in reg.ips]
+    check({p[4] for p in upstream} == {443}, "upstream leg not on 443")
+    # the ClientHello inside the tunnel is the one the proxy relays upstream
+    inner = {p[5] for p in to_proxy if p[5][:1] == b"\x16"
+             and reg.fqdns["sensor"].encode() in p[5]}
+    relayed = {p[5] for p in upstream if p[5][:1] == b"\x16"}
+    check(inner and inner <= relayed, "tunnelled ClientHello not relayed")
+    # order on the wire: CONNECT, upstream handshake, 200
+    pk = [p for p in (_edr_parse(f) for _, f in wire) if p]
+    i = next(n for n, p in enumerate(pk) if p[5].startswith(b"CONNECT "))
+    host = pk[i][0]
+    target = pk[i][5].split(b" ")[1].decode().split(":")[0]
+    ok = next(n for n, p in enumerate(pk) if n > i and p[1] == host
+              and p[5].startswith(b"HTTP/1.1 200"))
+    ip = next(x[1] for x in env.edr_plan()
+              if x[0].ip == host and x[2] == target)
+    check(any(p[0] == proxy.ip and p[1] == ip for p in pk[i:ok]),
+          "proxy did not open the upstream leg before its 200")
+    # DNS: the sensor resolves the proxy, the proxy resolves the cloud name
+    answers = _edr_dns_answers([f for _, f in wire])
+    for x in env.edr_paths():
+        if x.proxy is None:
+            continue
+        for c, _, n, a in answers:
+            if c == x.host.ip and n in reg.fqdns.values() and \
+                    x.host.name != proxy.name:
+                check(False, f"{x.host.name} resolved {n} despite the proxy")
+                break
+        if x.dns:
+            check(any(c == x.host.ip and a == proxy.ip
+                      for c, _, _, a in answers),
+                  f"{x.host.name}: proxy name not resolved to the proxy")
+    check(any(c == proxy.ip and n == reg.fqdns["sensor"] and a in reg.ips
+              for c, _, n, a in answers), "proxy did not resolve the cloud")
+
+
+def test_r22_edr_timed_schedule() -> None:
+    from tgt import schedule
+    for env, proxy in ((_edr_env({"profile": "generic"}, "ot-plant"), None),
+                       _edr_proxy_env("ot-plant", {"profile": "generic"})):
+        reg = env.edr.region
+        sched = schedule.Scheduler(7)
+        sched.load(schedule.env_streams(env), 0.0, env.hosts, initial=True)
+        items = list(sched.run(4000.0))
+        edr = [_edr_parse(it[3][0]) for it in items if it[2] == "edr"]
+        edr = [p for p in edr if p]
+        blob = b"".join(p[5] for p in edr)
+        for name in reg.fqdns.values():
+            check(name.encode() in blob, f"timed: {name} missing")
+        dns = _edr_dns_answers([it[3][0] for it in items if it[2] == "dns"])
+        planned = {(c.ip, n, a) for x in env.edr_paths()
+                   for c, _, n, a in x.dns}      # a DNS server asks nobody
+        check(bool(planned) and planned <= {(c, n, a) for c, _, n, a in dns},
+              f"timed: planned lookups missing: {sorted(planned)[:3]}")
+        # the heartbeat rides one long-lived connection
+        h = next(x for x in env.edr_paths() if x.channel == "sensor"
+                 and (proxy is None or x.host.name != proxy.name))
+        dst = proxy.ip if proxy else h.ip
+        syns = [it for it in items if it[2] == "edr" and
+                (_edr_parse(it[3][0]) or ())[:2] == (h.host.ip, dst) and
+                it[3][0][(18 if it[3][0][12:14] == b"\x81\x00" else 14)
+                         + 20 + 13] == 0x02]
+        check(len(syns) == 1, f"timed: {len(syns)} sensor connections")
+        if proxy:
+            # a tunnel closes on both legs in the same occurrence
+            s = next(x for x in schedule.env_streams(env)
+                     if isinstance(x, schedule.EdrStream)
+                     and len(x.legs) == 2 and x.legs[0].persistent)
+            s.bind(7)
+            s.occur(0.0)
+            s.legs[0].lifetime = 1.0
+            s.occur(100.0)                 # next poll passes the lifetime
+            s.legs[0].polls = []
+            s.legs[1].polls = []
+            closing = s.occur(200.0)
+            fins = [f for _, c, _, k in closing if k == "edr" for f in c
+                    if f[(18 if f[12:14] == b"\x81\x00" else 14) + 20 + 13]
+                    & 0x01]
+            check(s.legs[0].conn is None and s.legs[1].conn is None,
+                  "timed: a tunnel leg outlived the other")
+            check({(_edr_parse(f)[0]) for f in fins} >=
+                  {s.legs[0].ep.client_ip, s.legs[1].ep.client_ip},
+                  "timed: tunnel teardown not on both legs")
+            check(not any(p[0] == h.host.ip and p[1] in reg.ips for p in edr),
+                  "timed: direct egress when proxied")
+            check(any(p[5].startswith(b"CONNECT ") for p in edr),
+                  "timed: no CONNECT")
+            check(any(p[0] == proxy.ip and p[1] in reg.ips for p in edr),
+                  "timed: no upstream leg")
+
+
+def test_r22_edr_inventory_truth() -> None:
+    import ipaddress
+    from tgt import inventory
+    env = _edr_env(_EDR_CUSTOM, "enterprise-mixed")
+    inv = inventory.to_json(env)
+    cloud = [e for e in inv["external"] if e["kind"] == "edr-cloud"]
+    check({e["ip"] for e in cloud} <= set(_EDR_CUSTOM["ips"]) and cloud,
+          "custom cloud endpoints")
+    check(all(e["vendor"] == "Acme" and e["profile"] == "custom"
+              and e["region"] == "lab-a"
+              and e["ip_provenance"] == "documentation" for e in cloud),
+          f"cloud endpoint fields: {cloud[0]}")
+    check(not any(ipaddress.ip_address(e["ip"]).is_global for e in cloud),
+          "test expects RFC 5737 addresses")
+    ch = {c for e in cloud for c in e["channels"]}
+    check(ch == {"sensor", "upload", "download", "api"}, f"channels: {ch}")
+    check(inv["edr"]["vendor"] == "Acme" and inv["edr"]["region"] == "lab-a",
+          "inventory edr summary")
+    # the proxy, not the sensors, talks to the cloud
+    env, proxy = _edr_proxy_env()
+    inv = inventory.to_json(env)
+    cloud = [e for e in inv["external"] if e["kind"] == "edr-cloud"]
+    check(cloud and all(e["talkers"] == [proxy.name] for e in cloud),
+          f"proxied talkers: {cloud[0]['talkers'] if cloud else None}")
+    check(inv["edr"]["proxy"] == proxy.name, "summary names the proxy")
+    legs = [f for f in inv["flows"] if f["protocol"] == "edr"
+            and f["server"] == proxy.name]
+    check({f["client"] for f in legs} ==
+          {h.name for h in env.edr_hosts() if h.name != proxy.name},
+          "sensor -> proxy flows")
+    check(all(f["dport"] == 8080 and f["transport"] == "tcp" for f in legs),
+          "proxy leg port")
+    row = {h["name"]: h for h in inv["hosts"]}
+    check(any(s.startswith("edr 8080") for s in row[proxy.name]["serves"]),
+          f"proxy serves: {row[proxy.name]['serves']}")
+    resolvers = {r.name for p in env.edr_paths() for _, r, _, _ in p.dns}
+    check(all(any(s.startswith("dns") for s in row[r]["serves"])
+              for r in resolvers), "resolver does not serve dns")
+    # EDR off: nothing of it anywhere in the ground truth
+    off = inventory.to_json(_edr_env({"enabled": False}, "enterprise-mixed"))
+    check(not any(e["kind"] == "edr-cloud" for e in off["external"]),
+          "off: cloud endpoints remain")
+    check("edr" not in off, "off: summary remains")
+    check(not any(h["edr"] for h in off["hosts"]), "off: covered hosts")
+    check(not any("edr" in h["uses"] for h in off["hosts"]), "off: uses edr")
+    check(not any(f["protocol"] == "edr" for f in off["flows"]), "off: flows")
+    # the default keeps its exact shape
+    from tgt import enterprise
+    dflt = inventory.to_json(enterprise.get("ot-plant"))
+    check("edr" not in dflt and all(set(e) == {
+        "ip", "fqdns", "talkers", "kind", "vendor"}
+        for e in dflt["external"]), "default inventory changed")
+
+
+def _edr_run(doc: dict, d: str, *extra):
+    """Write ``doc`` as an env file, run one cycle: (rc, pcap, manifest)."""
+    import json
+    from tgt import cli, enterprise
+    path, pcap, man = (os.path.join(d, n) for n in
+                       ("site.json", "x.pcap", "m.json"))
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    try:
+        saved = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        try:
+            rc = cli.main(["run", "--env-file", path, "--once", "--rate", "0",
+                           "--clock", "synthetic", "--start-time",
+                           "2026-01-01T00:00:00Z", "--seed", "7", "--pcap",
+                           pcap, "--manifest", man] + list(extra))
+        finally:
+            sys.stdout.close()
+            sys.stdout = saved
+    finally:
+        enterprise.ENVIRONMENTS.pop(doc["key"], None)
+    return rc, pcap, man
+
+
+def test_r22_edr_manifest_and_score() -> None:
+    import json
+    from tgt import enterprise, envfile, score
+    base = enterprise.get("enterprise-mixed")
+    proxy = next(h for h in base.hosts if h.role == "proxy")
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-truth"
+    doc["edr"] = {"profile": "crowdstrike", "region": "us-1",
+                  "proxy": proxy.name}
+    reg = doc["edr"]["region"]
+    ips = set(__import__("tgt.edr", fromlist=["x"]).PROFILES["crowdstrike"]
+              .regions[reg].ips)
+    with tempfile.TemporaryDirectory() as d:
+        rc, _, man = _edr_run(doc, d)
+        check(rc == 0, f"manifest run rc={rc}")
+        m = json.load(open(man))
+        truth = score.load_truth(man)
+    seen = [f for f in m["flows_seen"] if f["protocol"] == "edr"]
+    pa = f"edr-truth:{proxy.name}"
+    check(any(f["server"] == pa for f in seen), "no sensor -> proxy flow")
+    check({f["server"] for f in seen if f["client"] == pa
+           and f["server"] in ips} <= ips and
+          any(f["client"] == pa and f["server"] in ips for f in seen),
+          "no proxy -> cloud flow")
+    check(not any(f["client"] != pa and f["server"] in ips for f in seen),
+          "a sensor reaches the cloud directly in flows_seen")
+    check(not any(k in ips for k in (a["ip"] for a in truth.assets)),
+          "a documentation cloud IP became an asset")
+    check(all(ip in truth.external for ip in ips & set(m["first_seen"])),
+          "cloud IP not external in the truth")
+    check(not any(a["ip"] in ips for a in truth.population()),
+          "cloud IP counted in the population")
+    ports = {(f["client"], f["server"]): f["dport"] for f in truth.flows
+             if f["protocol"] == "edr"}
+    check(any(v == 8080 for (c, s), v in ports.items() if s == proxy.name),
+          "score: sensor -> proxy port")
+    check(all(v == 443 for (c, s), v in ports.items() if s in ips),
+          f"score: cloud leg port {set(ports.values())}")
+    check(any(s in ips and c == proxy.name for c, s in ports),
+          "score: no proxy -> cloud flow")
+    # EDR off: no trace on the wire or in the manifest's truth
+    doc["edr"] = {"enabled": False}
+    with tempfile.TemporaryDirectory() as d:
+        rc, pcap, man = _edr_run(doc, d)
+        m = json.load(open(man))
+        raw = open(pcap, "rb").read()
+    check(rc == 0, f"off run rc={rc}")
+    check(not any(f["protocol"] == "edr" for f in m["flows_seen"]),
+          "off: edr in flows_seen")
+    check(not any(e["kind"] == "edr-cloud" for e in
+                  m["inventory"]["external"]), "off: cloud in the inventory")
+    check(b"cloudsink" not in raw and b"crowdstrike" not in raw,
+          "off: EDR hostnames on the wire")
+
+
+def _edr_cli(*argv) -> tuple:
+    import contextlib
+    import io
+    from tgt import cli
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = cli.main(list(argv))
+        except SystemExit as e:
+            rc = e.code
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_r22_edr_cli() -> None:
+    from tgt import edr, enterprise
+    rc, out, _ = _edr_cli("edr", "list")
+    check(rc == 0, f"edr list rc={rc}")
+    for prof in edr.PROFILES.values():
+        check(prof.key in out, f"edr list: {prof.key} missing")
+        for reg in prof.regions.values():
+            check(reg.key in out and reg.ip_provenance in out,
+                  f"edr list: {reg.key} missing")
+            for c, n in reg.fqdns.items():
+                check(n in out and reg.host_provenance[c] in out,
+                      f"edr list: {n} missing")
+    run = ("run", "-e", "ot-plant", "--once", "--rate", "0", "--clock",
+           "synthetic", "--start-time", "2026-01-01T00:00:00Z", "--seed", "7")
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        for bad, needle in (
+                (("--edr", "nope"), "nope"),
+                (("--edr", "crowdstrike:mars"), "mars"),
+                (("--edr", "custom"), "custom"),
+                (("--edr", "crowdstrike:"), "region"),
+                (("--edr", "generic", "--edr-proxy", "NO-SUCH"), "NO-SUCH"),
+                (("--edr", "off", "--edr-proxy", "HISTORIAN"), "off")):
+            rc, _, err = _edr_cli(*run, "--pcap", pcap, *bad)
+            check(rc == 2 and needle in err and "Traceback" not in err,
+                  f"{bad}: rc={rc} err={err!r}")
+        rc, _, err = _edr_cli("run", "-p", "modbus", "--once", "--rate", "0",
+                              "--pcap", pcap, "--edr", "generic")
+        check(rc == 2 and "--edr" in err, f"--edr without env: rc={rc}")
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr",
+                            "crowdstrike:us-gov-1")
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"ts01-laggar-gcw.cloudsink.net" in raw
+              and b"lanner-lion" not in raw, f"--edr region run rc={rc}")
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"cloudsink" not in raw, "--edr off on the wire")
+        proxy = enterprise.get("ot-plant").edr_hosts()[0].name
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr", "generic",
+                            "--edr-proxy", proxy)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"CONNECT sensor.edr.example:443" in raw,
+              "--edr-proxy on the wire")
+        # the proxy flag alone keeps the environment's default profile
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr-proxy", proxy)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"CONNECT ts01-lanner-lion" in raw,
+              "--edr-proxy without --edr")
+    check(enterprise.get("ot-plant").edr is None,
+          "--edr changed the registered environment")
+
+
+def test_r22_edr_cli_overrides_env_file() -> None:
+    import json
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    doc["key"] = "edr-cli-site"
+    doc["edr"] = _EDR_CUSTOM
+    with tempfile.TemporaryDirectory() as d:
+        rc, pcap, man = _edr_run(doc, d)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"s.acme.example" in raw, "custom block on the wire")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "custom")
+        check(rc == 0 and b"s.acme.example" in open(pcap, "rb").read(),
+              "--edr custom keeps the block")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "generic")
+        raw = open(pcap, "rb").read()
+        vendors = {e["vendor"] for e in json.load(open(man))["inventory"]
+                   ["external"] if e["kind"] == "edr-cloud"}
+        check(rc == 0 and b"acme" not in raw and b"sensor.edr.example" in raw
+              and vendors == {"Generic EDR"}, f"--edr override: {vendors}")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        m = json.load(open(man))
+        check(rc == 0 and b"acme" not in raw and not any(
+            e["kind"] == "edr-cloud" for e in m["inventory"]["external"]),
+            "--edr off over an env-file block")
+
+
+def test_r22_edr_campaign_option() -> None:
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        plan = os.path.join(d, "plan.json")
+        pcap, man = os.path.join(d, "c.pcap"), os.path.join(d, "c.json")
+        with open(plan, "w") as f:
+            json.dump({"env": "ot-plant", "phases": [
+                {"name": "a", "duration": "2h"},
+                {"name": "b", "duration": "2h"}]}, f)
+        common = (plan, "--force", "--clock", "synthetic", "--seed", "7",
+                  "--start-time", "2026-01-01T00:00:00Z", "--pcap", pcap,
+                  "--manifest", man, "--min-period", "120")
+        rc, _, err = _edr_cli("campaign", *common, "--edr", "nope")
+        check(rc == 2 and "nope" in err, f"campaign bad --edr: rc={rc} {err}")
+        rc, out, err = _edr_cli("campaign", *common, "--edr",
+                                "crowdstrike:us-2")
+        check(rc == 0, f"campaign --edr rc={rc}: {err[-200:]}")
+        raw = open(pcap, "rb").read()
+        check(b"ts01-gyr-maverick.cloudsink.net" in raw
+              and b"lanner-lion" not in raw, "campaign --edr on the wire")
+        m = json.load(open(man))
+        cloud = [e for e in m["inventory"]["external"]
+                 if e["kind"] == "edr-cloud"]
+        check(cloud and all(e["region"] == "us-2" for e in cloud),
+              "campaign truth region")
+        rc, _, err = _edr_cli("campaign", *common, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        m = json.load(open(man))
+        check(rc == 0 and b"cloudsink" not in raw and not any(
+            e["kind"] == "edr-cloud" for e in m["inventory"]["external"]),
+            f"campaign --edr off: rc={rc}")
+
+
+def test_r22_edr_custom_ips_must_be_address_strings() -> None:
+    from tgt import edr
+    base = {"profile": "custom", "vendor": "Example",
+            "fqdns": {c: f"{c}.vendor.example" for c in edr.CHANNELS}}
+    for bad in (5, 3232235777, True, "0.0.0.5"):
+        try:
+            edr.resolve(dict(base, ips=[bad]))
+            check(False, f"custom ips accepted {bad!r}")
+        except edr.EdrError as e:
+            check(e.path == "ips[0]", f"custom ips {bad!r}: path {e.path}")
+
+
+def test_r22_edr_proxy_behind_nat_dns_answer() -> None:
+    from tgt import edr, enterprise, envfile
+    envfile.load_user_envs()
+    base = enterprise.get("water-utility")
+    proxy = next(h for h in base.hosts if base.nat_of(h))
+    env = edr.apply(base, {"profile": "generic", "proxy": proxy.name})
+    parsed = [p for p in (_edr_parse(f) for _, f in _edr_wire(env))
+              if p is not None]
+    dials = {(p[0], p[1]) for p in parsed if p[2] == 6 and p[4] == 8080}
+    name = f"{proxy.name.lower()}.{enterprise.DNS_DOMAIN}"
+    answers = [a for a in _edr_dns_answers(f for _, f in _edr_wire(env))
+               if a[2] == name]
+    check(answers and dials, "NAT proxy: no lookups or connections")
+    for client, _, _, ip in answers:
+        check((client, ip) in dials,
+              f"NAT proxy: {client} resolved {ip}, dials "
+              f"{sorted(d for c, d in dials if c == client)}")
+
+
+def test_r22_edr_setup_replaces_declared_flows() -> None:
+    from tgt import enterprise, envfile, inventory
+    base = enterprise.get("enterprise-mixed")
+    host = next(h for h in base.edr_hosts() if h.name != "PROXY01")
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-declared"
+    doc["external"] = [{"name": "CLOUD", "ip": "203.0.113.90",
+                        "role": "broker", "os": "linux",
+                        "fqdn": "cloud.edr.example"}]
+    doc["flows"] = list(doc["flows"]) + [
+        {"client": host.name, "server": "CLOUD", "proto": "edr"}]
+    for block in ({"profile": "generic", "proxy": "PROXY01"},
+                  {"profile": "crowdstrike", "region": "us-2"},
+                  {"enabled": False}):
+        env = envfile.from_dict(dict(doc, edr=block), "declared.json")
+        ips = [p[:2] for p in (_edr_parse(f) for _, f in _edr_wire(env)) if p]
+        check(not any("203.0.113.90" in x for x in ips),
+              f"{block}: declared edr flow still on the wire")
+        check(not any(e["ip"] == "203.0.113.90"
+                      for e in inventory.external(env)),
+              f"{block}: endpoint of a replaced flow in ground truth")
+        check(any(f["proto"] == "edr" for f in envfile.to_dict(env)["flows"]),
+              f"{block}: export dropped the declared flow")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

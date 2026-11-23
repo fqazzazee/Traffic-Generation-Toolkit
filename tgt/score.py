@@ -647,9 +647,14 @@ class Truth:
 
         # expected flows (for --zeek): flows_seen if the manifest has them
         ports = {}
+        pair_ports = {}             # a proxied EDR leg has its own port
         for fl in inv.get("flows") or []:
-            ports.setdefault(fl.get("protocol"),
-                             (fl.get("dport"), fl.get("transport")))
+            where = (fl.get("dport"), fl.get("transport"))
+            if fl.get("path") == "edr-proxy":
+                pair_ports[(fl.get("client"), fl.get("server"),
+                            fl.get("protocol"))] = where
+                continue
+            ports.setdefault(fl.get("protocol"), where)
         self.flows: List[Dict[str, Any]] = []
 
         def resolve(x: str) -> Optional[Dict]:
@@ -663,9 +668,11 @@ class Truth:
         for fl in (seen or inv.get("flows") or []):
             proto = fl.get("protocol", "")
             dport, transport = fl.get("dport"), fl.get("transport")
-            if transport is None:
-                dport, transport = ports.get(proto) or _proto_port(proto)
             c, s = resolve(fl.get("client", "")), resolve(fl.get("server", ""))
+            if transport is None:
+                dport, transport = (
+                    pair_ports.get((c and c["name"], s and s["name"], proto))
+                    or ports.get(proto) or _proto_port(proto))
             if not c or not s or not c.get("ip") or transport == "l2":
                 continue
             self.flows.append({
