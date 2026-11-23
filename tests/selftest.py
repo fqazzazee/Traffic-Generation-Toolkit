@@ -6183,8 +6183,11 @@ def test_rolling_pps_shows_stalls() -> None:
     from tgt.engine import Stats
     from tgt.sender import RateLimiter
     s = Stats()
-    t0 = time.perf_counter()
-    s.started = t0 - 100.0
+    # Sample times are exact in binary: a live perf_counter base can round the
+    # sample placed exactly WINDOW back to just under it, keeping an older
+    # baseline. Only the lifetime average reads the real clock.
+    t0 = 1000.0
+    s.started = time.perf_counter() - 100.0
     s.packets, s.bytes = 10000, 1000000
     check(abs(s.rolling(now=t0)[0] - 100.0) < 1.0,
           "rolling: first sample should be the lifetime average")
