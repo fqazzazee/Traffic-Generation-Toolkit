@@ -515,8 +515,8 @@ class EdrStream(Stream):
         super().bind(seed, gen)
         for leg in self.legs:
             leg.bind(seed, gen)
-        for leg in self.legs[1:]:       # a tunnel's legs live and die together
-            leg.lifetime = self.legs[0].lifetime
+        for leg in self.legs[1:]:       # closes when the client leg does
+            leg.lifetime = 0.0
 
     def release(self, sched) -> None:
         for leg in self.legs:
@@ -557,7 +557,12 @@ class EdrStream(Stream):
         for ep, place in late:
             out += self._lookup(ep, place, t)
             t += 3 * self.LOOKUP_GAP
-        up = self.legs[1].occur(t, sched)
+        leg = self.legs[1]
+        closing = bool(self.legs[0].persistent) and self.legs[0].conn is None
+        if closing:                     # the tunnel ends on both sides at once
+            leg.lifetime = 1e-9
+        up = leg.occur(t, sched)
+        leg.lifetime = 0.0
         if not up:
             return client
         ready = up[min(2, len(up) - 1)][0] if fresh else up[-1][0]
@@ -673,6 +678,8 @@ def edr_streams(env, span: str, offline) -> List[Stream]:
     session per occurrence. A channel whose proxy is offline retries it."""
     from . import edr as edrmod
     setup, seg = env.edr, env.segment_or_none
+    if not setup.enabled:
+        return []
     life = timing.PERSISTENT["edr"][2]
     hs = edrmod.setup_exchanges(setup)
     out: List[Stream] = []
@@ -689,7 +696,10 @@ def edr_streams(env, span: str, offline) -> List[Stream]:
         period = timing.pick(lo, hi, p.host.name, p.ip, p.fqdn)
         count = edrmod.BULK_MESSAGES if p.bulk else 1
         sid = ("edr", p.host.name, p.channel, p.ip, p.fqdn)
-        fp = _fp(p.host, p.proxy, p.ip, p.fqdn, p.dns, span, setup.block)
+        fp = _fp(p.host, p.proxy, p.ip, p.fqdn, p.dns, span, setup.block,
+                 p.proxy is not None and p.proxy.name in offline,
+                 [c.name in offline or r.name in offline
+                  for c, r, _, _ in p.dns])
 
         def leg(tag, ep, c, s, setup_n, dead=False):
             return Stream(sid + (tag,), "edr", "baseline", edrmod.channel_flow,
