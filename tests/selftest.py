@@ -8751,6 +8751,51 @@ def test_r22_control_client_non_http_is_api_error() -> None:
         ls.close()
 
 
+def test_r22_control_ctl_hint_brackets_ipv6() -> None:
+    """The printed 'tgt ctl --api' works for an IPv6 bind (CLI and TUI)."""
+    import contextlib
+    import io
+    import re
+    import socket
+    import types
+    from tgt import api, cli, tui
+    from tgt.engine import Engine
+    check(api.host_port("::1", 8787) == "[::1]:8787" and
+          api.host_port("127.0.0.1", 8787) == "127.0.0.1:8787",
+          "host_port formatting")
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(("::1", 0))
+    except OSError:
+        _skipped.append("test_r22_control_ctl_hint_brackets_ipv6")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engine(RunConfig(profiles=["modbus"],
+                               pcap_path=os.path.join(d, "x.pcap")))
+        args = types.SimpleNamespace(api="[::1]:0", api_token=None,
+                                     api_allow_remote=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            srv = cli._start_api(args, eng)
+        try:
+            m = re.search(r"tgt ctl --api (\S+) status", out.getvalue())
+            check(m is not None and api.parse_bind(m.group(1)) ==
+                  ("::1", srv.port), f"CLI ctl hint: {out.getvalue()!r}")
+        finally:
+            srv.close()
+        logs = []
+        ui = types.SimpleNamespace(api="[::1]:0", api_server=None,
+                                   close_api=lambda: None,
+                                   add_log=logs.append)
+        check(tui.UI._start_api(ui, eng), f"TUI API start: {logs}")
+        try:
+            m = re.search(r"tgt ctl --api (\S+) status", logs[-1])
+            check(m is not None and api.parse_bind(m.group(1)) ==
+                  ("::1", ui.api_server.port), f"TUI ctl hint: {logs}")
+        finally:
+            ui.api_server.close()
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

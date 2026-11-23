@@ -479,7 +479,8 @@ def _start_api(args, eng):
     server.start()
     print(f"  [api] control API on {server.url} "
           f"({'token required' if token else 'no token'}) — "
-          f"try: tgt ctl --api {host}:{server.port} status", flush=True)
+          f"try: tgt ctl --api {api.host_port(host, server.port)} status",
+          flush=True)
     return server
 
 

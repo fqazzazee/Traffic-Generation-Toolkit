@@ -574,7 +574,7 @@ class UI:
         server.start()
         self.api_server = server
         self.add_log(f"control API on {server.url} — tgt ctl --api "
-                     f"{host}:{server.port} status")
+                     f"{api.host_port(host, server.port)} status")
         return True
 
     def inject(self, key: str, duration: Optional[float] = None,

@@ -83,6 +83,11 @@ def parse_bind(spec: str) -> Tuple[str, int]:
     return host, p
 
 
+def host_port(host: str, port: int) -> str:
+    """``host:port`` as :func:`parse_bind` reads it (IPv6 in brackets)."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 def is_loopback(host: str) -> bool:
     if host.lower() == "localhost":
         return True
