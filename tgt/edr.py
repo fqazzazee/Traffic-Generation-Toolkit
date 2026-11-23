@@ -312,6 +312,62 @@ def applied(env, raw: Any):
     return hit[1]
 
 
+def cli_block(current: Optional[Dict[str, Any]], spec: Optional[str],
+              proxy: Optional[str]) -> Dict[str, Any]:
+    """The ``edr`` block for ``--edr PROFILE[:REGION]|off`` and
+    ``--edr-proxy HOST`` over the environment's own block (``current``).
+    A new profile keeps the block's proxy. Only the block can define a
+    custom profile, so ``--edr custom`` needs one."""
+    base = copy.deepcopy(current or {})
+    if spec == "off":
+        if proxy:
+            raise EdrError("", "--edr off and --edr-proxy contradict")
+        return {"enabled": False}
+    if spec is None:
+        if base.get("enabled") is False:
+            raise EdrError("", "--edr-proxy needs EDR on, but the environment "
+                           "has it off; add --edr PROFILE")
+        block = base
+    else:
+        key, colon, region = spec.partition(":")
+        if colon and not region:
+            raise EdrError("", f"{spec!r}: empty region, use PROFILE[:REGION]")
+        if key == "custom":
+            if base.get("profile") != "custom":
+                raise EdrError("", "profile 'custom' is defined by the "
+                               "environment file's edr block, and this "
+                               "environment has none")
+            block = base
+            block.pop("enabled", None)
+        else:
+            block = {k: base[k] for k in ("proxy", "proxy_port") if k in base}
+            block["profile"] = key
+        if region:
+            block["region"] = region
+    if proxy is not None:
+        block["proxy"] = proxy
+    return block
+
+
+def describe() -> List[str]:
+    """``tgt edr list``: profiles, regions, hostnames and provenance."""
+    lines: List[str] = []
+    for p in PROFILES.values():
+        lines.append(f"{p.key}: {p.label} (vendor {p.vendor}, TLS client "
+                     f"{p.tls_client}, default region {p.default_region})")
+        for r in p.regions.values():
+            what = ("published list" if r.ip_provenance == "published"
+                    else "RFC 5737 placeholders")
+            lines.append(f"  {r.key}: {len(r.ips)} IPs, {r.ip_provenance} "
+                         f"({what})")
+            for c in CHANNELS:
+                lines.append(f"    {c:9}{r.fqdns[c]}  "
+                             f"[{r.host_provenance[c]}]")
+    lines.append("custom: bring your own through the env file's edr block "
+                 "(docs/edr.md)")
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Who connects where
 # ---------------------------------------------------------------------------

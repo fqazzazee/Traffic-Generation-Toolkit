@@ -10673,6 +10673,25 @@ def test_r22_edr_timed_schedule() -> None:
                          + 20 + 13] == 0x02]
         check(len(syns) == 1, f"timed: {len(syns)} sensor connections")
         if proxy:
+            # a tunnel closes on both legs in the same occurrence
+            s = next(x for x in schedule.env_streams(env)
+                     if isinstance(x, schedule.EdrStream)
+                     and len(x.legs) == 2 and x.legs[0].persistent)
+            s.bind(7)
+            s.occur(0.0)
+            s.legs[0].lifetime = 1.0
+            s.occur(100.0)                 # next poll passes the lifetime
+            s.legs[0].polls = []
+            s.legs[1].polls = []
+            closing = s.occur(200.0)
+            fins = [f for _, c, _, k in closing if k == "edr" for f in c
+                    if f[(18 if f[12:14] == b"\x81\x00" else 14) + 20 + 13]
+                    & 0x01]
+            check(s.legs[0].conn is None and s.legs[1].conn is None,
+                  "timed: a tunnel leg outlived the other")
+            check({(_edr_parse(f)[0]) for f in fins} >=
+                  {s.legs[0].ep.client_ip, s.legs[1].ep.client_ip},
+                  "timed: tunnel teardown not on both legs")
             check(not any(p[0] == h.host.ip and p[1] in reg.ips for p in edr),
                   "timed: direct egress when proxied")
             check(any(p[5].startswith(b"CONNECT ") for p in edr),
@@ -10812,6 +10831,131 @@ def test_r22_edr_manifest_and_score() -> None:
                   m["inventory"]["external"]), "off: cloud in the inventory")
     check(b"cloudsink" not in raw and b"crowdstrike" not in raw,
           "off: EDR hostnames on the wire")
+
+
+def _edr_cli(*argv) -> tuple:
+    import contextlib
+    import io
+    from tgt import cli
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = cli.main(list(argv))
+        except SystemExit as e:
+            rc = e.code
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_r22_edr_cli() -> None:
+    from tgt import edr, enterprise
+    rc, out, _ = _edr_cli("edr", "list")
+    check(rc == 0, f"edr list rc={rc}")
+    for prof in edr.PROFILES.values():
+        check(prof.key in out, f"edr list: {prof.key} missing")
+        for reg in prof.regions.values():
+            check(reg.key in out and reg.ip_provenance in out,
+                  f"edr list: {reg.key} missing")
+            for c, n in reg.fqdns.items():
+                check(n in out and reg.host_provenance[c] in out,
+                      f"edr list: {n} missing")
+    run = ("run", "-e", "ot-plant", "--once", "--rate", "0", "--clock",
+           "synthetic", "--start-time", "2026-01-01T00:00:00Z", "--seed", "7")
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        for bad, needle in (
+                (("--edr", "nope"), "nope"),
+                (("--edr", "crowdstrike:mars"), "mars"),
+                (("--edr", "custom"), "custom"),
+                (("--edr", "crowdstrike:"), "region"),
+                (("--edr", "generic", "--edr-proxy", "NO-SUCH"), "NO-SUCH"),
+                (("--edr", "off", "--edr-proxy", "HISTORIAN"), "off")):
+            rc, _, err = _edr_cli(*run, "--pcap", pcap, *bad)
+            check(rc == 2 and needle in err and "Traceback" not in err,
+                  f"{bad}: rc={rc} err={err!r}")
+        rc, _, err = _edr_cli("run", "-p", "modbus", "--once", "--rate", "0",
+                              "--pcap", pcap, "--edr", "generic")
+        check(rc == 2 and "--edr" in err, f"--edr without env: rc={rc}")
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr",
+                            "crowdstrike:us-gov-1")
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"ts01-laggar-gcw.cloudsink.net" in raw
+              and b"lanner-lion" not in raw, f"--edr region run rc={rc}")
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"cloudsink" not in raw, "--edr off on the wire")
+        proxy = enterprise.get("ot-plant").edr_hosts()[0].name
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr", "generic",
+                            "--edr-proxy", proxy)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"CONNECT sensor.edr.example:443" in raw,
+              "--edr-proxy on the wire")
+        # the proxy flag alone keeps the environment's default profile
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr-proxy", proxy)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"CONNECT ts01-lanner-lion" in raw,
+              "--edr-proxy without --edr")
+    check(enterprise.get("ot-plant").edr is None,
+          "--edr changed the registered environment")
+
+
+def test_r22_edr_cli_overrides_env_file() -> None:
+    import json
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    doc["key"] = "edr-cli-site"
+    doc["edr"] = _EDR_CUSTOM
+    with tempfile.TemporaryDirectory() as d:
+        rc, pcap, man = _edr_run(doc, d)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"s.acme.example" in raw, "custom block on the wire")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "custom")
+        check(rc == 0 and b"s.acme.example" in open(pcap, "rb").read(),
+              "--edr custom keeps the block")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "generic")
+        raw = open(pcap, "rb").read()
+        vendors = {e["vendor"] for e in json.load(open(man))["inventory"]
+                   ["external"] if e["kind"] == "edr-cloud"}
+        check(rc == 0 and b"acme" not in raw and b"sensor.edr.example" in raw
+              and vendors == {"Generic EDR"}, f"--edr override: {vendors}")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        m = json.load(open(man))
+        check(rc == 0 and b"acme" not in raw and not any(
+            e["kind"] == "edr-cloud" for e in m["inventory"]["external"]),
+            "--edr off over an env-file block")
+
+
+def test_r22_edr_campaign_option() -> None:
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        plan = os.path.join(d, "plan.json")
+        pcap, man = os.path.join(d, "c.pcap"), os.path.join(d, "c.json")
+        with open(plan, "w") as f:
+            json.dump({"env": "ot-plant", "phases": [
+                {"name": "a", "duration": "2h"},
+                {"name": "b", "duration": "2h"}]}, f)
+        common = (plan, "--force", "--clock", "synthetic", "--seed", "7",
+                  "--start-time", "2026-01-01T00:00:00Z", "--pcap", pcap,
+                  "--manifest", man, "--min-period", "120")
+        rc, _, err = _edr_cli("campaign", *common, "--edr", "nope")
+        check(rc == 2 and "nope" in err, f"campaign bad --edr: rc={rc} {err}")
+        rc, out, err = _edr_cli("campaign", *common, "--edr",
+                                "crowdstrike:us-2")
+        check(rc == 0, f"campaign --edr rc={rc}: {err[-200:]}")
+        raw = open(pcap, "rb").read()
+        check(b"ts01-gyr-maverick.cloudsink.net" in raw
+              and b"lanner-lion" not in raw, "campaign --edr on the wire")
+        m = json.load(open(man))
+        cloud = [e for e in m["inventory"]["external"]
+                 if e["kind"] == "edr-cloud"]
+        check(cloud and all(e["region"] == "us-2" for e in cloud),
+              "campaign truth region")
+        rc, _, err = _edr_cli("campaign", *common, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        m = json.load(open(man))
+        check(rc == 0 and b"cloudsink" not in raw and not any(
+            e["kind"] == "edr-cloud" for e in m["inventory"]["external"]),
+            f"campaign --edr off: rc={rc}")
 
 
 def main() -> int:
