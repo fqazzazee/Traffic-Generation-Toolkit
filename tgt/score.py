@@ -997,10 +997,40 @@ def _event_techniques(ev: Dict[str, Any]) -> List[str]:
     return []
 
 
+def _assign_alerts(fits: List[List[int]]) -> Dict[int, int]:
+    """Event index -> alert index: a maximum one-to-one assignment of the
+    alerts each event could use (``fits``, best first), by augmenting
+    paths."""
+    event_of: Dict[int, int] = {}
+    alert_of: Dict[int, int] = {}
+    for root in range(len(fits)):
+        parent: Dict[int, int] = {}
+        queue, free = [root], None
+        for ev in queue:
+            for j in fits[ev]:
+                if j in parent:
+                    continue
+                parent[j] = ev
+                if j not in event_of:
+                    free = j
+                    break
+                queue.append(event_of[j])
+            if free is not None:
+                break
+        while free is not None:
+            ev = parent[free]
+            free, alert_of[ev] = alert_of.get(ev), free
+            event_of[alert_of[ev]] = ev
+    return alert_of
+
+
 def detections(truth: Truth, alerts: List[Dict], tolerance: float,
                skew: float, strict_technique: bool = False) -> Dict[str, Any]:
     """Match alerts to manifest events: same generic category, inside
-    [start - skew, end + tolerance], sharing a host when both name hosts.
+    [start - skew, end + tolerance], sharing a host when the event names
+    hosts. An alert naming no host cannot detect such an event; it is counted
+    in ``hostless_alerts``, neither matched nor false. Each alert credits at
+    most one event (others it fits still keep it from being false).
     With ``strict_technique``, an alert that carries technique IDs (see
     :func:`read_alerts`) must also share one with a technique-tagged event
     (a parent ID matches its sub-techniques); alerts without IDs match on
@@ -1027,32 +1057,46 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
     for al in alerts:
         al["ips"] = ips(al["src"], al["dst"])
     used = set()
+    hostless = set()
     per_cat: Dict[str, Dict[str, Any]] = {}
     per_tech: Dict[str, Dict[str, Any]] = {}
     results = []
-    for ev in sorted(truth.events, key=lambda e: str(e.get("t_start", ""))):
-        cat = ev.get("category", "")
+    events = sorted(truth.events, key=lambda e: str(e.get("t_start", "")))
+    fits: List[List[int]] = []
+    for ev in events:
         etech = _event_techniques(ev)
         t0, t1 = parse_time(ev.get("t_start")), parse_time(ev.get("t_end"))
         t1 = t1 or t0
         hosts = ips(ev.get("hosts") or [], ev.get("src"), ev.get("dst"))
-        best = None
+        named = bool(ev.get("hosts") or ev.get("src") or ev.get("dst"))
+        fit: List[int] = []
         if t0 is not None:
             lo = t0 - _dt.timedelta(seconds=skew)
             hi = t1 + _dt.timedelta(seconds=tolerance)
-            for al in alerts:
-                if al["category"] != cat or al["time"] is None or \
-                        not lo <= al["time"] <= hi:
-                    continue
-                if hosts and al["ips"] and not hosts & al["ips"]:
+            for j, al in enumerate(alerts):
+                if al["category"] != ev.get("category", "") or \
+                        al["time"] is None or not lo <= al["time"] <= hi:
                     continue
                 if strict_technique and etech and \
                         al.get("techniques") and \
                         not tech.shares(al["techniques"], etech):
                     continue
-                if best is None or al["time"] < best["time"]:
-                    best = al
+                if named and not al["ips"]:
+                    hostless.add(al["row"])
+                    continue
+                if hosts and al["ips"] and not hosts & al["ips"]:
+                    continue
+                fit.append(j)
                 used.add(al["row"])
+        fit.sort(key=lambda j: alerts[j]["time"])
+        fits.append(fit)
+    assigned = _assign_alerts(fits)
+    for i, ev in enumerate(events):
+        cat = ev.get("category", "")
+        etech = _event_techniques(ev)
+        t0 = parse_time(ev.get("t_start"))
+        hosts = ips(ev.get("hosts") or [], ev.get("src"), ev.get("dst"))
+        best = alerts[assigned[i]] if i in assigned else None
         ttd = (best["time"] - t0).total_seconds() if best else None
         results.append({"id": ev.get("id"), "category": cat,
                         "t_start": ev.get("t_start"), "t_end": ev.get("t_end"),
@@ -1079,7 +1123,9 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
     for al in alerts:
         if al["category"] is None:
             unmapped[al["title"] or al["raw_category"] or "(untitled)"] += 1
-    false = [al for al in alerts if al["category"] and al["row"] not in used]
+    hostless -= used
+    false = [al for al in alerts if al["category"] and
+             al["row"] not in used and al["row"] not in hostless]
     det = [r for r in results if r["detected"]]
     return {
         "events": len(results), "detected": len(det),
@@ -1089,6 +1135,7 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
         "alerts": len(alerts),
         "mapped_alerts": sum(1 for a in alerts if a["category"]),
         "matched_alerts": len(used),
+        "hostless_alerts": len(hostless),
         "per_category": dict(sorted(per_cat.items())),
         "by_technique": dict(sorted(per_tech.items())),
         "strict_technique": bool(strict_technique),
@@ -1323,7 +1370,9 @@ def summary(res: Dict[str, Any]) -> str:
                      f"({_pct(det['rate'])}), median ttd "
                      f"{_secs(det['median_ttd_s'])}; "
                      f"{len(det['false_alerts'])} false, "
-                     f"{det['unmapped_alerts']} unmapped alerts")
+                     f"{det['unmapped_alerts']} unmapped alerts"
+                     + (f", {det['hostless_alerts']} host-less (not credited)"
+                        if det.get("hostless_alerts") else ""))
         bt = det.get("by_technique") or {}
         if bt:
             lines.append("techniques  ATT&CK coverage" + (

@@ -8807,6 +8807,73 @@ def test_r22_evaluation_new_assets_only_emitted() -> None:
         check(n is None, f"no emitted new assets, yet {n}")
 
 
+def test_r22_evaluation_alert_credit_is_one_to_one() -> None:
+    """One alert credits one event, and an alert naming no host cannot
+    detect an event that names hosts (it is reported separately)."""
+    from tgt import score
+    hosts = [{"asset_id": f"s:H{i}", "name": f"H{i}", "ip": f"10.0.0.{i}"}
+             for i in range(1, 7)]
+
+    def truth(evs):
+        rows = [{"id": f"e{i}", "category": "scan", "attack": "port-scan",
+                 "t_start": f"2026-11-05T14:00:0{i}Z",
+                 "t_end": f"2026-11-05T14:00:0{i}Z", "src": src, "dst": dst,
+                 "hosts": [], "source": "sprinkle:x"}
+                for i, (src, dst) in enumerate(evs)]
+        return score.Truth({"schema": "tgt-manifest/1",
+                            "start": "2026-11-05T14:00:00Z",
+                            "end": "2026-11-05T14:10:00Z",
+                            "inventory": {"hosts": hosts}, "first_seen": {},
+                            "events": rows}, "r22")
+
+    def alert(row, sec, src, dst=""):
+        return {"row": row, "time": score.parse_time(
+            f"2026-11-05T14:00:{sec:02d}Z"), "title": "scan",
+                "raw_category": "scan", "category": "scan", "src": src,
+                "dst": dst, "techniques": None}
+    five = truth([(f"10.0.0.{i}", None) for i in range(1, 6)])
+    det = score.detections(five, [alert(1, 6, "")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 1 and
+          not det["false_alerts"] and det["matched_alerts"] == 0,
+          f"blank alert: {det['detected']} detected, "
+          f"{det.get('hostless_alerts')} host-less")
+    det = score.detections(five, [alert(1, 6, "10.0.0.3")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["hostless_alerts"] == 0,
+          f"one alert detected {det['detected']} events")
+    shared = truth([("10.0.0.1", "10.0.0.2"), ("10.0.0.1", "10.0.0.3")])
+    det = score.detections(shared, [alert(1, 6, "10.0.0.1")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["matched_alerts"] == 1,
+          f"one alert on a shared host detected {det['detected']}")
+    # the first event must give up the only alert the second one can use
+    det = score.detections(shared, [alert(1, 6, "10.0.0.1"),
+                                    alert(2, 7, "10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 2 and
+          {r["alert_row"] for r in det["events_detail"]} == {1, 2},
+          f"assignment is not maximal: {det['detected']}")
+    # extra alerts on a detected event are matched, not false
+    det = score.detections(shared, [alert(1, 6, "10.0.0.2"),
+                                    alert(2, 7, "10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["matched_alerts"] == 2 and
+          not det["false_alerts"], f"duplicate alerts: {det['detected']}")
+    bare = score.Truth({"schema": "tgt-manifest/1",
+                        "start": "2026-11-05T14:00:00Z",
+                        "end": "2026-11-05T14:10:00Z",
+                        "inventory": {"hosts": hosts}, "first_seen": {},
+                        "events": [{"id": "e0", "category": "scan",
+                                    "t_start": "2026-11-05T14:00:00Z",
+                                    "t_end": "2026-11-05T14:00:00Z",
+                                    "hosts": [], "source": "x"}]}, "r22")
+    det = score.detections(bare, [alert(1, 6, "")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["hostless_alerts"] == 0,
+          "an event naming no host still matches on category and time")
+    res = score.score(five, [], {"rows": 0, "columns": {}, "source": "x",
+                                 "map": "m", "protocol_ignore": [],
+                                 "normalize": lambda f, v: v},
+                      alerts=[alert(1, 6, "")])
+    check("1 host-less" in score.summary(res),
+          "summary does not report host-less alerts")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
