@@ -8954,6 +8954,38 @@ def test_r22_ops_restart_keeps_daemon_when_preflight_fails() -> None:
             proc.wait()
 
 
+def test_r22_ops_preflight_checks_installed_unit_python() -> None:
+    """start and restart check the interpreter the installed unit runs: a
+    unit pointing into a private virtualenv fails before systemctl."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        rc, out, _ = _r22_ops_run(box, "register")
+        check(rc == 0, f"register rc={rc}: {out}")
+        venv = os.path.join(d, "private venv")
+        os.mkdir(venv)
+        py = os.path.join(venv, "python3")
+        with open(py, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(py, 0o755)
+        with open(box["unit"]) as fh:
+            lines = fh.read().splitlines(True)
+        for i, line in enumerate(lines):
+            if line.startswith("ExecStart="):
+                head, _, tail = line.partition(" exec ")
+                lines[i] = head + " exec " + py + " -m " + tail.split(" -m ", 1)[1]
+        with open(box["unit"], "w") as fh:
+            fh.writelines(lines)
+        for action in ("start", "restart"):
+            rc, out, calls = _r22_ops_run(box, action, STUB_DENY=venv)
+            check(rc != 0 and venv in out,
+                  f"{action}: private interpreter passed: rc={rc} {out}")
+            check(f"systemctl {action}" not in calls,
+                  f"{action}: systemctl ran: {calls}")
+        rc, out, calls = _r22_ops_run(box, "start")
+        check(rc == 0 and "systemctl start" in calls,
+              f"start with access: rc={rc} {out}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

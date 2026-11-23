@@ -146,6 +146,11 @@ unit_repo_root() {
     printf '%s\n' "${unit_root:-$REPO_ROOT}"
 }
 
+# The interpreter an installed unit runs, which may not be this script's.
+unit_python() {
+    sed -n '/^ExecStart=/s/.* exec \(.*\) -m tgt .*/\1/p' "$UNIT_FILE" | head -n 1
+}
+
 # --- dependency install -----------------------------------------------------
 detect_pm() {
     for pm in apt-get dnf yum apk pacman zypper; do
@@ -362,7 +367,7 @@ cmd_start() {
         cmd_register
     fi
     if use_systemd; then
-        service_preflight "$(unit_repo_root)"
+        service_preflight "$(unit_repo_root)" "$(unit_python)"
         systemctl start tgt.service && ok "service started"
     else
         daemon_start
@@ -381,7 +386,7 @@ cmd_stop() {
 cmd_restart() {
     need_root
     if use_systemd; then
-        service_preflight "$(unit_repo_root)"
+        service_preflight "$(unit_repo_root)" "$(unit_python)"
         systemctl restart tgt.service && ok "service restarted"
     else
         # Register first: a failed preflight must not cost the running daemon.
