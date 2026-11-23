@@ -44,6 +44,7 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import json
+import math
 import socket
 import threading
 import time
@@ -296,6 +297,9 @@ class ControlServer:
                         pps = float(p["pps"])
                     except (KeyError, ValueError):
                         return self._err(400, "need pps=N (packets/s)")
+                    if not math.isfinite(pps) or pps < 0:
+                        return self._err(400, "pps must be a finite number "
+                                         ">= 0")
                     try:
                         ctl.set_rate(pps)
                     except ValueError as e:

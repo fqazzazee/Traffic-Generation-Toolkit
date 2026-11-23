@@ -8673,6 +8673,48 @@ def test_r22_control_client_ignores_proxy() -> None:
             s.server_close()
 
 
+def test_r22_control_rate_must_be_finite() -> None:
+    """POST /rate refuses nan/inf with a 4xx, keeps the current rate, and
+    /status stays strict JSON."""
+    import json
+    import time
+    import urllib.request
+    from tgt import api
+    from tgt.engine import Engine
+
+    def strict(text):
+        def bad(c):
+            raise ValueError(c)
+        return json.loads(text, parse_constant=bad)
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(profiles=["modbus"], rate=200, duration=15,
+                        pcap_path=os.path.join(d, "r.pcap"), seed=1)
+        eng = Engine(cfg)
+        srv = api.ControlServer(eng, "127.0.0.1", 0).start()
+        a = f"127.0.0.1:{srv.port}"
+        eng.start()
+        try:
+            for _ in range(100):
+                if getattr(eng, "limiter", None) is not None:
+                    break
+                time.sleep(0.02)
+            for bad in ("nan", "NaN", "inf", "-inf", "1e999", "-1"):
+                code, _ = api.request(a, "POST", "/rate", {"pps": bad})
+                check(400 <= code < 500, f"/rate pps={bad} -> {code}")
+                check(cfg.rate == 200, f"/rate pps={bad} set {cfg.rate}")
+            with urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})).open(
+                        f"http://{a}/status", timeout=5) as r:
+                doc = strict(r.read().decode())
+            check(doc["rate"] == 200, f"/status rate {doc['rate']}")
+            code, _ = api.request(a, "POST", "/rate", {"pps": 0})
+            check(code == 200, f"/rate pps=0 -> {code}")
+        finally:
+            eng.stop()
+            eng.join(5)
+            srv.close()
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
