@@ -191,6 +191,16 @@ class RateLimiter:
             self._next = now + self.interval if self._armed else now
             self._cond.notify_all()
 
+    def carry_from(self, prev: "RateLimiter") -> None:
+        """Count this limiter's first slot from the last slot of ``prev``, so
+        a cap slower than one campaign phase still gets to send."""
+        with prev._cond:
+            if prev.interval <= 0:
+                return
+            last = prev._next - prev.interval if prev._armed else prev._next
+        if math.isfinite(last):
+            self._next = last
+
     def wait(self, stop: Optional[threading.Event] = None,
              deadline: Optional[float] = None) -> bool:
         """Block until the next send slot (True); with ``stop``, long waits

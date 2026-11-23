@@ -8953,6 +8953,24 @@ def test_r22_engine_plan_utc_offset_zero() -> None:
             del env.options["utc_offset"]
 
 
+def test_r22_engine_slow_cap_spans_short_phases() -> None:
+    """A cap slower than one phase still sends: pacing carries across phase
+    boundaries, including when the phases have different rates."""
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        plan = os.path.join(d, "short.json")
+        with open(plan, "w") as f:
+            json.dump({"env": "ot-plant", "phases": [
+                {"name": f"p{i}", "duration": 0.5,
+                 "rate": 1.0 if i % 2 else 0.9} for i in range(6)]}, f)
+        pcap = os.path.join(d, "short.pcap")
+        rc, out = _r22_cli(["campaign", plan, "--pcap", pcap, "--force"],
+                           timeout=20)
+        n = len(_pcap_records(pcap))
+        check(rc == 0 and 2 <= n <= 4,
+              f"1 pps cap over 6 x 0.5 s phases: rc={rc}, {n} packets")
+
+
 def test_r22_engine_check_rate_huge_int() -> None:
     """An integer too large for a float is a ValueError like any bad rate."""
     from tgt.sender import RateLimiter, check_rate

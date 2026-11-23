@@ -564,6 +564,8 @@ class Engine:
             cap = live if live is not None else min(
                 [c for c in (ph.rate, cfg.rate) if c], default=0)
             limiter = RateLimiter(cap if pace else 0)
+            if self.limiter is not None:     # pacing spans the phase boundary
+                limiter.carry_from(self.limiter)
             self.limiter = limiter if pace else None     # /rate adjusts it
             live = self.control.live_rate    # changed while this phase set up
             if pace and live is not None and live != limiter.pps:
