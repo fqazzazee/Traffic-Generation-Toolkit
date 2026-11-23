@@ -8621,6 +8621,58 @@ def test_r22_control_manifest_redacts_api_token() -> None:
                   f"redaction removed other arguments: {argv}")
 
 
+def test_r22_control_client_ignores_proxy() -> None:
+    """tgt ctl talks to the API directly: http_proxy never sees the call
+    or its bearer token."""
+    import json
+    import threading
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from tgt import api
+    hits = {"proxy": 0, "api": 0}
+
+    def handler(name):
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits[name] += 1
+                body = json.dumps({"ok": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        return H
+    target = HTTPServer(("127.0.0.1", 0), handler("api"))
+    proxy = HTTPServer(("127.0.0.1", 0), handler("proxy"))
+    for s in (target, proxy):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    names = ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY", "all_proxy",
+             "ALL_PROXY")
+    saved = {k: os.environ.get(k) for k in names}
+    opener = urllib.request._opener     # urlopen caches env proxies here
+    try:
+        for k in names:
+            os.environ.pop(k, None)
+        os.environ["http_proxy"] = f"http://127.0.0.1:{proxy.server_port}"
+        urllib.request._opener = None
+        code, _ = api.request(f"127.0.0.1:{target.server_port}", "GET",
+                              "/status", token="SECRET123")
+        check(code == 200 and hits == {"proxy": 0, "api": 1},
+              f"tgt ctl went through http_proxy: {code} {hits}")
+    finally:
+        urllib.request._opener = opener
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for s in (target, proxy):
+            s.shutdown()
+            s.server_close()
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
