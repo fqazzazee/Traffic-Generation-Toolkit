@@ -8910,6 +8910,40 @@ def test_r22_control_rejects_bad_ip_and_vlan() -> None:
               f"{flag} {val}: exit {code} {err.getvalue()[-80:]!r}")
 
 
+def test_r22_control_client_deep_json_is_api_error() -> None:
+    """JSON nested past the parser's limit is a bad reply like any other,
+    on a success status and on an error status."""
+    import socket
+    import threading
+    from tgt import api
+    body = b"[" * 200000
+    for status, want_error in ((b"200 OK", True), (b"500 Oops", False)):
+        reply = (b"HTTP/1.1 " + status + b"\r\nContent-Length: " +
+                 str(len(body)).encode() + b"\r\n\r\n" + body)
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+
+        def serve():
+            c, _ = ls.accept()
+            c.recv(4096)
+            c.sendall(reply)
+            c.close()
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            code, doc = api.request(f"127.0.0.1:{ls.getsockname()[1]}", "GET",
+                                    "/status", timeout=5)
+            check(not want_error and code == 500 and doc.get("ok") is False,
+                  f"deep JSON accepted: {code}")
+        except api.ApiError:
+            check(want_error, "error status with deep JSON raised ApiError")
+        except RecursionError:
+            check(False, "deep JSON raised RecursionError")
+        t.join(5)
+        ls.close()
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

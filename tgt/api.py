@@ -389,12 +389,13 @@ def request(api: str, method: str, path: str,
     except urllib.error.HTTPError as e:
         try:
             doc = json.loads(e.read().decode() or "{}")
-        except (ValueError, http.client.HTTPException, OSError):
+        except (ValueError, RecursionError, http.client.HTTPException,
+                OSError):
             doc = None
         if not isinstance(doc, dict):
             doc = {"ok": False, "error": str(e)}
         return e.code, doc
-    except (http.client.HTTPException, ValueError) as e:
+    except (http.client.HTTPException, ValueError, RecursionError) as e:
         raise ApiError(f"{base} did not answer as the control API: {e}")
     except (urllib.error.URLError, OSError) as e:
         raise ApiError(f"cannot reach the control API at {base}: "
