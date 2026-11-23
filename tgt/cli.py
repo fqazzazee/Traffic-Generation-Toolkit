@@ -285,6 +285,8 @@ def cmd_run(args) -> int:
             print(f"unknown protocol: {e}. Try 'tgt list'.", file=sys.stderr)
             return 2
 
+    if _bad_rate(args.rate):
+        return 2
     schedule = getattr(args, "schedule", "cycle") or "cycle"
     rate = args.rate
     if rate is None:            # timed: the schedule paces, no cap by default
@@ -356,6 +358,17 @@ def cmd_run(args) -> int:
                     return 2
                 print(f"  mapping -> {args.remap_report}")
     return _run_engine(cfg, args)
+
+
+def _bad_rate(rate) -> bool:
+    """Report a --rate that is not a finite number >= 0."""
+    from .sender import check_rate
+    try:
+        check_rate(rate)
+    except ValueError as e:
+        print(f"--rate: {e}", file=sys.stderr)
+        return True
+    return False
 
 
 def _run_engine(cfg: RunConfig, args) -> int:
@@ -573,6 +586,8 @@ def cmd_campaign(args) -> int:
             except campaign.CampaignError as e:
                 print(f"  {os.path.basename(p):32} (invalid: {e})")
         return 0 if args.list else 2
+    if _bad_rate(args.rate):
+        return 2
     path = campaign.find(args.plan)
     try:
         plan = campaign.load(path)

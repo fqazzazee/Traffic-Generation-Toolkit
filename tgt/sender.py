@@ -7,6 +7,7 @@ fall back to pcap-only output, which needs nothing at all.
 from __future__ import annotations
 
 import errno
+import math
 import socket
 import threading
 import time
@@ -153,6 +154,18 @@ class RawSender:
         self.close()
 
 
+def check_rate(pps: Optional[float]) -> None:
+    """ValueError unless ``pps`` is a finite number >= 0 (None = unpaced)."""
+    if pps is None:
+        return
+    try:
+        ok = math.isfinite(pps) and pps >= 0
+    except TypeError:
+        ok = False
+    if not ok:
+        raise ValueError(f"rate must be a finite number >= 0, got {pps!r}")
+
+
 class RateLimiter:
     """Simple pacing to approximate a target packets-per-second."""
 
@@ -160,6 +173,7 @@ class RateLimiter:
     MAX_BACKLOG = 0.1
 
     def __init__(self, pps: float):
+        check_rate(pps)
         self.pps = pps
         self.interval = 1.0 / pps if pps and pps > 0 else 0.0
         self._next = time.perf_counter()
@@ -169,6 +183,7 @@ class RateLimiter:
     def set_rate(self, pps: float) -> None:
         """Change the pace of a running limiter (no burst to catch up); a
         blocked :meth:`wait` wakes and waits one interval of the new rate."""
+        check_rate(pps)
         with self._cond:
             self.pps = pps
             self.interval = 1.0 / pps if pps and pps > 0 else 0.0

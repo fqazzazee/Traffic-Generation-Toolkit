@@ -135,8 +135,8 @@ class RunControl:
     def set_rate(self, pps: float) -> None:
         """Re-pace a rate-limited run; ValueError when the run's pacing is
         not rate based (realtime replay, synthetic-clock pcap-only)."""
-        if pps < 0:
-            raise ValueError("rate must be >= 0")
+        from .sender import check_rate
+        check_rate(pps)
         eng = self.engine
         lim = getattr(eng, "limiter", None) if eng is not None else None
         if lim is None:

@@ -8680,6 +8680,45 @@ def test_r22_engine_limiter_wakes_on_rate_change() -> None:
     check(0.07 <= took <= 0.3, f"slower rate waited {took:.3f}s")
 
 
+def test_r22_engine_rate_validated() -> None:
+    """The CLI and the limiter accept only a finite rate >= 0."""
+    from tgt.config import RunConfig as RC
+    from tgt.engine import Engine
+    from tgt.sender import RateLimiter
+    nan = float("nan")
+    for bad in (-5, nan, float("inf"), -float("inf")):
+        try:
+            RateLimiter(bad)
+            check(False, f"RateLimiter({bad}) accepted")
+        except ValueError:
+            pass
+        lim = RateLimiter(10)
+        try:
+            lim.set_rate(bad)
+            check(False, f"set_rate({bad}) accepted")
+        except ValueError:
+            check(lim.pps == 10 and lim.interval == 0.1,
+                  f"set_rate({bad}) changed the limiter")
+    check(RateLimiter(0).interval == 0, "rate 0 must mean unpaced")
+    eng = Engine(RC(profiles=["modbus"], rate=10))
+    eng.limiter = RateLimiter(10)
+    try:
+        eng.control.set_rate(nan)
+        check(False, "control accepted a NaN rate")
+    except ValueError:
+        check(eng.cfg.rate == 10, "a rejected rate changed cfg.rate")
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        plan = _r22_plan(d)
+        for val in ("-5", "nan", "inf"):
+            for cmd in (["run", "-p", "modbus", "--count", "1"],
+                        ["campaign", plan, "--force"]):
+                rc, out = _r22_cli(cmd + ["--rate=" + val, "--pcap", pcap])
+                check(rc == 2 and "--rate" in out,
+                      f"{cmd[0]} --rate {val}: rc={rc}")
+                check(not os.path.exists(pcap), f"--rate {val} wrote a pcap")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
