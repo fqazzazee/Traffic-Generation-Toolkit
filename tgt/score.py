@@ -1222,7 +1222,7 @@ def score(truth: Truth, rows: List[Dict], export_info: Dict[str, Any],
         o["accuracy_with_partial"] = _ratio(o["correct"] + o["partial"],
                                             o["n"])
 
-    new = [a for a in truth.assets if a["new"]]
+    new = [a for a in truth.assets if a["new"] and a["emitted"]]
     res: Dict[str, Any] = {
         "schema": SCHEMA,
         "truth": {"mode": truth.mode, "source": truth.source,

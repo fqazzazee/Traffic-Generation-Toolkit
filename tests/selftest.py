@@ -8780,6 +8780,33 @@ def test_r22_evaluation_stage_inherits_plan_settings() -> None:
               f"stage value must win: {doc['day_profile']}")
 
 
+def test_r22_evaluation_new_assets_only_emitted() -> None:
+    """A perfect monitor is not charged for sprinkle-planned hosts that
+    never reached the wire."""
+    from tgt import score as S
+    with tempfile.TemporaryDirectory() as d:
+        m, csvp = os.path.join(d, "m.json"), os.path.join(d, "assets.csv")
+        p = _cli(["run", "-e", "ot-plant", "--sprinkle", "wannacry", "--count",
+                  "3", "--rate", "0", "--pcap", os.path.join(d, "x.pcap"),
+                  "--manifest", m])
+        out, _ = p.communicate(timeout=60)
+        check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+        truth = S.load_truth(m)
+        planned = [a for a in truth.assets if a["new"]]
+        emitted = [a["id"] for a in planned if a["emitted"]]
+        check(len(emitted) < len(planned),
+              "fixture: expected planned hosts that were not emitted")
+        S.write_perfect_export(truth, csvp)
+        rows, info = S.read_export(csvp, S.load_json_spec("generic"))
+        info.update(source="assets.csv", map="generic.json")
+        n = S.score(truth, rows, info)["new_assets"]
+    if emitted:
+        check(n["total"] == len(emitted) and not n["missed"] and
+              sorted(n["detected"]) == sorted(emitted), f"new assets {n}")
+    else:
+        check(n is None, f"no emitted new assets, yet {n}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
