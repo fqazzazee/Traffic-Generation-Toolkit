@@ -8989,6 +8989,43 @@ def test_r22_evaluation_ftp_backup_class() -> None:
           "the office-class refinement must still apply")
 
 
+def test_r22_evaluation_alert_host_must_match_named_event() -> None:
+    """An event naming a host no alert address resolves to is not detected
+    by an alert on another host, and an alert naming an unknown host is a
+    false alert rather than a host-less one."""
+    from tgt import score
+    hosts = [{"asset_id": f"s:H{i}", "name": f"H{i}", "ip": f"10.0.0.{i}"}
+             for i in range(1, 4)]
+
+    def truth(host):
+        return score.Truth({
+            "schema": "tgt-manifest/1", "start": "2026-11-05T14:00:00Z",
+            "end": "2026-11-05T14:10:00Z", "inventory": {"hosts": hosts},
+            "first_seen": {}, "events": [{
+                "id": "e", "category": "scan",
+                "t_start": "2026-11-05T14:00:00Z",
+                "t_end": "2026-11-05T14:00:00Z", "hosts": [host],
+                "source": "x"}]}, "r22")
+
+    def alert(src):
+        return {"row": 1, "time": score.parse_time("2026-11-05T14:00:03Z"),
+                "title": "scan", "raw_category": "scan", "category": "scan",
+                "src": src, "dst": "", "techniques": None}
+    det = score.detections(truth("s:GHOST"), [alert("10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 0 and len(det["false_alerts"]) == 1,
+          f"unresolved event host: {det['detected']} detected")
+    det = score.detections(truth("s:H1"), [alert("GHOST-NAME")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 0 and
+          len(det["false_alerts"]) == 1,
+          f"unknown alert host: {det['hostless_alerts']} host-less, "
+          f"{len(det['false_alerts'])} false")
+    det = score.detections(truth("s:H1"), [alert("")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 1 and
+          not det["false_alerts"], "a blank alert stays host-less")
+    det = score.detections(truth("s:H1"), [alert("H1")], 300.0, 5.0)
+    check(det["detected"] == 1, "an alert naming the host by name matches")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

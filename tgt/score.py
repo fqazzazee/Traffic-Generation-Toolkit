@@ -1081,10 +1081,9 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
                         al.get("techniques") and \
                         not tech.shares(al["techniques"], etech):
                     continue
-                if named and not al["ips"]:
-                    hostless.add(al["row"])
-                    continue
-                if hosts and al["ips"] and not hosts & al["ips"]:
+                if named and not hosts & al["ips"]:
+                    if not (al["src"] or al["dst"]):
+                        hostless.add(al["row"])
                     continue
                 fit.append(j)
                 used.add(al["row"])
