@@ -1474,5 +1474,12 @@ def get(key: str) -> Environment:
     return ENVIRONMENTS[key]
 
 
+def for_run(cfg) -> Environment:
+    """The environment of a run, with its ``--edr`` override if any."""
+    env = ENVIRONMENTS[cfg.env]
+    block = getattr(cfg, "edr", None)
+    return env if block is None else _edr.applied(env, block)
+
+
 def all_environments() -> List[Environment]:
     return list(ENVIRONMENTS.values())

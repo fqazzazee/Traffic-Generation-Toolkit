@@ -10681,6 +10681,139 @@ def test_r22_edr_timed_schedule() -> None:
                   "timed: no upstream leg")
 
 
+def test_r22_edr_inventory_truth() -> None:
+    import ipaddress
+    from tgt import inventory
+    env = _edr_env(_EDR_CUSTOM, "enterprise-mixed")
+    inv = inventory.to_json(env)
+    cloud = [e for e in inv["external"] if e["kind"] == "edr-cloud"]
+    check({e["ip"] for e in cloud} <= set(_EDR_CUSTOM["ips"]) and cloud,
+          "custom cloud endpoints")
+    check(all(e["vendor"] == "Acme" and e["profile"] == "custom"
+              and e["region"] == "lab-a"
+              and e["ip_provenance"] == "documentation" for e in cloud),
+          f"cloud endpoint fields: {cloud[0]}")
+    check(not any(ipaddress.ip_address(e["ip"]).is_global for e in cloud),
+          "test expects RFC 5737 addresses")
+    ch = {c for e in cloud for c in e["channels"]}
+    check(ch == {"sensor", "upload", "download", "api"}, f"channels: {ch}")
+    check(inv["edr"]["vendor"] == "Acme" and inv["edr"]["region"] == "lab-a",
+          "inventory edr summary")
+    # the proxy, not the sensors, talks to the cloud
+    env, proxy = _edr_proxy_env()
+    inv = inventory.to_json(env)
+    cloud = [e for e in inv["external"] if e["kind"] == "edr-cloud"]
+    check(cloud and all(e["talkers"] == [proxy.name] for e in cloud),
+          f"proxied talkers: {cloud[0]['talkers'] if cloud else None}")
+    check(inv["edr"]["proxy"] == proxy.name, "summary names the proxy")
+    legs = [f for f in inv["flows"] if f["protocol"] == "edr"
+            and f["server"] == proxy.name]
+    check({f["client"] for f in legs} ==
+          {h.name for h in env.edr_hosts() if h.name != proxy.name},
+          "sensor -> proxy flows")
+    check(all(f["dport"] == 8080 and f["transport"] == "tcp" for f in legs),
+          "proxy leg port")
+    row = {h["name"]: h for h in inv["hosts"]}
+    check(any(s.startswith("edr 8080") for s in row[proxy.name]["serves"]),
+          f"proxy serves: {row[proxy.name]['serves']}")
+    resolvers = {r.name for p in env.edr_paths() for _, r, _, _ in p.dns}
+    check(all(any(s.startswith("dns") for s in row[r]["serves"])
+              for r in resolvers), "resolver does not serve dns")
+    # EDR off: nothing of it anywhere in the ground truth
+    off = inventory.to_json(_edr_env({"enabled": False}, "enterprise-mixed"))
+    check(not any(e["kind"] == "edr-cloud" for e in off["external"]),
+          "off: cloud endpoints remain")
+    check("edr" not in off, "off: summary remains")
+    check(not any(h["edr"] for h in off["hosts"]), "off: covered hosts")
+    check(not any("edr" in h["uses"] for h in off["hosts"]), "off: uses edr")
+    check(not any(f["protocol"] == "edr" for f in off["flows"]), "off: flows")
+    # the default keeps its exact shape
+    from tgt import enterprise
+    dflt = inventory.to_json(enterprise.get("ot-plant"))
+    check("edr" not in dflt and all(set(e) == {
+        "ip", "fqdns", "talkers", "kind", "vendor"}
+        for e in dflt["external"]), "default inventory changed")
+
+
+def _edr_run(doc: dict, d: str, *extra):
+    """Write ``doc`` as an env file, run one cycle: (rc, pcap, manifest)."""
+    import json
+    from tgt import cli, enterprise
+    path, pcap, man = (os.path.join(d, n) for n in
+                       ("site.json", "x.pcap", "m.json"))
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    try:
+        saved = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        try:
+            rc = cli.main(["run", "--env-file", path, "--once", "--rate", "0",
+                           "--clock", "synthetic", "--start-time",
+                           "2026-01-01T00:00:00Z", "--seed", "7", "--pcap",
+                           pcap, "--manifest", man] + list(extra))
+        finally:
+            sys.stdout.close()
+            sys.stdout = saved
+    finally:
+        enterprise.ENVIRONMENTS.pop(doc["key"], None)
+    return rc, pcap, man
+
+
+def test_r22_edr_manifest_and_score() -> None:
+    import json
+    from tgt import enterprise, envfile, score
+    base = enterprise.get("enterprise-mixed")
+    proxy = next(h for h in base.hosts if h.role == "proxy")
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-truth"
+    doc["edr"] = {"profile": "crowdstrike", "region": "us-1",
+                  "proxy": proxy.name}
+    reg = doc["edr"]["region"]
+    ips = set(__import__("tgt.edr", fromlist=["x"]).PROFILES["crowdstrike"]
+              .regions[reg].ips)
+    with tempfile.TemporaryDirectory() as d:
+        rc, _, man = _edr_run(doc, d)
+        check(rc == 0, f"manifest run rc={rc}")
+        m = json.load(open(man))
+        truth = score.load_truth(man)
+    seen = [f for f in m["flows_seen"] if f["protocol"] == "edr"]
+    pa = f"edr-truth:{proxy.name}"
+    check(any(f["server"] == pa for f in seen), "no sensor -> proxy flow")
+    check({f["server"] for f in seen if f["client"] == pa
+           and f["server"] in ips} <= ips and
+          any(f["client"] == pa and f["server"] in ips for f in seen),
+          "no proxy -> cloud flow")
+    check(not any(f["client"] != pa and f["server"] in ips for f in seen),
+          "a sensor reaches the cloud directly in flows_seen")
+    check(not any(k in ips for k in (a["ip"] for a in truth.assets)),
+          "a documentation cloud IP became an asset")
+    check(all(ip in truth.external for ip in ips & set(m["first_seen"])),
+          "cloud IP not external in the truth")
+    check(not any(a["ip"] in ips for a in truth.population()),
+          "cloud IP counted in the population")
+    ports = {(f["client"], f["server"]): f["dport"] for f in truth.flows
+             if f["protocol"] == "edr"}
+    check(any(v == 8080 for (c, s), v in ports.items() if s == proxy.name),
+          "score: sensor -> proxy port")
+    check(all(v == 443 for (c, s), v in ports.items() if s in ips),
+          f"score: cloud leg port {set(ports.values())}")
+    check(any(s in ips and c == proxy.name for c, s in ports),
+          "score: no proxy -> cloud flow")
+    # EDR off: no trace on the wire or in the manifest's truth
+    doc["edr"] = {"enabled": False}
+    with tempfile.TemporaryDirectory() as d:
+        rc, pcap, man = _edr_run(doc, d)
+        m = json.load(open(man))
+        raw = open(pcap, "rb").read()
+    check(rc == 0, f"off run rc={rc}")
+    check(not any(f["protocol"] == "edr" for f in m["flows_seen"]),
+          "off: edr in flows_seen")
+    check(not any(e["kind"] == "edr-cloud" for e in
+                  m["inventory"]["external"]), "off: cloud in the inventory")
+    check(b"cloudsink" not in raw and b"crowdstrike" not in raw,
+          "off: EDR hostnames on the wire")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

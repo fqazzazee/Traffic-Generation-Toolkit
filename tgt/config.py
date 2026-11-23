@@ -11,6 +11,7 @@ from .packet import Endpoints
 class RunConfig:
     profiles: List[str] = field(default_factory=lambda: ["modbus"])
     env: Optional[str] = None            # modeled environment; overrides profiles
+    edr: Optional[dict] = None           # --edr: an "edr" block replacing the env's
     span: str = "access"                 # env capture point: access | core (routed hops too)
     incident: Optional[str] = None       # famous-incident scenario; overrides profiles
     sprinkle: List[str] = field(default_factory=list)  # incidents mixed into the base

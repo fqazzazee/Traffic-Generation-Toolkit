@@ -92,7 +92,7 @@ class Recorder:
         from . import enterprise, incidents
         self.cfg, self.seed, self.argv, self.clock = cfg, seed, list(argv), clock
         self.git = _git_sha()
-        self.env = enterprise.get(cfg.env) if cfg.env else None
+        self.env = enterprise.for_run(cfg) if cfg.env else None
         # replay --remap-env: the capture's hosts stand in for env hosts,
         # whose inventory (and asset ids) is the ground truth
         self.remap = None
@@ -174,7 +174,16 @@ class Recorder:
                 if vc is not ch or vs is not sh:
                     self._add(proto, vc, vs, caid or self._aid(ch),
                               said or self._aid(sh))
-            for h, ip, fqdn, _ in env.edr_plan():
+            if env.edr is not None:
+                from . import edr
+                for c, s, proto, ip, _ in edr.legs(env):
+                    self._add(proto, c, s, said=ip)
+                    vc, vs = env.nat_view(c, s)
+                    if vc is not c or vs is not s:
+                        self._add(proto, vc, vs, self._aid(c),
+                                  ip or self._aid(s))
+            for h, ip, fqdn, _ in (() if env.edr is not None
+                                   else env.edr_plan()):
                 cloud = enterprise._cs_cloud_host(ip, fqdn)
                 self._add("edr", h, cloud, said=ip)
         elif cfg.incident:

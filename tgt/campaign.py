@@ -63,7 +63,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from . import enterprise, envfile, schedule, timing
+from . import edr, enterprise, envfile, schedule, timing
 
 _PLAN_KEYS = {"name", "description", "env", "env_file", "start_time", "seed",
               "day_profile", "utc_offset", "span", "rate",
@@ -198,16 +198,26 @@ class Plan:
                     raise CampaignError(f"{path}.{k}: expected a list")
             self.phases.append(dict(p, duration=dur))
 
+    # --edr: an "edr" block replacing the environment's for this run
+    edr_block: Optional[Dict[str, Any]] = None
+
     def base_env(self) -> enterprise.Environment:
         if self.env_file:
             try:
-                return envfile.load(self.env_file)
+                env = envfile.load(self.env_file)
             except envfile.EnvFileError as e:
                 raise CampaignError(f"{self.source}: env_file: {e}") from None
-        if self.env_key not in enterprise.ENVIRONMENTS:
+        elif self.env_key not in enterprise.ENVIRONMENTS:
             raise CampaignError(f"{self.source}: env: unknown environment "
                                 f"{self.env_key!r} (see 'tgt list')")
-        return enterprise.get(self.env_key)
+        else:
+            env = enterprise.get(self.env_key)
+        if self.edr_block is None:
+            return env
+        try:
+            return edr.applied(env, self.edr_block)
+        except edr.EdrError as e:
+            raise CampaignError(f"{self.source}: --edr: {e}") from None
 
     @property
     def duration(self) -> float:
@@ -633,8 +643,10 @@ def phases_for(cfg) -> List[Phase]:
         cached = _PLAN_CACHE.get(cfg.campaign)
         if cached is not None:
             return cached
-        return build(load(cfg.campaign))
-    env = enterprise.get(cfg.env) if cfg.env else None
+        plan = load(cfg.campaign)
+        plan.edr_block = cfg.edr
+        return build(plan)
+    env = enterprise.for_run(cfg) if cfg.env else None
     sprinkle = list(cfg.sprinkle)
     if cfg.sprinkle_random:
         from . import incidents

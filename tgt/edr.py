@@ -386,6 +386,38 @@ def paths(env) -> List[Path]:
     return out
 
 
+def legs(env) -> List[Tuple[Any, Any, str, Optional[str], int]]:
+    """Every distinct conversation the EDR setup puts on the wire, as
+    (client, server, protocol, cloud IP or None, server port)."""
+    out: Dict[tuple, tuple] = {}
+
+    def add(c, s, proto, ip, port) -> None:
+        out.setdefault((c.name, s.name, proto), (c, s, proto, ip, port))
+
+    for p in env.edr_paths():
+        cloud = cloud_host(env.edr, p.ip, p.fqdn)
+        if p.proxy is None:
+            add(p.host, cloud, "edr", p.ip, 443)
+        else:
+            add(p.host, p.proxy, "edr", None, env.edr.proxy_port)
+            add(p.proxy, cloud, "edr", p.ip, 443)
+        for c, r, _, _ in p.dns:
+            add(c, r, "dns", None, 53)
+    return list(out.values())
+
+
+def summary(env) -> Dict[str, Any]:
+    """The active setup as the inventory reports it."""
+    s = env.edr
+    return {"profile": s.profile.key, "label": s.profile.label,
+            "vendor": s.profile.vendor, "region": s.region.key,
+            "fqdns": dict(s.region.fqdns),
+            "ip_provenance": s.region.ip_provenance,
+            "host_provenance": dict(s.region.host_provenance),
+            "proxy": s.proxy,
+            "proxy_port": s.proxy_port if s.proxy else None}
+
+
 def cloud_host(setup: Setup, ip: str, fqdn: str):
     """An on-the-fly cloud endpoint; its MAC is cosmetic (``place`` rewrites
     it to the gateway as it egresses)."""
