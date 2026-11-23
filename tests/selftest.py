@@ -8738,6 +8738,31 @@ def test_r22_ops_unregister_only_removes_tgt_veths() -> None:
             check(name in out, f"no notice for kept interface {name}: {out}")
 
 
+def test_r22_ops_status_logs_find_root_daemon_files() -> None:
+    """Without write access to /run and /var/log, status and logs still find
+    the root daemon's PID and log files. PID 1 gives a real EPERM."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        run_dir, log_dir = (os.path.join(box["root"], s) for s in ("run", "var/log"))
+        with open(os.path.join(run_dir, "tgt.pid"), "w") as fh:
+            fh.write("1\n")
+        log_file = os.path.join(log_dir, "tgt.log")
+        with open(log_file, "w") as fh:
+            fh.write("daemon line\n")
+        os.chmod(run_dir, 0o555)
+        os.chmod(log_dir, 0o555)
+        try:
+            rc, out, _ = _r22_ops_run(box, "status", STUB_UID="1000")
+            check(rc == 0 and "running (pid 1)" in out and log_file in out,
+                  f"status without root: rc={rc} {out}")
+            rc, out, _ = _r22_ops_run(box, "logs", STUB_UID="1000")
+            check(rc == 0 and log_file in out,
+                  f"logs without root: rc={rc} {out}")
+        finally:
+            os.chmod(run_dir, 0o755)
+            os.chmod(log_dir, 0o755)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -182,7 +182,27 @@ EOF
 daemon_running() {
     [ -f "$PID_FILE" ] || return 1
     pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    [ -n "$pid" ] || return 1
+    # EPERM means the process exists: a non-root status of a root daemon.
+    kill_err=$(LC_ALL=C kill -0 "$pid" 2>&1) && return 0
+    case "$kill_err" in *"not permitted"*) return 0 ;; *) return 1 ;; esac
+}
+
+# status and logs can run unprivileged, where the writability test at the top
+# picks /tmp even though a root daemon used /run and /var/log. Search both.
+find_daemon_files() {
+    chosen=$PID_FILE
+    for f in /run/tgt.pid /tmp/tgt.pid; do
+        PID_FILE=$f
+        if daemon_running; then chosen=$f; break; fi
+    done
+    PID_FILE=$chosen
+    for f in /var/log/tgt.log /tmp/tgt.log; do
+        [ -r "$f" ] || continue
+        if [ ! -r "$LOG_FILE" ] || [ -n "$(find "$f" -newer "$LOG_FILE" 2>/dev/null)" ]; then
+            LOG_FILE=$f
+        fi
+    done
 }
 
 daemon_start() {
@@ -274,6 +294,7 @@ cmd_status() {
     if have_systemd && [ -f "$UNIT_FILE" ]; then
         systemctl status tgt.service --no-pager || true
     else
+        find_daemon_files
         if daemon_running; then
             ok "running (pid $(cat "$PID_FILE"))"
             [ -f "$LOG_FILE" ] && tail -n 5 "$LOG_FILE"
@@ -287,6 +308,7 @@ cmd_logs() {
     if have_systemd && [ -f "$UNIT_FILE" ]; then
         journalctl -u tgt.service -f --no-pager
     else
+        find_daemon_files
         [ -f "$LOG_FILE" ] || die "no log file at $LOG_FILE"
         tail -n 50 -f "$LOG_FILE"
     fi
