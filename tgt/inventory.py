@@ -269,6 +269,12 @@ def external(env: Environment) -> List[Dict]:
         e["channels"][p.channel] = p.fqdn
     # declared external endpoints (cloud brokers, vendor portals)
     ext = {h.name: h for h in env.external}
+    if env.edr is not None:             # reached only by replaced edr flows
+        live = {n for c, s, _ in env.conversations for n in (c, s)}
+        for c, s, proto in env.spec[1]:
+            if proto == "edr":
+                for n in {c, s} - live:
+                    ext.pop(n, None)
     for h in ext.values():
         e = plan.setdefault(h.ip, {"ip": h.ip, "fqdns": set(),
                                    "talkers": set(), "kind": h.role,

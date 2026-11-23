@@ -86,6 +86,10 @@ These options override the file's `edr` block for that run; a new profile keeps 
 proxy. They need an environment and do not apply to `--replay`. An unknown profile, region or
 proxy host exits with status 2.
 
+An explicit setup owns every EDR path: flows an environment file declares with protocol `edr`
+are not generated while it is active, and an external endpoint only they reach leaves the
+ground truth. `tgt env export` still writes them back.
+
 `tgt inventory` reads the environment file's block but has no `--edr` option. For a run with
 a command-line override, take the ground truth from `--manifest`.
 

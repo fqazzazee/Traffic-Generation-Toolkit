@@ -298,14 +298,14 @@ def check(env, setup: Setup) -> None:
 
 def apply(env, raw: Any):
     """A view of ``env`` running the EDR setup ``raw``; ``env`` is unchanged.
-    With EDR off, declared ``edr`` flows are dropped as well."""
+    The setup owns every EDR path, so declared ``edr`` flows are dropped: they
+    would bypass the proxy and the profile (export still keeps them)."""
     setup = resolve(raw)
     check(env, setup)
     new = copy.copy(env)
     new.edr = setup
     new._edr_cache = None
-    if not setup.enabled:
-        new.conversations = [c for c in env.conversations if c[2] != "edr"]
+    new.conversations = [c for c in env.conversations if c[2] != "edr"]
     return new
 
 

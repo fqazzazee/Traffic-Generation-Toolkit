@@ -10990,6 +10990,31 @@ def test_r22_edr_proxy_behind_nat_dns_answer() -> None:
               f"{sorted(d for c, d in dials if c == client)}")
 
 
+def test_r22_edr_setup_replaces_declared_flows() -> None:
+    from tgt import enterprise, envfile, inventory
+    base = enterprise.get("enterprise-mixed")
+    host = next(h for h in base.edr_hosts() if h.name != "PROXY01")
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-declared"
+    doc["external"] = [{"name": "CLOUD", "ip": "203.0.113.90",
+                        "role": "broker", "os": "linux",
+                        "fqdn": "cloud.edr.example"}]
+    doc["flows"] = list(doc["flows"]) + [
+        {"client": host.name, "server": "CLOUD", "proto": "edr"}]
+    for block in ({"profile": "generic", "proxy": "PROXY01"},
+                  {"profile": "crowdstrike", "region": "us-2"},
+                  {"enabled": False}):
+        env = envfile.from_dict(dict(doc, edr=block), "declared.json")
+        ips = [p[:2] for p in (_edr_parse(f) for _, f in _edr_wire(env)) if p]
+        check(not any("203.0.113.90" in x for x in ips),
+              f"{block}: declared edr flow still on the wire")
+        check(not any(e["ip"] == "203.0.113.90"
+                      for e in inventory.external(env)),
+              f"{block}: endpoint of a replaced flow in ground truth")
+        check(any(f["proto"] == "edr" for f in envfile.to_dict(env)["flows"]),
+              f"{block}: export dropped the declared flow")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
