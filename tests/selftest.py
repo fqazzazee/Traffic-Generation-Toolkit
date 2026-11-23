@@ -8594,6 +8594,45 @@ def test_review_injection_worker_ends_with_run() -> None:
           "injection worker outlived close() and clobbered the context")
 
 
+def test_r22_evaluation_overwrite_never_certifies_stale() -> None:
+    """--overwrite clears what the last run wrote: a run whose stages all
+    fail cannot be reported complete from the old manifests, and files the
+    bench does not own stay."""
+    import json
+    suite = {"name": "tiny", "env": "ot-plant", "seed": 9,
+             "start_time": "2026-11-02T08:00:00Z", "stages": [
+                 {"id": "one", "kind": "baseline", "duration": "1m"},
+                 {"id": "two", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path, b = os.path.join(d, "tiny.json"), os.path.join(d, "bundle")
+        with open(path, "w") as f:
+            json.dump(suite, f)
+        p = _cli(["bench", "run", path, "--out", b])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"first run rc={p.returncode} {out[-300:]}")
+        mine = os.path.join(b, "stages", "notes.txt")
+        with open(mine, "w") as f:
+            f.write("keep")
+        bad = os.path.join(d, "bad")        # a pcap path that cannot open
+        for sid in ("one", "two"):
+            os.makedirs(os.path.join(bad, f"{sid}.pcap"))
+        p = _cli(["bench", "run", path, "--out", b, "--overwrite",
+                  "--pcap-dir", bad])
+        out, _ = p.communicate(timeout=120)
+        with open(os.path.join(b, "bench.json")) as f:
+            idx = json.load(f)
+        check(p.returncode != 0 and idx["status"] != "complete" and
+              not any(r["status"] == "complete" for r in idx["stages"]),
+              f"failed overwrite certified: rc={p.returncode} "
+              f"{idx['status']} {[r['status'] for r in idx['stages']]}")
+        for rel in ("manifest.json", "stages/one.manifest.json",
+                    "stages/two.manifest.json", "stages/one.pcap",
+                    "stages/two.pcap"):
+            check(not os.path.exists(os.path.join(b, rel)),
+                  f"stale {rel} survived --overwrite")
+        check(os.path.exists(mine), "--overwrite removed a foreign file")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

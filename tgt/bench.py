@@ -485,6 +485,37 @@ def merge_manifests(stages: Sequence[Tuple[str, Dict[str, Any]]],
     }
 
 
+def _remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise BenchError(f"{path}: cannot remove: {e.strerror or e}") from None
+
+
+def _clear_bundle(out: str, suite: Suite) -> None:
+    """Remove what a bench run wrote to ``out``: the index, the merged
+    manifest and each stage's plan, manifest and pcap, for the stages of
+    this suite and of the bundle being replaced. Other files stay."""
+    ids = {st.id for st in suite.stages}
+    try:
+        old = _read_json(os.path.join(out, "bench.json"), "bench index")
+        rows = old.get("stages")
+        ids |= {r["id"] for r in rows if isinstance(r, dict) and
+                re.fullmatch(r"[A-Za-z0-9_.-]+", str(r.get("id")))} \
+            if isinstance(rows, list) else set()
+    except (BenchError, AttributeError):  # missing or damaged index
+        pass
+    names = ["bench.json", "manifest.json"]
+    for sid in sorted(ids):
+        names += [os.path.join("stages", f"{sid}{ext}") for ext in (
+            ".plan.json", ".manifest.json", ".pcap")]
+    for name in names:
+        _remove(os.path.join(out, name))
+        _remove(os.path.join(out, name + ".tmp"))
+
+
 def run(suite: Suite, out: str, iface: Optional[str] = None,
         pcap_dir: Optional[str] = None, clock: Optional[str] = None,
         speed: float = 1.0, min_period: Optional[float] = None,
@@ -505,6 +536,8 @@ def run(suite: Suite, out: str, iface: Optional[str] = None,
         pcap_dir = os.path.join(out, "stages")
     if pcap_dir:
         os.makedirs(pcap_dir, exist_ok=True)
+    if overwrite:
+        _clear_bundle(out, suite)
     mp = suite.min_period if min_period is None else min_period
     t0 = None
     if clock == "synthetic":
@@ -545,6 +578,7 @@ def run(suite: Suite, out: str, iface: Optional[str] = None,
             man_rel = f"stages/{st.id}.manifest.json"
             plan_path = os.path.join(out, plan_rel)
             man_path = os.path.join(out, man_rel)
+            _remove(man_path)             # only this run's manifest counts
             _write_json(plan_path, st.plan(start_iso))
             pcap = os.path.join(pcap_dir, f"{st.id}.pcap") if pcap_dir \
                 else None
