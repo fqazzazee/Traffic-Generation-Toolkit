@@ -386,6 +386,11 @@ def _run_engine(cfg: RunConfig, args) -> int:
             print(f"bad --start-time {cfg.start_time!r}: use ISO-8601, e.g. "
                   "2026-11-05T14:00:00Z", file=sys.stderr)
             return 2
+    from .engine import synthetic_range_error
+    bad_clock = synthetic_range_error(cfg)
+    if bad_clock:
+        print(bad_clock, file=sys.stderr)
+        return 2
     if cfg.seed is None:                # chosen now so it is printed + logged
         from .engine import new_seed
         cfg.seed = new_seed()

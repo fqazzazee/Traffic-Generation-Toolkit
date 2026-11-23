@@ -8876,6 +8876,34 @@ def test_r22_engine_synthetic_follows_live_rate() -> None:
         E.RawSender = real
 
 
+def test_r22_engine_synthetic_clock_range() -> None:
+    """A synthetic clock outside classic pcap's range fails before the run."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        for start, extra in (("2200-01-01T00:00:00Z", ["--count", "3"]),
+                             ("1969-12-31T23:59:59Z", ["--count", "3"]),
+                             ("2106-02-07T06:28:00Z", ["--duration", "1h"]),
+                             ("2106-02-07T06:28:15Z", ["--count", "5"])):
+            rc, out = _r22_cli(["run", "-p", "modbus", "--clock", "synthetic",
+                                "--start-time", start, "--rate", "1",
+                                "--pcap", pcap] + extra)
+            check(rc == 2 and "start-time" in out and "pcap" in out,
+                  f"{start} {extra}: rc={rc}")
+            check(not os.path.exists(pcap), f"{start}: wrote a pcap")
+        for start in ("1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z"):
+            rc, _ = _r22_cli(["run", "-p", "modbus", "--clock", "synthetic",
+                              "--start-time", start, "--rate", "0",
+                              "--count", "3", "--pcap", pcap])
+            check(rc == 0 and len(_pcap_records(pcap)) == 3,
+                  f"valid start {start}: rc={rc}")
+        plan = _r22_plan(d, start_time="2106-02-07T06:28:15Z")
+        rc, out = _r22_cli(["campaign", plan, "--clock", "synthetic",
+                            "--force", "--pcap", os.path.join(d, "c.pcap")])
+        check(rc == 2 and "start-time" in out, f"campaign span: rc={rc}")
+        check(not os.path.exists(os.path.join(d, "c.pcap")),
+              "out-of-range campaign wrote a pcap")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

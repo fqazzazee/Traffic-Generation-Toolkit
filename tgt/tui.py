@@ -502,6 +502,10 @@ class UI:
             except ValueError:
                 return (f"bad start time {cfg.start_time!r}: use ISO-8601, "
                         "e.g. 2026-11-05T14:00:00Z")
+            from .engine import synthetic_range_error
+            bad_clock = synthetic_range_error(cfg)
+            if bad_clock:
+                return bad_clock
         if cfg.replay_path:
             from . import pcapread
             from .replay import rewriter_for

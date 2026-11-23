@@ -339,6 +339,9 @@ class Engine:
         self.stats.seed = seed
         synthetic = cfg.clock == "synthetic"
         try:
+            bad_clock = synthetic_range_error(cfg)
+            if bad_clock:
+                raise ValueError(bad_clock)
             if cfg.iface:
                 sender = RawSender(cfg.iface)
                 try:
@@ -657,6 +660,29 @@ class Engine:
 def new_seed() -> int:
     """A fresh random run seed (logged + recorded so the run can be redone)."""
     return random.SystemRandom().randrange(1 << 32)
+
+
+def synthetic_range_error(cfg: RunConfig) -> Optional[str]:
+    """Why a synthetic clock cannot be written to classic pcap (unsigned
+    32-bit seconds), counting the run's known span; None when it fits."""
+    if cfg.clock != "synthetic":
+        return None
+    start = parse_start(cfg.start_time)
+    if cfg.schedule == "timed" and not cfg.replay_path:
+        from . import campaign
+        span = (sum(ph.duration for ph in campaign.phases_for(cfg))
+                if cfg.campaign else cfg.duration)
+    else:
+        step = 1.0 / cfg.rate if cfg.rate and cfg.rate > 0 else 0.001
+        spans = [cfg.duration] if cfg.duration else []
+        if cfg.count:
+            spans.append((cfg.count - 1) * step)
+        span = min(spans, default=0.0)
+    if start < 0 or start + span >= 2 ** 32:
+        return (f"--start-time {cfg.start_time}: the synthetic clock must "
+                "stay within the classic pcap range (1970-01-01 to "
+                f"2106-02-07 UTC), including this run's {span:g} s")
+    return None
 
 
 def parse_start(text: Optional[str]) -> float:
