@@ -43,7 +43,8 @@ class Injection:
         self.id, self.incident, self.via = ident, incident, via
         self.duration, self.ratio = duration, ratio
         self.requested = time.time()
-        self.state = "pending"          # pending | active | done | failed
+        # pending | active | done | failed | stopped (the run ended first)
+        self.state = "pending"
         self.error = ""
         self.passes = 0
         self.frames_out = 0             # handed to the engine
@@ -112,6 +113,7 @@ class RunControl:
         self.paused_total = 0.0
         self._paused_at: Optional[float] = None
         self._pool = None               # injection pass builder (lazy)
+        self._closed = False            # the run ended: no new injections
 
     # -- pause / rate ----------------------------------------------------------
     @property
@@ -162,6 +164,8 @@ class RunControl:
         if not 0 < ratio <= 0.9:
             raise ValueError("ratio must be in (0, 0.9]")
         with self._lock:
+            if self._closed:
+                raise ValueError("the run has already finished")
             busy = [i for i in list(self._pending) + list(self._active.values())
                     if i.incident == incident]
             if busy:
@@ -211,7 +215,18 @@ class RunControl:
     def close(self) -> None:
         """End the injection worker with the run: queued passes are dropped
         and one in flight finishes, so no build outlives the engine (it would
-        restore a stale build context over a later caller's)."""
+        restore a stale build context over a later caller's). Injections
+        still pending or active end as ``stopped``."""
+        with self._lock:
+            self._closed = True
+            unfinished = list(self._pending) + list(self._active.values())
+            self._pending.clear()
+            self._active.clear()
+        for inj in unfinished:
+            inj.state = "stopped"
+            if inj._next is not None:
+                inj._next.cancel()
+                inj._next = None
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None

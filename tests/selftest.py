@@ -8796,6 +8796,30 @@ def test_r22_control_ctl_hint_brackets_ipv6() -> None:
             ui.api_server.close()
 
 
+def test_r22_control_close_finalizes_injections() -> None:
+    """An injection outlasting the run ends with it: no active/pending
+    state or countdown after the engine exits, and no new one is queued."""
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engine(RunConfig(profiles=["modbus"], rate=300, duration=1.0,
+                               pcap_path=os.path.join(d, "x.pcap"), seed=3))
+        eng.control.inject("wannacry", 60, 0.3)
+        eng.start()
+        eng.join(20)
+        check(not eng.is_alive(), "engine did not finish")
+        row = eng.control.status()[0]
+        check(row["state"] == "stopped" and "remaining" not in row,
+              f"injection after the run: {row}")
+        check(not eng.control._pending and not eng.control._active,
+              "injection still queued after close()")
+        try:
+            eng.control.inject("stuxnet", 5)
+            check(False, "inject accepted after the run closed")
+        except ValueError:
+            pass
+        check(len(eng.control.status()) == 1, "late injection recorded")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
