@@ -8874,6 +8874,58 @@ def test_r22_evaluation_alert_credit_is_one_to_one() -> None:
           "summary does not report host-less alerts")
 
 
+def test_r22_evaluation_reused_ip_credits_new_owner() -> None:
+    """An IP handed to a new host is that host's from the phase on; a
+    host's old address stays credited to it only while nobody reused it."""
+    import json
+    from tgt import campaign
+    from tgt.manifest import Recorder
+    plan = {"name": "reuse", "env": "ot-plant", "seed": 3,
+            "start_time": "2026-11-02T08:00:00Z", "phases": [
+                {"name": "a", "duration": "10m"},
+                {"name": "b", "duration": "10m", "remove_host": ["PLC-RW1"],
+                 "add_host": [{"name": "NEW-HOST", "ip": "172.16.1.21",
+                               "model": "rockwell-1769-l36erm"}],
+                 "add_flow": [{"client": "HMI-RW", "server": "NEW-HOST",
+                               "proto": "enip"}],
+                 "set": [{"host": "PLC-RW2", "ip": "172.16.1.29"}]}]}
+    with tempfile.TemporaryDirectory() as d:
+        pp, m = os.path.join(d, "p.json"), os.path.join(d, "m.json")
+        with open(pp, "w") as f:
+            json.dump(plan, f)
+        p = _cli(["campaign", pp, "--clock", "synthetic", "--pcap",
+                  os.path.join(d, "p.pcap"), "--manifest", m, "--rate", "0",
+                  "--force"])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"campaign rc={p.returncode} {out[-300:]}")
+        with open(m) as f:
+            doc = json.load(f)
+        phases = campaign.build(campaign.load(pp))
+        rec = Recorder(RunConfig(env="ot-plant", campaign=pp), 3,
+                       clock="synthetic")
+        rec.campaign(phases)
+        before = next(h.ip for h in phases[0].env.hosts
+                      if h.name == "PLC-RW2")
+        rec.begin_phase(phases[0], 0.0)
+        check(rec.addr_aid["172.16.1.21"] == "ot-plant:PLC-RW1",
+              "first phase: the address belongs to PLC-RW1")
+        rec.begin_phase(phases[1], 600.0)
+    switch = doc["phases"][1]["start"]
+    old, new = doc["last_seen"]["ot-plant:PLC-RW1"], \
+        doc["last_seen"]["ot-plant:NEW-HOST"]
+    check(old <= switch, f"PLC-RW1 credited after it left: {old} > {switch}")
+    check(new > switch and new > old, f"NEW-HOST last seen {new}")
+    check(rec.addr_aid["172.16.1.21"] == "ot-plant:NEW-HOST",
+          f"reused IP maps to {rec.addr_aid['172.16.1.21']}")
+    check(rec.addr_aid[before] == "ot-plant:PLC-RW2" and
+          rec.addr_aid["172.16.1.29"] == "ot-plant:PLC-RW2",
+          "a re-addressed host keeps its unclaimed old address")
+    stale = [k for k, r in rec.flowidx.items()
+             if "172.16.1.21" in (r[2], r[3]) and
+             "ot-plant:PLC-RW1" in (r[0], r[1])]
+    check(not stale, f"flow index still credits PLC-RW1: {stale[:2]}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
