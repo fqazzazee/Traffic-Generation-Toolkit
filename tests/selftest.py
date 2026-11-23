@@ -8594,6 +8594,42 @@ def test_review_injection_worker_ends_with_run() -> None:
           "injection worker outlived close() and clobbered the context")
 
 
+def _r22_cli(args: list, timeout: float = 20.0) -> tuple:
+    """Run ``python3 -m tgt`` -> (exit code, stdout + stderr)."""
+    import subprocess
+    p = subprocess.run([sys.executable, "-m", "tgt"] + args, cwd=_REPO,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True, timeout=timeout)
+    return p.returncode, p.stdout
+
+
+def _r22_plan(d: str, name: str = "plan.json", **kw) -> str:
+    """Write a small two-phase campaign plan; keyword args override keys."""
+    import json
+    doc = {"env": "it-org", "phases": [{"name": "a", "duration": 1},
+                                       {"name": "b", "duration": 1}]}
+    doc.update(kw)
+    path = os.path.join(d, name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    return path
+
+
+def test_r22_engine_crash_reports_failure() -> None:
+    """An exception in the engine thread is a failed run: counted, reported
+    and a non-zero exit, with no thread traceback."""
+    with tempfile.TemporaryDirectory() as d:
+        for extra in (["--pcap", os.path.join(d, "missing", "x.pcap")],
+                      ["--client-ip", "nope",
+                       "--pcap", os.path.join(d, "x.pcap")]):
+            rc, out = _r22_cli(["run", "-p", "modbus", "--count", "5",
+                                "--rate", "0"] + extra)
+            check(rc != 0, f"crashed run exited {rc}: {extra}")
+            check("Traceback" not in out, f"crash traceback: {extra}")
+            check("1 errors" in out and "last error:" in out,
+                  f"crash not reported: {extra}: {out[-200:]}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

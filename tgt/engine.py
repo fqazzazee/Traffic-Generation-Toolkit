@@ -446,6 +446,10 @@ class Engine:
                 cycle += 1
                 if nxt is not None:
                     batch = nxt.result()
+        except Exception as e:  # noqa: BLE001 - a crash is a failed run
+            self.stats.errors += 1
+            self.stats.last_error = f"{type(e).__name__}: {e}"
+            self.log(f"run failed: {self.stats.last_error}")
         finally:
             if pool is not None:
                 pool.shutdown(wait=False)
