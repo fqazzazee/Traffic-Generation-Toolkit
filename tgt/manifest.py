@@ -454,6 +454,22 @@ class Recorder:
             if ip:
                 self.addr_aid.setdefault(ip, aid)
 
+    def _reindex(self) -> None:
+        """Rebuild the address and flow indexes for the current phase. An
+        earlier phase's entries (a host's old IP, a running injection's
+        flows) stay only while no current host has taken their addresses."""
+        old_addr, old_flow, old_l2 = self.addr_aid, self.flowidx, self.l2src
+        self.addr_aid, self.flowidx, self.l2src = {}, {}, {}
+        self._index()
+        for addr, aid in old_addr.items():
+            self.addr_aid.setdefault(addr, aid)
+        for now, old in ((self.flowidx, old_flow), (self.l2src, old_l2)):
+            for k, rec in old.items():
+                if k not in now and all(
+                        self.addr_aid.get(x, rec[0]) in rec[:2]
+                        for x in k[1:] + rec[2:4]):
+                    now[k] = rec
+
     def begin_phase(self, ph, ts: float) -> None:
         """Phase ``ph`` starts at ``ts``: index its environment and
         sprinkles, record it and stamp its change events."""
@@ -463,7 +479,7 @@ class Recorder:
             self.env = ph.env
         self.sprinkle = list(ph.sprinkle)
         self._cache.clear()
-        self._index()
+        self._reindex()
         self.phase_log.append({
             "id": ph.id, "name": ph.name, "description": ph.description,
             "start": ts, "end": None, "duration_s": ph.duration,

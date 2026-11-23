@@ -225,7 +225,8 @@ class Suite:
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise BenchError(f"{path}.seed: expected an integer")
         desc = str(raw.get("description", ""))
-        allowed = {"baseline": {"duration"}, "incidents": {"duration",
+        inherited: Dict[str, Any] = {}
+        allowed ={"baseline": {"duration"}, "incidents": {"duration",
                                                             "inject"},
                    "campaign": {"plan", "phases"}}[kind]
         extra = sorted(set(raw) & {"duration", "inject", "plan", "phases"}
@@ -260,6 +261,9 @@ class Suite:
                         f"{self.env!r} (every stage shares one environment)")
                 phases = [dict(ph) for ph in plan.doc["phases"]]
                 desc = desc or plan.description
+                inherited = {k: plan.doc[k] for k in (
+                    "day_profile", "utc_offset", "span", "rate",
+                    "sprinkle_messages") if plan.doc.get(k) is not None}
             else:
                 phases = raw["phases"]
                 if not isinstance(phases, list) or not phases:
@@ -268,6 +272,7 @@ class Suite:
         doc: Dict[str, Any] = {
             "name": f"{self.name}-{sid}", "description": desc,
             "env": self.env, "seed": seed, "phases": phases}
+        doc.update(inherited)             # suite and stage values override
         for k in ("day_profile", "utc_offset", "span", "sprinkle_messages"):
             if self.doc.get(k) is not None:
                 doc[k] = self.doc[k]
@@ -335,11 +340,33 @@ class Suite:
                          for p in campaign.validate(phases, mp)]
         return problems
 
-    def fingerprint(self) -> str:
-        """What fixes the traffic: the suite document and its seeds."""
-        blob = json.dumps({"suite": self.doc,
-                           "seeds": [st.seed for st in self.stages]},
-                          sort_keys=True, default=str)
+    def fingerprint(self, min_period: Optional[float] = None,
+                    rate: Optional[float] = None,
+                    start_time: Optional[str] = None,
+                    clock: str = "synthetic", speed: float = 1.0) -> str:
+        """What fixes the traffic: the suite document, its seeds, the
+        effective run parameters and the resolved stage plans and
+        environment."""
+        from . import enterprise, envfile
+        wall = clock == "wall"
+        try:
+            env = envfile.to_dict(enterprise.get(self.env))
+        except KeyError:                  # reported by check()
+            env = None
+        blob = json.dumps({
+            "suite": self.doc, "seeds": [st.seed for st in self.stages],
+            "run": {"min_period": float(self.min_period if min_period is None
+                                        else min_period),
+                    "rate": float(rate) if rate and rate > 0 else 0.0,
+                    "clock": clock,
+                    "start_time": None if wall else
+                    (start_time or self.start_time),
+                    "speed": float(speed) if wall else None},
+            # the plan's name comes from the suite's file name
+            "plans": [{k: v for k, v in st.plan_doc.items()
+                       if k not in ("name", "description")}
+                      for st in self.stages],
+            "environment": env}, sort_keys=True, default=str)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -485,6 +512,44 @@ def merge_manifests(stages: Sequence[Tuple[str, Dict[str, Any]]],
     }
 
 
+def _remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise BenchError(f"{path}: cannot remove: {e.strerror or e}") from None
+
+
+def _clear_bundle(out: str, suite: Suite) -> None:
+    """Remove what a bench run wrote to ``out``: the index, the merged
+    manifest and each stage's plan, manifest and pcap, for the stages of
+    this suite and of the bundle being replaced. Other files stay."""
+    ids = {st.id for st in suite.stages}
+    owned = os.path.exists(os.path.join(out, "bench.json"))
+    try:
+        old = _read_json(os.path.join(out, "bench.json"), "bench index")
+        rows = old.get("stages")
+        ids |= {r["id"] for r in rows if isinstance(r, dict) and
+                re.fullmatch(r"[A-Za-z0-9_.-]+", str(r.get("id")))} \
+            if isinstance(rows, list) else set()
+    except (BenchError, AttributeError):  # missing or damaged index
+        pass
+    if not owned:                         # no index: is it a merged manifest?
+        try:
+            owned = bool(_read_json(os.path.join(out, "manifest.json"),
+                                    "manifest").get("bench"))
+        except BenchError:
+            pass
+    names = ["bench.json"] + (["manifest.json"] if owned else [])
+    for sid in sorted(ids):
+        names += [os.path.join("stages", f"{sid}{ext}") for ext in (
+            ".plan.json", ".manifest.json", ".pcap")]
+    for name in names:
+        _remove(os.path.join(out, name))
+        _remove(os.path.join(out, name + ".tmp"))
+
+
 def run(suite: Suite, out: str, iface: Optional[str] = None,
         pcap_dir: Optional[str] = None, clock: Optional[str] = None,
         speed: float = 1.0, min_period: Optional[float] = None,
@@ -505,6 +570,8 @@ def run(suite: Suite, out: str, iface: Optional[str] = None,
         pcap_dir = os.path.join(out, "stages")
     if pcap_dir:
         os.makedirs(pcap_dir, exist_ok=True)
+    if overwrite:
+        _clear_bundle(out, suite)
     mp = suite.min_period if min_period is None else min_period
     t0 = None
     if clock == "synthetic":
@@ -514,7 +581,7 @@ def run(suite: Suite, out: str, iface: Optional[str] = None,
         "schema": SCHEMA,
         "suite": {"name": suite.name, "description": suite.description,
                   "source": suite.source, "doc": suite.doc},
-        "fingerprint": suite.fingerprint(),
+        "fingerprint": suite.fingerprint(mp, rate, start_time, clock, speed),
         "tool": {"name": "tgt", "version": __version__, "git": _git_sha()},
         "created": _iso(time.time()), "env": suite.env, "clock": clock,
         "speed": speed, "min_period": mp, "iface": iface,
@@ -545,6 +612,7 @@ def run(suite: Suite, out: str, iface: Optional[str] = None,
             man_rel = f"stages/{st.id}.manifest.json"
             plan_path = os.path.join(out, plan_rel)
             man_path = os.path.join(out, man_rel)
+            _remove(man_path)             # only this run's manifest counts
             _write_json(plan_path, st.plan(start_iso))
             pcap = os.path.join(pcap_dir, f"{st.id}.pcap") if pcap_dir \
                 else None
@@ -708,6 +776,21 @@ def _field_accuracy(res: Dict[str, Any]) -> Tuple[Optional[float], int]:
     return _rate(sum(o["correct"] for o in obs), n), n
 
 
+def _bundle_complete(index: Dict[str, Any],
+                     stages: List[Tuple[str, Dict[str, Any]]]) -> bool:
+    """The run finished, and every stage of its suite completed and left a
+    manifest."""
+    if index.get("status") != "complete":
+        return False
+    rows = {r.get("id"): r for r in index.get("stages") or []}
+    doc = (index.get("suite") or {}).get("doc") or {}
+    want = [s.get("id") for s in doc.get("stages") or []] or list(rows)
+    have = {sid for sid, _ in stages}
+    return bool(want) and all(
+        i in have and (rows.get(i) or {}).get("status") == "complete"
+        for i in want)
+
+
 def scorecard(index: Dict[str, Any],
               stages: List[Tuple[str, Dict[str, Any]]],
               res: Dict[str, Any], label: Optional[str] = None,
@@ -803,7 +886,8 @@ def scorecard(index: Dict[str, Any],
                            "value": v, "pass": ok})
     verdict = None
     if checks:
-        verdict = "fail" if any(c["pass"] is False for c in checks) else \
+        verdict = "incomplete" if not _bundle_complete(index, stages) else \
+            "fail" if any(c["pass"] is False for c in checks) else \
             "incomplete" if any(c["pass"] is None for c in checks) else \
             "pass"
     return {
@@ -1326,9 +1410,13 @@ def main(args) -> int:
             return 1 if bad else 0
         if cmd == "run":
             suite = load(find(args.suite))
+            fp = suite.fingerprint(
+                args.min_period, args.rate, args.start_time,
+                args.clock or ("wall" if args.iface else "synthetic"),
+                args.speed)
             print(f"suite {suite.name}: env {suite.env}, "
                   f"{len(suite.stages)} stages, {_fmt(suite.duration)} "
-                  f"simulated, fingerprint {suite.fingerprint()}")
+                  f"simulated, fingerprint {fp}")
             _print_stages(suite)
             probs = suite.check(args.min_period)
             for pr in probs:

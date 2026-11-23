@@ -292,12 +292,12 @@ def activity_class(proto: str, client_role: str = "",
     """Day-profile class of a conversation: the table's, refined by who is
     talking — user traffic from servers is unattended (``infra``), from an
     HMI it is the operator's (24/7), and SMB from servers to a file share or
-    historian is a nightly backup."""
+    historian is a nightly backup, as is FTP on the same path."""
     cls = spec(proto)[4]
+    if proto in ("smb", "ftp") and server_role in ("file", "hist") \
+            and client_role not in ("ws", "jump"):
+        return "backup"
     if cls == "office":
-        if proto in ("smb", "ftp") and server_role in ("file", "hist") \
-                and client_role not in ("ws", "jump"):
-            return "backup"
         if client_role in ("hmi", "scada"):
             return "operator"
         if client_role not in ("ws", "jump", "eng", ""):

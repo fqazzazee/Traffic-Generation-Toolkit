@@ -9370,6 +9370,461 @@ def test_r22_control_tagged_l2_builders_reject_bad_vlan() -> None:
         for vid in (1, 4095):
             tci = struct.unpack("!H", fn(vid)[14:16])[0]
             check(tci == prio | vid, f"{name} VLAN {vid}: TCI {tci:#x}")
+def test_r22_evaluation_overwrite_never_certifies_stale() -> None:
+    """--overwrite clears what the last run wrote: a run whose stages all
+    fail cannot be reported complete from the old manifests, and files the
+    bench does not own stay."""
+    import json
+    suite = {"name": "tiny", "env": "ot-plant", "seed": 9,
+             "start_time": "2026-11-02T08:00:00Z", "stages": [
+                 {"id": "one", "kind": "baseline", "duration": "1m"},
+                 {"id": "two", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path, b = os.path.join(d, "tiny.json"), os.path.join(d, "bundle")
+        with open(path, "w") as f:
+            json.dump(suite, f)
+        p = _cli(["bench", "run", path, "--out", b])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"first run rc={p.returncode} {out[-300:]}")
+        mine = os.path.join(b, "stages", "notes.txt")
+        with open(mine, "w") as f:
+            f.write("keep")
+        bad = os.path.join(d, "bad")        # a pcap path that cannot open
+        for sid in ("one", "two"):
+            os.makedirs(os.path.join(bad, f"{sid}.pcap"))
+        p = _cli(["bench", "run", path, "--out", b, "--overwrite",
+                  "--pcap-dir", bad])
+        out, _ = p.communicate(timeout=120)
+        with open(os.path.join(b, "bench.json")) as f:
+            idx = json.load(f)
+        check(p.returncode != 0 and idx["status"] != "complete" and
+              not any(r["status"] == "complete" for r in idx["stages"]),
+              f"failed overwrite certified: rc={p.returncode} "
+              f"{idx['status']} {[r['status'] for r in idx['stages']]}")
+        for rel in ("manifest.json", "stages/one.manifest.json",
+                    "stages/two.manifest.json", "stages/one.pcap",
+                    "stages/two.pcap"):
+            check(not os.path.exists(os.path.join(b, rel)),
+                  f"stale {rel} survived --overwrite")
+        check(os.path.exists(mine), "--overwrite removed a foreign file")
+
+
+def test_r22_evaluation_verdict_needs_complete_bundle() -> None:
+    """A PASS needs a complete bundle: an interrupted run, a failed stage or
+    a stage missing from the index is incomplete, whatever the metrics."""
+    import json
+    from tgt import bench
+    suite = {"name": "tiny", "env": "ot-plant", "seed": 9,
+             "start_time": "2026-11-02T08:00:00Z",
+             "thresholds": {"discovery_recall": {"min": 0.1}}, "stages": [
+                 {"id": "one", "kind": "baseline", "duration": "1m"},
+                 {"id": "two", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path, b = os.path.join(d, "tiny.json"), os.path.join(d, "bundle")
+        with open(path, "w") as f:
+            json.dump(suite, f)
+        p = _cli(["bench", "run", path, "--out", b])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+        pe = os.path.join(d, "perfect")
+        bench.write_self_test(b, pe)
+        assets = os.path.join(pe, "assets.csv")
+        ip = os.path.join(b, "bench.json")
+        with open(ip) as f:
+            good = json.load(f)
+
+        def verdict(doc):
+            with open(ip, "w") as f:
+                json.dump(doc, f)
+            return bench.score_bundle(b, assets, "generic")[0]["verdict"]
+        check(verdict(good) == "pass", "complete bundle should pass")
+        check(verdict(dict(good, status="interrupted")) == "incomplete",
+              "interrupted bundle got a verdict")
+        rows = [dict(r) for r in good["stages"]]
+        rows[1]["status"] = "failed"
+        check(verdict(dict(good, stages=rows)) == "incomplete",
+              "failed stage got a verdict")
+        check(verdict(dict(good, stages=good["stages"][:1])) == "incomplete",
+              "bundle missing a suite stage got a verdict")
+
+
+def test_r22_evaluation_fingerprint_covers_effective_run() -> None:
+    """The fingerprint follows what changes the traffic: run parameters and
+    the contents of referenced plans and the environment."""
+    import json
+    from tgt import bench, enterprise, envfile
+    q = bench.load(bench.find("quick"))
+    fp = q.fingerprint()
+    check(fp == bench.load(bench.find("quick")).fingerprint(),
+          "fingerprint is not stable")
+    for kw in ({"min_period": 30}, {"min_period": 90}, {"rate": 500.0},
+               {"start_time": "2027-01-01T00:00:00Z"}, {"clock": "wall"}):
+        check(q.fingerprint(**kw) != fp, f"fingerprint ignores {kw}")
+    check(q.fingerprint(min_period=30) != q.fingerprint(min_period=90),
+          "fingerprint ignores --min-period")
+    check(q.fingerprint(start_time=q.start_time) == fp,
+          "the suite's own start time is not the default")
+    check(q.fingerprint(clock="wall", speed=2.0) !=
+          q.fingerprint(clock="wall", speed=4.0),
+          "wall-clock fingerprint ignores --speed")
+    base = envfile.to_dict(enterprise.get("ot-plant"))
+    key = "r22-fingerprint-env"
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            pp = os.path.join(d, "plan.json")
+
+            def suite():
+                return bench.Suite({"name": "s", "env": key, "stages": [
+                    {"id": "c", "kind": "campaign", "plan": pp}]}, "s.json")
+
+            def plan(dur):
+                with open(pp, "w") as f:
+                    json.dump({"env": key, "phases": [
+                        {"name": "a", "duration": dur}]}, f)
+
+            def env(ip):
+                doc = json.loads(json.dumps(dict(base, key=key)))
+                doc["hosts"][0]["ip"] = ip
+                envfile.register(envfile.from_dict(doc, "r22"))
+            first = base["hosts"][0]["ip"]
+            env(first)
+            plan("10m")
+            a = suite().fingerprint()
+            check(a == suite().fingerprint(), "plan fingerprint unstable")
+            plan("20m")
+            b = suite().fingerprint()
+            check(a != b, "fingerprint ignores the referenced plan")
+            env(first.rsplit(".", 1)[0] + ".250")
+            check(suite().fingerprint() != b,
+                  "fingerprint ignores the environment's contents")
+    finally:
+        enterprise.ENVIRONMENTS.pop(key, None)
+    # and the bundle records the effective value
+    tiny = {"name": "tiny", "env": "ot-plant", "seed": 9,
+            "start_time": "2026-11-02T08:00:00Z", "stages": [
+                {"id": "one", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "tiny.json")
+        with open(path, "w") as f:
+            json.dump(tiny, f)
+        fps = []
+        for mp in ("30", "90"):
+            b = os.path.join(d, mp)
+            p = _cli(["bench", "run", path, "--out", b, "--min-period", mp,
+                      "--force"])
+            out, _ = p.communicate(timeout=120)
+            check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+            with open(os.path.join(b, "bench.json")) as f:
+                fps.append(json.load(f)["fingerprint"])
+        check(fps[0] != fps[1], f"bundles share a fingerprint {fps}")
+
+
+def test_r22_evaluation_stage_inherits_plan_settings() -> None:
+    """A stage referencing a plan keeps the plan's run settings; explicit
+    suite and stage values override them."""
+    import json
+    from tgt import bench
+    s = bench.Suite({"name": "s", "env": "ot-plant", "stages": [
+        {"id": "c", "kind": "campaign", "plan": "ot-plant-drift"}]}, "s.json")
+    check(s.stages[0].plan_doc.get("day_profile") == "shift",
+          f"packaged plan day_profile {s.stages[0].plan_doc.get('day_profile')}")
+    with tempfile.TemporaryDirectory() as d:
+        pp = os.path.join(d, "plan.json")
+        with open(pp, "w") as f:
+            json.dump({"env": "ot-plant", "day_profile": "shift",
+                       "utc_offset": 2, "span": "core", "rate": 50,
+                       "sprinkle_messages": 5,
+                       "phases": [{"name": "a", "duration": "10m"}]}, f)
+        stage = {"id": "c", "kind": "campaign", "plan": pp}
+        doc = bench.Suite({"env": "ot-plant", "stages": [stage]},
+                          "s.json").stages[0].plan_doc
+        got = {k: doc.get(k) for k in ("day_profile", "utc_offset", "span",
+                                       "rate", "sprinkle_messages")}
+        check(got == {"day_profile": "shift", "utc_offset": 2, "span": "core",
+                      "rate": 50, "sprinkle_messages": 5},
+              f"inherited plan settings {got}")
+        doc = bench.Suite({"env": "ot-plant", "utc_offset": 0, "span":
+                           "access", "day_profile": "flat",
+                           "stages": [stage]}, "s.json").stages[0].plan_doc
+        check(doc["utc_offset"] == 0 and doc["span"] == "access" and
+              doc["day_profile"] == "flat" and doc["rate"] == 50,
+              f"suite values must override the plan: {doc}")
+        doc = bench.Suite({"env": "ot-plant", "day_profile": "flat",
+                           "stages": [dict(stage, day_profile="shift")]},
+                          "s.json").stages[0].plan_doc
+        check(doc["day_profile"] == "shift",
+              f"stage value must win: {doc['day_profile']}")
+
+
+def test_r22_evaluation_new_assets_only_emitted() -> None:
+    """A perfect monitor is not charged for sprinkle-planned hosts that
+    never reached the wire."""
+    from tgt import score as S
+    with tempfile.TemporaryDirectory() as d:
+        m, csvp = os.path.join(d, "m.json"), os.path.join(d, "assets.csv")
+        p = _cli(["run", "-e", "ot-plant", "--sprinkle", "wannacry", "--count",
+                  "3", "--rate", "0", "--pcap", os.path.join(d, "x.pcap"),
+                  "--manifest", m])
+        out, _ = p.communicate(timeout=60)
+        check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+        truth = S.load_truth(m)
+        planned = [a for a in truth.assets if a["new"]]
+        emitted = [a["id"] for a in planned if a["emitted"]]
+        check(len(emitted) < len(planned),
+              "fixture: expected planned hosts that were not emitted")
+        S.write_perfect_export(truth, csvp)
+        rows, info = S.read_export(csvp, S.load_json_spec("generic"))
+        info.update(source="assets.csv", map="generic.json")
+        n = S.score(truth, rows, info)["new_assets"]
+    if emitted:
+        check(n["total"] == len(emitted) and not n["missed"] and
+              sorted(n["detected"]) == sorted(emitted), f"new assets {n}")
+    else:
+        check(n is None, f"no emitted new assets, yet {n}")
+
+
+def test_r22_evaluation_alert_credit_is_one_to_one() -> None:
+    """One alert credits one event, and an alert naming no host cannot
+    detect an event that names hosts (it is reported separately)."""
+    from tgt import score
+    hosts = [{"asset_id": f"s:H{i}", "name": f"H{i}", "ip": f"10.0.0.{i}"}
+             for i in range(1, 7)]
+
+    def truth(evs):
+        rows = [{"id": f"e{i}", "category": "scan", "attack": "port-scan",
+                 "t_start": f"2026-11-05T14:00:0{i}Z",
+                 "t_end": f"2026-11-05T14:00:0{i}Z", "src": src, "dst": dst,
+                 "hosts": [], "source": "sprinkle:x"}
+                for i, (src, dst) in enumerate(evs)]
+        return score.Truth({"schema": "tgt-manifest/1",
+                            "start": "2026-11-05T14:00:00Z",
+                            "end": "2026-11-05T14:10:00Z",
+                            "inventory": {"hosts": hosts}, "first_seen": {},
+                            "events": rows}, "r22")
+
+    def alert(row, sec, src, dst=""):
+        return {"row": row, "time": score.parse_time(
+            f"2026-11-05T14:00:{sec:02d}Z"), "title": "scan",
+                "raw_category": "scan", "category": "scan", "src": src,
+                "dst": dst, "techniques": None}
+    five = truth([(f"10.0.0.{i}", None) for i in range(1, 6)])
+    det = score.detections(five, [alert(1, 6, "")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 1 and
+          not det["false_alerts"] and det["matched_alerts"] == 0,
+          f"blank alert: {det['detected']} detected, "
+          f"{det.get('hostless_alerts')} host-less")
+    det = score.detections(five, [alert(1, 6, "10.0.0.3")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["hostless_alerts"] == 0,
+          f"one alert detected {det['detected']} events")
+    shared = truth([("10.0.0.1", "10.0.0.2"), ("10.0.0.1", "10.0.0.3")])
+    det = score.detections(shared, [alert(1, 6, "10.0.0.1")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["matched_alerts"] == 1,
+          f"one alert on a shared host detected {det['detected']}")
+    # the first event must give up the only alert the second one can use
+    det = score.detections(shared, [alert(1, 6, "10.0.0.1"),
+                                    alert(2, 7, "10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 2 and
+          {r["alert_row"] for r in det["events_detail"]} == {1, 2},
+          f"assignment is not maximal: {det['detected']}")
+    # extra alerts on a detected event are matched, not false
+    det = score.detections(shared, [alert(1, 6, "10.0.0.2"),
+                                    alert(2, 7, "10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["matched_alerts"] == 2 and
+          not det["false_alerts"], f"duplicate alerts: {det['detected']}")
+    bare = score.Truth({"schema": "tgt-manifest/1",
+                        "start": "2026-11-05T14:00:00Z",
+                        "end": "2026-11-05T14:10:00Z",
+                        "inventory": {"hosts": hosts}, "first_seen": {},
+                        "events": [{"id": "e0", "category": "scan",
+                                    "t_start": "2026-11-05T14:00:00Z",
+                                    "t_end": "2026-11-05T14:00:00Z",
+                                    "hosts": [], "source": "x"}]}, "r22")
+    det = score.detections(bare, [alert(1, 6, "")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["hostless_alerts"] == 0,
+          "an event naming no host still matches on category and time")
+    res = score.score(five, [], {"rows": 0, "columns": {}, "source": "x",
+                                 "map": "m", "protocol_ignore": [],
+                                 "normalize": lambda f, v: v},
+                      alerts=[alert(1, 6, "")])
+    check("1 host-less" in score.summary(res),
+          "summary does not report host-less alerts")
+
+
+def test_r22_evaluation_reused_ip_credits_new_owner() -> None:
+    """An IP handed to a new host is that host's from the phase on; a
+    host's old address stays credited to it only while nobody reused it."""
+    import json
+    from tgt import campaign
+    from tgt.manifest import Recorder
+    plan = {"name": "reuse", "env": "ot-plant", "seed": 3,
+            "start_time": "2026-11-02T08:00:00Z", "phases": [
+                {"name": "a", "duration": "10m"},
+                {"name": "b", "duration": "10m", "remove_host": ["PLC-RW1"],
+                 "add_host": [{"name": "NEW-HOST", "ip": "172.16.1.21",
+                               "model": "rockwell-1769-l36erm"}],
+                 "add_flow": [{"client": "HMI-RW", "server": "NEW-HOST",
+                               "proto": "enip"}],
+                 "set": [{"host": "PLC-RW2", "ip": "172.16.1.29"}]}]}
+    with tempfile.TemporaryDirectory() as d:
+        pp, m = os.path.join(d, "p.json"), os.path.join(d, "m.json")
+        with open(pp, "w") as f:
+            json.dump(plan, f)
+        p = _cli(["campaign", pp, "--clock", "synthetic", "--pcap",
+                  os.path.join(d, "p.pcap"), "--manifest", m, "--rate", "0",
+                  "--force"])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"campaign rc={p.returncode} {out[-300:]}")
+        with open(m) as f:
+            doc = json.load(f)
+        phases = campaign.build(campaign.load(pp))
+        rec = Recorder(RunConfig(env="ot-plant", campaign=pp), 3,
+                       clock="synthetic")
+        rec.campaign(phases)
+        before = next(h.ip for h in phases[0].env.hosts
+                      if h.name == "PLC-RW2")
+        rec.begin_phase(phases[0], 0.0)
+        check(rec.addr_aid["172.16.1.21"] == "ot-plant:PLC-RW1",
+              "first phase: the address belongs to PLC-RW1")
+        rec.begin_phase(phases[1], 600.0)
+    switch = doc["phases"][1]["start"]
+    old, new = doc["last_seen"]["ot-plant:PLC-RW1"], \
+        doc["last_seen"]["ot-plant:NEW-HOST"]
+    check(old <= switch, f"PLC-RW1 credited after it left: {old} > {switch}")
+    check(new > switch and new > old, f"NEW-HOST last seen {new}")
+    check(rec.addr_aid["172.16.1.21"] == "ot-plant:NEW-HOST",
+          f"reused IP maps to {rec.addr_aid['172.16.1.21']}")
+    check(rec.addr_aid[before] == "ot-plant:PLC-RW2" and
+          rec.addr_aid["172.16.1.29"] == "ot-plant:PLC-RW2",
+          "a re-addressed host keeps its unclaimed old address")
+    stale = [k for k, r in rec.flowidx.items()
+             if "172.16.1.21" in (r[2], r[3]) and
+             "ot-plant:PLC-RW1" in (r[0], r[1])]
+    check(not stale, f"flow index still credits PLC-RW1: {stale[:2]}")
+
+
+def test_r22_evaluation_remap_arp_macs_follow_ip() -> None:
+    """--remap-env: when one capture MAC owns two IPs, each ARP's sender and
+    target MACs are those of the host its IP maps to."""
+    from types import SimpleNamespace
+    from tgt import enterprise
+    from tgt.remapenv import EnvRewriter, HostProfile
+    env = enterprise.get("ot-plant")
+    a, b, c = env.hosts[:3]
+    shared, peer = "02:00:00:00:00:aa", "02:00:00:00:00:bb"
+    mapped = [(HostProfile(key=ip, ip=ip, mac=mac), h, env.segment_of(h), 1.0)
+              for ip, mac, h in (("10.9.0.1", shared, a),
+                                 ("10.9.0.2", shared, b),
+                                 ("10.9.0.3", peer, c))]
+    rw = EnvRewriter(SimpleNamespace(mapped=mapped, env=env, span="access",
+                                     describe=lambda: "remap"))
+    m, ip = P.mac_to_bytes, P.ip_to_bytes
+
+    def arp(op, emac, smac, sip, tmac, tip):
+        return (m(emac) + m(smac) + b"\x08\x06\x00\x01\x08\x00\x06\x04" +
+                struct.pack("!H", op) + m(smac) + ip(sip) + m(tmac) + ip(tip))
+
+    def fields(frame):
+        off = 18 if frame[12:14] == b"\x81\x00" else 14
+        return frame[:6], frame[6:12], frame[off + 8:off + 14], \
+            frame[off + 18:off + 24]
+    for sip, host in (("10.9.0.1", a), ("10.9.0.2", b)):
+        ed, es, sm, tm = fields(rw.apply_all(arp(2, peer, shared, sip, peer,
+                                                 "10.9.0.3"))[0])
+        want = m(host.mac)
+        check(es == want and sm == want and ed == m(c.mac) and
+              tm == m(c.mac), f"ARP reply from {sip}: sender {sm.hex()} / "
+                              f"eth {es.hex()}, want {want.hex()}")
+    for tip, host in (("10.9.0.1", a), ("10.9.0.2", b)):
+        ed, es, sm, tm = fields(rw.apply_all(arp(2, shared, peer, "10.9.0.3",
+                                                 shared, tip))[0])
+        want = m(host.mac)
+        check(ed == want and tm == want and sm == m(c.mac),
+              f"ARP reply to {tip}: target {tm.hex()} / eth {ed.hex()}, "
+              f"want {want.hex()}")
+    ed, _, sm, tm = fields(rw.apply_all(arp(1, "ff:ff:ff:ff:ff:ff", shared,
+                                            "10.9.0.1", "00:00:00:00:00:00",
+                                            "10.9.0.3"))[0])
+    check(ed == b"\xff" * 6 and tm == b"\0" * 6 and sm == m(a.mac),
+          "ARP request: broadcast and empty target MAC must stay")
+
+
+def test_r22_evaluation_ftp_backup_class() -> None:
+    """FTP to a file share or historian is a backup, like the same SMB flow;
+    other FTP keeps its engineering class."""
+    from tgt import timing
+    for server in ("file", "hist"):
+        check(timing.activity_class("ftp", "hist", server) == "backup",
+              f"ftp hist -> {server}")
+        check(timing.activity_class("smb", "hist", server) == "backup",
+              f"smb hist -> {server}")
+    check(timing.activity_class("ftp", "ws", "file") == "eng",
+          "ftp from a workstation is not a backup")
+    check(timing.activity_class("ftp", "eng", "plc") == "eng",
+          "ftp to a PLC is not a backup")
+    check(timing.activity_class("smb", "hmi", "plc") == "operator",
+          "the office-class refinement must still apply")
+
+
+def test_r22_evaluation_alert_host_must_match_named_event() -> None:
+    """An event naming a host no alert address resolves to is not detected
+    by an alert on another host, and an alert naming an unknown host is a
+    false alert rather than a host-less one."""
+    from tgt import score
+    hosts = [{"asset_id": f"s:H{i}", "name": f"H{i}", "ip": f"10.0.0.{i}"}
+             for i in range(1, 4)]
+
+    def truth(host):
+        return score.Truth({
+            "schema": "tgt-manifest/1", "start": "2026-11-05T14:00:00Z",
+            "end": "2026-11-05T14:10:00Z", "inventory": {"hosts": hosts},
+            "first_seen": {}, "events": [{
+                "id": "e", "category": "scan",
+                "t_start": "2026-11-05T14:00:00Z",
+                "t_end": "2026-11-05T14:00:00Z", "hosts": [host],
+                "source": "x"}]}, "r22")
+
+    def alert(src):
+        return {"row": 1, "time": score.parse_time("2026-11-05T14:00:03Z"),
+                "title": "scan", "raw_category": "scan", "category": "scan",
+                "src": src, "dst": "", "techniques": None}
+    det = score.detections(truth("s:GHOST"), [alert("10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 0 and len(det["false_alerts"]) == 1,
+          f"unresolved event host: {det['detected']} detected")
+    det = score.detections(truth("s:H1"), [alert("GHOST-NAME")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 0 and
+          len(det["false_alerts"]) == 1,
+          f"unknown alert host: {det['hostless_alerts']} host-less, "
+          f"{len(det['false_alerts'])} false")
+    det = score.detections(truth("s:H1"), [alert("")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 1 and
+          not det["false_alerts"], "a blank alert stays host-less")
+    det = score.detections(truth("s:H1"), [alert("H1")], 300.0, 5.0)
+    check(det["detected"] == 1, "an alert naming the host by name matches")
+
+
+def test_r22_evaluation_overwrite_keeps_foreign_manifest() -> None:
+    """--overwrite on a directory that holds no bench bundle leaves a
+    manifest.json the bench did not write, but clears its own."""
+    import json
+    from tgt import bench
+    suite = bench.Suite({"name": "tiny", "env": "ot-plant", "stages": [
+        {"id": "one", "kind": "baseline", "duration": "1m"}]}, "tiny.json")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "manifest.json")
+        with open(path, "w") as f:
+            json.dump({"mine": 1}, f)
+        bench._clear_bundle(d, suite)
+        check(os.path.exists(path), "--overwrite removed a foreign manifest")
+        with open(path, "w") as f:
+            json.dump({"bench": {"suite": "tiny"}}, f)
+        bench._clear_bundle(d, suite)
+        check(not os.path.exists(path), "a merged manifest was not cleared")
+        with open(path, "w") as f:
+            json.dump({"mine": 1}, f)
+        with open(os.path.join(d, "bench.json"), "w") as f:
+            json.dump({"stages": []}, f)
+        bench._clear_bundle(d, suite)
+        check(not os.path.exists(path), "a bundle's manifest was not cleared")
 
 
 def main() -> int:
