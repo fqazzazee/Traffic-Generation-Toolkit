@@ -132,6 +132,13 @@ ensure_veth() {
     info "created veth pair: $iface <-> ${iface}-mon"
 }
 
+# True only for the pair ensure_veth creates: a veth whose peer is <name>-mon.
+is_tgt_veth() {
+    link=$(ip -o -d link show "$1" 2>/dev/null) || return 1
+    case "$link" in *": $1@$1-mon:"*) ;; *) return 1 ;; esac
+    case "$link" in *" veth "*) return 0 ;; *) return 1 ;; esac
+}
+
 # --- systemd path -----------------------------------------------------------
 write_unit() {
     cat > "$UNIT_FILE" <<EOF
@@ -301,7 +308,11 @@ cmd_unregister() {
     if [ -f "$CONF_FILE" ]; then . "$CONF_FILE" 2>/dev/null || true; fi
     for iface in $(echo "${TGT_IFACE:-tgt0}" | tr , " "); do
         if command -v ip >/dev/null 2>&1 && ip link show "$iface" >/dev/null 2>&1; then
-            if ip link del "$iface" 2>/dev/null; then info "removed veth $iface"; fi
+            if ! is_tgt_veth "$iface"; then
+                warn "leaving $iface: not a veth paired with ${iface}-mon"
+            elif ip link del "$iface" 2>/dev/null; then
+                info "removed veth $iface"
+            fi
         fi
     done
     warn "config kept at $CONF_FILE (delete manually if desired)"

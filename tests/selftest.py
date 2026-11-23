@@ -8710,6 +8710,34 @@ def test_r22_ops_service_state_permission_means_running() -> None:
             service._have_systemd, service.PID_PATHS, os.kill = saved
 
 
+def test_r22_ops_unregister_only_removes_tgt_veths() -> None:
+    """unregister deletes a veth whose peer is <name>-mon and leaves any
+    other interface named in TGT_IFACE alone."""
+    links = {
+        "tgt0": "7: tgt0@tgt0-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:01"
+                " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    veth addrgenmode eui64",
+        "eth9": "3: eth9: <UP> mtu 1500\\    link/ether 02:00:00:00:00:02"
+                " brd ff:ff:ff:ff:ff:ff promiscuity 0 addrgenmode eui64",
+        "vethx": "8: vethx@other: <UP> mtu 1500\\    link/ether 02:00:00:00:00:03"
+                 " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    veth addrgenmode eui64",
+        "vlan5": "9: vlan5@vlan5-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:04"
+                 " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    vlan id 5",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        _r22_ops_conf(box, ",".join(links))
+        for name, line in links.items():
+            with open(os.path.join(box["links"], name), "w") as fh:
+                fh.write(line + "\n")
+        rc, out, calls = _r22_ops_run(box, "unregister")
+        check(rc == 0, f"unregister rc={rc}: {out}")
+        check("ip link del tgt0" in calls, f"TGT veth not removed: {calls}")
+        for name in ("eth9", "vethx", "vlan5"):
+            check(f"ip link del {name}" not in calls,
+                  f"unregister deleted foreign interface {name}")
+            check(name in out, f"no notice for kept interface {name}: {out}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
