@@ -435,8 +435,9 @@ def paths(env) -> List[Path]:
                 dns.append((h, own, name, ip))
         else:
             if own is not None:
+                # the address h really connects to (a NAT site's outside IP)
                 dns.append((h, own, f"{proxy.name.lower()}.{DNS_DOMAIN}",
-                            proxy.ip))
+                            env.nat_view(h, proxy)[1].ip))
             up = _resolver(env, proxy)
             if up is not None:
                 dns.append((proxy, up, name, ip))

@@ -10971,6 +10971,25 @@ def test_r22_edr_custom_ips_must_be_address_strings() -> None:
             check(e.path == "ips[0]", f"custom ips {bad!r}: path {e.path}")
 
 
+def test_r22_edr_proxy_behind_nat_dns_answer() -> None:
+    from tgt import edr, enterprise, envfile
+    envfile.load_user_envs()
+    base = enterprise.get("water-utility")
+    proxy = next(h for h in base.hosts if base.nat_of(h))
+    env = edr.apply(base, {"profile": "generic", "proxy": proxy.name})
+    parsed = [p for p in (_edr_parse(f) for _, f in _edr_wire(env))
+              if p is not None]
+    dials = {(p[0], p[1]) for p in parsed if p[2] == 6 and p[4] == 8080}
+    name = f"{proxy.name.lower()}.{enterprise.DNS_DOMAIN}"
+    answers = [a for a in _edr_dns_answers(f for _, f in _edr_wire(env))
+               if a[2] == name]
+    check(answers and dials, "NAT proxy: no lookups or connections")
+    for client, _, _, ip in answers:
+        check((client, ip) in dials,
+              f"NAT proxy: {client} resolved {ip}, dials "
+              f"{sorted(d for c, d in dials if c == client)}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
