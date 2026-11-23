@@ -10959,6 +10959,18 @@ def test_r22_edr_campaign_option() -> None:
             f"campaign --edr off: rc={rc}")
 
 
+def test_r22_edr_custom_ips_must_be_address_strings() -> None:
+    from tgt import edr
+    base = {"profile": "custom", "vendor": "Example",
+            "fqdns": {c: f"{c}.vendor.example" for c in edr.CHANNELS}}
+    for bad in (5, 3232235777, True, "0.0.0.5"):
+        try:
+            edr.resolve(dict(base, ips=[bad]))
+            check(False, f"custom ips accepted {bad!r}")
+        except edr.EdrError as e:
+            check(e.path == "ips[0]", f"custom ips {bad!r}: path {e.path}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

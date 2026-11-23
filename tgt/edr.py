@@ -189,11 +189,14 @@ def _custom_region(block: Dict[str, Any]) -> Region:
     for i, ip in enumerate(ips):
         p = f"ips[{i}]"
         try:
+            if not isinstance(ip, str):     # IPv4Address(5) would be 0.0.0.5
+                raise ValueError
             a = ipaddress.IPv4Address(ip)
         except (ipaddress.AddressValueError, ValueError):
             raise EdrError(p, f"not an IPv4 address: {ip!r}") from None
         if (a.is_multicast or a.is_loopback or a.is_unspecified
-                or a.is_link_local or a.is_reserved):
+                or a.is_link_local or a.is_reserved
+                or a in ipaddress.ip_network("0.0.0.0/8")):
             raise EdrError(p, f"{ip} is not a unicast cloud address")
         if ip in ips[:i]:
             raise EdrError(p, f"duplicate address {ip}")
