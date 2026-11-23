@@ -6183,8 +6183,11 @@ def test_rolling_pps_shows_stalls() -> None:
     from tgt.engine import Stats
     from tgt.sender import RateLimiter
     s = Stats()
-    t0 = time.perf_counter()
-    s.started = t0 - 100.0
+    # Sample times are exact in binary: a live perf_counter base can round the
+    # sample placed exactly WINDOW back to just under it, keeping an older
+    # baseline. Only the lifetime average reads the real clock.
+    t0 = 1000.0
+    s.started = time.perf_counter() - 100.0
     s.packets, s.bytes = 10000, 1000000
     check(abs(s.rolling(now=t0)[0] - 100.0) < 1.0,
           "rolling: first sample should be the lifetime average")
@@ -9825,6 +9828,412 @@ def test_r22_evaluation_overwrite_keeps_foreign_manifest() -> None:
             json.dump({"stages": []}, f)
         bench._clear_bundle(d, suite)
         check(not os.path.exists(path), "a bundle's manifest was not cleared")
+def _r22_ops_sandbox(d: str, systemd: bool = True) -> dict:
+    """A patched copy of tgtctl.sh whose system paths live under ``d`` and
+    whose ip/systemctl/journalctl/setpriv/id/tail are stubs: nothing here can
+    reach a real service or a host interface."""
+    import stat
+    root = os.path.join(d, "root")
+    for sub in ("etc", "run", "var/log", "tmp"):
+        os.makedirs(os.path.join(root, sub))
+    if systemd:
+        os.makedirs(os.path.join(root, "run/systemd/system"))
+        os.makedirs(os.path.join(root, "etc/systemd/system"))
+    repo, bin_dir, links = (os.path.join(d, n) for n in ("repo", "bin", "links"))
+    for p in (os.path.join(repo, "scripts"), os.path.join(repo, "tgt"),
+              bin_dir, links):
+        os.makedirs(p)
+    for name, body in (("__init__.py", ""), ("__main__.py", "raise SystemExit(0)\n")):
+        with open(os.path.join(repo, "tgt", name), "w") as fh:
+            fh.write(body)
+    with open(os.path.join(_REPO, "scripts", "tgtctl.sh")) as fh:
+        text = fh.read()
+    for path in ("/etc/", "/run", "/var/log", "/tmp/tgt"):
+        text = text.replace(path, root + path)
+    ctl = os.path.join(repo, "scripts", "tgtctl.sh")
+    with open(ctl, "w") as fh:
+        fh.write(text)
+    stubs = {
+        "id": 'echo "${STUB_UID:-0}"\n',
+        "systemctl": 'echo "systemctl $*" >> "$STUB_LOG"\n',
+        "journalctl": 'echo "journalctl $*" >> "$STUB_LOG"\n',
+        "tail": 'echo "tail $*"\n',
+        "ip": 'echo "ip $*" >> "$STUB_LOG"\n'
+              'for n; do :; done\n'
+              'case "$*" in\n'
+              '  "-o -d link show "*) [ -f "$STUB_LINKS/$n" ] && '
+              'cat "$STUB_LINKS/$n" ;;\n'
+              '  "link show "*) [ -f "$STUB_LINKS/$n" ] ;;\n'
+              'esac\n',
+        "setpriv": '[ -z "${STUB_SETPRIV_FAIL:-}" ] || exit 1\n'
+                   'while case "$1" in --*) true ;; *) false ;; esac; do '
+                   'shift; done\n'
+                   'for a in "$@"; do case "$a" in\n'
+                   '  "${STUB_DENY:-/nonexistent}"|"${STUB_DENY:-/nonexistent}"/*)'
+                   ' exit 1 ;;\n'
+                   'esac; done\n'
+                   'exec "$@"\n',
+    }
+    for name, body in stubs.items():
+        path = os.path.join(bin_dir, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n" + body)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+    log = os.path.join(d, "calls.log")
+    open(log, "w").close()
+    env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"],
+               STUB_LOG=log, STUB_LINKS=links, PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    return {"ctl": ctl, "env": env, "root": root, "repo": repo, "log": log,
+            "links": links, "bin": bin_dir,
+            "conf": os.path.join(root, "etc/tgt/tgt.conf"),
+            "unit": os.path.join(root, "etc/systemd/system/tgt.service")}
+
+
+def _r22_ops_run(box: dict, *args: str, **env: str):
+    import subprocess
+    r = subprocess.run(["sh", box["ctl"]] + list(args),
+                       env=dict(box["env"], **env), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True,
+                       timeout=30)
+    with open(box["log"]) as fh:
+        return r.returncode, r.stdout, fh.read()
+
+
+def _r22_ops_conf(box: dict, iface: str = "tgt0") -> None:
+    os.makedirs(os.path.dirname(box["conf"]), exist_ok=True)
+    with open(box["conf"], "w") as fh:
+        fh.write(f"TGT_IFACE={iface}\nTGT_RUN_ARGS=\n")
+
+
+def test_r22_ops_service_state_permission_means_running() -> None:
+    """EPERM from kill(pid, 0) proves the process exists, so a root daemon
+    reads as active to a non-root TUI. A stale first PID file does not hide
+    a live daemon recorded in the second."""
+    from tgt import service
+    saved = service._have_systemd, service.PID_PATHS, os.kill
+    with tempfile.TemporaryDirectory() as d:
+        first, second = os.path.join(d, "a.pid"), os.path.join(d, "b.pid")
+
+        def fake_kill(pid, sig):
+            if pid == 111:
+                raise PermissionError(1, "not permitted")
+            if pid == 222:
+                raise ProcessLookupError(3, "no such process")
+        try:
+            service._have_systemd = lambda: False
+            service.PID_PATHS = (first, second)
+            os.kill = fake_kill
+            with open(first, "w") as fh:
+                fh.write("111\n")
+            st = service.service_state()
+            check(st.status == "active" and st.detail == "pid 111",
+                  f"service_state on EPERM: {st}")
+            with open(first, "w") as fh:
+                fh.write("222\n")
+            st = service.service_state()
+            check(st.status == "inactive", f"service_state on ESRCH: {st}")
+            with open(second, "w") as fh:
+                fh.write("111\n")
+            st = service.service_state()
+            check(st.status == "active", f"stale PID file hid a daemon: {st}")
+        finally:
+            service._have_systemd, service.PID_PATHS, os.kill = saved
+
+
+def test_r22_ops_unregister_only_removes_tgt_veths() -> None:
+    """unregister deletes a veth whose peer is <name>-mon and leaves any
+    other interface named in TGT_IFACE alone."""
+    links = {
+        "tgt0": "7: tgt0@tgt0-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:01"
+                " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    veth addrgenmode eui64",
+        "eth9": "3: eth9: <UP> mtu 1500\\    link/ether 02:00:00:00:00:02"
+                " brd ff:ff:ff:ff:ff:ff promiscuity 0 addrgenmode eui64",
+        "vethx": "8: vethx@other: <UP> mtu 1500\\    link/ether 02:00:00:00:00:03"
+                 " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    veth addrgenmode eui64",
+        "vlan5": "9: vlan5@vlan5-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:04"
+                 " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    vlan id 5",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        _r22_ops_conf(box, ",".join(links))
+        for name, line in links.items():
+            with open(os.path.join(box["links"], name), "w") as fh:
+                fh.write(line + "\n")
+        rc, out, calls = _r22_ops_run(box, "unregister")
+        check(rc == 0, f"unregister rc={rc}: {out}")
+        check("ip link del tgt0" in calls, f"TGT veth not removed: {calls}")
+        for name in ("eth9", "vethx", "vlan5"):
+            check(f"ip link del {name}" not in calls,
+                  f"unregister deleted foreign interface {name}")
+            check(name in out, f"no notice for kept interface {name}: {out}")
+
+
+def test_r22_ops_status_logs_find_root_daemon_files() -> None:
+    """Without write access to /run and /var/log, status and logs still find
+    the root daemon's PID and log files. PID 1 gives a real EPERM."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        run_dir, log_dir = (os.path.join(box["root"], s) for s in ("run", "var/log"))
+        with open(os.path.join(run_dir, "tgt.pid"), "w") as fh:
+            fh.write("1\n")
+        log_file = os.path.join(log_dir, "tgt.log")
+        with open(log_file, "w") as fh:
+            fh.write("daemon line\n")
+        os.chmod(run_dir, 0o555)
+        os.chmod(log_dir, 0o555)
+        try:
+            rc, out, _ = _r22_ops_run(box, "status", STUB_UID="1000")
+            check(rc == 0 and "running (pid 1)" in out and log_file in out,
+                  f"status without root: rc={rc} {out}")
+            rc, out, _ = _r22_ops_run(box, "logs", STUB_UID="1000")
+            check(rc == 0 and log_file in out,
+                  f"logs without root: rc={rc} {out}")
+        finally:
+            os.chmod(run_dir, 0o755)
+            os.chmod(log_dir, 0o755)
+
+
+def test_r22_ops_start_registers_missing_unit() -> None:
+    """On a systemd host an existing config no longer skips registration:
+    start and restart go through a unit, never an unmanaged daemon. A legacy
+    daemon that is already running is not doubled up."""
+    for action in ("start", "restart"):
+        with tempfile.TemporaryDirectory() as d:
+            box = _r22_ops_sandbox(d)
+            _r22_ops_conf(box)
+            rc, out, calls = _r22_ops_run(box, action)
+            pid_file = os.path.join(box["root"], "run", "tgt.pid")
+            check(rc == 0 and os.path.exists(box["unit"]),
+                  f"{action}: unit not registered: rc={rc} {out}")
+            check(f"systemctl {action} tgt.service" in calls or
+                  "systemctl start tgt.service" in calls,
+                  f"{action}: systemctl not used: {calls}")
+            check(not os.path.exists(pid_file),
+                  f"{action}: launched an unmanaged daemon")
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        _r22_ops_conf(box)
+        with open(os.path.join(box["root"], "run", "tgt.pid"), "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        rc, out, calls = _r22_ops_run(box, "start")
+        check(rc == 0 and not os.path.exists(box["unit"]) and
+              "systemctl start" not in calls,
+              f"start doubled a running daemon: rc={rc} {out} {calls}")
+
+
+def test_r22_ops_service_uses_same_mode_as_tgtctl() -> None:
+    """tgt.service picks systemctl only when the unit exists, like tgtctl;
+    otherwise the action goes through tgtctl, which registers it."""
+    import subprocess
+    from tgt import service
+    saved = service._have_systemd, service.UNIT_PATH, service.subprocess.run
+    saved_paths = service.PID_PATHS
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "active\n", "")
+    with tempfile.TemporaryDirectory() as d:
+        unit = os.path.join(d, "tgt.service")
+        try:
+            service._have_systemd = lambda: True
+            service.UNIT_PATH = unit
+            service.PID_PATHS = (os.path.join(d, "none.pid"),)
+            service.subprocess.run = fake_run
+            service.service_action("start")
+            check(not any("systemctl" in c for c in calls) and
+                  any(str(x).endswith("tgtctl.sh") for x in calls[-1]),
+                  f"no unit: action should use tgtctl: {calls}")
+            st = service.service_state()
+            check(st.status == "not-installed" and st.mode == "systemd",
+                  f"no unit: state {st}")
+            calls.clear()
+            open(unit, "w").close()
+            service.service_action("start")
+            check(any("systemctl" in c for c in calls),
+                  f"unit present: action should use systemctl: {calls}")
+        finally:
+            service._have_systemd, service.UNIT_PATH = saved[:2]
+            service.subprocess.run = saved[2]
+            service.PID_PATHS = saved_paths
+
+
+def test_r22_ops_preflight_uses_service_capabilities() -> None:
+    """register fails before writing a unit when the service, which has no
+    DAC capabilities, cannot read the checkout; the message names the path
+    and the remedy, and the unit's capabilities stay narrow."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        denied = os.path.join(box["repo"], "tgt")
+        rc, out, calls = _r22_ops_run(box, "register", STUB_DENY=denied)
+        check(rc != 0 and denied in out and "/opt" in out and
+              "CAP_DAC" in out, f"preflight message: rc={rc} {out}")
+        check(not os.path.exists(box["unit"]) and "systemctl" not in calls,
+              f"unit written despite failed preflight: {calls}")
+        rc, out, _ = _r22_ops_run(box, "register")
+        check(rc == 0 and os.path.exists(box["unit"]),
+              f"register with access: rc={rc} {out}")
+        with open(box["unit"]) as fh:
+            unit = fh.read()
+        check("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\n" in unit and
+              "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\n" in unit,
+              "service capabilities changed")
+        rc, out, calls = _r22_ops_run(box, "start", STUB_DENY=denied)
+        check(rc != 0 and denied in out and
+              "systemctl start" not in calls,
+              f"start with an unreadable checkout: rc={rc} {out}")
+    with tempfile.TemporaryDirectory() as d:     # daemon mode keeps full root
+        box = _r22_ops_sandbox(d, systemd=False)
+        rc, out, _ = _r22_ops_run(box, "register",
+                                  STUB_DENY=os.path.join(box["repo"], "tgt"))
+        check(rc == 0, f"daemon-mode register blocked: rc={rc} {out}")
+
+
+def test_r22_ops_preflight_walks_permissions_without_setpriv() -> None:
+    """When setpriv cannot run, mode bits decide what root without
+    CAP_DAC_* could read."""
+    base = "/dev/shm" if os.access("/dev/shm", os.W_OK) else "/tmp"
+    with tempfile.TemporaryDirectory(dir=base) as d:
+        os.chmod(d, 0o755)
+        box = _r22_ops_sandbox(d)
+        rc, out, _ = _r22_ops_run(box, "register", STUB_SETPRIV_FAIL="1")
+        check(rc == 0, f"walk rejected a readable checkout: rc={rc} {out}")
+        os.unlink(box["unit"])
+        secret = os.path.join(box["repo"], "tgt", "data.json")
+        open(secret, "w").close()
+        os.chmod(secret, 0)
+        rc, out, _ = _r22_ops_run(box, "register", STUB_SETPRIV_FAIL="1")
+        check(rc != 0 and secret in out and not os.path.exists(box["unit"]),
+              f"walk missed an unreadable file: rc={rc} {out}")
+
+
+def test_r22_ops_entrypoint_splits_interfaces() -> None:
+    """docker-entrypoint.sh creates one veth pair per comma-separated name
+    and leaves an existing interface alone."""
+    import stat
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        py = os.path.join(box["bin"], "python3")
+        with open(py, "w") as fh:
+            fh.write('#!/bin/sh\necho "python3 $*"\n')
+        os.chmod(py, os.stat(py).st_mode | stat.S_IXUSR)
+        open(os.path.join(box["links"], "tgt2"), "w").close()
+        r = subprocess.run(
+            ["sh", os.path.join(_REPO, "docker-entrypoint.sh"), "list"],
+            env=dict(box["env"], TGT_IFACE="tgt0,tgt1,tgt2"),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, timeout=10)
+        with open(box["log"]) as fh:
+            calls = fh.read()
+        for name in ("tgt0", "tgt1"):
+            check(f"ip link add {name} type veth peer name {name}-mon" in calls
+                  and f"ip link set {name} up" in calls
+                  and f"ip link set {name}-mon up" in calls,
+                  f"entrypoint: no pair for {name}: {calls}")
+        check("link add tgt2" not in calls and "tgt0,tgt1" not in calls,
+              f"entrypoint: wrong interface handling: {calls}")
+        check(r.returncode == 0 and "python3 -m tgt list" in r.stdout,
+              f"entrypoint: no hand-off: {r.stdout}")
+
+
+def test_r22_ops_unregister_ignores_link_alias() -> None:
+    """A link alias is free text: one mentioning veth does not make a VLAN
+    on <name>-mon look like a TGT pair, and a real pair with an alias goes."""
+    head = "7: {0}@{0}-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:01"
+    links = {
+        "fake": head.format("fake") + " promiscuity 0 \\    vlan protocol "
+                "802.1Q id 7 addrgenmode eui64 \\    alias lab veth uplink",
+        "tgt0": head.format("tgt0") + " promiscuity 0 \\    veth addrgenmode "
+                "eui64 \\    alias traffic",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        _r22_ops_conf(box, ",".join(links))
+        for name, line in links.items():
+            with open(os.path.join(box["links"], name), "w") as fh:
+                fh.write(line + "\n")
+        rc, out, calls = _r22_ops_run(box, "unregister")
+        check(rc == 0, f"unregister rc={rc}: {out}")
+        check("ip link del fake" not in calls,
+              f"alias made a VLAN look like a TGT veth: {calls}")
+        check("ip link del tgt0" in calls, f"aliased veth kept: {calls}")
+
+
+def test_r22_ops_restart_keeps_daemon_when_preflight_fails() -> None:
+    """Moving an unmanaged daemon under systemd checks access first, so a
+    checkout the service cannot read leaves the daemon running."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        _r22_ops_conf(box)
+        pid_file = os.path.join(box["root"], "run", "tgt.pid")
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            with open(pid_file, "w") as fh:
+                fh.write(f"{proc.pid}\n")
+            rc, out, calls = _r22_ops_run(
+                box, "restart", STUB_DENY=os.path.join(box["repo"], "tgt"))
+            check(rc != 0 and "cannot access" in out,
+                  f"restart preflight: rc={rc} {out}")
+            check(proc.poll() is None and os.path.exists(pid_file),
+                  "restart stopped the daemon before a failed preflight")
+            check("systemctl" not in calls, f"systemctl used: {calls}")
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+def test_r22_ops_preflight_checks_installed_unit_python() -> None:
+    """start and restart check the interpreter the installed unit runs: a
+    unit pointing into a private virtualenv fails before systemctl."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        rc, out, _ = _r22_ops_run(box, "register")
+        check(rc == 0, f"register rc={rc}: {out}")
+        venv = os.path.join(d, "private venv")
+        os.mkdir(venv)
+        py = os.path.join(venv, "python3")
+        with open(py, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(py, 0o755)
+        with open(box["unit"]) as fh:
+            lines = fh.read().splitlines(True)
+        for i, line in enumerate(lines):
+            if line.startswith("ExecStart="):
+                head, _, tail = line.partition(" exec ")
+                lines[i] = head + " exec " + py + " -m " + tail.split(" -m ", 1)[1]
+        with open(box["unit"], "w") as fh:
+            fh.writelines(lines)
+        for action in ("start", "restart"):
+            rc, out, calls = _r22_ops_run(box, action, STUB_DENY=venv)
+            check(rc != 0 and venv in out,
+                  f"{action}: private interpreter passed: rc={rc} {out}")
+            check(f"systemctl {action}" not in calls,
+                  f"{action}: systemctl ran: {calls}")
+        rc, out, calls = _r22_ops_run(box, "start")
+        check(rc == 0 and "systemctl start" in calls,
+              f"start with access: rc={rc} {out}")
+
+
+def test_r22_ops_logs_follow_live_daemon() -> None:
+    """logs reads the live daemon's log even when the other location holds
+    a newer, unrelated file."""
+    for pid_dir, log_rel, other_rel in (("run", "var/log/tgt.log", "tmp/tgt.log"),
+                                        ("tmp", "tmp/tgt.log", "var/log/tgt.log")):
+        with tempfile.TemporaryDirectory() as d:
+            box = _r22_ops_sandbox(d, systemd=False)
+            with open(os.path.join(box["root"], pid_dir, "tgt.pid"), "w") as fh:
+                fh.write(f"{os.getpid()}\n")
+            log, other = (os.path.join(box["root"], r) for r in (log_rel, other_rel))
+            for path in (log, other):
+                with open(path, "w") as fh:
+                    fh.write("line\n")
+            os.utime(log, (1000, 1000))
+            rc, out, _ = _r22_ops_run(box, "logs")
+            check(rc == 0 and log in out and other not in out,
+                  f"logs with a live {pid_dir} daemon: rc={rc} {out}")
 
 
 def main() -> int:

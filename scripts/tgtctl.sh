@@ -48,6 +48,12 @@ have_systemd() {
         [ -d /run/systemd/system ] 2>/dev/null
 }
 
+# The service is managed by systemd only once its unit exists. tgt/service.py
+# (_use_systemd) makes the same check.
+use_systemd() {
+    have_systemd && [ -f "$UNIT_FILE" ]
+}
+
 # Verify the tgt package is importable from REPO_ROOT before we register/start,
 # so a wrong path or incomplete checkout fails loudly instead of crash-looping.
 preflight_check() {
@@ -57,6 +63,92 @@ preflight_check() {
     if ! PYTHONPATH="$REPO_ROOT" "$PY" -c "import tgt" >/dev/null 2>&1; then
         die "python at '$PY' cannot import tgt from $REPO_ROOT — check the Python version (needs 3.9+) and repo path"
     fi
+}
+
+# The unit runs as root with only CAP_NET_ADMIN and CAP_NET_RAW, so unlike this
+# script it is bound by ordinary file permissions. Run a command the same way.
+as_service() {
+    setpriv --reuid=0 --regid=0 --clear-groups \
+        --inh-caps=-all,+net_admin,+net_raw \
+        --ambient-caps=-all,+net_admin,+net_raw \
+        --bounding-set=-all,+net_admin,+net_raw "$@"
+}
+
+# Can the service do this? $1: r (read), x (enter a directory), e (execute).
+# Uses real opens under setpriv, else the mode bits as root without DAC caps
+# (the fallback cannot see ACLs).
+service_can() {
+    if [ "$SERVICE_PROBE" = setpriv ]; then
+        # shellcheck disable=SC2016  # $1 expands in the inner shell
+        case "$1" in
+            r) as_service /bin/sh -c ': < "$1"' sh "$2" ;;
+            x) as_service /bin/sh -c 'cd -- "$1"' sh "$2" ;;
+            e) as_service "$2" -c '' ;;
+        esac >/dev/null 2>&1
+        return
+    fi
+    mode_info=$(stat -Lc '%u %g %a' "$2" 2>/dev/null) || return 1
+    # shellcheck disable=SC2086
+    set -- "$1" $mode_info
+    case "$1" in r) want=4 ;; *) want=1 ;; esac
+    if [ "$2" -eq 0 ]; then bits=6; elif [ "$3" -eq 0 ]; then bits=3; else bits=0; fi
+    [ $(( (0$4 >> bits) & want )) -ne 0 ]
+}
+
+# Print the first component of path $2 the service cannot reach, if any.
+service_blocked() {
+    walked=""
+    rest=${2#/}
+    while [ "$rest" != "${rest#*/}" ]; do
+        walked="$walked/${rest%%/*}"
+        rest=${rest#*/}
+        service_can x "$walked" || { printf '%s\n' "$walked"; return 0; }
+    done
+    service_can "$1" "$2" || printf '%s\n' "$2"
+}
+
+# Fail before systemd does when the service could not read the checkout $1,
+# the config, or run the interpreter $2 (optional).
+service_preflight() {
+    if command -v setpriv >/dev/null 2>&1 && as_service /bin/sh -c : >/dev/null 2>&1; then
+        SERVICE_PROBE=setpriv
+    elif command -v stat >/dev/null 2>&1; then
+        SERVICE_PROBE=stat
+    else
+        return 0
+    fi
+    blocked=$(service_blocked x "$1")
+    [ -n "$blocked" ] || blocked=$(service_blocked r "$1")
+    if [ -z "$blocked" ]; then
+        real_root=$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")
+        blocked=$(service_blocked x "$real_root")
+    fi
+    if [ -z "$blocked" ]; then
+        blocked=$(find "$1/tgt" -name __pycache__ -prune -o \
+                \( -type d -o -name '*.py' -o -name '*.json' -o -name '*.toml' \) -print |
+            while IFS= read -r f; do
+                if [ -d "$f" ] && ! service_can x "$f"; then printf '%s\n' "$f"; break; fi
+                if ! service_can r "$f"; then printf '%s\n' "$f"; break; fi
+            done)
+    fi
+    if [ -z "$blocked" ] && [ -f "$CONF_FILE" ]; then
+        blocked=$(service_blocked r "$CONF_FILE")
+    fi
+    if [ -z "$blocked" ] && [ -n "${2:-}" ]; then
+        blocked=$(service_blocked e "$2")
+    fi
+    [ -z "$blocked" ] || die "the tgt service cannot access $blocked: it runs as root without CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH, so normal file permissions apply. Move the checkout somewhere world-readable such as /opt/tgt, or grant access (a parent directory: chmod o+x; inside the checkout: chmod -R o+rX), then retry."
+}
+
+# The checkout an installed unit runs from, which may not be this one.
+unit_repo_root() {
+    unit_root=$(sed -n 's/^Environment=PYTHONPATH=//p' "$UNIT_FILE" | head -n 1)
+    printf '%s\n' "${unit_root:-$REPO_ROOT}"
+}
+
+# The interpreter an installed unit runs, which may not be this script's.
+unit_python() {
+    sed -n '/^ExecStart=/s/.* exec \(.*\) -m tgt .*/\1/p' "$UNIT_FILE" | head -n 1
 }
 
 # --- dependency install -----------------------------------------------------
@@ -132,6 +224,15 @@ ensure_veth() {
     info "created veth pair: $iface <-> ${iface}-mon"
 }
 
+# True only for the pair ensure_veth creates: a veth whose peer is <name>-mon.
+is_tgt_veth() {
+    link=$(ip -o -d link show "$1" 2>/dev/null) || return 1
+    # An alias is free text, so it must not be able to supply either match.
+    link=${link%%'\    alias '*}
+    case "$link" in *": $1@$1-mon:"*) ;; *) return 1 ;; esac
+    case "$link" in *'\    veth '*) return 0 ;; *) return 1 ;; esac
+}
+
 # --- systemd path -----------------------------------------------------------
 write_unit() {
     cat > "$UNIT_FILE" <<EOF
@@ -175,7 +276,35 @@ EOF
 daemon_running() {
     [ -f "$PID_FILE" ] || return 1
     pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    [ -n "$pid" ] || return 1
+    # EPERM means the process exists: a non-root status of a root daemon.
+    kill_err=$(LC_ALL=C kill -0 "$pid" 2>&1) && return 0
+    case "$kill_err" in *"not permitted"*) return 0 ;; *) return 1 ;; esac
+}
+
+# status and logs can run unprivileged, where the writability test at the top
+# picks /tmp even though a root daemon used /run and /var/log. Search both.
+find_daemon_files() {
+    chosen=$PID_FILE
+    live=""
+    for f in /run/tgt.pid /tmp/tgt.pid; do
+        PID_FILE=$f
+        if daemon_running; then chosen=$f; live=$f; break; fi
+    done
+    PID_FILE=$chosen
+    # A live daemon's log sits with its PID file, whatever else is newer.
+    case "$live" in
+        /run/tgt.pid) f=/var/log/tgt.log ;;
+        /tmp/tgt.pid) f=/tmp/tgt.log ;;
+        *) f="" ;;
+    esac
+    if [ -n "$f" ] && [ -r "$f" ]; then LOG_FILE=$f; return 0; fi
+    for f in /var/log/tgt.log /tmp/tgt.log; do
+        [ -r "$f" ] || continue
+        if [ ! -r "$LOG_FILE" ] || [ -n "$(find "$f" -newer "$LOG_FILE" 2>/dev/null)" ]; then
+            LOG_FILE=$f
+        fi
+    done
 }
 
 daemon_start() {
@@ -224,6 +353,7 @@ cmd_register() {
     preflight_check
     write_default_config
     if have_systemd; then
+        service_preflight "$REPO_ROOT" "$PY"
         write_unit
         systemctl daemon-reload
         systemctl enable tgt.service >/dev/null 2>&1 || true
@@ -237,8 +367,15 @@ cmd_register() {
 
 cmd_start() {
     need_root
-    [ -f "$CONF_FILE" ] || cmd_register
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if have_systemd && [ ! -f "$UNIT_FILE" ] && daemon_running; then
+        warn "already running unmanaged (pid $(cat "$PID_FILE")); run '$0 stop', then start it under systemd"
+        return 0
+    fi
+    if [ ! -f "$CONF_FILE" ] || { have_systemd && [ ! -f "$UNIT_FILE" ]; }; then
+        cmd_register
+    fi
+    if use_systemd; then
+        service_preflight "$(unit_repo_root)" "$(unit_python)"
         systemctl start tgt.service && ok "service started"
     else
         daemon_start
@@ -247,7 +384,7 @@ cmd_start() {
 
 cmd_stop() {
     need_root
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         systemctl stop tgt.service && ok "service stopped"
     else
         daemon_stop
@@ -256,17 +393,21 @@ cmd_stop() {
 
 cmd_restart() {
     need_root
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
+        service_preflight "$(unit_repo_root)" "$(unit_python)"
         systemctl restart tgt.service && ok "service restarted"
     else
-        daemon_stop; daemon_start
+        # Register first: a failed preflight must not cost the running daemon.
+        if have_systemd; then cmd_register; fi
+        daemon_stop; cmd_start
     fi
 }
 
 cmd_status() {
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         systemctl status tgt.service --no-pager || true
     else
+        find_daemon_files
         if daemon_running; then
             ok "running (pid $(cat "$PID_FILE"))"
             [ -f "$LOG_FILE" ] && tail -n 5 "$LOG_FILE"
@@ -277,9 +418,10 @@ cmd_status() {
 }
 
 cmd_logs() {
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         journalctl -u tgt.service -f --no-pager
     else
+        find_daemon_files
         [ -f "$LOG_FILE" ] || die "no log file at $LOG_FILE"
         tail -n 50 -f "$LOG_FILE"
     fi
@@ -287,7 +429,7 @@ cmd_logs() {
 
 cmd_unregister() {
     need_root
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         systemctl stop tgt.service 2>/dev/null || true
         systemctl disable tgt.service 2>/dev/null || true
         rm -f "$UNIT_FILE"
@@ -301,7 +443,11 @@ cmd_unregister() {
     if [ -f "$CONF_FILE" ]; then . "$CONF_FILE" 2>/dev/null || true; fi
     for iface in $(echo "${TGT_IFACE:-tgt0}" | tr , " "); do
         if command -v ip >/dev/null 2>&1 && ip link show "$iface" >/dev/null 2>&1; then
-            if ip link del "$iface" 2>/dev/null; then info "removed veth $iface"; fi
+            if ! is_tgt_veth "$iface"; then
+                warn "leaving $iface: not a veth paired with ${iface}-mon"
+            elif ip link del "$iface" 2>/dev/null; then
+                info "removed veth $iface"
+            fi
         fi
     done
     warn "config kept at $CONF_FILE (delete manually if desired)"
