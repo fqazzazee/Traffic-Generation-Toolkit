@@ -588,7 +588,25 @@ def _truth_asset(h: Dict, new: bool = False) -> Dict[str, Any]:
         # nor does a serial / LoRaWAN device behind a gateway (no IP / MAC)
         "emitted": not (h.get("nat_hidden") or h.get("behind")),
         "first_seen": None,
+        "nat_ip": norm_ip(h.get("nat_ip") or ""),
+        "nat_hidden": bool(h.get("nat_hidden")),
     }
+
+
+def _wire_views(c: Dict[str, Any],
+                s: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The (client, server) address pairs a flow can show on the capture,
+    primary first. A flow leaving a NAT site carries the outside address; a
+    site with ``local: true`` also shows the inside pair. Empty when the flow
+    stays inside a hidden site and so never reaches the capture."""
+    cn, sn = c.get("nat_ip") or "", s.get("nat_ip") or ""
+    hidden = c.get("nat_hidden") or s.get("nat_hidden")
+    if not cn and not sn:
+        return [(c["ip"], s["ip"])]
+    if cn == sn:
+        return [] if hidden else [(c["ip"], s["ip"])]
+    outside = (cn or c["ip"], sn or s["ip"])
+    return [outside] if hidden else [outside, (c["ip"], s["ip"])]
 
 
 class Truth:
@@ -647,9 +665,14 @@ class Truth:
 
         # expected flows (for --zeek): flows_seen if the manifest has them
         ports = {}
+        pair_ports = {}             # a proxied EDR leg has its own port
         for fl in inv.get("flows") or []:
-            ports.setdefault(fl.get("protocol"),
-                             (fl.get("dport"), fl.get("transport")))
+            where = (fl.get("dport"), fl.get("transport"))
+            if fl.get("path") == "edr-proxy":
+                pair_ports[(fl.get("client"), fl.get("server"),
+                            fl.get("protocol"))] = where
+                continue
+            ports.setdefault(fl.get("protocol"), where)
         self.flows: List[Dict[str, Any]] = []
 
         def resolve(x: str) -> Optional[Dict]:
@@ -663,14 +686,20 @@ class Truth:
         for fl in (seen or inv.get("flows") or []):
             proto = fl.get("protocol", "")
             dport, transport = fl.get("dport"), fl.get("transport")
-            if transport is None:
-                dport, transport = ports.get(proto) or _proto_port(proto)
             c, s = resolve(fl.get("client", "")), resolve(fl.get("server", ""))
+            if transport is None:
+                dport, transport = (
+                    pair_ports.get((c and c["name"], s and s["name"], proto))
+                    or ports.get(proto) or _proto_port(proto))
             if not c or not s or not c.get("ip") or transport == "l2":
+                continue
+            views = _wire_views(c, s)
+            if not views:
                 continue
             self.flows.append({
                 "client": c["name"], "server": s["name"], "protocol": proto,
-                "cip": c["ip"], "sip": s["ip"], "dport": dport,
+                "cip": views[0][0], "sip": views[0][1], "views": views,
+                "dport": dport,
                 "transport": "icmp" if transport == "ip" else transport,
                 "self": c["id"] == s["id"]})
         for ip, e in self.external.items():       # EDR beacons to the cloud
@@ -679,10 +708,11 @@ class Truth:
             for t in e.get("talkers") or []:
                 c = by_name.get(t)
                 if c and c.get("ip"):
+                    views = _wire_views(c, {"ip": ip})
                     self.flows.append({
                         "client": c["name"], "server": ip, "protocol": "edr",
-                        "cip": c["ip"], "sip": ip, "dport": 443,
-                        "transport": "tcp", "self": False})
+                        "cip": views[0][0], "sip": ip, "views": views,
+                        "dport": 443, "transport": "tcp", "self": False})
 
     def population(self) -> List[Dict[str, Any]]:
         return [a for a in self.assets if a["emitted"]]
@@ -863,16 +893,37 @@ def _conns(path: str) -> List[Dict[str, Any]]:
     return out
 
 
+# Other well-known (port, transport) a protocol's flow also uses: SNMP
+# notifications, NetBIOS browser datagrams, and the TCP session that sets up
+# CIP class-1 I/O (Forward_Open) in the clear or over TLS.
+_COMPANION_PORTS = {"snmp": ((162, "udp"),), "netbios": ((138, "udp"),),
+                    "enip-io": ((44818, "tcp"),), "enip-dtls": ((2221, "tcp"),)}
+
+
+def _flow_views(fl: Dict) -> List[Tuple[str, str]]:
+    return fl.get("views") or [(fl["cip"], fl["sip"])]
+
+
 def _flow_hits(fl: Dict, c: Dict) -> bool:
-    if fl["transport"] != c["proto"]:
+    extra = {p for p, t in _COMPANION_PORTS.get(fl["protocol"], ())
+             if t == c["proto"]}
+    primary = fl["transport"] == c["proto"]
+    if not primary and not extra:
         return False
     port = fl["dport"]
-    fwd = (c["o"] == fl["cip"] and (port is None or c["dp"] == port) and
-           (c["d"] == fl["sip"] or ((fl["self"] or fl["transport"] == "udp")
-                                    and _is_group(c["d"]))))
-    rev = (c["o"] == fl["sip"] and c["d"] == fl["cip"] and
-           (port is None or c["op"] == port))
-    return fwd or rev
+    to_port = (primary and (port is None or c["dp"] == port)) or \
+        c["dp"] in extra
+    udp_group = c["proto"] == "udp" and _is_group(c["d"])
+    for cip, sip in _flow_views(fl):
+        fwd = c["o"] == cip and to_port and (
+            c["d"] == sip or (fl["self"] and _is_group(c["d"])) or udp_group)
+        rev = (c["o"] == sip and c["d"] == cip and
+               ((primary and (port is None or c["op"] == port)) or
+                c["dp"] in extra))
+        announce = c["o"] == sip and udp_group and to_port   # e.g. BACnet I-Am
+        if fwd or rev or announce:
+            return True
+    return False
 
 
 def baseline(truth: Truth, zeek: str) -> Dict[str, Any]:
@@ -885,8 +936,8 @@ def baseline(truth: Truth, zeek: str) -> Dict[str, Any]:
     hit = [False] * len(flows)
     by_cip: Dict[str, List[int]] = defaultdict(list)
     for i, fl in enumerate(flows):
-        by_cip[fl["cip"]].append(i)
-        by_cip[fl["sip"]].append(i)
+        for ip in {a for view in _flow_views(fl) for a in view}:
+            by_cip[ip].append(i)
     unexpected: Dict[Tuple, int] = defaultdict(int)
     known_ports = {(fl["dport"], fl["transport"]) for fl in flows}
     for c in conns:
@@ -997,10 +1048,40 @@ def _event_techniques(ev: Dict[str, Any]) -> List[str]:
     return []
 
 
+def _assign_alerts(fits: List[List[int]]) -> Dict[int, int]:
+    """Event index -> alert index: a maximum one-to-one assignment of the
+    alerts each event could use (``fits``, best first), by augmenting
+    paths."""
+    event_of: Dict[int, int] = {}
+    alert_of: Dict[int, int] = {}
+    for root in range(len(fits)):
+        parent: Dict[int, int] = {}
+        queue, free = [root], None
+        for ev in queue:
+            for j in fits[ev]:
+                if j in parent:
+                    continue
+                parent[j] = ev
+                if j not in event_of:
+                    free = j
+                    break
+                queue.append(event_of[j])
+            if free is not None:
+                break
+        while free is not None:
+            ev = parent[free]
+            free, alert_of[ev] = alert_of.get(ev), free
+            event_of[alert_of[ev]] = ev
+    return alert_of
+
+
 def detections(truth: Truth, alerts: List[Dict], tolerance: float,
                skew: float, strict_technique: bool = False) -> Dict[str, Any]:
     """Match alerts to manifest events: same generic category, inside
-    [start - skew, end + tolerance], sharing a host when both name hosts.
+    [start - skew, end + tolerance], sharing a host when the event names
+    hosts. An alert naming no host cannot detect such an event; it is counted
+    in ``hostless_alerts``, neither matched nor false. Each alert credits at
+    most one event (others it fits still keep it from being false).
     With ``strict_technique``, an alert that carries technique IDs (see
     :func:`read_alerts`) must also share one with a technique-tagged event
     (a parent ID matches its sub-techniques); alerts without IDs match on
@@ -1027,32 +1108,45 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
     for al in alerts:
         al["ips"] = ips(al["src"], al["dst"])
     used = set()
+    hostless = set()
     per_cat: Dict[str, Dict[str, Any]] = {}
     per_tech: Dict[str, Dict[str, Any]] = {}
     results = []
-    for ev in sorted(truth.events, key=lambda e: str(e.get("t_start", ""))):
-        cat = ev.get("category", "")
+    events = sorted(truth.events, key=lambda e: str(e.get("t_start", "")))
+    fits: List[List[int]] = []
+    for ev in events:
         etech = _event_techniques(ev)
         t0, t1 = parse_time(ev.get("t_start")), parse_time(ev.get("t_end"))
         t1 = t1 or t0
         hosts = ips(ev.get("hosts") or [], ev.get("src"), ev.get("dst"))
-        best = None
+        named = bool(ev.get("hosts") or ev.get("src") or ev.get("dst"))
+        fit: List[int] = []
         if t0 is not None:
             lo = t0 - _dt.timedelta(seconds=skew)
             hi = t1 + _dt.timedelta(seconds=tolerance)
-            for al in alerts:
-                if al["category"] != cat or al["time"] is None or \
-                        not lo <= al["time"] <= hi:
-                    continue
-                if hosts and al["ips"] and not hosts & al["ips"]:
+            for j, al in enumerate(alerts):
+                if al["category"] != ev.get("category", "") or \
+                        al["time"] is None or not lo <= al["time"] <= hi:
                     continue
                 if strict_technique and etech and \
                         al.get("techniques") and \
                         not tech.shares(al["techniques"], etech):
                     continue
-                if best is None or al["time"] < best["time"]:
-                    best = al
+                if named and not hosts & al["ips"]:
+                    if not (al["src"] or al["dst"]):
+                        hostless.add(al["row"])
+                    continue
+                fit.append(j)
                 used.add(al["row"])
+        fit.sort(key=lambda j: alerts[j]["time"])
+        fits.append(fit)
+    assigned = _assign_alerts(fits)
+    for i, ev in enumerate(events):
+        cat = ev.get("category", "")
+        etech = _event_techniques(ev)
+        t0 = parse_time(ev.get("t_start"))
+        hosts = ips(ev.get("hosts") or [], ev.get("src"), ev.get("dst"))
+        best = alerts[assigned[i]] if i in assigned else None
         ttd = (best["time"] - t0).total_seconds() if best else None
         results.append({"id": ev.get("id"), "category": cat,
                         "t_start": ev.get("t_start"), "t_end": ev.get("t_end"),
@@ -1079,7 +1173,9 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
     for al in alerts:
         if al["category"] is None:
             unmapped[al["title"] or al["raw_category"] or "(untitled)"] += 1
-    false = [al for al in alerts if al["category"] and al["row"] not in used]
+    hostless -= used
+    false = [al for al in alerts if al["category"] and
+             al["row"] not in used and al["row"] not in hostless]
     det = [r for r in results if r["detected"]]
     return {
         "events": len(results), "detected": len(det),
@@ -1089,6 +1185,7 @@ def detections(truth: Truth, alerts: List[Dict], tolerance: float,
         "alerts": len(alerts),
         "mapped_alerts": sum(1 for a in alerts if a["category"]),
         "matched_alerts": len(used),
+        "hostless_alerts": len(hostless),
         "per_category": dict(sorted(per_cat.items())),
         "by_technique": dict(sorted(per_tech.items())),
         "strict_technique": bool(strict_technique),
@@ -1222,7 +1319,7 @@ def score(truth: Truth, rows: List[Dict], export_info: Dict[str, Any],
         o["accuracy_with_partial"] = _ratio(o["correct"] + o["partial"],
                                             o["n"])
 
-    new = [a for a in truth.assets if a["new"]]
+    new = [a for a in truth.assets if a["new"] and a["emitted"]]
     res: Dict[str, Any] = {
         "schema": SCHEMA,
         "truth": {"mode": truth.mode, "source": truth.source,
@@ -1323,7 +1420,9 @@ def summary(res: Dict[str, Any]) -> str:
                      f"({_pct(det['rate'])}), median ttd "
                      f"{_secs(det['median_ttd_s'])}; "
                      f"{len(det['false_alerts'])} false, "
-                     f"{det['unmapped_alerts']} unmapped alerts")
+                     f"{det['unmapped_alerts']} unmapped alerts"
+                     + (f", {det['hostless_alerts']} host-less (not credited)"
+                        if det.get("hostless_alerts") else ""))
         bt = det.get("by_technique") or {}
         if bt:
             lines.append("techniques  ATT&CK coverage" + (

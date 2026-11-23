@@ -43,7 +43,8 @@ class Injection:
         self.id, self.incident, self.via = ident, incident, via
         self.duration, self.ratio = duration, ratio
         self.requested = time.time()
-        self.state = "pending"          # pending | active | done | failed
+        # pending | active | done | failed | stopped (the run ended first)
+        self.state = "pending"
         self.error = ""
         self.passes = 0
         self.frames_out = 0             # handed to the engine
@@ -111,7 +112,9 @@ class RunControl:
         self.injections: List[Injection] = []
         self.paused_total = 0.0
         self._paused_at: Optional[float] = None
+        self.live_rate: Optional[float] = None  # last set_rate; outlives phases
         self._pool = None               # injection pass builder (lazy)
+        self._closed = False            # the run ended: no new injections
 
     # -- pause / rate ----------------------------------------------------------
     @property
@@ -135,15 +138,18 @@ class RunControl:
     def set_rate(self, pps: float) -> None:
         """Re-pace a rate-limited run; ValueError when the run's pacing is
         not rate based (realtime replay, synthetic-clock pcap-only)."""
-        if pps < 0:
-            raise ValueError("rate must be >= 0")
+        from .sender import check_rate
+        check_rate(pps)
         eng = self.engine
         lim = getattr(eng, "limiter", None) if eng is not None else None
         if lim is None:
             raise ValueError("this run is not paced by --rate (realtime "
                              "replay or a synthetic-clock pcap-only run)")
+        # set before touching the limiter: a phase starting now either sees
+        # live_rate or has its new limiter updated here
+        self.live_rate = pps
         eng.cfg.rate = pps
-        lim.set_rate(pps)
+        eng.limiter.set_rate(pps)
 
     # -- injection -----------------------------------------------------------
     def inject(self, incident: str, duration: float = 60.0,
@@ -162,6 +168,8 @@ class RunControl:
         if not 0 < ratio <= 0.9:
             raise ValueError("ratio must be in (0, 0.9]")
         with self._lock:
+            if self._closed:
+                raise ValueError("the run has already finished")
             busy = [i for i in list(self._pending) + list(self._active.values())
                     if i.incident == incident]
             if busy:
@@ -211,7 +219,18 @@ class RunControl:
     def close(self) -> None:
         """End the injection worker with the run: queued passes are dropped
         and one in flight finishes, so no build outlives the engine (it would
-        restore a stale build context over a later caller's)."""
+        restore a stale build context over a later caller's). Injections
+        still pending or active end as ``stopped``."""
+        with self._lock:
+            self._closed = True
+            unfinished = list(self._pending) + list(self._active.values())
+            self._pending.clear()
+            self._active.clear()
+        for inj in unfinished:
+            inj.state = "stopped"
+            if inj._next is not None:
+                inj._next.cancel()
+                inj._next = None
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None
@@ -246,7 +265,6 @@ class RunControl:
         rec = getattr(eng, "recorder", None)
         if rec is not None:
             rec.add_injection(inj.incident, inj.label, inj.record)
-        self._active[inj.id] = inj
         eng.log(f"injection {inj.id}: {inj.incident} for {inj.duration:g}s "
                 f"at {inj.ratio:.0%} ({len(frames)} frames/pass)")
 
@@ -272,7 +290,8 @@ class RunControl:
 
     def _finish(self, inj: Injection, failed: bool = False) -> None:
         inj.state = "failed" if failed else "done"
-        self._active.pop(inj.id, None)
+        with self._lock:
+            self._active.pop(inj.id, None)
         nxt = getattr(inj, "_next", None)
         if nxt is not None:
             nxt.cancel()
@@ -295,9 +314,11 @@ class RunControl:
                 continue
             if not fut.done():
                 continue                     # still building: next frame
-            with self._lock:
-                self._pending.remove(inj)
             frames = self._take(inj, fut)
+            with self._lock:        # one step, so inject() always sees it
+                self._pending.remove(inj)
+                if frames is not None:
+                    self._active[inj.id] = inj
             if frames is None:
                 inj._next = None
                 self._finish(inj, failed=True)

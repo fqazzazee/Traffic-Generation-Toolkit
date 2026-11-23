@@ -19,6 +19,7 @@ import json
 from typing import Dict, List, Sequence, Set, TextIO
 
 from . import devices, packet, protocols, protocols_iiot
+from . import edr as edr_mod
 from .protocols_ot import ENGINEERING, OPERATIONS
 from .protocols_sec import CERTS_IN_CLEAR, ENCRYPTION
 from .enterprise import (CROWDSTRIKE_CLOUD_IPS, OUI_VENDORS, Environment,
@@ -113,6 +114,11 @@ def hosts(env: Environment) -> List[Dict]:
     # Falcon-covered Windows hosts beacon EDR telemetry to the CrowdStrike cloud
     for h in env.edr_hosts():
         uses[h.name].add("edr")
+    # an explicit EDR setup: the proxy relays, DNS servers answer the lookups
+    for c, s, proto, cloud, port in edr_mod.legs(env):
+        uses[c.name].add(proto)
+        if cloud is None:
+            serves[s.name].add(_service(proto, port))
     if env.arp_enabled:                 # every host ARPs each cycle
         for h in env.hosts:
             uses[h.name].add("arp")
@@ -195,6 +201,10 @@ def _evidence(env: Environment) -> Dict[str, Dict[str, Set[str]]]:
                 ev[server][f].add(proto)
     for h in env.edr_hosts():
         emits(h.name, "edr")
+    for c, s, proto, cloud, _ in edr_mod.legs(env):
+        emits(c.name, proto)
+        if cloud is None:
+            emits(s.name, proto)
     if env.arp_enabled:
         for h in env.hosts:
             if h.name not in hidden:
@@ -243,13 +253,28 @@ def external(env: Environment) -> List[Dict]:
     CrowdStrike cloud and anything else found on the wire. They are not
     assets — a monitor listing them as such scores a false positive."""
     plan: Dict[str, Dict] = {}
-    for h, ip, fqdn, _ in env.edr_plan():
+    for h, ip, fqdn, _ in (() if env.edr is not None else env.edr_plan()):
         e = plan.setdefault(ip, {"ip": ip, "fqdns": set(), "talkers": set(),
                                  "kind": "edr-cloud", "vendor": "CrowdStrike"})
         e["fqdns"].add(fqdn)
         e["talkers"].add(h.name)
+    for p in env.edr_paths():           # the host that really reaches it
+        e = plan.setdefault(p.ip, {
+            "ip": p.ip, "fqdns": set(), "talkers": set(), "kind": "edr-cloud",
+            "vendor": env.edr.profile.vendor, "profile": env.edr.profile.key,
+            "region": env.edr.region.key,
+            "ip_provenance": env.edr.region.ip_provenance, "channels": {}})
+        e["fqdns"].add(p.fqdn)
+        e["talkers"].add((p.proxy or p.host).name)
+        e["channels"][p.channel] = p.fqdn
     # declared external endpoints (cloud brokers, vendor portals)
     ext = {h.name: h for h in env.external}
+    if env.edr is not None:             # reached only by replaced edr flows
+        live = {n for c, s, _ in env.conversations for n in (c, s)}
+        for c, s, proto in env.spec[1]:
+            if proto == "edr":
+                for n in {c, s} - live:
+                    ext.pop(n, None)
     for h in ext.values():
         e = plan.setdefault(h.ip, {"ip": h.ip, "fqdns": set(),
                                    "talkers": set(), "kind": h.role,
@@ -277,7 +302,9 @@ def external(env: Environment) -> List[Dict]:
                        "kind": "unknown", "vendor": ""}
             if b in by_ip:
                 plan[a]["talkers"].add(by_ip[b])
-    order = {ip: i for i, ip in enumerate(CROWDSTRIKE_CLOUD_IPS)}
+    pool = env.edr.region.ips if env.edr is not None and env.edr.enabled \
+        else CROWDSTRIKE_CLOUD_IPS
+    order = {ip: i for i, ip in enumerate(pool)}
     return [{**e, "fqdns": sorted(e["fqdns"]), "talkers": sorted(e["talkers"])}
             for e in sorted(plan.values(),
                             key=lambda e: (order.get(e["ip"], len(order)),
@@ -382,6 +409,15 @@ def to_json(env: Environment, sprinkle: Sequence[str] = ()) -> Dict:
         port = protocols_iiot.flow_dport(env, conv)
         if port:
             fl["dport"], fl["service"] = port, _service(conv[2], port)
+    if env.edr is not None and env.edr.enabled:
+        doc["edr"] = edr_mod.summary(env)
+        known = set(env.conversations)
+        for c, s, proto, cloud, port in edr_mod.legs(env):
+            if cloud is None and (c.name, s.name, proto) not in known:
+                fl = _flow(c.name, s.name, proto)
+                fl.update(dport=port, service=_service(proto, port),
+                          path="edr-proxy" if proto == "edr" else "edr-dns")
+                doc["flows"].append(fl)
     if sprinkle:
         doc["new_assets"] = new_assets(env, sprinkle)
         doc["sprinkle"] = sprinkle_mapping(env, sprinkle)

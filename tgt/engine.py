@@ -213,7 +213,7 @@ def _build_base(cfg: RunConfig) -> List[tuple[str, bytes]]:
         return incidents.get(cfg.incident).build(cfg.messages)
     if cfg.env:
         from . import enterprise
-        return enterprise.get(cfg.env).build(cfg.messages, span=cfg.span)
+        return enterprise.for_run(cfg).build(cfg.messages, span=cfg.span)
     per_profile: List[List[tuple[str, bytes]]] = []
     for key in cfg.profiles:
         prof = protocols.get(key)
@@ -311,6 +311,21 @@ class Engine:
         elif delay > 0:
             time.sleep(delay)
 
+    def _await_slot(self, limiter: RateLimiter,
+                    deadline: Callable[[], float]) -> bool:
+        """Wait for a send slot before ``deadline()`` (which moves with a
+        pause). False when the deadline passed first or the run stopped."""
+        while not self._stop.is_set():
+            if (limiter.wait(self._stop, deadline())
+                    and time.perf_counter() < deadline()):
+                return True
+            # a pause holds the deadline back: wait it out, then re-check
+            if not self.control.gate(self._stop):
+                return False
+            if time.perf_counter() >= deadline():
+                return False
+        return False
+
     def _run(self) -> None:
         cfg = self.cfg
         sender: Optional[RawSender] = None
@@ -324,6 +339,9 @@ class Engine:
         self.stats.seed = seed
         synthetic = cfg.clock == "synthetic"
         try:
+            bad_clock = synthetic_range_error(cfg)
+            if bad_clock:
+                raise ValueError(bad_clock)
             if cfg.iface:
                 sender = RawSender(cfg.iface)
                 try:
@@ -383,7 +401,20 @@ class Engine:
                 self.log(f"built {len(batch)} frames/cycle for [{what}] in "
                          f"{time.perf_counter() - tb:.2f}s (seed {seed})")
             self.stats.cycle_frames = len(batch)
+            if synthetic and not cfg.loop:
+                # one cycle: its size is known only now that it is built
+                frames = min(len(batch), cfg.count or len(batch))
+                span = max(frames - 1, 0) * step
+                if cfg.duration:
+                    span = min(span, cfg.duration)
+                if t0 + span >= 2 ** 32:
+                    raise ValueError(
+                        f"--start-time {cfg.start_time}: the synthetic clock "
+                        "must stay within the classic pcap range (1970-01-01 "
+                        f"to 2106-02-07 UTC), including this run's {span:g} s")
 
+            # synthetic time: frames since the last rate change, at its step
+            mark_ts, mark_n, cur_step = t0, 0, step
             cycle = 0
             while not self._stop.is_set():
                 self.stats.cycles = cycle + 1
@@ -399,7 +430,15 @@ class Engine:
                         batch, self._stop):
                     if self._stop.is_set():
                         break
-                    limiter.wait(self._stop)
+                    if pace and cfg.duration:
+                        # time spent paused does not count toward --duration
+                        if not self._await_slot(
+                                limiter, lambda: self.stats.started
+                                + cfg.duration + self.control.paused_for()):
+                            self._stop.set()
+                            break
+                    else:
+                        limiter.wait(self._stop)
                     # a pause that began while this frame waited holds it
                     if not self.control.gate(self._stop):
                         break
@@ -414,8 +453,18 @@ class Engine:
                     # only frames that really left (or are file-only) count and
                     # land in the pcap, so the pcap stays ground truth
                     if sent:
-                        ts = (t0 + self.stats.packets * step if synthetic
-                              else time.time())
+                        if synthetic:
+                            live = self.limiter
+                            now_step = (live.interval if live is not None
+                                        else step) or 0.001
+                            if now_step != cur_step:
+                                mark_ts += (self.stats.packets - mark_n
+                                            ) * cur_step
+                                mark_n, cur_step = self.stats.packets, now_step
+                            ts = mark_ts + (self.stats.packets - mark_n
+                                            ) * cur_step
+                        else:
+                            ts = time.time()
                         if pcap is not None:
                             pcap.write(frame, ts=ts)
                         if recorder is not None:
@@ -446,6 +495,10 @@ class Engine:
                 cycle += 1
                 if nxt is not None:
                     batch = nxt.result()
+        except Exception as e:  # noqa: BLE001 - a crash is a failed run
+            self.stats.errors += 1
+            self.stats.last_error = f"{type(e).__name__}: {e}"
+            self.log(f"run failed: {self.stats.last_error}")
         finally:
             if pool is not None:
                 pool.shutdown(wait=False)
@@ -516,13 +569,26 @@ class Engine:
                 # included), like end_phase
                 recorder.begin_phase(ph, ts_of(t) if synthetic or not pace
                                      else time.time())
-            cap = ph.rate if ph.rate is not None else cfg.rate
-            limiter = RateLimiter(cap if pace and cap and cap > 0 else 0)
+            # the lower of the plan's and the operator's caps (0 = none),
+            # unless a live /rate change replaced them
+            live = self.control.live_rate
+            cap = live if live is not None else min(
+                [c for c in (ph.rate, cfg.rate) if c], default=0)
+            limiter = RateLimiter(cap if pace else 0)
+            if self.limiter is not None:     # pacing spans the phase boundary
+                limiter.carry_from(self.limiter)
             self.limiter = limiter if pace else None     # /rate adjusts it
+            live = self.control.live_rate    # changed while this phase set up
+            if pace and live is not None and live != limiter.pps:
+                limiter.set_rate(live)
             # a plain timed run's --duration is its one phase's duration
             # (campaign.phases_for)
             t_end = t + ph.duration if ph.duration else float("inf")
             ft = t
+            held = 0                    # frames a rate cap kept past the phase
+
+            def phase_end() -> float:
+                return wall0 + self.control.paused_for() + t_end / speed
             # the control API gates this stream (pause) and splices injected
             # incident frames in after the scheduled ones (tgt.control)
             for _, item in self.control.feed(sched.run(t_end), self._stop):
@@ -538,8 +604,12 @@ class Engine:
                     # backlog on resume (tgt.control.RunControl.paused_total)
                     self._sleep_until(wall0 + self.control.paused_total
                                       + ft / speed)
-                    if limiter.interval:
-                        limiter.wait(self._stop)
+                    # a cap never stretches the phase: frames it cannot fit
+                    # are dropped, so the scheduler still advances to t_end
+                    if limiter.interval and not self._await_slot(limiter,
+                                                                 phase_end):
+                        held += len(copies)
+                        continue
                     # a pause that began during the sleep holds this frame
                     if not self.control.gate(self._stop):
                         break
@@ -576,6 +646,9 @@ class Engine:
                 if recorder is not None:
                     recorder.end_phase(None)
                 break
+            if held:
+                self.log(f"phase {ph.id}: rate cap dropped {held} frames "
+                         "that did not fit before the phase ended")
             t = t_end
             if t == float("inf"):
                 break
@@ -600,6 +673,29 @@ class Engine:
 def new_seed() -> int:
     """A fresh random run seed (logged + recorded so the run can be redone)."""
     return random.SystemRandom().randrange(1 << 32)
+
+
+def synthetic_range_error(cfg: RunConfig) -> Optional[str]:
+    """Why a synthetic clock cannot be written to classic pcap (unsigned
+    32-bit seconds), counting the run's known span; None when it fits."""
+    if cfg.clock != "synthetic":
+        return None
+    start = parse_start(cfg.start_time)
+    if cfg.schedule == "timed" and not cfg.replay_path:
+        from . import campaign
+        span = (sum(ph.duration for ph in campaign.phases_for(cfg))
+                if cfg.campaign else cfg.duration)
+    else:
+        step = 1.0 / cfg.rate if cfg.rate and cfg.rate > 0 else 0.001
+        spans = [cfg.duration] if cfg.duration else []
+        if cfg.count:
+            spans.append((cfg.count - 1) * step)
+        span = min(spans, default=0.0)
+    if start < 0 or start + span >= 2 ** 32:
+        return (f"--start-time {cfg.start_time}: the synthetic clock must "
+                "stay within the classic pcap range (1970-01-01 to "
+                f"2106-02-07 UTC), including this run's {span:g} s")
+    return None
 
 
 def parse_start(text: Optional[str]) -> float:

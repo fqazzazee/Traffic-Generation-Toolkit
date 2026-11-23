@@ -6183,8 +6183,11 @@ def test_rolling_pps_shows_stalls() -> None:
     from tgt.engine import Stats
     from tgt.sender import RateLimiter
     s = Stats()
-    t0 = time.perf_counter()
-    s.started = t0 - 100.0
+    # Sample times are exact in binary: a live perf_counter base can round the
+    # sample placed exactly WINDOW back to just under it, keeping an older
+    # baseline. Only the lifetime average reads the real clock.
+    t0 = 1000.0
+    s.started = time.perf_counter() - 100.0
     s.packets, s.bytes = 10000, 1000000
     check(abs(s.rolling(now=t0)[0] - 100.0) < 1.0,
           "rolling: first sample should be the lifetime average")
@@ -8592,6 +8595,2497 @@ def test_review_injection_worker_ends_with_run() -> None:
     time.sleep(0.4)
     check(protocols.build_context() is ctx,
           "injection worker outlived close() and clobbered the context")
+
+
+def _r22_cli(args: list, timeout: float = 20.0) -> tuple:
+    """Run ``python3 -m tgt`` -> (exit code, stdout + stderr)."""
+    import subprocess
+    p = subprocess.run([sys.executable, "-m", "tgt"] + args, cwd=_REPO,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True, timeout=timeout)
+    return p.returncode, p.stdout
+
+
+def _r22_plan(d: str, name: str = "plan.json", **kw) -> str:
+    """Write a small two-phase campaign plan; keyword args override keys."""
+    import json
+    doc = {"env": "it-org", "phases": [{"name": "a", "duration": 1},
+                                       {"name": "b", "duration": 1}]}
+    doc.update(kw)
+    path = os.path.join(d, name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    return path
+
+
+def test_r22_engine_crash_reports_failure() -> None:
+    """An exception in the engine thread is a failed run: counted, reported
+    and a non-zero exit, with no thread traceback."""
+    with tempfile.TemporaryDirectory() as d:
+        extra = ["--pcap", os.path.join(d, "missing", "x.pcap")]
+        rc, out = _r22_cli(["run", "-p", "modbus", "--count", "5",
+                            "--rate", "0"] + extra)
+        check(rc != 0, f"crashed run exited {rc}: {extra}")
+        check("Traceback" not in out, f"crash traceback: {extra}")
+        check("1 errors" in out and "last error:" in out,
+              f"crash not reported: {extra}: {out[-200:]}")
+        # a bad address never reaches the engine: the CLI rejects it
+        rc, out = _r22_cli(["run", "-p", "modbus", "--count", "5", "--rate",
+                            "0", "--client-ip", "nope",
+                            "--pcap", os.path.join(d, "x.pcap")])
+        check(rc == 2 and "Traceback" not in out,
+              f"bad --client-ip: rc={rc}")
+
+
+def test_r22_engine_once_rejected_with_timed() -> None:
+    """--once has no meaning on the timed schedule, which would otherwise
+    run (and write) forever."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        try:
+            rc, out = _r22_cli(["run", "-p", "modbus", "--schedule", "timed",
+                                "--clock", "synthetic", "--once",
+                                "--pcap", pcap], timeout=5)
+        except Exception as e:  # noqa: BLE001 - subprocess timeout
+            check(False, f"--once with timed did not exit: {type(e).__name__}")
+            return
+        check(rc == 2 and "--once" in out, f"--once timed: rc={rc}")
+        check(not os.path.exists(pcap), "--once timed wrote a pcap")
+
+
+def test_r22_engine_limiter_wakes_on_rate_change() -> None:
+    """A rate change wakes a blocked wait and recomputes its deadline."""
+    import threading
+    import time
+    from tgt.sender import RateLimiter
+    for new in (1000, 0):
+        for stop in (None, threading.Event()):
+            lim = RateLimiter(0.2)
+            done = []
+
+            def waiter():
+                lim.wait(stop)
+                done.append(time.perf_counter())
+            th = threading.Thread(target=waiter, daemon=True)
+            t0 = time.perf_counter()
+            th.start()
+            time.sleep(0.2)
+            lim.set_rate(new)
+            th.join(1.5)
+            took = done[0] - t0 if done else None
+            check(took is not None and took < 0.6,
+                  f"set_rate({new}) with stop={stop is not None}: {took}")
+            if not done:                # release the daemon thread
+                lim.set_rate(0)
+                th.join(6)
+    lim = RateLimiter(100)              # a rate decrease re-paces as well
+    lim.wait()
+    lim.set_rate(10)
+    t0 = time.perf_counter()
+    lim.wait()
+    took = time.perf_counter() - t0
+    check(0.07 <= took <= 0.3, f"slower rate waited {took:.3f}s")
+
+
+def test_r22_engine_rate_validated() -> None:
+    """The CLI and the limiter accept only a finite rate >= 0."""
+    from tgt.config import RunConfig as RC
+    from tgt.engine import Engine
+    from tgt.sender import RateLimiter
+    nan = float("nan")
+    for bad in (-5, nan, float("inf"), -float("inf")):
+        try:
+            RateLimiter(bad)
+            check(False, f"RateLimiter({bad}) accepted")
+        except ValueError:
+            pass
+        lim = RateLimiter(10)
+        try:
+            lim.set_rate(bad)
+            check(False, f"set_rate({bad}) accepted")
+        except ValueError:
+            check(lim.pps == 10 and lim.interval == 0.1,
+                  f"set_rate({bad}) changed the limiter")
+    check(RateLimiter(0).interval == 0, "rate 0 must mean unpaced")
+    eng = Engine(RC(profiles=["modbus"], rate=10))
+    eng.limiter = RateLimiter(10)
+    try:
+        eng.control.set_rate(nan)
+        check(False, "control accepted a NaN rate")
+    except ValueError:
+        check(eng.cfg.rate == 10, "a rejected rate changed cfg.rate")
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        plan = _r22_plan(d)
+        for val in ("-5", "nan", "inf"):
+            for cmd in (["run", "-p", "modbus", "--count", "1"],
+                        ["campaign", plan, "--force"]):
+                rc, out = _r22_cli(cmd + ["--rate=" + val, "--pcap", pcap])
+                check(rc == 2 and "--rate" in out,
+                      f"{cmd[0]} --rate {val}: rc={rc}")
+                check(not os.path.exists(pcap), f"--rate {val} wrote a pcap")
+
+
+def test_r22_engine_duration_bounds_slow_rate() -> None:
+    """--duration ends a slow run on time, without sending past it, and time
+    spent paused still does not count."""
+    import time
+    from tgt.engine import Engine
+    from tgt.sender import RateLimiter
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        eng = Engine(RunConfig(profiles=["modbus"], rate=0.2, duration=0.5,
+                               pcap_path=pcap))
+        t0 = time.perf_counter()
+        eng.start()
+        eng.join(4)
+        took = time.perf_counter() - t0
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive and took < 1.5, f"--duration 0.5 took {took:.2f}s")
+        check(eng.stats.packets == 0,
+              f"sent {eng.stats.packets} frames past the deadline")
+
+        eng = Engine(RunConfig(profiles=["modbus"], rate=0.2, duration=0.6,
+                               pcap_path=pcap))
+        eng.start()
+        time.sleep(0.1)
+        eng.control.pause()
+        time.sleep(0.8)
+        check(eng.is_alive(), "a pause counted toward --duration")
+        eng.control.resume()
+        eng.join(3)
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive, "run did not end after the pause")
+
+        # timed: a cap below the schedule cannot stretch the phase
+        eng = Engine(RunConfig(profiles=["modbus"], schedule="timed", rate=0.2,
+                               duration=0.5, seed=1, pcap_path=pcap))
+        t0 = time.perf_counter()
+        eng.start()
+        eng.join(4)
+        took = time.perf_counter() - t0
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive and took < 1.5, f"timed cap overran: {took:.2f}s")
+
+    lim = RateLimiter(0.2)
+    t0 = time.perf_counter()
+    ok = lim.wait(deadline=t0 + 0.1)
+    took = time.perf_counter() - t0
+    check(ok is False and 0.08 <= took < 0.5,
+          f"limiter deadline: {ok} after {took:.3f}s")
+
+
+def test_r22_engine_campaign_rate_caps() -> None:
+    """The lower of the plan and operator caps applies, and a live rate
+    change survives the next phase."""
+    import time
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        plan = _r22_plan(d, rate=2000)
+        pcap = os.path.join(d, "cap.pcap")
+        rc, out = _r22_cli(["campaign", plan, "--pcap", pcap, "--rate", "2",
+                            "--force"], timeout=20)
+        n = len(_pcap_records(pcap))
+        check(rc == 0 and n <= 6, f"campaign --rate 2: rc={rc}, {n} packets")
+
+        for plan_rate, op, want in ((2000, 50, 50), (40, 1000, 40),
+                                    (0, 30, 30), (30, 0, 30)):
+            path = _r22_plan(d, "p.json", rate=plan_rate)
+            eng = Engine(RunConfig(env="it-org", schedule="timed", rate=op,
+                                   campaign=path, seed=1, pcap_path=pcap))
+            eng.start()
+            end = time.monotonic() + 3
+            while eng.limiter is None and time.monotonic() < end:
+                time.sleep(0.01)
+            got = eng.limiter.pps if eng.limiter else None
+            eng.stop()
+            eng.join(5)
+            check(got == want, f"cap plan={plan_rate} op={op}: {got}")
+
+        # a live change, up or down, holds through the next phase
+        for live in (500.0, 5.0):
+            path = _r22_plan(d, "p.json", rate=40)
+            eng = Engine(RunConfig(env="it-org", schedule="timed", rate=0,
+                                   campaign=path, seed=1, pcap_path=pcap))
+            eng.start()
+            end = time.monotonic() + 3
+            while eng.limiter is None and time.monotonic() < end:
+                time.sleep(0.01)
+            eng.control.set_rate(live)
+            end = time.monotonic() + 4
+            while eng.stats.cycles < 2 and eng.is_alive() \
+                    and time.monotonic() < end:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            got = eng.limiter.pps if eng.limiter else None
+            phase = eng.stats.cycles
+            eng.stop()
+            eng.join(5)
+            check(phase == 2 and got == live,
+                  f"live rate {live} in phase {phase}: limiter {got}")
+
+
+def test_r22_engine_synthetic_follows_live_rate() -> None:
+    """Synthetic timestamps use the rate in force when each frame leaves."""
+    import threading
+    import time
+    from tgt import engine as E
+
+    class Sink:
+        counters: dict = {}
+        open_errors = ()
+
+        def __init__(self, iface):
+            pass
+
+        def open(self):
+            pass
+
+        def send(self, frame):
+            return len(frame)
+
+        def close(self):
+            pass
+
+    real, E.RawSender = E.RawSender, Sink
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            pcap = os.path.join(d, "x.pcap")
+            eng = E.Engine(RunConfig(
+                profiles=["modbus"], iface="fake0", rate=200, count=30,
+                clock="synthetic", start_time="2026-01-01T00:00:00Z",
+                pcap_path=pcap))
+
+            def retune():
+                end = time.monotonic() + 3
+                while eng.stats.packets < 10 and time.monotonic() < end:
+                    time.sleep(0.001)
+                eng.control.set_rate(50)
+            th = threading.Thread(target=retune)
+            eng.start()
+            th.start()
+            eng.join(5)
+            th.join(4)
+            ts = [r[0] for r in _pcap_records(pcap)]
+            gaps = [b - a for a, b in zip(ts, ts[1:])]
+            check(len(ts) == 30, f"synthetic live rate: {len(ts)} frames")
+            check(gaps and abs(gaps[0] - 0.005) < 1e-4
+                  and abs(gaps[-1] - 0.02) < 1e-4,
+                  f"synthetic gaps {gaps[:1]} .. {gaps[-1:]}")
+            check(all(g > 0 for g in gaps), "synthetic time went backwards")
+    finally:
+        E.RawSender = real
+
+
+def test_r22_engine_synthetic_clock_range() -> None:
+    """A synthetic clock outside classic pcap's range fails before the run."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        for start, extra in (("2200-01-01T00:00:00Z", ["--count", "3"]),
+                             ("1969-12-31T23:59:59Z", ["--count", "3"]),
+                             ("2106-02-07T06:28:00Z", ["--duration", "1h"]),
+                             ("2106-02-07T06:28:15Z", ["--count", "5"])):
+            rc, out = _r22_cli(["run", "-p", "modbus", "--clock", "synthetic",
+                                "--start-time", start, "--rate", "1",
+                                "--pcap", pcap] + extra)
+            check(rc == 2 and "start-time" in out and "pcap" in out,
+                  f"{start} {extra}: rc={rc}")
+            check(not os.path.exists(pcap), f"{start}: wrote a pcap")
+        for start in ("1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z"):
+            rc, _ = _r22_cli(["run", "-p", "modbus", "--clock", "synthetic",
+                              "--start-time", start, "--rate", "0",
+                              "--count", "3", "--pcap", pcap])
+            check(rc == 0 and len(_pcap_records(pcap)) == 3,
+                  f"valid start {start}: rc={rc}")
+        plan = _r22_plan(d, start_time="2106-02-07T06:28:15Z")
+        rc, out = _r22_cli(["campaign", plan, "--clock", "synthetic",
+                            "--force", "--pcap", os.path.join(d, "c.pcap")])
+        check(rc == 2 and "start-time" in out, f"campaign span: rc={rc}")
+        check(not os.path.exists(os.path.join(d, "c.pcap")),
+              "out-of-range campaign wrote a pcap")
+
+
+def test_r22_engine_plan_rate_validated() -> None:
+    """Plan and phase rates must be finite, non-negative numbers."""
+    from tgt import campaign
+
+    def doc(plan=None, phase=None):
+        p = {"name": "a", "duration": 1}
+        if phase is not None:
+            p["rate"] = phase
+        d = {"env": "it-org", "phases": [p]}
+        if plan is not None:
+            d["rate"] = plan
+        return d
+    for bad in ("fast", -1, float("nan"), float("inf"), True, [5]):
+        for kw in ({"plan": bad}, {"phase": bad}):
+            try:
+                campaign.Plan(doc(**kw))
+                check(False, f"plan accepted rate {kw}")
+            except campaign.CampaignError as e:
+                check("rate" in str(e), f"rate error unclear: {e}")
+    for good in (0, 2, 2.5):
+        campaign.Plan(doc(plan=good, phase=good))
+    with tempfile.TemporaryDirectory() as d:
+        path = _r22_plan(d, rate="fast")
+        rc, out = _r22_cli(["campaign", path, "--force", "--pcap",
+                            os.path.join(d, "x.pcap")])
+        check(rc == 2 and "rate" in out, f"bad plan rate: rc={rc}")
+
+
+def test_r22_engine_plan_utc_offset_zero() -> None:
+    """A plan's utc_offset 0 overrides an environment default."""
+    from tgt import campaign, enterprise
+    env = enterprise.get("it-org")
+    had = "utc_offset" in env.options
+    old = env.options.get("utc_offset")
+    env.options["utc_offset"] = 5.0
+    try:
+        for doc_extra, want in (({"utc_offset": 0}, 0.0),
+                                ({"utc_offset": 3}, 3.0), ({}, 5.0)):
+            doc = dict({"env": "it-org",
+                        "phases": [{"name": "a", "duration": 1}]}, **doc_extra)
+            got = campaign.build(campaign.Plan(doc))[0].utc_offset
+            check(got == want, f"utc_offset {doc_extra}: {got}, want {want}")
+    finally:
+        if had:
+            env.options["utc_offset"] = old
+        else:
+            del env.options["utc_offset"]
+
+
+def test_r22_engine_slow_cap_spans_short_phases() -> None:
+    """A cap slower than one phase still sends: pacing carries across phase
+    boundaries, including when the phases have different rates."""
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        plan = os.path.join(d, "short.json")
+        with open(plan, "w") as f:
+            json.dump({"env": "ot-plant", "phases": [
+                {"name": f"p{i}", "duration": 0.5,
+                 "rate": 1.0 if i % 2 else 0.9} for i in range(6)]}, f)
+        pcap = os.path.join(d, "short.pcap")
+        rc, out = _r22_cli(["campaign", plan, "--pcap", pcap, "--force"],
+                           timeout=20)
+        n = len(_pcap_records(pcap))
+        check(rc == 0 and 2 <= n <= 4,
+              f"1 pps cap over 6 x 0.5 s phases: rc={rc}, {n} packets")
+
+
+def test_r22_engine_check_rate_huge_int() -> None:
+    """An integer too large for a float is a ValueError like any bad rate."""
+    from tgt.sender import RateLimiter, check_rate
+    for call in (check_rate, RateLimiter, RateLimiter(1).set_rate):
+        try:
+            call(10 ** 400)
+            check(False, f"{call}: accepted 10**400")
+        except ValueError:
+            pass
+
+
+def test_r22_engine_once_past_clock_range() -> None:
+    """--once whose frames would pass 2106 fails with the clock error, before
+    any frame is written; the same cycle that fits still runs."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "once.pcap")
+        args = ["run", "-p", "modbus", "--clock", "synthetic", "--once",
+                "--pcap", pcap, "--start-time", "2106-02-07T06:28:14Z"]
+        rc, out = _r22_cli(args + ["--rate", "1"])
+        check(rc != 0 and "classic pcap range" in out,
+              f"--once past 2106: rc={rc}")
+        check(not _pcap_records(pcap), "--once past 2106 wrote frames")
+        rc, _ = _r22_cli(args + ["--rate", "1", "--count", "2"])
+        check(rc == 0 and len(_pcap_records(pcap)) == 2,
+              f"--once bounded by --count inside the range: rc={rc}")
+        rc, _ = _r22_cli(args + ["--rate", "0"])
+        check(rc == 0 and len(_pcap_records(pcap)) > 2,
+              f"--once inside the range: rc={rc}")
+def test_r22_control_manifest_redacts_api_token() -> None:
+    """--api-token never reaches the manifest's argv, in any spelling
+    argparse accepts (separate value, =value, unique abbreviation)."""
+    import contextlib
+    import io
+    import json
+    from tgt import cli
+    forms = (["--api-token", "SECRET123"], ["--api-token=SECRET123"],
+             ["--api-tok", "SECRET123"], ["--api-t=SECRET123"])
+    with tempfile.TemporaryDirectory() as d:
+        for form in forms:
+            m = os.path.join(d, "m.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(["run", "-p", "modbus", "--once", "--rate", "0",
+                               "--messages", "1", "--seed", "1",
+                               "--pcap", os.path.join(d, "x.pcap"),
+                               "--manifest", m,
+                               "--api", "127.0.0.1:0"] + form)
+            with open(m, encoding="utf-8") as f:
+                text = f.read()
+            argv = json.loads(text).get("argv", [])
+            check(rc == 0 and "SECRET123" not in text,
+                  f"manifest leaks the API token for {form}: {argv}")
+            check("--api" in argv and "127.0.0.1:0" in argv,
+                  f"redaction removed other arguments: {argv}")
+
+
+def test_r22_control_client_ignores_proxy() -> None:
+    """tgt ctl talks to the API directly: http_proxy never sees the call
+    or its bearer token."""
+    import json
+    import threading
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from tgt import api
+    hits = {"proxy": 0, "api": 0}
+
+    def handler(name):
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits[name] += 1
+                body = json.dumps({"ok": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        return H
+    target = HTTPServer(("127.0.0.1", 0), handler("api"))
+    proxy = HTTPServer(("127.0.0.1", 0), handler("proxy"))
+    for s in (target, proxy):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    names = ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY", "all_proxy",
+             "ALL_PROXY")
+    saved = {k: os.environ.get(k) for k in names}
+    opener = urllib.request._opener     # urlopen caches env proxies here
+    try:
+        for k in names:
+            os.environ.pop(k, None)
+        os.environ["http_proxy"] = f"http://127.0.0.1:{proxy.server_port}"
+        urllib.request._opener = None
+        code, _ = api.request(f"127.0.0.1:{target.server_port}", "GET",
+                              "/status", token="SECRET123")
+        check(code == 200 and hits == {"proxy": 0, "api": 1},
+              f"tgt ctl went through http_proxy: {code} {hits}")
+    finally:
+        urllib.request._opener = opener
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for s in (target, proxy):
+            s.shutdown()
+            s.server_close()
+
+
+def test_r22_control_rate_must_be_finite() -> None:
+    """POST /rate refuses nan/inf with a 4xx, keeps the current rate, and
+    /status stays strict JSON."""
+    import json
+    import time
+    import urllib.request
+    from tgt import api
+    from tgt.engine import Engine
+
+    def strict(text):
+        def bad(c):
+            raise ValueError(c)
+        return json.loads(text, parse_constant=bad)
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(profiles=["modbus"], rate=200, duration=15,
+                        pcap_path=os.path.join(d, "r.pcap"), seed=1)
+        eng = Engine(cfg)
+        srv = api.ControlServer(eng, "127.0.0.1", 0).start()
+        a = f"127.0.0.1:{srv.port}"
+        eng.start()
+        try:
+            for _ in range(100):
+                if getattr(eng, "limiter", None) is not None:
+                    break
+                time.sleep(0.02)
+            for bad in ("nan", "NaN", "inf", "-inf", "1e999", "-1"):
+                code, _ = api.request(a, "POST", "/rate", {"pps": bad})
+                check(400 <= code < 500, f"/rate pps={bad} -> {code}")
+                check(cfg.rate == 200, f"/rate pps={bad} set {cfg.rate}")
+            with urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})).open(
+                        f"http://{a}/status", timeout=5) as r:
+                doc = strict(r.read().decode())
+            check(doc["rate"] == 200, f"/status rate {doc['rate']}")
+            code, _ = api.request(a, "POST", "/rate", {"pps": 0})
+            check(code == 200, f"/rate pps=0 -> {code}")
+        finally:
+            eng.stop()
+            eng.join(5)
+            srv.close()
+
+
+def test_r22_control_client_non_http_is_api_error() -> None:
+    """A port that does not speak the API gives ApiError (a clean tgt ctl
+    message), not a traceback."""
+    import socket
+    import threading
+    from tgt import api
+    replies = (b"SSH-2.0-x\r\n",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nnot json!",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n[1]",
+               b"HTTP/1.1 500 Oops\r\nContent-Length: 3\r\n\r\n[1]",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n\xff\xfe")
+    for reply in replies:
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+
+        def serve():
+            c, _ = ls.accept()
+            c.recv(4096)
+            c.sendall(reply)
+            c.close()
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            code, doc = api.request(f"127.0.0.1:{ls.getsockname()[1]}", "GET",
+                                    "/status", timeout=3)
+            check(code >= 400 and isinstance(doc, dict),
+                  f"ctl accepted {reply[:20]!r}: {code} {doc!r}")
+        except api.ApiError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            check(False, f"ctl raised {type(e).__name__} on {reply[:20]!r}")
+        t.join(3)
+        ls.close()
+
+
+def test_r22_control_ctl_hint_brackets_ipv6() -> None:
+    """The printed 'tgt ctl --api' works for an IPv6 bind (CLI and TUI)."""
+    import contextlib
+    import io
+    import re
+    import socket
+    import types
+    from tgt import api, cli, tui
+    from tgt.engine import Engine
+    check(api.host_port("::1", 8787) == "[::1]:8787" and
+          api.host_port("127.0.0.1", 8787) == "127.0.0.1:8787",
+          "host_port formatting")
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(("::1", 0))
+    except OSError:
+        _skipped.append("test_r22_control_ctl_hint_brackets_ipv6")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engine(RunConfig(profiles=["modbus"],
+                               pcap_path=os.path.join(d, "x.pcap")))
+        args = types.SimpleNamespace(api="[::1]:0", api_token=None,
+                                     api_allow_remote=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            srv = cli._start_api(args, eng)
+        try:
+            m = re.search(r"tgt ctl --api (\S+) status", out.getvalue())
+            check(m is not None and api.parse_bind(m.group(1)) ==
+                  ("::1", srv.port), f"CLI ctl hint: {out.getvalue()!r}")
+        finally:
+            srv.close()
+        logs = []
+        ui = types.SimpleNamespace(api="[::1]:0", api_server=None,
+                                   close_api=lambda: None,
+                                   add_log=logs.append)
+        check(tui.UI._start_api(ui, eng), f"TUI API start: {logs}")
+        try:
+            m = re.search(r"tgt ctl --api (\S+) status", logs[-1])
+            check(m is not None and api.parse_bind(m.group(1)) ==
+                  ("::1", ui.api_server.port), f"TUI ctl hint: {logs}")
+        finally:
+            ui.api_server.close()
+
+
+def test_r22_control_close_finalizes_injections() -> None:
+    """An injection outlasting the run ends with it: no active/pending
+    state or countdown after the engine exits, and no new one is queued."""
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engine(RunConfig(profiles=["modbus"], rate=300, duration=1.0,
+                               pcap_path=os.path.join(d, "x.pcap"), seed=3))
+        eng.control.inject("wannacry", 60, 0.3)
+        eng.start()
+        eng.join(20)
+        check(not eng.is_alive(), "engine did not finish")
+        row = eng.control.status()[0]
+        check(row["state"] == "stopped" and "remaining" not in row,
+              f"injection after the run: {row}")
+        check(not eng.control._pending and not eng.control._active,
+              "injection still queued after close()")
+        try:
+            eng.control.inject("stuxnet", 5)
+            check(False, "inject accepted after the run closed")
+        except ValueError:
+            pass
+        check(len(eng.control.status()) == 1, "late injection recorded")
+
+
+def test_r22_control_inject_duplicate_blocked_during_start() -> None:
+    """While the engine moves an injection from pending to active, a second
+    injection of that incident is still refused."""
+    import types
+    from concurrent.futures import Future
+    from tgt.control import RunControl
+    eng = types.SimpleNamespace(cfg=RunConfig(profiles=["modbus"]),
+                                log=lambda m: None, recorder=None)
+    rc = RunControl(eng)
+    accepted = []
+
+    def probe():
+        try:
+            accepted.append(rc.inject("wannacry", 5, 0.5))
+        except ValueError:
+            pass
+
+    def submit(inj, n):
+        if n > 1:
+            probe()             # _start prefetches the next pass here
+        fut = Future()
+        fut.set_result([(0, b"x", inj.label)])
+        return fut
+    take = rc._take
+
+    def probing_take(inj, fut):
+        probe()
+        return take(inj, fut)
+    rc._submit, rc._take = submit, probing_take
+    rc.inject("wannacry", 5, 0.5)
+    rc._extras()                # submits pass 1
+    rc._extras()                # pending -> active
+    check(not accepted and len(rc.injections) == 1 and len(rc._active) == 1,
+          f"duplicate accepted during the move: {len(rc.injections)}")
+
+
+def test_r22_control_rejects_bad_ip_and_vlan() -> None:
+    """Bad octets and VLAN ids are refused, never wrapped onto another
+    address or VLAN; the CLI reports them without a traceback."""
+    import contextlib
+    import io
+    from tgt import cli, protocols_site
+    for bad in ("10.0.0.300", "10.0.0.-1", "256.1.1.1", "1.2.3.1_0",
+                "1.2.3. 4", "1.2.3.+4"):
+        P.ip_to_bytes.cache_clear()
+        try:
+            got = P.ip_to_bytes(bad)
+            check(False, f"ip_to_bytes({bad!r}) -> {got!r}")
+        except ValueError:
+            pass
+    check(P.ip_to_bytes("255.0.0.1") == b"\xff\x00\x00\x01", "valid IP")
+    mac = "02:00:00:00:00:01"
+    tagged = P.ethernet(mac, mac, P.ETH_P_IP, b"\x45", vlan=7)
+    prio = tagged[:14] + struct.pack("!H", 0x6007) + tagged[16:]
+    for vid in (5000, 4096, -1):
+        for name, fn in (
+                ("ethernet", lambda: P.ethernet(mac, mac, P.ETH_P_IP, b"",
+                                                vlan=vid)),
+                ("rewrite_l2", lambda: P.rewrite_l2(prio, mac, mac, vid)),
+                ("site _l2", lambda: protocols_site._l2(mac, mac, 0x88B8, b"",
+                                                        vid, 4))):
+            try:
+                fn()
+                check(False, f"{name} accepted VLAN {vid}")
+            except ValueError:
+                pass
+    for vid in (0, 4095):
+        f = P.ethernet(mac, mac, P.ETH_P_IP, b"", vlan=vid)
+        check(struct.unpack("!H", f[14:16])[0] == vid, f"VLAN {vid} changed")
+    base = ["run", "-p", "modbus", "--once", "--rate", "0"]
+    for flag, val in (("--client-ip", "10.0.0.300"),
+                      ("--server-ip", "10.0.0.-1"),
+                      ("--vlan", "5000"), ("--vlan", "-1")):
+        err = io.StringIO()
+        code = None
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                with contextlib.redirect_stderr(err), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = cli.main(base + ["--pcap", os.path.join(d, "x"),
+                                            f"{flag}={val}"])
+            except SystemExit as e:
+                code = e.code
+            except Exception as e:  # noqa: BLE001
+                code = repr(e)
+        check(code == 2 and flag in err.getvalue() and
+              "Traceback" not in err.getvalue(),
+              f"{flag} {val}: exit {code} {err.getvalue()[-80:]!r}")
+
+
+def test_r22_control_client_deep_json_is_api_error() -> None:
+    """JSON nested past the parser's limit is a bad reply like any other,
+    on a success status and on an error status."""
+    import socket
+    import threading
+    from tgt import api
+    body = b"[" * 200000
+    for status, want_error in ((b"200 OK", True), (b"500 Oops", False)):
+        reply = (b"HTTP/1.1 " + status + b"\r\nContent-Length: " +
+                 str(len(body)).encode() + b"\r\n\r\n" + body)
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+
+        def serve():
+            c, _ = ls.accept()
+            c.recv(4096)
+            c.sendall(reply)
+            c.close()
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            code, doc = api.request(f"127.0.0.1:{ls.getsockname()[1]}", "GET",
+                                    "/status", timeout=5)
+            check(not want_error and code == 500 and doc.get("ok") is False,
+                  f"deep JSON accepted: {code}")
+        except api.ApiError:
+            check(want_error, "error status with deep JSON raised ApiError")
+        except RecursionError:
+            check(False, "deep JSON raised RecursionError")
+        t.join(5)
+        ls.close()
+
+
+def test_r22_control_tagged_l2_builders_reject_bad_vlan() -> None:
+    """The PCP-tagging builders refuse a bad VLAN id instead of masking it,
+    and keep valid ids intact."""
+    from tgt import protocols_ind, remapenv
+    mac = "02:00:00:00:00:01"
+    raw = P.mac_to_bytes(mac)
+    builders = (
+        ("ind _l2", lambda v: protocols_ind._l2(mac, mac, 0x8892, b"x",
+                                                vlan=v, pcp=6), 0xC000),
+        ("remapenv _l2", lambda v: remapenv._l2(raw, raw, v, 0x2000, 0x0800,
+                                                b"x"), 0x2000))
+    for name, fn, prio in builders:
+        for vid in (5000, 4096, -1):
+            try:
+                fn(vid)
+                check(False, f"{name} accepted VLAN {vid}")
+            except ValueError:
+                pass
+        for vid in (1, 4095):
+            tci = struct.unpack("!H", fn(vid)[14:16])[0]
+            check(tci == prio | vid, f"{name} VLAN {vid}: TCI {tci:#x}")
+def test_r22_evaluation_overwrite_never_certifies_stale() -> None:
+    """--overwrite clears what the last run wrote: a run whose stages all
+    fail cannot be reported complete from the old manifests, and files the
+    bench does not own stay."""
+    import json
+    suite = {"name": "tiny", "env": "ot-plant", "seed": 9,
+             "start_time": "2026-11-02T08:00:00Z", "stages": [
+                 {"id": "one", "kind": "baseline", "duration": "1m"},
+                 {"id": "two", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path, b = os.path.join(d, "tiny.json"), os.path.join(d, "bundle")
+        with open(path, "w") as f:
+            json.dump(suite, f)
+        p = _cli(["bench", "run", path, "--out", b])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"first run rc={p.returncode} {out[-300:]}")
+        mine = os.path.join(b, "stages", "notes.txt")
+        with open(mine, "w") as f:
+            f.write("keep")
+        bad = os.path.join(d, "bad")        # a pcap path that cannot open
+        for sid in ("one", "two"):
+            os.makedirs(os.path.join(bad, f"{sid}.pcap"))
+        p = _cli(["bench", "run", path, "--out", b, "--overwrite",
+                  "--pcap-dir", bad])
+        out, _ = p.communicate(timeout=120)
+        with open(os.path.join(b, "bench.json")) as f:
+            idx = json.load(f)
+        check(p.returncode != 0 and idx["status"] != "complete" and
+              not any(r["status"] == "complete" for r in idx["stages"]),
+              f"failed overwrite certified: rc={p.returncode} "
+              f"{idx['status']} {[r['status'] for r in idx['stages']]}")
+        for rel in ("manifest.json", "stages/one.manifest.json",
+                    "stages/two.manifest.json", "stages/one.pcap",
+                    "stages/two.pcap"):
+            check(not os.path.exists(os.path.join(b, rel)),
+                  f"stale {rel} survived --overwrite")
+        check(os.path.exists(mine), "--overwrite removed a foreign file")
+
+
+def test_r22_evaluation_verdict_needs_complete_bundle() -> None:
+    """A PASS needs a complete bundle: an interrupted run, a failed stage or
+    a stage missing from the index is incomplete, whatever the metrics."""
+    import json
+    from tgt import bench
+    suite = {"name": "tiny", "env": "ot-plant", "seed": 9,
+             "start_time": "2026-11-02T08:00:00Z",
+             "thresholds": {"discovery_recall": {"min": 0.1}}, "stages": [
+                 {"id": "one", "kind": "baseline", "duration": "1m"},
+                 {"id": "two", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path, b = os.path.join(d, "tiny.json"), os.path.join(d, "bundle")
+        with open(path, "w") as f:
+            json.dump(suite, f)
+        p = _cli(["bench", "run", path, "--out", b])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+        pe = os.path.join(d, "perfect")
+        bench.write_self_test(b, pe)
+        assets = os.path.join(pe, "assets.csv")
+        ip = os.path.join(b, "bench.json")
+        with open(ip) as f:
+            good = json.load(f)
+
+        def verdict(doc):
+            with open(ip, "w") as f:
+                json.dump(doc, f)
+            return bench.score_bundle(b, assets, "generic")[0]["verdict"]
+        check(verdict(good) == "pass", "complete bundle should pass")
+        check(verdict(dict(good, status="interrupted")) == "incomplete",
+              "interrupted bundle got a verdict")
+        rows = [dict(r) for r in good["stages"]]
+        rows[1]["status"] = "failed"
+        check(verdict(dict(good, stages=rows)) == "incomplete",
+              "failed stage got a verdict")
+        check(verdict(dict(good, stages=good["stages"][:1])) == "incomplete",
+              "bundle missing a suite stage got a verdict")
+
+
+def test_r22_evaluation_fingerprint_covers_effective_run() -> None:
+    """The fingerprint follows what changes the traffic: run parameters and
+    the contents of referenced plans and the environment."""
+    import json
+    from tgt import bench, enterprise, envfile
+    q = bench.load(bench.find("quick"))
+    fp = q.fingerprint()
+    check(fp == bench.load(bench.find("quick")).fingerprint(),
+          "fingerprint is not stable")
+    for kw in ({"min_period": 30}, {"min_period": 90}, {"rate": 500.0},
+               {"start_time": "2027-01-01T00:00:00Z"}, {"clock": "wall"}):
+        check(q.fingerprint(**kw) != fp, f"fingerprint ignores {kw}")
+    check(q.fingerprint(min_period=30) != q.fingerprint(min_period=90),
+          "fingerprint ignores --min-period")
+    check(q.fingerprint(start_time=q.start_time) == fp,
+          "the suite's own start time is not the default")
+    check(q.fingerprint(clock="wall", speed=2.0) !=
+          q.fingerprint(clock="wall", speed=4.0),
+          "wall-clock fingerprint ignores --speed")
+    base = envfile.to_dict(enterprise.get("ot-plant"))
+    key = "r22-fingerprint-env"
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            pp = os.path.join(d, "plan.json")
+
+            def suite():
+                return bench.Suite({"name": "s", "env": key, "stages": [
+                    {"id": "c", "kind": "campaign", "plan": pp}]}, "s.json")
+
+            def plan(dur):
+                with open(pp, "w") as f:
+                    json.dump({"env": key, "phases": [
+                        {"name": "a", "duration": dur}]}, f)
+
+            def env(ip):
+                doc = json.loads(json.dumps(dict(base, key=key)))
+                doc["hosts"][0]["ip"] = ip
+                envfile.register(envfile.from_dict(doc, "r22"))
+            first = base["hosts"][0]["ip"]
+            env(first)
+            plan("10m")
+            a = suite().fingerprint()
+            check(a == suite().fingerprint(), "plan fingerprint unstable")
+            plan("20m")
+            b = suite().fingerprint()
+            check(a != b, "fingerprint ignores the referenced plan")
+            env(first.rsplit(".", 1)[0] + ".250")
+            check(suite().fingerprint() != b,
+                  "fingerprint ignores the environment's contents")
+    finally:
+        enterprise.ENVIRONMENTS.pop(key, None)
+    # and the bundle records the effective value
+    tiny = {"name": "tiny", "env": "ot-plant", "seed": 9,
+            "start_time": "2026-11-02T08:00:00Z", "stages": [
+                {"id": "one", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "tiny.json")
+        with open(path, "w") as f:
+            json.dump(tiny, f)
+        fps = []
+        for mp in ("30", "90"):
+            b = os.path.join(d, mp)
+            p = _cli(["bench", "run", path, "--out", b, "--min-period", mp,
+                      "--force"])
+            out, _ = p.communicate(timeout=120)
+            check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+            with open(os.path.join(b, "bench.json")) as f:
+                fps.append(json.load(f)["fingerprint"])
+        check(fps[0] != fps[1], f"bundles share a fingerprint {fps}")
+
+
+def test_r22_evaluation_stage_inherits_plan_settings() -> None:
+    """A stage referencing a plan keeps the plan's run settings; explicit
+    suite and stage values override them."""
+    import json
+    from tgt import bench
+    s = bench.Suite({"name": "s", "env": "ot-plant", "stages": [
+        {"id": "c", "kind": "campaign", "plan": "ot-plant-drift"}]}, "s.json")
+    check(s.stages[0].plan_doc.get("day_profile") == "shift",
+          f"packaged plan day_profile {s.stages[0].plan_doc.get('day_profile')}")
+    with tempfile.TemporaryDirectory() as d:
+        pp = os.path.join(d, "plan.json")
+        with open(pp, "w") as f:
+            json.dump({"env": "ot-plant", "day_profile": "shift",
+                       "utc_offset": 2, "span": "core", "rate": 50,
+                       "sprinkle_messages": 5,
+                       "phases": [{"name": "a", "duration": "10m"}]}, f)
+        stage = {"id": "c", "kind": "campaign", "plan": pp}
+        doc = bench.Suite({"env": "ot-plant", "stages": [stage]},
+                          "s.json").stages[0].plan_doc
+        got = {k: doc.get(k) for k in ("day_profile", "utc_offset", "span",
+                                       "rate", "sprinkle_messages")}
+        check(got == {"day_profile": "shift", "utc_offset": 2, "span": "core",
+                      "rate": 50, "sprinkle_messages": 5},
+              f"inherited plan settings {got}")
+        doc = bench.Suite({"env": "ot-plant", "utc_offset": 0, "span":
+                           "access", "day_profile": "flat",
+                           "stages": [stage]}, "s.json").stages[0].plan_doc
+        check(doc["utc_offset"] == 0 and doc["span"] == "access" and
+              doc["day_profile"] == "flat" and doc["rate"] == 50,
+              f"suite values must override the plan: {doc}")
+        doc = bench.Suite({"env": "ot-plant", "day_profile": "flat",
+                           "stages": [dict(stage, day_profile="shift")]},
+                          "s.json").stages[0].plan_doc
+        check(doc["day_profile"] == "shift",
+              f"stage value must win: {doc['day_profile']}")
+
+
+def test_r22_evaluation_new_assets_only_emitted() -> None:
+    """A perfect monitor is not charged for sprinkle-planned hosts that
+    never reached the wire."""
+    from tgt import score as S
+    with tempfile.TemporaryDirectory() as d:
+        m, csvp = os.path.join(d, "m.json"), os.path.join(d, "assets.csv")
+        p = _cli(["run", "-e", "ot-plant", "--sprinkle", "wannacry", "--count",
+                  "3", "--rate", "0", "--pcap", os.path.join(d, "x.pcap"),
+                  "--manifest", m])
+        out, _ = p.communicate(timeout=60)
+        check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+        truth = S.load_truth(m)
+        planned = [a for a in truth.assets if a["new"]]
+        emitted = [a["id"] for a in planned if a["emitted"]]
+        check(len(emitted) < len(planned),
+              "fixture: expected planned hosts that were not emitted")
+        S.write_perfect_export(truth, csvp)
+        rows, info = S.read_export(csvp, S.load_json_spec("generic"))
+        info.update(source="assets.csv", map="generic.json")
+        n = S.score(truth, rows, info)["new_assets"]
+    if emitted:
+        check(n["total"] == len(emitted) and not n["missed"] and
+              sorted(n["detected"]) == sorted(emitted), f"new assets {n}")
+    else:
+        check(n is None, f"no emitted new assets, yet {n}")
+
+
+def test_r22_evaluation_alert_credit_is_one_to_one() -> None:
+    """One alert credits one event, and an alert naming no host cannot
+    detect an event that names hosts (it is reported separately)."""
+    from tgt import score
+    hosts = [{"asset_id": f"s:H{i}", "name": f"H{i}", "ip": f"10.0.0.{i}"}
+             for i in range(1, 7)]
+
+    def truth(evs):
+        rows = [{"id": f"e{i}", "category": "scan", "attack": "port-scan",
+                 "t_start": f"2026-11-05T14:00:0{i}Z",
+                 "t_end": f"2026-11-05T14:00:0{i}Z", "src": src, "dst": dst,
+                 "hosts": [], "source": "sprinkle:x"}
+                for i, (src, dst) in enumerate(evs)]
+        return score.Truth({"schema": "tgt-manifest/1",
+                            "start": "2026-11-05T14:00:00Z",
+                            "end": "2026-11-05T14:10:00Z",
+                            "inventory": {"hosts": hosts}, "first_seen": {},
+                            "events": rows}, "r22")
+
+    def alert(row, sec, src, dst=""):
+        return {"row": row, "time": score.parse_time(
+            f"2026-11-05T14:00:{sec:02d}Z"), "title": "scan",
+                "raw_category": "scan", "category": "scan", "src": src,
+                "dst": dst, "techniques": None}
+    five = truth([(f"10.0.0.{i}", None) for i in range(1, 6)])
+    det = score.detections(five, [alert(1, 6, "")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 1 and
+          not det["false_alerts"] and det["matched_alerts"] == 0,
+          f"blank alert: {det['detected']} detected, "
+          f"{det.get('hostless_alerts')} host-less")
+    det = score.detections(five, [alert(1, 6, "10.0.0.3")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["hostless_alerts"] == 0,
+          f"one alert detected {det['detected']} events")
+    shared = truth([("10.0.0.1", "10.0.0.2"), ("10.0.0.1", "10.0.0.3")])
+    det = score.detections(shared, [alert(1, 6, "10.0.0.1")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["matched_alerts"] == 1,
+          f"one alert on a shared host detected {det['detected']}")
+    # the first event must give up the only alert the second one can use
+    det = score.detections(shared, [alert(1, 6, "10.0.0.1"),
+                                    alert(2, 7, "10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 2 and
+          {r["alert_row"] for r in det["events_detail"]} == {1, 2},
+          f"assignment is not maximal: {det['detected']}")
+    # extra alerts on a detected event are matched, not false
+    det = score.detections(shared, [alert(1, 6, "10.0.0.2"),
+                                    alert(2, 7, "10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["matched_alerts"] == 2 and
+          not det["false_alerts"], f"duplicate alerts: {det['detected']}")
+    bare = score.Truth({"schema": "tgt-manifest/1",
+                        "start": "2026-11-05T14:00:00Z",
+                        "end": "2026-11-05T14:10:00Z",
+                        "inventory": {"hosts": hosts}, "first_seen": {},
+                        "events": [{"id": "e0", "category": "scan",
+                                    "t_start": "2026-11-05T14:00:00Z",
+                                    "t_end": "2026-11-05T14:00:00Z",
+                                    "hosts": [], "source": "x"}]}, "r22")
+    det = score.detections(bare, [alert(1, 6, "")], 300.0, 5.0)
+    check(det["detected"] == 1 and det["hostless_alerts"] == 0,
+          "an event naming no host still matches on category and time")
+    res = score.score(five, [], {"rows": 0, "columns": {}, "source": "x",
+                                 "map": "m", "protocol_ignore": [],
+                                 "normalize": lambda f, v: v},
+                      alerts=[alert(1, 6, "")])
+    check("1 host-less" in score.summary(res),
+          "summary does not report host-less alerts")
+
+
+def test_r22_evaluation_reused_ip_credits_new_owner() -> None:
+    """An IP handed to a new host is that host's from the phase on; a
+    host's old address stays credited to it only while nobody reused it."""
+    import json
+    from tgt import campaign
+    from tgt.manifest import Recorder
+    plan = {"name": "reuse", "env": "ot-plant", "seed": 3,
+            "start_time": "2026-11-02T08:00:00Z", "phases": [
+                {"name": "a", "duration": "10m"},
+                {"name": "b", "duration": "10m", "remove_host": ["PLC-RW1"],
+                 "add_host": [{"name": "NEW-HOST", "ip": "172.16.1.21",
+                               "model": "rockwell-1769-l36erm"}],
+                 "add_flow": [{"client": "HMI-RW", "server": "NEW-HOST",
+                               "proto": "enip"}],
+                 "set": [{"host": "PLC-RW2", "ip": "172.16.1.29"}]}]}
+    with tempfile.TemporaryDirectory() as d:
+        pp, m = os.path.join(d, "p.json"), os.path.join(d, "m.json")
+        with open(pp, "w") as f:
+            json.dump(plan, f)
+        p = _cli(["campaign", pp, "--clock", "synthetic", "--pcap",
+                  os.path.join(d, "p.pcap"), "--manifest", m, "--rate", "0",
+                  "--force"])
+        out, _ = p.communicate(timeout=120)
+        check(p.returncode == 0, f"campaign rc={p.returncode} {out[-300:]}")
+        with open(m) as f:
+            doc = json.load(f)
+        phases = campaign.build(campaign.load(pp))
+        rec = Recorder(RunConfig(env="ot-plant", campaign=pp), 3,
+                       clock="synthetic")
+        rec.campaign(phases)
+        before = next(h.ip for h in phases[0].env.hosts
+                      if h.name == "PLC-RW2")
+        rec.begin_phase(phases[0], 0.0)
+        check(rec.addr_aid["172.16.1.21"] == "ot-plant:PLC-RW1",
+              "first phase: the address belongs to PLC-RW1")
+        rec.begin_phase(phases[1], 600.0)
+    switch = doc["phases"][1]["start"]
+    old, new = doc["last_seen"]["ot-plant:PLC-RW1"], \
+        doc["last_seen"]["ot-plant:NEW-HOST"]
+    check(old <= switch, f"PLC-RW1 credited after it left: {old} > {switch}")
+    check(new > switch and new > old, f"NEW-HOST last seen {new}")
+    check(rec.addr_aid["172.16.1.21"] == "ot-plant:NEW-HOST",
+          f"reused IP maps to {rec.addr_aid['172.16.1.21']}")
+    check(rec.addr_aid[before] == "ot-plant:PLC-RW2" and
+          rec.addr_aid["172.16.1.29"] == "ot-plant:PLC-RW2",
+          "a re-addressed host keeps its unclaimed old address")
+    stale = [k for k, r in rec.flowidx.items()
+             if "172.16.1.21" in (r[2], r[3]) and
+             "ot-plant:PLC-RW1" in (r[0], r[1])]
+    check(not stale, f"flow index still credits PLC-RW1: {stale[:2]}")
+
+
+def test_r22_evaluation_remap_arp_macs_follow_ip() -> None:
+    """--remap-env: when one capture MAC owns two IPs, each ARP's sender and
+    target MACs are those of the host its IP maps to."""
+    from types import SimpleNamespace
+    from tgt import enterprise
+    from tgt.remapenv import EnvRewriter, HostProfile
+    env = enterprise.get("ot-plant")
+    a, b, c = env.hosts[:3]
+    shared, peer = "02:00:00:00:00:aa", "02:00:00:00:00:bb"
+    mapped = [(HostProfile(key=ip, ip=ip, mac=mac), h, env.segment_of(h), 1.0)
+              for ip, mac, h in (("10.9.0.1", shared, a),
+                                 ("10.9.0.2", shared, b),
+                                 ("10.9.0.3", peer, c))]
+    rw = EnvRewriter(SimpleNamespace(mapped=mapped, env=env, span="access",
+                                     describe=lambda: "remap"))
+    m, ip = P.mac_to_bytes, P.ip_to_bytes
+
+    def arp(op, emac, smac, sip, tmac, tip):
+        return (m(emac) + m(smac) + b"\x08\x06\x00\x01\x08\x00\x06\x04" +
+                struct.pack("!H", op) + m(smac) + ip(sip) + m(tmac) + ip(tip))
+
+    def fields(frame):
+        off = 18 if frame[12:14] == b"\x81\x00" else 14
+        return frame[:6], frame[6:12], frame[off + 8:off + 14], \
+            frame[off + 18:off + 24]
+    for sip, host in (("10.9.0.1", a), ("10.9.0.2", b)):
+        ed, es, sm, tm = fields(rw.apply_all(arp(2, peer, shared, sip, peer,
+                                                 "10.9.0.3"))[0])
+        want = m(host.mac)
+        check(es == want and sm == want and ed == m(c.mac) and
+              tm == m(c.mac), f"ARP reply from {sip}: sender {sm.hex()} / "
+                              f"eth {es.hex()}, want {want.hex()}")
+    for tip, host in (("10.9.0.1", a), ("10.9.0.2", b)):
+        ed, es, sm, tm = fields(rw.apply_all(arp(2, shared, peer, "10.9.0.3",
+                                                 shared, tip))[0])
+        want = m(host.mac)
+        check(ed == want and tm == want and sm == m(c.mac),
+              f"ARP reply to {tip}: target {tm.hex()} / eth {ed.hex()}, "
+              f"want {want.hex()}")
+    ed, _, sm, tm = fields(rw.apply_all(arp(1, "ff:ff:ff:ff:ff:ff", shared,
+                                            "10.9.0.1", "00:00:00:00:00:00",
+                                            "10.9.0.3"))[0])
+    check(ed == b"\xff" * 6 and tm == b"\0" * 6 and sm == m(a.mac),
+          "ARP request: broadcast and empty target MAC must stay")
+
+
+def test_r22_evaluation_ftp_backup_class() -> None:
+    """FTP to a file share or historian is a backup, like the same SMB flow;
+    other FTP keeps its engineering class."""
+    from tgt import timing
+    for server in ("file", "hist"):
+        check(timing.activity_class("ftp", "hist", server) == "backup",
+              f"ftp hist -> {server}")
+        check(timing.activity_class("smb", "hist", server) == "backup",
+              f"smb hist -> {server}")
+    check(timing.activity_class("ftp", "ws", "file") == "eng",
+          "ftp from a workstation is not a backup")
+    check(timing.activity_class("ftp", "eng", "plc") == "eng",
+          "ftp to a PLC is not a backup")
+    check(timing.activity_class("smb", "hmi", "plc") == "operator",
+          "the office-class refinement must still apply")
+
+
+def test_r22_evaluation_alert_host_must_match_named_event() -> None:
+    """An event naming a host no alert address resolves to is not detected
+    by an alert on another host, and an alert naming an unknown host is a
+    false alert rather than a host-less one."""
+    from tgt import score
+    hosts = [{"asset_id": f"s:H{i}", "name": f"H{i}", "ip": f"10.0.0.{i}"}
+             for i in range(1, 4)]
+
+    def truth(host):
+        return score.Truth({
+            "schema": "tgt-manifest/1", "start": "2026-11-05T14:00:00Z",
+            "end": "2026-11-05T14:10:00Z", "inventory": {"hosts": hosts},
+            "first_seen": {}, "events": [{
+                "id": "e", "category": "scan",
+                "t_start": "2026-11-05T14:00:00Z",
+                "t_end": "2026-11-05T14:00:00Z", "hosts": [host],
+                "source": "x"}]}, "r22")
+
+    def alert(src):
+        return {"row": 1, "time": score.parse_time("2026-11-05T14:00:03Z"),
+                "title": "scan", "raw_category": "scan", "category": "scan",
+                "src": src, "dst": "", "techniques": None}
+    det = score.detections(truth("s:GHOST"), [alert("10.0.0.2")], 300.0, 5.0)
+    check(det["detected"] == 0 and len(det["false_alerts"]) == 1,
+          f"unresolved event host: {det['detected']} detected")
+    det = score.detections(truth("s:H1"), [alert("GHOST-NAME")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 0 and
+          len(det["false_alerts"]) == 1,
+          f"unknown alert host: {det['hostless_alerts']} host-less, "
+          f"{len(det['false_alerts'])} false")
+    det = score.detections(truth("s:H1"), [alert("")], 300.0, 5.0)
+    check(det["detected"] == 0 and det["hostless_alerts"] == 1 and
+          not det["false_alerts"], "a blank alert stays host-less")
+    det = score.detections(truth("s:H1"), [alert("H1")], 300.0, 5.0)
+    check(det["detected"] == 1, "an alert naming the host by name matches")
+
+
+def test_r22_evaluation_overwrite_keeps_foreign_manifest() -> None:
+    """--overwrite on a directory that holds no bench bundle leaves a
+    manifest.json the bench did not write, but clears its own."""
+    import json
+    from tgt import bench
+    suite = bench.Suite({"name": "tiny", "env": "ot-plant", "stages": [
+        {"id": "one", "kind": "baseline", "duration": "1m"}]}, "tiny.json")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "manifest.json")
+        with open(path, "w") as f:
+            json.dump({"mine": 1}, f)
+        bench._clear_bundle(d, suite)
+        check(os.path.exists(path), "--overwrite removed a foreign manifest")
+        with open(path, "w") as f:
+            json.dump({"bench": {"suite": "tiny"}}, f)
+        bench._clear_bundle(d, suite)
+        check(not os.path.exists(path), "a merged manifest was not cleared")
+        with open(path, "w") as f:
+            json.dump({"mine": 1}, f)
+        with open(os.path.join(d, "bench.json"), "w") as f:
+            json.dump({"stages": []}, f)
+        bench._clear_bundle(d, suite)
+        check(not os.path.exists(path), "a bundle's manifest was not cleared")
+def _r22_ops_sandbox(d: str, systemd: bool = True) -> dict:
+    """A patched copy of tgtctl.sh whose system paths live under ``d`` and
+    whose ip/systemctl/journalctl/setpriv/id/tail are stubs: nothing here can
+    reach a real service or a host interface."""
+    import stat
+    root = os.path.join(d, "root")
+    for sub in ("etc", "run", "var/log", "tmp"):
+        os.makedirs(os.path.join(root, sub))
+    if systemd:
+        os.makedirs(os.path.join(root, "run/systemd/system"))
+        os.makedirs(os.path.join(root, "etc/systemd/system"))
+    repo, bin_dir, links = (os.path.join(d, n) for n in ("repo", "bin", "links"))
+    for p in (os.path.join(repo, "scripts"), os.path.join(repo, "tgt"),
+              bin_dir, links):
+        os.makedirs(p)
+    for name, body in (("__init__.py", ""), ("__main__.py", "raise SystemExit(0)\n")):
+        with open(os.path.join(repo, "tgt", name), "w") as fh:
+            fh.write(body)
+    with open(os.path.join(_REPO, "scripts", "tgtctl.sh")) as fh:
+        text = fh.read()
+    for path in ("/etc/", "/run", "/var/log", "/tmp/tgt"):
+        text = text.replace(path, root + path)
+    ctl = os.path.join(repo, "scripts", "tgtctl.sh")
+    with open(ctl, "w") as fh:
+        fh.write(text)
+    stubs = {
+        "id": 'echo "${STUB_UID:-0}"\n',
+        "systemctl": 'echo "systemctl $*" >> "$STUB_LOG"\n',
+        "journalctl": 'echo "journalctl $*" >> "$STUB_LOG"\n',
+        "tail": 'echo "tail $*"\n',
+        "ip": 'echo "ip $*" >> "$STUB_LOG"\n'
+              'for n; do :; done\n'
+              'case "$*" in\n'
+              '  "-o -d link show "*) [ -f "$STUB_LINKS/$n" ] && '
+              'cat "$STUB_LINKS/$n" ;;\n'
+              '  "link show "*) [ -f "$STUB_LINKS/$n" ] ;;\n'
+              'esac\n',
+        "setpriv": '[ -z "${STUB_SETPRIV_FAIL:-}" ] || exit 1\n'
+                   'while case "$1" in --*) true ;; *) false ;; esac; do '
+                   'shift; done\n'
+                   'for a in "$@"; do case "$a" in\n'
+                   '  "${STUB_DENY:-/nonexistent}"|"${STUB_DENY:-/nonexistent}"/*)'
+                   ' exit 1 ;;\n'
+                   'esac; done\n'
+                   'exec "$@"\n',
+    }
+    for name, body in stubs.items():
+        path = os.path.join(bin_dir, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n" + body)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+    log = os.path.join(d, "calls.log")
+    open(log, "w").close()
+    env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"],
+               STUB_LOG=log, STUB_LINKS=links, PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    return {"ctl": ctl, "env": env, "root": root, "repo": repo, "log": log,
+            "links": links, "bin": bin_dir,
+            "conf": os.path.join(root, "etc/tgt/tgt.conf"),
+            "unit": os.path.join(root, "etc/systemd/system/tgt.service")}
+
+
+def _r22_ops_run(box: dict, *args: str, **env: str):
+    import subprocess
+    r = subprocess.run(["sh", box["ctl"]] + list(args),
+                       env=dict(box["env"], **env), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True,
+                       timeout=30)
+    with open(box["log"]) as fh:
+        return r.returncode, r.stdout, fh.read()
+
+
+def _r22_ops_conf(box: dict, iface: str = "tgt0") -> None:
+    os.makedirs(os.path.dirname(box["conf"]), exist_ok=True)
+    with open(box["conf"], "w") as fh:
+        fh.write(f"TGT_IFACE={iface}\nTGT_RUN_ARGS=\n")
+
+
+def test_r22_ops_service_state_permission_means_running() -> None:
+    """EPERM from kill(pid, 0) proves the process exists, so a root daemon
+    reads as active to a non-root TUI. A stale first PID file does not hide
+    a live daemon recorded in the second."""
+    from tgt import service
+    saved = service._have_systemd, service.PID_PATHS, os.kill
+    with tempfile.TemporaryDirectory() as d:
+        first, second = os.path.join(d, "a.pid"), os.path.join(d, "b.pid")
+
+        def fake_kill(pid, sig):
+            if pid == 111:
+                raise PermissionError(1, "not permitted")
+            if pid == 222:
+                raise ProcessLookupError(3, "no such process")
+        try:
+            service._have_systemd = lambda: False
+            service.PID_PATHS = (first, second)
+            os.kill = fake_kill
+            with open(first, "w") as fh:
+                fh.write("111\n")
+            st = service.service_state()
+            check(st.status == "active" and st.detail == "pid 111",
+                  f"service_state on EPERM: {st}")
+            with open(first, "w") as fh:
+                fh.write("222\n")
+            st = service.service_state()
+            check(st.status == "inactive", f"service_state on ESRCH: {st}")
+            with open(second, "w") as fh:
+                fh.write("111\n")
+            st = service.service_state()
+            check(st.status == "active", f"stale PID file hid a daemon: {st}")
+        finally:
+            service._have_systemd, service.PID_PATHS, os.kill = saved
+
+
+def test_r22_ops_unregister_only_removes_tgt_veths() -> None:
+    """unregister deletes a veth whose peer is <name>-mon and leaves any
+    other interface named in TGT_IFACE alone."""
+    links = {
+        "tgt0": "7: tgt0@tgt0-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:01"
+                " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    veth addrgenmode eui64",
+        "eth9": "3: eth9: <UP> mtu 1500\\    link/ether 02:00:00:00:00:02"
+                " brd ff:ff:ff:ff:ff:ff promiscuity 0 addrgenmode eui64",
+        "vethx": "8: vethx@other: <UP> mtu 1500\\    link/ether 02:00:00:00:00:03"
+                 " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    veth addrgenmode eui64",
+        "vlan5": "9: vlan5@vlan5-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:04"
+                 " brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    vlan id 5",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        _r22_ops_conf(box, ",".join(links))
+        for name, line in links.items():
+            with open(os.path.join(box["links"], name), "w") as fh:
+                fh.write(line + "\n")
+        rc, out, calls = _r22_ops_run(box, "unregister")
+        check(rc == 0, f"unregister rc={rc}: {out}")
+        check("ip link del tgt0" in calls, f"TGT veth not removed: {calls}")
+        for name in ("eth9", "vethx", "vlan5"):
+            check(f"ip link del {name}" not in calls,
+                  f"unregister deleted foreign interface {name}")
+            check(name in out, f"no notice for kept interface {name}: {out}")
+
+
+def test_r22_ops_status_logs_find_root_daemon_files() -> None:
+    """Without write access to /run and /var/log, status and logs still find
+    the root daemon's PID and log files. PID 1 gives a real EPERM."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        run_dir, log_dir = (os.path.join(box["root"], s) for s in ("run", "var/log"))
+        with open(os.path.join(run_dir, "tgt.pid"), "w") as fh:
+            fh.write("1\n")
+        log_file = os.path.join(log_dir, "tgt.log")
+        with open(log_file, "w") as fh:
+            fh.write("daemon line\n")
+        os.chmod(run_dir, 0o555)
+        os.chmod(log_dir, 0o555)
+        try:
+            rc, out, _ = _r22_ops_run(box, "status", STUB_UID="1000")
+            check(rc == 0 and "running (pid 1)" in out and log_file in out,
+                  f"status without root: rc={rc} {out}")
+            rc, out, _ = _r22_ops_run(box, "logs", STUB_UID="1000")
+            check(rc == 0 and log_file in out,
+                  f"logs without root: rc={rc} {out}")
+        finally:
+            os.chmod(run_dir, 0o755)
+            os.chmod(log_dir, 0o755)
+
+
+def test_r22_ops_start_registers_missing_unit() -> None:
+    """On a systemd host an existing config no longer skips registration:
+    start and restart go through a unit, never an unmanaged daemon. A legacy
+    daemon that is already running is not doubled up."""
+    for action in ("start", "restart"):
+        with tempfile.TemporaryDirectory() as d:
+            box = _r22_ops_sandbox(d)
+            _r22_ops_conf(box)
+            rc, out, calls = _r22_ops_run(box, action)
+            pid_file = os.path.join(box["root"], "run", "tgt.pid")
+            check(rc == 0 and os.path.exists(box["unit"]),
+                  f"{action}: unit not registered: rc={rc} {out}")
+            check(f"systemctl {action} tgt.service" in calls or
+                  "systemctl start tgt.service" in calls,
+                  f"{action}: systemctl not used: {calls}")
+            check(not os.path.exists(pid_file),
+                  f"{action}: launched an unmanaged daemon")
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        _r22_ops_conf(box)
+        with open(os.path.join(box["root"], "run", "tgt.pid"), "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        rc, out, calls = _r22_ops_run(box, "start")
+        check(rc == 0 and not os.path.exists(box["unit"]) and
+              "systemctl start" not in calls,
+              f"start doubled a running daemon: rc={rc} {out} {calls}")
+
+
+def test_r22_ops_service_uses_same_mode_as_tgtctl() -> None:
+    """tgt.service picks systemctl only when the unit exists, like tgtctl;
+    otherwise the action goes through tgtctl, which registers it."""
+    import subprocess
+    from tgt import service
+    saved = service._have_systemd, service.UNIT_PATH, service.subprocess.run
+    saved_paths = service.PID_PATHS
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "active\n", "")
+    with tempfile.TemporaryDirectory() as d:
+        unit = os.path.join(d, "tgt.service")
+        try:
+            service._have_systemd = lambda: True
+            service.UNIT_PATH = unit
+            service.PID_PATHS = (os.path.join(d, "none.pid"),)
+            service.subprocess.run = fake_run
+            service.service_action("start")
+            check(not any("systemctl" in c for c in calls) and
+                  any(str(x).endswith("tgtctl.sh") for x in calls[-1]),
+                  f"no unit: action should use tgtctl: {calls}")
+            st = service.service_state()
+            check(st.status == "not-installed" and st.mode == "systemd",
+                  f"no unit: state {st}")
+            calls.clear()
+            open(unit, "w").close()
+            service.service_action("start")
+            check(any("systemctl" in c for c in calls),
+                  f"unit present: action should use systemctl: {calls}")
+        finally:
+            service._have_systemd, service.UNIT_PATH = saved[:2]
+            service.subprocess.run = saved[2]
+            service.PID_PATHS = saved_paths
+
+
+def test_r22_ops_preflight_uses_service_capabilities() -> None:
+    """register fails before writing a unit when the service, which has no
+    DAC capabilities, cannot read the checkout; the message names the path
+    and the remedy, and the unit's capabilities stay narrow."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        denied = os.path.join(box["repo"], "tgt")
+        rc, out, calls = _r22_ops_run(box, "register", STUB_DENY=denied)
+        check(rc != 0 and denied in out and "/opt" in out and
+              "CAP_DAC" in out, f"preflight message: rc={rc} {out}")
+        check(not os.path.exists(box["unit"]) and "systemctl" not in calls,
+              f"unit written despite failed preflight: {calls}")
+        rc, out, _ = _r22_ops_run(box, "register")
+        check(rc == 0 and os.path.exists(box["unit"]),
+              f"register with access: rc={rc} {out}")
+        with open(box["unit"]) as fh:
+            unit = fh.read()
+        check("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\n" in unit and
+              "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\n" in unit,
+              "service capabilities changed")
+        rc, out, calls = _r22_ops_run(box, "start", STUB_DENY=denied)
+        check(rc != 0 and denied in out and
+              "systemctl start" not in calls,
+              f"start with an unreadable checkout: rc={rc} {out}")
+    with tempfile.TemporaryDirectory() as d:     # daemon mode keeps full root
+        box = _r22_ops_sandbox(d, systemd=False)
+        rc, out, _ = _r22_ops_run(box, "register",
+                                  STUB_DENY=os.path.join(box["repo"], "tgt"))
+        check(rc == 0, f"daemon-mode register blocked: rc={rc} {out}")
+
+
+def test_r22_ops_preflight_walks_permissions_without_setpriv() -> None:
+    """When setpriv cannot run, mode bits decide what root without
+    CAP_DAC_* could read."""
+    base = "/dev/shm" if os.access("/dev/shm", os.W_OK) else "/tmp"
+    with tempfile.TemporaryDirectory(dir=base) as d:
+        os.chmod(d, 0o755)
+        box = _r22_ops_sandbox(d)
+        rc, out, _ = _r22_ops_run(box, "register", STUB_SETPRIV_FAIL="1")
+        check(rc == 0, f"walk rejected a readable checkout: rc={rc} {out}")
+        os.unlink(box["unit"])
+        secret = os.path.join(box["repo"], "tgt", "data.json")
+        open(secret, "w").close()
+        os.chmod(secret, 0)
+        rc, out, _ = _r22_ops_run(box, "register", STUB_SETPRIV_FAIL="1")
+        check(rc != 0 and secret in out and not os.path.exists(box["unit"]),
+              f"walk missed an unreadable file: rc={rc} {out}")
+
+
+def test_r22_ops_entrypoint_splits_interfaces() -> None:
+    """docker-entrypoint.sh creates one veth pair per comma-separated name
+    and leaves an existing interface alone."""
+    import stat
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        py = os.path.join(box["bin"], "python3")
+        with open(py, "w") as fh:
+            fh.write('#!/bin/sh\necho "python3 $*"\n')
+        os.chmod(py, os.stat(py).st_mode | stat.S_IXUSR)
+        open(os.path.join(box["links"], "tgt2"), "w").close()
+        r = subprocess.run(
+            ["sh", os.path.join(_REPO, "docker-entrypoint.sh"), "list"],
+            env=dict(box["env"], TGT_IFACE="tgt0,tgt1,tgt2"),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, timeout=10)
+        with open(box["log"]) as fh:
+            calls = fh.read()
+        for name in ("tgt0", "tgt1"):
+            check(f"ip link add {name} type veth peer name {name}-mon" in calls
+                  and f"ip link set {name} up" in calls
+                  and f"ip link set {name}-mon up" in calls,
+                  f"entrypoint: no pair for {name}: {calls}")
+        check("link add tgt2" not in calls and "tgt0,tgt1" not in calls,
+              f"entrypoint: wrong interface handling: {calls}")
+        check(r.returncode == 0 and "python3 -m tgt list" in r.stdout,
+              f"entrypoint: no hand-off: {r.stdout}")
+
+
+def test_r22_ops_unregister_ignores_link_alias() -> None:
+    """A link alias is free text: one mentioning veth does not make a VLAN
+    on <name>-mon look like a TGT pair, and a real pair with an alias goes."""
+    head = "7: {0}@{0}-mon: <UP> mtu 1500\\    link/ether 02:00:00:00:00:01"
+    links = {
+        "fake": head.format("fake") + " promiscuity 0 \\    vlan protocol "
+                "802.1Q id 7 addrgenmode eui64 \\    alias lab veth uplink",
+        "tgt0": head.format("tgt0") + " promiscuity 0 \\    veth addrgenmode "
+                "eui64 \\    alias traffic",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        _r22_ops_conf(box, ",".join(links))
+        for name, line in links.items():
+            with open(os.path.join(box["links"], name), "w") as fh:
+                fh.write(line + "\n")
+        rc, out, calls = _r22_ops_run(box, "unregister")
+        check(rc == 0, f"unregister rc={rc}: {out}")
+        check("ip link del fake" not in calls,
+              f"alias made a VLAN look like a TGT veth: {calls}")
+        check("ip link del tgt0" in calls, f"aliased veth kept: {calls}")
+
+
+def test_r22_ops_restart_keeps_daemon_when_preflight_fails() -> None:
+    """Moving an unmanaged daemon under systemd checks access first, so a
+    checkout the service cannot read leaves the daemon running."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        _r22_ops_conf(box)
+        pid_file = os.path.join(box["root"], "run", "tgt.pid")
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            with open(pid_file, "w") as fh:
+                fh.write(f"{proc.pid}\n")
+            rc, out, calls = _r22_ops_run(
+                box, "restart", STUB_DENY=os.path.join(box["repo"], "tgt"))
+            check(rc != 0 and "cannot access" in out,
+                  f"restart preflight: rc={rc} {out}")
+            check(proc.poll() is None and os.path.exists(pid_file),
+                  "restart stopped the daemon before a failed preflight")
+            check("systemctl" not in calls, f"systemctl used: {calls}")
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+def test_r22_ops_preflight_checks_installed_unit_python() -> None:
+    """start and restart check the interpreter the installed unit runs: a
+    unit pointing into a private virtualenv fails before systemctl."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        rc, out, _ = _r22_ops_run(box, "register")
+        check(rc == 0, f"register rc={rc}: {out}")
+        venv = os.path.join(d, "private venv")
+        os.mkdir(venv)
+        py = os.path.join(venv, "python3")
+        with open(py, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(py, 0o755)
+        with open(box["unit"]) as fh:
+            lines = fh.read().splitlines(True)
+        for i, line in enumerate(lines):
+            if line.startswith("ExecStart="):
+                head, _, tail = line.partition(" exec ")
+                lines[i] = head + " exec " + py + " -m " + tail.split(" -m ", 1)[1]
+        with open(box["unit"], "w") as fh:
+            fh.writelines(lines)
+        for action in ("start", "restart"):
+            rc, out, calls = _r22_ops_run(box, action, STUB_DENY=venv)
+            check(rc != 0 and venv in out,
+                  f"{action}: private interpreter passed: rc={rc} {out}")
+            check(f"systemctl {action}" not in calls,
+                  f"{action}: systemctl ran: {calls}")
+        rc, out, calls = _r22_ops_run(box, "start")
+        check(rc == 0 and "systemctl start" in calls,
+              f"start with access: rc={rc} {out}")
+
+
+def test_r22_ops_logs_follow_live_daemon() -> None:
+    """logs reads the live daemon's log even when the other location holds
+    a newer, unrelated file."""
+    for pid_dir, log_rel, other_rel in (("run", "var/log/tgt.log", "tmp/tgt.log"),
+                                        ("tmp", "tmp/tgt.log", "var/log/tgt.log")):
+        with tempfile.TemporaryDirectory() as d:
+            box = _r22_ops_sandbox(d, systemd=False)
+            with open(os.path.join(box["root"], pid_dir, "tgt.pid"), "w") as fh:
+                fh.write(f"{os.getpid()}\n")
+            log, other = (os.path.join(box["root"], r) for r in (log_rel, other_rel))
+            for path in (log, other):
+                with open(path, "w") as fh:
+                    fh.write("line\n")
+            os.utime(log, (1000, 1000))
+            rc, out, _ = _r22_ops_run(box, "logs")
+            check(rc == 0 and log in out and other not in out,
+                  f"logs with a live {pid_dir} daemon: rc={rc} {out}")
+
+
+def test_r22_residual_ctl_token_and_bad_replies() -> None:
+    """tgt ctl keeps its token off redirects and reports bad input cleanly."""
+    import contextlib
+    import http.server
+    import io
+    import threading
+    from tgt import api, cli, pcap, service
+    seen = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+    tport = target.server_address[1]
+
+    class Redirect(Target):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{tport}/status")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    class Odd(Target):
+        def do_GET(self):
+            body = b'{"injections": [{}], "interfaces": {"a": 1}, "uptime": "x"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    redirect = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    odd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Odd)
+    for s in (target, redirect, odd):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    try:
+        code, _ = api.request(f"127.0.0.1:{redirect.server_address[1]}",
+                              "GET", "/status", token="SECRET")
+        check(code == 302, f"redirect followed: {code}")
+        check(not seen, "bearer token sent to a redirect target")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["ctl", "--api",
+                           f"127.0.0.1:{odd.server_address[1]}", "status"])
+        check(rc == 2, f"odd status reply: rc={rc}")
+    finally:
+        for s in (target, redirect, odd):
+            s.shutdown()
+            s.server_close()
+    try:
+        api.request("http://[::1", "GET", "/status")
+        check(False, "malformed API address accepted")
+    except api.ApiError:
+        pass
+    with tempfile.TemporaryDirectory() as d:
+        pid = os.path.join(d, "tgt.pid")
+        with open(pid, "w") as f:
+            f.write("99999999999999999999")
+        saved = service.PID_PATHS, service._use_systemd, service._have_systemd
+        service.PID_PATHS = [pid]
+        service._use_systemd = service._have_systemd = lambda: False
+        try:
+            check(service.service_state().status == "inactive",
+                  "huge PID not treated as dead")
+        finally:
+            service.PID_PATHS, service._use_systemd, service._have_systemd = saved
+        with pcap.PcapWriter(os.path.join(d, "x.pcap")) as w:
+            try:
+                w.write(b"\x00" * 60, ts=2.0 ** 33)
+                check(False, "out-of-range pcap timestamp accepted")
+            except ValueError as e:
+                check("classic pcap" in str(e), f"pcap range error: {e}")
+
+
+def test_r22_edr_catalogue() -> None:
+    import ipaddress
+    from tgt import edr, enterprise, incidents, tls
+    check(sorted(edr.PROFILES) == ["crowdstrike", "generic"],
+          f"built-in EDR profiles: {sorted(edr.PROFILES)}")
+    cs = edr.PROFILES["crowdstrike"]
+    check(list(cs.regions) == ["us-1", "us-2", "eu-1", "us-gov-1"],
+          f"crowdstrike regions: {list(cs.regions)}")
+    check(cs.vendor == "CrowdStrike" and cs.tls_client == "falcon",
+          "crowdstrike vendor / TLS template")
+    want = {
+        "us-1": ("ts01-b.cloudsink.net", "lfoup01-b.cloudsink.net",
+                 "lfodown01-b.cloudsink.net", "api.crowdstrike.com"),
+        "us-2": ("ts01-gyr-maverick.cloudsink.net",
+                 "lfoup01-gyr-maverick.cloudsink.net",
+                 "lfodown01-gyr-maverick.cloudsink.net",
+                 "api.us-2.crowdstrike.com"),
+        "us-gov-1": ("ts01-laggar-gcw.cloudsink.net",
+                     "lfoup01-laggar-gcw.cloudsink.net",
+                     "lfodown01-laggar-gcw.cloudsink.net",
+                     "api.laggar.gcw.crowdstrike.com")}
+    for key, names in want.items():
+        got = tuple(cs.regions[key].fqdns[c] for c in edr.CHANNELS)
+        check(got == names, f"{key} hostnames: {got}")
+    eu = cs.regions["eu-1"]
+    fq = enterprise.CROWDSTRIKE_FQDNS
+    check((eu.fqdns["sensor"], eu.fqdns["upload"], eu.fqdns["download"],
+           eu.fqdns["api"]) == (fq["ts"], fq["up"], fq["down"], fq["api"]),
+          "eu-1 hostnames differ from CROWDSTRIKE_FQDNS")
+    check(list(eu.ips) == list(enterprise.CROWDSTRIKE_CLOUD_IPS),
+          "eu-1 IPs differ from CROWDSTRIKE_CLOUD_IPS (or their order)")
+    check(eu.ip_provenance == "published", "eu-1 IP provenance")
+    for key, reg in cs.regions.items():
+        check(reg.host_provenance["api"] == "vendor-docs",
+              f"{key}: API host provenance")
+        sensor = "unverified" if key == "us-gov-1" else "mirrored-docs"
+        for c in ("sensor", "upload", "download"):
+            check(reg.host_provenance[c] == sensor,
+                  f"{key}: {c} host provenance {reg.host_provenance[c]}")
+    doc = [ipaddress.ip_network(n) for n in
+           ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+    gen = edr.PROFILES["generic"]
+    check("crowdstrike" not in gen.tls_client and "falcon" not in gen.tls_client
+          and gen.tls_client in tls.TEMPLATES, "generic TLS template")
+    pools = [(k, r) for k, r in cs.regions.items() if k != "eu-1"] + \
+        list(gen.regions.items())
+    seen: set = set()
+    c2 = {h.ip for i in incidents.INCIDENTS.values() for h in i.hosts}
+    for key, reg in pools:
+        check(reg.ip_provenance == "documentation", f"{key}: IP provenance")
+        check(len(reg.ips) >= 3, f"{key}: pool too small")
+        for ip in reg.ips:
+            a = ipaddress.ip_address(ip)
+            check(any(a in n for n in doc), f"{key}: {ip} not RFC 5737")
+            check(ip not in seen, f"{key}: {ip} reused across regions")
+            check(ip not in c2, f"{key}: {ip} is an incident's address")
+            seen.add(ip)
+    for reg in gen.regions.values():
+        check(all(n.endswith(".edr.example") for n in reg.fqdns.values()),
+              "generic hostnames are not RFC 2606 names under edr.example")
+
+
+def _edr_env(block, key: str = "ot-plant"):
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get(key))
+    if block is not None:
+        doc["edr"] = block
+    return envfile.from_dict(doc, "edr-test.json")
+
+
+_EDR_CUSTOM = {"profile": "custom", "vendor": "Acme", "region": "lab-a",
+               "fqdns": {"sensor": "s.acme.example", "upload": "u.acme.example",
+                         "download": "d.acme.example",
+                         "api": "m.acme.example"},
+               "ips": ["198.51.100.200", "198.51.100.201"]}
+
+
+def test_r22_edr_env_block() -> None:
+    from tgt import edr, enterprise, envfile
+    base = enterprise.get("ot-plant")
+    check("edr" not in envfile.to_dict(base), "export invents an edr block")
+    check(base.edr is None, "built-in env has an explicit EDR setup")
+    for block in ({"enabled": True, "profile": "crowdstrike",
+                   "region": "us-2"},
+                  {"profile": "generic"}, {"enabled": False}, _EDR_CUSTOM,
+                  {"profile": "crowdstrike", "proxy": base.hosts[0].name,
+                   "proxy_port": 3128}):
+        env = _edr_env(block)
+        doc = envfile.to_dict(env)
+        check(doc.get("edr") == block, f"export lost the block: {block}")
+        again = envfile.loads(envfile.dumps(doc), source="again.json")
+        check(envfile.to_dict(again) == doc, f"round trip differs: {block}")
+    check(base.edr is None, "applying a block changed the registered env")
+    cust = _edr_env(_EDR_CUSTOM).edr
+    check(cust.profile.vendor == "Acme" and cust.region.key == "lab-a"
+          and cust.region.ip_provenance == "documentation", "custom setup")
+    check(_edr_env({"profile": "crowdstrike"}).edr.region.key == "eu-1",
+          "crowdstrike default region")
+    bad = [
+        ({"profile": "nope"}, "edr.profile"),
+        ({"profile": "crowdstrike", "region": "mars"}, "edr.region"),
+        ({"profile": "crowdstrike", "proxy": "NO-SUCH"}, "edr.proxy"),
+        ({"profile": "crowdstrike", "proxy": base.hosts[0].name,
+          "proxy_port": 0}, "edr.proxy_port"),
+        ({"profile": "crowdstrike", "typo": 1}, "edr.typo"),
+        ({"enabled": "yes"}, "edr.enabled"),
+        ({"profile": "generic", "vendor": "X"}, "edr.vendor"),
+        ({"profile": "custom", "vendor": "X"}, "edr"),
+        (dict(_EDR_CUSTOM, ips=[]), "edr.ips"),
+        (dict(_EDR_CUSTOM, ips=["1.2.3"]), "edr.ips[0]"),
+        (dict(_EDR_CUSTOM, ips=["224.0.0.5"]), "edr.ips[0]"),
+        (dict(_EDR_CUSTOM, ips=[base.hosts[0].ip]), "edr.ips"),
+        (dict(_EDR_CUSTOM, ips=["198.51.100.20"]), "edr.ips"),   # incident C2
+        (dict(_EDR_CUSTOM, fqdns={"sensor": "s.acme.example"}), "edr.fqdns"),
+        (dict(_EDR_CUSTOM, fqdns=dict(_EDR_CUSTOM["fqdns"], api="no spaces")),
+         "edr.fqdns.api"),
+        (dict(_EDR_CUSTOM, tls_client="nope"), "edr.tls_client"),
+        (dict(_EDR_CUSTOM, tls_client="schannel-2000"), "edr.tls_client"),
+        ("crowdstrike", "edr"),
+    ]
+    for block, where in bad:
+        try:
+            _edr_env(block)
+            check(False, f"accepted bad edr block {block}")
+        except envfile.EnvFileError as e:
+            check(f"edr-test.json: {where}" in str(e),
+                  f"bad block {block}: error {e}")
+    check(issubclass(edr.EdrError, ValueError), "EdrError type")
+
+
+def test_r22_edr_off_removes_declared_flows() -> None:
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    h = enterprise.get("ot-plant").edr_hosts()[0].name
+    doc["external"] = [{"name": "CLOUD", "ip": "203.0.113.90",
+                        "role": "broker", "os": "linux",
+                        "fqdn": "cloud.edr.example"}]
+    doc["flows"] = list(doc["flows"]) + [
+        {"client": h, "server": "CLOUD", "proto": "edr"}]
+    doc["edr"] = {"enabled": False}
+    env = envfile.from_dict(doc, "off.json")
+    check(not env.edr_hosts() and not env.edr_plan(), "off: sensors remain")
+    check(not any(k == "edr" for k, _ in env.build(1)), "off: edr on wire")
+    check("edr" not in env.protocols(), "off: edr advertised")
+    check(any(f["proto"] == "edr" for f in envfile.to_dict(env)["flows"]),
+          "off: export dropped the declared flow")
+
+
+def _edr_parse(frame: bytes):
+    """(src ip, dst ip, proto, sport, dport, L4 payload) or None."""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    if frame[off - 2:off] != b"\x08\x00":
+        return None
+    ihl = (frame[off] & 15) * 4
+    total = struct.unpack_from("!H", frame, off + 2)[0]
+    src = ".".join(map(str, frame[off + 12:off + 16]))
+    dst = ".".join(map(str, frame[off + 16:off + 20]))
+    proto, l4 = frame[off + 9], off + ihl
+    if proto == 6:
+        doff = (frame[l4 + 12] >> 4) * 4
+        data = frame[l4 + doff:off + total]
+    elif proto == 17:
+        data = frame[l4 + 8:off + total]
+    else:
+        return None
+    sp, dp = struct.unpack_from("!HH", frame, l4)
+    return src, dst, proto, sp, dp, data
+
+
+def _edr_dns_answers(frames) -> list:
+    """(resolver client ip, resolver ip, name, answer) of DNS responses."""
+    out = []
+    for f in frames:
+        p = _edr_parse(f)
+        if p is None or p[2] != 17 or p[3] != 53 or len(p[5]) < 16:
+            continue
+        d, i, labels = p[5], 12, []
+        while d[i]:
+            labels.append(d[i + 1:i + 1 + d[i]].decode())
+            i += 1 + d[i]
+        out.append((p[1], p[0], ".".join(labels),
+                    ".".join(map(str, d[-4:]))))
+    return out
+
+
+def _edr_wire(env, messages: int = 3):
+    protocols.begin_build(7, 0)
+    return [(k, f) for k, f in env.build(messages)]
+
+
+def test_r22_edr_channels_on_wire() -> None:
+    for block in ({"profile": "crowdstrike", "region": "us-2"},
+                  {"profile": "generic"}, _EDR_CUSTOM):
+        env = _edr_env(block, "enterprise-mixed")
+        reg, fleet = env.edr.region, env.edr_hosts()
+        wire = [f for k, f in _edr_wire(env) if k == "edr"]
+        parsed = [p for p in map(_edr_parse, wire) if p]
+        check(all(p[1] in reg.ips or p[0] in reg.ips for p in parsed),
+              f"{block}: edr frame outside the region's pool")
+        blob = b"".join(p[5] for p in parsed)
+        for c, name in reg.fqdns.items():
+            check(name.encode() in blob, f"{block}: {c} SNI {name} missing")
+        # certificates are presented for the requested name
+        for name in reg.fqdns.values():
+            check(blob.count(name.encode()) >= 2,
+                  f"{block}: no certificate naming {name}")
+        plan = env.edr_plan()
+        sensors = [x for x in plan if x[2] == reg.fqdns["sensor"]]
+        check(sorted(x[0].name for x in sensors) ==
+              sorted(h.name for h in fleet), f"{block}: one sensor per host")
+        check(len({x[1] for x in sensors}) == min(len(fleet), len(reg.ips)),
+              f"{block}: sensors not spread over the pool")
+        api = [x for x in plan if x[2] == reg.fqdns["api"]]
+        check(len(api) == 1, f"{block}: api from {len(api)} hosts")
+        bytes_of = {}
+        for x in plan:
+            cs = sum(len(p[5]) for p in parsed
+                     if p[0] == x[0].ip and p[1] == x[1])
+            sc = sum(len(p[5]) for p in parsed
+                     if p[1] == x[0].ip and p[0] == x[1])
+            bytes_of[x[2]] = bytes_of.get(x[2], (0, 0))
+            bytes_of[x[2]] = (bytes_of[x[2]][0] + cs, bytes_of[x[2]][1] + sc)
+        up, down = bytes_of[reg.fqdns["upload"]], bytes_of[reg.fqdns["download"]]
+        check(up[0] > up[1], f"{block}: upload not client-heavy {up}")
+        check(down[1] > down[0], f"{block}: download not server-heavy {down}")
+
+
+def test_r22_edr_dns_matches_connection() -> None:
+    env = _edr_env({"profile": "crowdstrike", "region": "us-1"},
+                   "enterprise-mixed")
+    frames = [f for _, f in _edr_wire(env)]
+    answers = _edr_dns_answers(frames)
+    resolved = {(c, n): a for c, _, n, a in answers}
+    for p in env.edr_paths():
+        if not p.dns:
+            continue
+        check(resolved.get((p.host.ip, p.fqdn)) == p.ip,
+              f"{p.host.name}: {p.fqdn} answer {resolved.get((p.host.ip, p.fqdn))}"
+              f" != {p.ip}")
+        ans = next((i for i, f in enumerate(frames)
+                    if _edr_dns_answers([f]) and
+                    _edr_dns_answers([f])[0][0] == p.host.ip and
+                    _edr_dns_answers([f])[0][2] == p.fqdn), None)
+        syn = next((i for i, f in enumerate(frames)
+                    if (_edr_parse(f) or ())[:2] == (p.host.ip, p.ip)), None)
+        check(ans is not None and syn is not None and ans < syn,
+              f"{p.host.name}: {p.channel} DNS answer not before connect")
+    check(any(p.dns for p in env.edr_paths()), "no host resolved anything")
+    # no DNS server in the environment: no invented resolver
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    doc["flows"] = [f for f in doc["flows"] if f["proto"] != "dns"]
+    for h in doc["hosts"]:
+        if h.get("role") == "dns":
+            h["role"] = "file"
+    doc["edr"] = {"profile": "generic"}
+    bare = envfile.from_dict(doc, "bare.json")
+    check(not any(p.dns for p in bare.edr_paths()),
+          "resolver invented for an environment without DNS")
+
+
+def _edr_proxy_env(key: str = "enterprise-mixed", block=None):
+    from tgt import enterprise
+    base = enterprise.get(key)
+    proxy = next((h for h in base.hosts if h.role == "proxy"),
+                 base.edr_hosts()[0])
+    env = _edr_env(dict(block or {"profile": "crowdstrike", "region": "us-2"},
+                        proxy=proxy.name), key)
+    return env, proxy
+
+
+def test_r22_edr_proxy_path() -> None:
+    env, proxy = _edr_proxy_env()
+    reg = env.edr.region
+    wire = _edr_wire(env)
+    parsed = [p for p in (_edr_parse(f) for k, f in wire if k == "edr") if p]
+    for h in env.edr_hosts():
+        if h.name == proxy.name:
+            continue
+        check(not any(h.ip in p[:2] and (p[0] in reg.ips or p[1] in reg.ips)
+                      for p in parsed), f"{h.name}: direct egress when proxied")
+    to_proxy = [p for p in parsed if p[1] == proxy.ip and p[4] == 8080]
+    connects = {p[5].split(b" ")[1].decode() for p in to_proxy
+                if p[5].startswith(b"CONNECT ")}
+    check(connects == {f"{n}:443" for n in reg.fqdns.values()},
+          f"CONNECT targets: {connects}")
+    check(any(p[0] == proxy.ip and p[3] == 8080 and
+              p[5].startswith(b"HTTP/1.1 200") for p in parsed),
+          "proxy never answered 200")
+    upstream = [p for p in parsed if p[0] == proxy.ip and p[1] in reg.ips]
+    check({p[4] for p in upstream} == {443}, "upstream leg not on 443")
+    # the ClientHello inside the tunnel is the one the proxy relays upstream
+    inner = {p[5] for p in to_proxy if p[5][:1] == b"\x16"
+             and reg.fqdns["sensor"].encode() in p[5]}
+    relayed = {p[5] for p in upstream if p[5][:1] == b"\x16"}
+    check(inner and inner <= relayed, "tunnelled ClientHello not relayed")
+    # order on the wire: CONNECT, upstream handshake, 200
+    pk = [p for p in (_edr_parse(f) for _, f in wire) if p]
+    i = next(n for n, p in enumerate(pk) if p[5].startswith(b"CONNECT "))
+    host = pk[i][0]
+    target = pk[i][5].split(b" ")[1].decode().split(":")[0]
+    ok = next(n for n, p in enumerate(pk) if n > i and p[1] == host
+              and p[5].startswith(b"HTTP/1.1 200"))
+    ip = next(x[1] for x in env.edr_plan()
+              if x[0].ip == host and x[2] == target)
+    check(any(p[0] == proxy.ip and p[1] == ip for p in pk[i:ok]),
+          "proxy did not open the upstream leg before its 200")
+    # DNS: the sensor resolves the proxy, the proxy resolves the cloud name
+    answers = _edr_dns_answers([f for _, f in wire])
+    for x in env.edr_paths():
+        if x.proxy is None:
+            continue
+        for c, _, n, a in answers:
+            if c == x.host.ip and n in reg.fqdns.values() and \
+                    x.host.name != proxy.name:
+                check(False, f"{x.host.name} resolved {n} despite the proxy")
+                break
+        if x.dns:
+            check(any(c == x.host.ip and a == proxy.ip
+                      for c, _, _, a in answers),
+                  f"{x.host.name}: proxy name not resolved to the proxy")
+    check(any(c == proxy.ip and n == reg.fqdns["sensor"] and a in reg.ips
+              for c, _, n, a in answers), "proxy did not resolve the cloud")
+
+
+def test_r22_edr_timed_schedule() -> None:
+    from tgt import schedule
+    for env, proxy in ((_edr_env({"profile": "generic"}, "ot-plant"), None),
+                       _edr_proxy_env("ot-plant", {"profile": "generic"})):
+        reg = env.edr.region
+        sched = schedule.Scheduler(7)
+        sched.load(schedule.env_streams(env), 0.0, env.hosts, initial=True)
+        items = list(sched.run(4000.0))
+        edr = [_edr_parse(it[3][0]) for it in items if it[2] == "edr"]
+        edr = [p for p in edr if p]
+        blob = b"".join(p[5] for p in edr)
+        for name in reg.fqdns.values():
+            check(name.encode() in blob, f"timed: {name} missing")
+        dns = _edr_dns_answers([it[3][0] for it in items if it[2] == "dns"])
+        planned = {(c.ip, n, a) for x in env.edr_paths()
+                   for c, _, n, a in x.dns}      # a DNS server asks nobody
+        check(bool(planned) and planned <= {(c, n, a) for c, _, n, a in dns},
+              f"timed: planned lookups missing: {sorted(planned)[:3]}")
+        # the heartbeat rides one long-lived connection
+        h = next(x for x in env.edr_paths() if x.channel == "sensor"
+                 and (proxy is None or x.host.name != proxy.name))
+        dst = proxy.ip if proxy else h.ip
+        syns = [it for it in items if it[2] == "edr" and
+                (_edr_parse(it[3][0]) or ())[:2] == (h.host.ip, dst) and
+                it[3][0][(18 if it[3][0][12:14] == b"\x81\x00" else 14)
+                         + 20 + 13] == 0x02]
+        check(len(syns) == 1, f"timed: {len(syns)} sensor connections")
+        if proxy:
+            # a tunnel closes on both legs in the same occurrence
+            s = next(x for x in schedule.env_streams(env)
+                     if isinstance(x, schedule.EdrStream)
+                     and len(x.legs) == 2 and x.legs[0].persistent)
+            s.bind(7)
+            s.occur(0.0)
+            s.legs[0].lifetime = 1.0
+            s.occur(100.0)                 # next poll passes the lifetime
+            s.legs[0].polls = []
+            s.legs[1].polls = []
+            closing = s.occur(200.0)
+            fins = [f for _, c, _, k in closing if k == "edr" for f in c
+                    if f[(18 if f[12:14] == b"\x81\x00" else 14) + 20 + 13]
+                    & 0x01]
+            check(s.legs[0].conn is None and s.legs[1].conn is None,
+                  "timed: a tunnel leg outlived the other")
+            check({(_edr_parse(f)[0]) for f in fins} >=
+                  {s.legs[0].ep.client_ip, s.legs[1].ep.client_ip},
+                  "timed: tunnel teardown not on both legs")
+            check(not any(p[0] == h.host.ip and p[1] in reg.ips for p in edr),
+                  "timed: direct egress when proxied")
+            check(any(p[5].startswith(b"CONNECT ") for p in edr),
+                  "timed: no CONNECT")
+            check(any(p[0] == proxy.ip and p[1] in reg.ips for p in edr),
+                  "timed: no upstream leg")
+
+
+def test_r22_edr_inventory_truth() -> None:
+    import ipaddress
+    from tgt import inventory
+    env = _edr_env(_EDR_CUSTOM, "enterprise-mixed")
+    inv = inventory.to_json(env)
+    cloud = [e for e in inv["external"] if e["kind"] == "edr-cloud"]
+    check({e["ip"] for e in cloud} <= set(_EDR_CUSTOM["ips"]) and cloud,
+          "custom cloud endpoints")
+    check(all(e["vendor"] == "Acme" and e["profile"] == "custom"
+              and e["region"] == "lab-a"
+              and e["ip_provenance"] == "documentation" for e in cloud),
+          f"cloud endpoint fields: {cloud[0]}")
+    check(not any(ipaddress.ip_address(e["ip"]).is_global for e in cloud),
+          "test expects RFC 5737 addresses")
+    ch = {c for e in cloud for c in e["channels"]}
+    check(ch == {"sensor", "upload", "download", "api"}, f"channels: {ch}")
+    check(inv["edr"]["vendor"] == "Acme" and inv["edr"]["region"] == "lab-a",
+          "inventory edr summary")
+    # the proxy, not the sensors, talks to the cloud
+    env, proxy = _edr_proxy_env()
+    inv = inventory.to_json(env)
+    cloud = [e for e in inv["external"] if e["kind"] == "edr-cloud"]
+    check(cloud and all(e["talkers"] == [proxy.name] for e in cloud),
+          f"proxied talkers: {cloud[0]['talkers'] if cloud else None}")
+    check(inv["edr"]["proxy"] == proxy.name, "summary names the proxy")
+    legs = [f for f in inv["flows"] if f["protocol"] == "edr"
+            and f["server"] == proxy.name]
+    check({f["client"] for f in legs} ==
+          {h.name for h in env.edr_hosts() if h.name != proxy.name},
+          "sensor -> proxy flows")
+    check(all(f["dport"] == 8080 and f["transport"] == "tcp" for f in legs),
+          "proxy leg port")
+    row = {h["name"]: h for h in inv["hosts"]}
+    check(any(s.startswith("edr 8080") for s in row[proxy.name]["serves"]),
+          f"proxy serves: {row[proxy.name]['serves']}")
+    resolvers = {r.name for p in env.edr_paths() for _, r, _, _ in p.dns}
+    check(all(any(s.startswith("dns") for s in row[r]["serves"])
+              for r in resolvers), "resolver does not serve dns")
+    # EDR off: nothing of it anywhere in the ground truth
+    off = inventory.to_json(_edr_env({"enabled": False}, "enterprise-mixed"))
+    check(not any(e["kind"] == "edr-cloud" for e in off["external"]),
+          "off: cloud endpoints remain")
+    check("edr" not in off, "off: summary remains")
+    check(not any(h["edr"] for h in off["hosts"]), "off: covered hosts")
+    check(not any("edr" in h["uses"] for h in off["hosts"]), "off: uses edr")
+    check(not any(f["protocol"] == "edr" for f in off["flows"]), "off: flows")
+    # the default keeps its exact shape
+    from tgt import enterprise
+    dflt = inventory.to_json(enterprise.get("ot-plant"))
+    check("edr" not in dflt and all(set(e) == {
+        "ip", "fqdns", "talkers", "kind", "vendor"}
+        for e in dflt["external"]), "default inventory changed")
+
+
+def _edr_run(doc: dict, d: str, *extra):
+    """Write ``doc`` as an env file, run one cycle: (rc, pcap, manifest)."""
+    import json
+    from tgt import cli, enterprise
+    path, pcap, man = (os.path.join(d, n) for n in
+                       ("site.json", "x.pcap", "m.json"))
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    try:
+        saved = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        try:
+            rc = cli.main(["run", "--env-file", path, "--once", "--rate", "0",
+                           "--clock", "synthetic", "--start-time",
+                           "2026-01-01T00:00:00Z", "--seed", "7", "--pcap",
+                           pcap, "--manifest", man] + list(extra))
+        finally:
+            sys.stdout.close()
+            sys.stdout = saved
+    finally:
+        enterprise.ENVIRONMENTS.pop(doc["key"], None)
+    return rc, pcap, man
+
+
+def test_r22_edr_manifest_and_score() -> None:
+    import json
+    from tgt import enterprise, envfile, score
+    base = enterprise.get("enterprise-mixed")
+    proxy = next(h for h in base.hosts if h.role == "proxy")
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-truth"
+    doc["edr"] = {"profile": "crowdstrike", "region": "us-1",
+                  "proxy": proxy.name}
+    reg = doc["edr"]["region"]
+    ips = set(__import__("tgt.edr", fromlist=["x"]).PROFILES["crowdstrike"]
+              .regions[reg].ips)
+    with tempfile.TemporaryDirectory() as d:
+        rc, _, man = _edr_run(doc, d)
+        check(rc == 0, f"manifest run rc={rc}")
+        m = json.load(open(man))
+        truth = score.load_truth(man)
+    seen = [f for f in m["flows_seen"] if f["protocol"] == "edr"]
+    pa = f"edr-truth:{proxy.name}"
+    check(any(f["server"] == pa for f in seen), "no sensor -> proxy flow")
+    check({f["server"] for f in seen if f["client"] == pa
+           and f["server"] in ips} <= ips and
+          any(f["client"] == pa and f["server"] in ips for f in seen),
+          "no proxy -> cloud flow")
+    check(not any(f["client"] != pa and f["server"] in ips for f in seen),
+          "a sensor reaches the cloud directly in flows_seen")
+    check(not any(k in ips for k in (a["ip"] for a in truth.assets)),
+          "a documentation cloud IP became an asset")
+    check(all(ip in truth.external for ip in ips & set(m["first_seen"])),
+          "cloud IP not external in the truth")
+    check(not any(a["ip"] in ips for a in truth.population()),
+          "cloud IP counted in the population")
+    ports = {(f["client"], f["server"]): f["dport"] for f in truth.flows
+             if f["protocol"] == "edr"}
+    check(any(v == 8080 for (c, s), v in ports.items() if s == proxy.name),
+          "score: sensor -> proxy port")
+    check(all(v == 443 for (c, s), v in ports.items() if s in ips),
+          f"score: cloud leg port {set(ports.values())}")
+    check(any(s in ips and c == proxy.name for c, s in ports),
+          "score: no proxy -> cloud flow")
+    # EDR off: no trace on the wire or in the manifest's truth
+    doc["edr"] = {"enabled": False}
+    with tempfile.TemporaryDirectory() as d:
+        rc, pcap, man = _edr_run(doc, d)
+        m = json.load(open(man))
+        raw = open(pcap, "rb").read()
+    check(rc == 0, f"off run rc={rc}")
+    check(not any(f["protocol"] == "edr" for f in m["flows_seen"]),
+          "off: edr in flows_seen")
+    check(not any(e["kind"] == "edr-cloud" for e in
+                  m["inventory"]["external"]), "off: cloud in the inventory")
+    check(b"cloudsink" not in raw and b"crowdstrike" not in raw,
+          "off: EDR hostnames on the wire")
+
+
+def _edr_cli(*argv) -> tuple:
+    import contextlib
+    import io
+    from tgt import cli
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = cli.main(list(argv))
+        except SystemExit as e:
+            rc = e.code
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_r22_edr_cli() -> None:
+    from tgt import edr, enterprise
+    rc, out, _ = _edr_cli("edr", "list")
+    check(rc == 0, f"edr list rc={rc}")
+    for prof in edr.PROFILES.values():
+        check(prof.key in out, f"edr list: {prof.key} missing")
+        for reg in prof.regions.values():
+            check(reg.key in out and reg.ip_provenance in out,
+                  f"edr list: {reg.key} missing")
+            for c, n in reg.fqdns.items():
+                check(n in out and reg.host_provenance[c] in out,
+                      f"edr list: {n} missing")
+    run = ("run", "-e", "ot-plant", "--once", "--rate", "0", "--clock",
+           "synthetic", "--start-time", "2026-01-01T00:00:00Z", "--seed", "7")
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        for bad, needle in (
+                (("--edr", "nope"), "nope"),
+                (("--edr", "crowdstrike:mars"), "mars"),
+                (("--edr", "custom"), "custom"),
+                (("--edr", "crowdstrike:"), "region"),
+                (("--edr", "generic", "--edr-proxy", "NO-SUCH"), "NO-SUCH"),
+                (("--edr", "off", "--edr-proxy", "HISTORIAN"), "off")):
+            rc, _, err = _edr_cli(*run, "--pcap", pcap, *bad)
+            check(rc == 2 and needle in err and "Traceback" not in err,
+                  f"{bad}: rc={rc} err={err!r}")
+        rc, _, err = _edr_cli("run", "-p", "modbus", "--once", "--rate", "0",
+                              "--pcap", pcap, "--edr", "generic")
+        check(rc == 2 and "--edr" in err, f"--edr without env: rc={rc}")
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr",
+                            "crowdstrike:us-gov-1")
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"ts01-laggar-gcw.cloudsink.net" in raw
+              and b"lanner-lion" not in raw, f"--edr region run rc={rc}")
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"cloudsink" not in raw, "--edr off on the wire")
+        proxy = enterprise.get("ot-plant").edr_hosts()[0].name
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr", "generic",
+                            "--edr-proxy", proxy)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"CONNECT sensor.edr.example:443" in raw,
+              "--edr-proxy on the wire")
+        # the proxy flag alone keeps the environment's default profile
+        rc, _, _ = _edr_cli(*run, "--pcap", pcap, "--edr-proxy", proxy)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"CONNECT ts01-lanner-lion" in raw,
+              "--edr-proxy without --edr")
+    check(enterprise.get("ot-plant").edr is None,
+          "--edr changed the registered environment")
+
+
+def test_r22_edr_cli_overrides_env_file() -> None:
+    import json
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    doc["key"] = "edr-cli-site"
+    doc["edr"] = _EDR_CUSTOM
+    with tempfile.TemporaryDirectory() as d:
+        rc, pcap, man = _edr_run(doc, d)
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"s.acme.example" in raw, "custom block on the wire")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "custom")
+        check(rc == 0 and b"s.acme.example" in open(pcap, "rb").read(),
+              "--edr custom keeps the block")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "generic")
+        raw = open(pcap, "rb").read()
+        vendors = {e["vendor"] for e in json.load(open(man))["inventory"]
+                   ["external"] if e["kind"] == "edr-cloud"}
+        check(rc == 0 and b"acme" not in raw and b"sensor.edr.example" in raw
+              and vendors == {"Generic EDR"}, f"--edr override: {vendors}")
+        rc, pcap, man = _edr_run(doc, d, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        m = json.load(open(man))
+        check(rc == 0 and b"acme" not in raw and not any(
+            e["kind"] == "edr-cloud" for e in m["inventory"]["external"]),
+            "--edr off over an env-file block")
+
+
+def test_r22_edr_campaign_option() -> None:
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        plan = os.path.join(d, "plan.json")
+        pcap, man = os.path.join(d, "c.pcap"), os.path.join(d, "c.json")
+        with open(plan, "w") as f:
+            json.dump({"env": "ot-plant", "phases": [
+                {"name": "a", "duration": "2h"},
+                {"name": "b", "duration": "2h"}]}, f)
+        common = (plan, "--force", "--clock", "synthetic", "--seed", "7",
+                  "--start-time", "2026-01-01T00:00:00Z", "--pcap", pcap,
+                  "--manifest", man, "--min-period", "120")
+        rc, _, err = _edr_cli("campaign", *common, "--edr", "nope")
+        check(rc == 2 and "nope" in err, f"campaign bad --edr: rc={rc} {err}")
+        rc, out, err = _edr_cli("campaign", *common, "--edr",
+                                "crowdstrike:us-2")
+        check(rc == 0, f"campaign --edr rc={rc}: {err[-200:]}")
+        raw = open(pcap, "rb").read()
+        check(b"ts01-gyr-maverick.cloudsink.net" in raw
+              and b"lanner-lion" not in raw, "campaign --edr on the wire")
+        m = json.load(open(man))
+        cloud = [e for e in m["inventory"]["external"]
+                 if e["kind"] == "edr-cloud"]
+        check(cloud and all(e["region"] == "us-2" for e in cloud),
+              "campaign truth region")
+        rc, _, err = _edr_cli("campaign", *common, "--edr", "off")
+        raw = open(pcap, "rb").read()
+        m = json.load(open(man))
+        check(rc == 0 and b"cloudsink" not in raw and not any(
+            e["kind"] == "edr-cloud" for e in m["inventory"]["external"]),
+            f"campaign --edr off: rc={rc}")
+
+
+def test_r22_edr_custom_ips_must_be_address_strings() -> None:
+    from tgt import edr
+    base = {"profile": "custom", "vendor": "Example",
+            "fqdns": {c: f"{c}.vendor.example" for c in edr.CHANNELS}}
+    for bad in (5, 3232235777, True, "0.0.0.5"):
+        try:
+            edr.resolve(dict(base, ips=[bad]))
+            check(False, f"custom ips accepted {bad!r}")
+        except edr.EdrError as e:
+            check(e.path == "ips[0]", f"custom ips {bad!r}: path {e.path}")
+
+
+def test_r22_edr_proxy_behind_nat_dns_answer() -> None:
+    from tgt import edr, enterprise, envfile
+    envfile.load_user_envs()
+    base = enterprise.get("water-utility")
+    proxy = next(h for h in base.hosts if base.nat_of(h))
+    env = edr.apply(base, {"profile": "generic", "proxy": proxy.name})
+    parsed = [p for p in (_edr_parse(f) for _, f in _edr_wire(env))
+              if p is not None]
+    dials = {(p[0], p[1]) for p in parsed if p[2] == 6 and p[4] == 8080}
+    name = f"{proxy.name.lower()}.{enterprise.DNS_DOMAIN}"
+    answers = [a for a in _edr_dns_answers(f for _, f in _edr_wire(env))
+               if a[2] == name]
+    check(answers and dials, "NAT proxy: no lookups or connections")
+    for client, _, _, ip in answers:
+        check((client, ip) in dials,
+              f"NAT proxy: {client} resolved {ip}, dials "
+              f"{sorted(d for c, d in dials if c == client)}")
+
+
+def test_r22_edr_setup_replaces_declared_flows() -> None:
+    from tgt import enterprise, envfile, inventory
+    base = enterprise.get("enterprise-mixed")
+    host = next(h for h in base.edr_hosts() if h.name != "PROXY01")
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-declared"
+    doc["external"] = [{"name": "CLOUD", "ip": "203.0.113.90",
+                        "role": "broker", "os": "linux",
+                        "fqdn": "cloud.edr.example"}]
+    doc["flows"] = list(doc["flows"]) + [
+        {"client": host.name, "server": "CLOUD", "proto": "edr"}]
+    for block in ({"profile": "generic", "proxy": "PROXY01"},
+                  {"profile": "crowdstrike", "region": "us-2"},
+                  {"enabled": False}):
+        env = envfile.from_dict(dict(doc, edr=block), "declared.json")
+        ips = [p[:2] for p in (_edr_parse(f) for _, f in _edr_wire(env)) if p]
+        check(not any("203.0.113.90" in x for x in ips),
+              f"{block}: declared edr flow still on the wire")
+        check(not any(e["ip"] == "203.0.113.90"
+                      for e in inventory.external(env)),
+              f"{block}: endpoint of a replaced flow in ground truth")
+        check(any(f["proto"] == "edr" for f in envfile.to_dict(env)["flows"]),
+              f"{block}: export dropped the declared flow")
+
+
+def test_r22_score_flows_use_the_nat_wire_view() -> None:
+    """A flow leaving a NAT site is expected at its outside address, and one
+    kept inside a hidden site is not expected on the capture at all."""
+    from tgt import score
+    hosts = [
+        {"name": "SCADA", "ip": "10.0.0.10"},
+        {"name": "RTU1", "ip": "192.168.1.21", "nat_ip": "10.250.0.11",
+         "nat_hidden": True},
+        {"name": "RTU2", "ip": "192.168.1.22", "nat_ip": "10.250.0.11",
+         "nat_hidden": True},
+        {"name": "PLC", "ip": "192.168.2.5", "nat_ip": "10.250.0.12",
+         "nat_hidden": False},
+    ]
+    flows = [
+        {"client": "SCADA", "server": "RTU1", "protocol": "dnp3",
+         "dport": 20000, "transport": "tcp"},
+        {"client": "RTU1", "server": "RTU2", "protocol": "modbus",
+         "dport": 502, "transport": "tcp"},
+        {"client": "SCADA", "server": "PLC", "protocol": "modbus",
+         "dport": 502, "transport": "tcp"},
+    ]
+    truth = score.Truth({"hosts": hosts, "flows": flows}, "t")
+    check(len(truth.flows) == 2, f"hidden intra-site flow: {truth.flows}")
+    check((truth.flows[0]["cip"], truth.flows[0]["sip"]) ==
+          ("10.0.0.10", "10.250.0.11"), f"NAT view: {truth.flows[0]}")
+    head = "#fields\tid.orig_h\tid.orig_p\tid.resp_h\tid.resp_p\tproto\n"
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "conn.log")
+        with open(log, "w") as f:
+            f.write(head + "10.0.0.10\t40000\t10.250.0.11\t20000\ttcp\n"
+                    "10.0.0.10\t40001\t192.168.2.5\t502\ttcp\n")
+        b = score.baseline(truth, log)
+    check(b["coverage"] == 1.0 and not b["unexpected"],
+          f"perfect NAT capture scored {b['coverage']}: {b['unexpected']}")
+
+
+def test_r22_score_flows_accept_real_companion_traffic() -> None:
+    """SNMP traps, NetBIOS datagrams and a server's UDP broadcast belong to
+    their flow; an unrelated port between the same hosts does not."""
+    from tgt import score
+    hosts = [{"name": "NMS", "ip": "10.0.0.5"}, {"name": "SW", "ip": "10.0.0.2"},
+             {"name": "WS", "ip": "10.0.0.20"}, {"name": "AHU", "ip": "10.0.0.21"}]
+    flows = [
+        {"client": "NMS", "server": "SW", "protocol": "snmp", "dport": 161,
+         "transport": "udp"},
+        {"client": "WS", "server": "NMS", "protocol": "netbios", "dport": 137,
+         "transport": "udp"},
+        {"client": "NMS", "server": "AHU", "protocol": "bacnet",
+         "dport": 47808, "transport": "udp"},
+        {"client": "NMS", "server": "WS", "protocol": "enip-io",
+         "dport": 2222, "transport": "udp"},
+    ]
+    truth = score.Truth({"hosts": hosts, "flows": flows}, "t")
+    rows = ("10.0.0.5\t40004\t10.0.0.20\t44818\ttcp",
+            "10.0.0.5\t2222\t10.0.0.20\t2222\tudp",
+            "10.0.0.5\t40000\t10.0.0.2\t161\tudp",
+            "10.0.0.2\t40001\t10.0.0.5\t162\tudp",
+            "10.0.0.20\t138\t10.0.0.255\t138\tudp",
+            "10.0.0.20\t40002\t10.0.0.5\t137\tudp",
+            "10.0.0.5\t47808\t10.0.0.21\t47808\tudp",
+            "10.0.0.21\t47808\t10.0.0.255\t47808\tudp",
+            "10.0.0.2\t40003\t10.0.0.5\t9999\tudp")
+    head = "#fields\tid.orig_h\tid.orig_p\tid.resp_h\tid.resp_p\tproto\n"
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "conn.log")
+        with open(log, "w") as f:
+            f.write(head + "\n".join(rows) + "\n")
+        b = score.baseline(truth, log)
+    check(b["coverage"] == 1.0, f"companion coverage {b['coverage']}")
+    check([u["dport"] for u in b["unexpected"]] == [9999],
+          f"unexpected: {b['unexpected']}")
 
 
 def main() -> int:

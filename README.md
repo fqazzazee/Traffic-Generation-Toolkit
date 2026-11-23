@@ -163,6 +163,7 @@ always beacons out to a public IP. See **[Attacks](docs/attacks.md)**.
 | [Networks](docs/networks.md) | scenarios, built-in networks, packaged sites, VLANs and SPAN view, device catalog, env files, timing |
 | [Protocols](docs/protocols.md) | every protocol key, what it carries, identity exposed, TCP/IP + TLS fingerprints |
 | [Attacks](docs/attacks.md) | the 17 incidents, sprinkling, host mapping |
+| [EDR traffic](docs/edr.md) | EDR profiles, regions, provenance, proxy paths; payloads are simulated and non-EU-1 addresses are placeholders |
 | [Using TGT](docs/usage.md) | TUI, CLI reference, multiple interfaces, control API, pcap replay, plugins, self-test, layout |
 | [Deployment](docs/deployment.md) | service, WSL, Podman/Docker, sensor in another VM, Proxmox hub bridge |
 | [SPAN Configuration](SPAN%20Configuration/README.md) | hypervisor port mirroring: Proxmox, VMware, Nutanix, Xen |

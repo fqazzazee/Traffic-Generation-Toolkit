@@ -11,6 +11,7 @@ from .packet import Endpoints
 class RunConfig:
     profiles: List[str] = field(default_factory=lambda: ["modbus"])
     env: Optional[str] = None            # modeled environment; overrides profiles
+    edr: Optional[dict] = None           # --edr: an "edr" block replacing the env's
     span: str = "access"                 # env capture point: access | core (routed hops too)
     incident: Optional[str] = None       # famous-incident scenario; overrides profiles
     sprinkle: List[str] = field(default_factory=list)  # incidents mixed into the base
@@ -67,6 +68,13 @@ class RunConfig:
             what = f"incident={self.incident}"
         elif self.env:
             what = f"env={self.env}"
+            if self.edr is not None:
+                what += (" edr=off" if self.edr.get("enabled") is False else
+                         f" edr={self.edr.get('profile', 'crowdstrike')}"
+                         + (f":{self.edr['region']}" if "region" in self.edr
+                            else "")
+                         + (f" via {self.edr['proxy']}" if "proxy" in self.edr
+                            else ""))
             if self.span != "access":
                 what += f" span={self.span}"
         else:

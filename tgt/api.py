@@ -44,9 +44,11 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import json
+import math
 import socket
 import threading
 import time
+import urllib.request
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
@@ -80,6 +82,11 @@ def parse_bind(spec: str) -> Tuple[str, int]:
     if not 0 <= p <= 65535:
         raise ApiError(f"bad port {p}")
     return host, p
+
+
+def host_port(host: str, port: int) -> str:
+    """``host:port`` as :func:`parse_bind` reads it (IPv6 in brackets)."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 def is_loopback(host: str) -> bool:
@@ -296,6 +303,9 @@ class ControlServer:
                         pps = float(p["pps"])
                     except (KeyError, ValueError):
                         return self._err(400, "need pps=N (packets/s)")
+                    if not math.isfinite(pps) or pps < 0:
+                        return self._err(400, "pps must be a finite number "
+                                         ">= 0")
                     try:
                         ctl.set_rate(pps)
                     except ValueError as e:
@@ -338,21 +348,31 @@ def _iso(ts: float) -> str:
 # ---------------------------------------------------------------------------
 # client (tgt ctl)
 # ---------------------------------------------------------------------------
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface a 3xx as an error instead of re-sending the bearer token."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def request(api: str, method: str, path: str,
             params: Optional[Dict[str, Any]] = None,
             token: Optional[str] = None,
             timeout: float = 10.0) -> Tuple[int, Dict]:
     """Call the control API at ``api`` ([HOST:]PORT or a URL); returns
     (HTTP status, JSON reply). Raises ApiError when it cannot connect."""
+    import http.client
     import urllib.error
-    import urllib.request
     from urllib.parse import urlencode
-    if api.startswith(("http://", "https://")):
-        base = api.rstrip("/")
-    else:
-        host, port = parse_bind(api)
-        h = f"[{host}]" if ":" in host else host
-        base = f"http://{h}:{port}"
+    try:
+        if api.startswith(("http://", "https://")):
+            base = api.rstrip("/")
+        else:
+            host, port = parse_bind(api)
+            h = f"[{host}]" if ":" in host else host
+            base = f"http://{h}:{port}"
+    except ValueError as e:
+        raise ApiError(f"bad control API address {api!r}: {e}")
     url = base + path
     data = None
     if params:
@@ -361,7 +381,10 @@ def request(api: str, method: str, path: str,
             url += "?" + q
         else:
             data = q.encode()
-    req = urllib.request.Request(url, data=data, method=method)
+    try:
+        req = urllib.request.Request(url, data=data, method=method)
+    except ValueError as e:
+        raise ApiError(f"bad control API address {api!r}: {e}")
     if data is not None:
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
     elif method == "POST":
@@ -369,14 +392,26 @@ def request(api: str, method: str, path: str,
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode() or "{}")
+        # never via http_proxy or a redirect: the call and its bearer token
+        # go only to the address the operator named
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                             _NoRedirect())
+        with opener.open(req, timeout=timeout) as r:
+            doc = json.loads(r.read().decode() or "{}")
+            if not isinstance(doc, dict):
+                raise ValueError("reply is not a JSON object")
+            return r.status, doc
     except urllib.error.HTTPError as e:
         try:
             doc = json.loads(e.read().decode() or "{}")
-        except ValueError:
+        except (ValueError, RecursionError, http.client.HTTPException,
+                OSError):
+            doc = None
+        if not isinstance(doc, dict):
             doc = {"ok": False, "error": str(e)}
         return e.code, doc
+    except (http.client.HTTPException, ValueError, RecursionError) as e:
+        raise ApiError(f"{base} did not answer as the control API: {e}")
     except (urllib.error.URLError, OSError) as e:
         raise ApiError(f"cannot reach the control API at {base}: "
                        f"{getattr(e, 'reason', e)}")

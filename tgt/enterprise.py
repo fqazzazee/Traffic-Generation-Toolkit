@@ -24,6 +24,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import devices, protocols, stacks, tls
+from . import edr as _edr
+from .edr import CROWDSTRIKE_CLOUD_IPS, CROWDSTRIKE_FQDNS  # noqa: F401
 from .packet import (ETH_P_ARP, Endpoints, arp, bytes_to_mac, ethernet,
                      frame_ips, mac_to_bytes, rewrite_ips, rewrite_l2,
                      set_ip_id)
@@ -191,29 +193,7 @@ class Host:
 # ---------------------------------------------------------------------------
 # CrowdStrike Falcon EDR — the cloud every Windows host beacons to
 # ---------------------------------------------------------------------------
-# The sensor reaches the Security Cloud by FQDN — the SNI is the authoritative
-# EDR tell — and each name resolves to many AWS IPs. These are CrowdStrike's
-# EU-1 cloud (AWS eu-central-1 / Frankfurt): the FQDNs below and the published
-# egress IP set the fleet's beacons are spread across.
-CROWDSTRIKE_FQDNS = {
-    "ts": "ts01-lanner-lion.cloudsink.net",        # sensor channel (C2)
-    "up": "lfoup01-lanner-lion.cloudsink.net",     # telemetry upload
-    "down": "lfodown01-lanner-lion.cloudsink.net",  # content / policy download
-    "api": "api.eu-1.crowdstrike.com",             # OAuth2 API / console
-}
-
-CROWDSTRIKE_CLOUD_IPS = [
-    "18.158.187.80", "18.198.53.88", "3.121.187.176", "3.121.238.86",
-    "3.121.6.180", "3.125.15.130", "18.194.222.197", "18.197.35.253",
-    "3.122.135.178", "35.157.198.104", "63.179.114.102", "63.179.203.249",
-    "18.196.94.202", "3.121.28.37", "52.29.26.172", "18.158.141.230",
-    "18.184.139.200", "18.195.129.87", "3.64.87.158", "3.73.169.253",
-    "3.79.224.18", "52.28.120.115", "52.57.246.231", "3.123.89.179",
-    "3.126.96.195", "3.69.129.49", "18.184.114.155", "18.194.8.224",
-    "3.121.13.180", "3.123.240.202", "3.78.32.129", "35.156.219.65",
-    "3.69.184.79", "3.76.143.53", "3.77.82.22",
-]
-
+# The catalogue (FQDNs, published EU-1 IP set, other regions) is tgt.edr.
 # Falcon runs on modern Windows (Win7 SP1+ / Server 2012+) and Linux servers;
 # the EOL Win2000/XP hosts and embedded OT devices (PLC/RTU/relay/drive/meter
 # and BACnet/JACE firmware, identified by their tgt.devices model) cannot, so they
@@ -557,11 +537,14 @@ class Environment:
     findings: List[Dict[str, Any]] = field(default_factory=list)
     external: List[Host] = field(default_factory=list)
     field_devices: List[Dict[str, Any]] = field(default_factory=list)
+    # an explicit EDR setup (tgt.edr.Setup); None = the default Falcon EU-1
+    edr: Any = None
 
     def __post_init__(self) -> None:
         # what was declared, before options rewrite it (env export uses this)
         self.spec = (list(self.hosts), list(self.conversations),
                      list(self.segments))
+        self._edr_cache = None                 # tgt.edr.paths, once computed
         self._alias: Dict[str, str] = {}       # second-NIC twin -> host name
         self._apply_options()
         vlans = [s.vlan for s in self.segments]
@@ -987,7 +970,10 @@ class Environment:
     def edr_hosts(self) -> List[Host]:
         """Windows and Linux hosts that run a Falcon sensor. Excludes the EOL
         XP/2000 Windows and embedded OT devices (by catalog model, else
-        vendor MAC OUI), which can't — so they stay uncovered."""
+        vendor MAC OUI), which can't — so they stay uncovered. Nobody runs
+        one with EDR switched off."""
+        if self.edr is not None and not self.edr.enabled:
+            return []
         return [h for h in self.hosts if h.os in EDR_OS and not h.embedded
                 and h.name not in self._alias]     # one sensor per machine
 
@@ -1007,7 +993,11 @@ class Environment:
         channel open to the CrowdStrike sensor cloud, egressing via its own
         gateway (like any internet-bound flow). Beacons spread across the EU-1
         cloud IP pool; a representative host also exercises the upload / download
-        / API FQDNs so all of them appear on the wire."""
+        / API FQDNs so all of them appear on the wire. An explicit EDR setup
+        builds its channels in :mod:`tgt.edr`."""
+        if self.edr is not None:
+            return _edr.cycle_streams(self, messages, span)
+
         def flow(host: Host, ip: str, fqdn: str, n: int):
             cloud = _cs_cloud_host(ip, fqdn)
             ep = self._edr_endpoints(host, cloud)
@@ -1023,6 +1013,8 @@ class Environment:
     def edr_plan(self) -> List[Tuple[Host, str, str, bool]]:
         """Who beacons where: (host, cloud IP, FQDN, bulk) per Falcon flow;
         ``bulk`` flows carry ``messages`` exchanges, the rest one beacon."""
+        if self.edr is not None:
+            return [(p.host, p.ip, p.fqdn, p.bulk) for p in self.edr_paths()]
         fleet = self.edr_hosts()
         if not fleet:
             return []
@@ -1038,6 +1030,14 @@ class Environment:
                  (anchor, ips[-2], fq["down"], True),
                  (anchor, ips[-3], fq["api"], False)]
         return plan
+
+    def edr_paths(self) -> List["_edr.Path"]:
+        """The channels of an explicit EDR setup (empty without one)."""
+        if self.edr is None:
+            return []
+        if self._edr_cache is None:
+            self._edr_cache = _edr.paths(self)
+        return self._edr_cache
 
     def build(self, messages: int, span: str = "access",
               edr: bool = True) -> List[Tuple[str, bytes]]:
@@ -1113,6 +1113,7 @@ class Environment:
         used = {proto for _, _, proto in self.conversations}
         if self.edr_hosts():
             used.add("edr")
+        used.update(leg[2] for leg in _edr.legs(self))  # lookups it adds
         if self.arp_enabled and self.hosts:
             used.add("arp")
         return [k for k in protocols.PROFILES if k in used]
@@ -1472,6 +1473,13 @@ BUILTIN_KEYS = frozenset(ENVIRONMENTS)
 
 def get(key: str) -> Environment:
     return ENVIRONMENTS[key]
+
+
+def for_run(cfg) -> Environment:
+    """The environment of a run, with its ``--edr`` override if any."""
+    env = ENVIRONMENTS[cfg.env]
+    block = getattr(cfg, "edr", None)
+    return env if block is None else _edr.applied(env, block)
 
 
 def all_environments() -> List[Environment]:

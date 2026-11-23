@@ -8,6 +8,7 @@
     tgt inventory -e ENV     export an environment's ground-truth asset list
     tgt env export ENV       write an environment as an env file (JSON)
     tgt campaign PLAN        phased run: baseline, then changes (timed)
+    tgt edr list             EDR profiles, regions, hostnames and provenance
     tgt ctl ...              control a running "tgt run --api" (status, inject…)
     tgt bench ...            seeded evaluation suite -> bundle -> scorecard
 """
@@ -148,6 +149,38 @@ def cmd_env_export(args) -> int:
     return 0
 
 
+def cmd_edr(args) -> int:
+    from . import edr
+    print("\n".join(edr.describe()))
+    return 0
+
+
+def _edr_block(args, env):
+    """(ok, block) for --edr / --edr-proxy on ``env``; block None = unset."""
+    from . import edr
+    spec, proxy = getattr(args, "edr_spec", None), \
+        getattr(args, "edr_proxy", None)
+    if spec is None and proxy is None:
+        return True, None
+    try:
+        block = edr.cli_block(env.edr.block if env.edr is not None else None,
+                              spec, proxy)
+        edr.apply(env, block)
+    except edr.EdrError as e:
+        print(f"--edr: {e}", file=sys.stderr)
+        return False, None
+    return True, block
+
+
+def _add_edr_options(p) -> None:
+    p.add_argument("--edr", dest="edr_spec", metavar="PROFILE[:REGION]",
+                   help="EDR traffic profile and region, or 'off' (see 'tgt "
+                   "edr list'; needs an environment)")
+    p.add_argument("--edr-proxy", metavar="HOST",
+                   help="environment host the sensors reach the EDR cloud "
+                   "through (HTTP CONNECT)")
+
+
 def _load_env_file(path: str):
     """Load + register ``--env-file``; returns its key or None (reported)."""
     from . import envfile
@@ -224,6 +257,16 @@ def cmd_run(args) -> int:
     if env and env not in enterprise.ENVIRONMENTS:
         print(f"unknown environment: {env}. Try 'tgt list'.", file=sys.stderr)
         return 2
+    edr_block = None
+    if getattr(args, "edr_spec", None) is not None or \
+            getattr(args, "edr_proxy", None) is not None:
+        if not env or replay:
+            print("--edr/--edr-proxy shape a generated environment: use them "
+                  "with --env or --env-file, not --replay.", file=sys.stderr)
+            return 2
+        ok, edr_block = _edr_block(args, enterprise.get(env))
+        if not ok:
+            return 2
     span = getattr(args, "span", "access")
     remap_env = getattr(args, "remap_env", None)
     if remap_env and remap_env not in enterprise.ENVIRONMENTS:
@@ -285,6 +328,8 @@ def cmd_run(args) -> int:
             print(f"unknown protocol: {e}. Try 'tgt list'.", file=sys.stderr)
             return 2
 
+    if _bad_rate(args.rate):
+        return 2
     schedule = getattr(args, "schedule", "cycle") or "cycle"
     rate = args.rate
     if rate is None:            # timed: the schedule paces, no cap by default
@@ -295,7 +340,7 @@ def cmd_run(args) -> int:
         vlan=args.vlan,
     )
     cfg = RunConfig(
-        profiles=profs, env=env, span=span, incident=incident,
+        profiles=profs, env=env, edr=edr_block, span=span, incident=incident,
         sprinkle=sprinkle,
         sprinkle_ratio=max(0.0, getattr(args, "sprinkle_ratio", 0.0)),
         sprinkle_random=getattr(args, "sprinkle_random", False),
@@ -327,6 +372,10 @@ def cmd_run(args) -> int:
               "capture's own timing (use --replay-realtime).",
               file=sys.stderr)
         return 2
+    if schedule == "timed" and args.once:
+        print("--once needs --schedule cycle: a timed run has no cycles; "
+              "bound it with --duration or --count.", file=sys.stderr)
+        return 2
     if replay:
         from .replay import rewriter_for
         from .rewrite import RewriteError
@@ -354,6 +403,17 @@ def cmd_run(args) -> int:
     return _run_engine(cfg, args)
 
 
+def _bad_rate(rate) -> bool:
+    """Report a --rate that is not a finite number >= 0."""
+    from .sender import check_rate
+    try:
+        check_rate(rate)
+    except ValueError as e:
+        print(f"--rate: {e}", file=sys.stderr)
+        return True
+    return False
+
+
 def _run_engine(cfg: RunConfig, args) -> int:
     """Validate the output/clock options of ``cfg``, run the engine to the
     end (Ctrl-C / SIGTERM stop it cleanly) and print the summary."""
@@ -369,6 +429,11 @@ def _run_engine(cfg: RunConfig, args) -> int:
             print(f"bad --start-time {cfg.start_time!r}: use ISO-8601, e.g. "
                   "2026-11-05T14:00:00Z", file=sys.stderr)
             return 2
+    from .engine import synthetic_range_error
+    bad_clock = synthetic_range_error(cfg)
+    if bad_clock:
+        print(bad_clock, file=sys.stderr)
+        return 2
     if cfg.seed is None:                # chosen now so it is printed + logged
         from .engine import new_seed
         cfg.seed = new_seed()
@@ -479,7 +544,8 @@ def _start_api(args, eng):
     server.start()
     print(f"  [api] control API on {server.url} "
           f"({'token required' if token else 'no token'}) — "
-          f"try: tgt ctl --api {host}:{server.port} status", flush=True)
+          f"try: tgt ctl --api {api.host_port(host, server.port)} status",
+          flush=True)
     return server
 
 
@@ -514,13 +580,19 @@ def cmd_ctl(args) -> int:
         print(f"wrote manifest to {args.output}", file=sys.stderr)
     elif args.json or what == "manifest" or code >= 300:
         print(json.dumps(doc, indent=1))
-    elif what == "status":
-        _print_status(doc)
-    elif what == "inject":
-        i = doc.get("injection", {})
-        print(f"injection {i.get('id')}: {i.get('incident')} for "
-              f"{i.get('duration')}s at {i.get('ratio', 0):.0%} "
-              f"({i.get('state')})")
+    elif what in ("status", "inject"):
+        try:
+            if what == "status":
+                _print_status(doc)
+            else:
+                i = doc.get("injection", {})
+                print(f"injection {i.get('id')}: {i.get('incident')} for "
+                      f"{i.get('duration')}s at {i.get('ratio', 0):.0%} "
+                      f"({i.get('state')})")
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
+            print(f"{args.api} sent an unexpected {what} reply: {e}",
+                  file=sys.stderr)
+            return 2
     else:
         print(json.dumps(doc))
     return 0 if code < 300 else 1
@@ -569,10 +641,18 @@ def cmd_campaign(args) -> int:
             except campaign.CampaignError as e:
                 print(f"  {os.path.basename(p):32} (invalid: {e})")
         return 0 if args.list else 2
+    if _bad_rate(args.rate):
+        return 2
     path = campaign.find(args.plan)
     try:
         plan = campaign.load(path)
         base = plan.base_env()
+        ok, edr_block = _edr_block(args, base)
+        if not ok:
+            return 2
+        if edr_block is not None:
+            plan.edr_block = edr_block
+            base = plan.base_env()
         if plan.env_file:
             envfile.register(base)
         phases = campaign.build(plan)
@@ -605,7 +685,8 @@ def cmd_campaign(args) -> int:
         seed = new_seed()
     rate = args.rate if args.rate is not None else 0.0
     cfg = RunConfig(
-        env=base.key, span=plan.span, iface=args.iface, pcap_path=args.pcap,
+        env=base.key, edr=edr_block, span=plan.span, iface=args.iface,
+        pcap_path=args.pcap,
         rate=rate, count=args.count, duration=0.0,
         sprinkle_messages=plan.sprinkle_messages, seed=seed,
         manifest_path=args.manifest, clock=args.clock,
@@ -750,6 +831,10 @@ def build_parser() -> argparse.ArgumentParser:
         "bench", help="play a fixed, seeded evaluation suite and score a "
                       "monitor on it (list, run, score, compare)"))
 
+    pd = sub.add_parser("edr", help="EDR traffic profiles")
+    pds = pd.add_subparsers(dest="edr_cmd", required=True)
+    pds.add_parser("list", help="profiles, regions, hostnames and provenance")
+
     pi = sub.add_parser("iface", help="manage virtual interfaces")
     isub = pi.add_subparsers(dest="iface_cmd", required=True)
     isub.add_parser("list", help="list interfaces")
@@ -778,6 +863,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="--env capture point: access = each frame once on its "
                         "sender's VLAN; core = also the routed copy on the "
                         "receiver's VLAN (gateway MAC, TTL-1)")
+    _add_edr_options(r)
     r.add_argument("--incident",
                    help="famous incident scenario, e.g. wannacry | stuxnet | "
                         "industroyer | triton (see 'tgt list')")
@@ -839,10 +925,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--once", action="store_true",
                    help="send one cycle then stop (do not loop)")
     r.add_argument("--client-mac", default="02:00:00:00:00:01")
-    r.add_argument("--client-ip", default="10.10.10.10")
+    r.add_argument("--client-ip", type=_ipv4, default="10.10.10.10")
     r.add_argument("--server-mac", default="02:00:00:00:00:02")
-    r.add_argument("--server-ip", default="10.10.10.20")
-    r.add_argument("--vlan", type=int, default=None,
+    r.add_argument("--server-ip", type=_ipv4, default="10.10.10.20")
+    r.add_argument("--vlan", type=_vlan_id, default=None,
                    help="802.1Q VLAN id (with --replay: retag every frame, "
                         "0 = strip the tag)")
     r.add_argument("--seed", type=int, default=None,
@@ -883,6 +969,7 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--force", action="store_true",
                     help="run even if a phase is shorter than 3x the "
                          "slowest period its change involves")
+    _add_edr_options(pc)
     pc.add_argument("--iface", "-i", help="interface to send on (needs root)")
     pc.add_argument("--pcap", help="also/only write frames to this pcap")
     pc.add_argument("--manifest", metavar="FILE",
@@ -951,6 +1038,24 @@ def _duration(text: str) -> float:
         raise argparse.ArgumentTypeError(str(e)) from None
 
 
+def _ipv4(text: str) -> str:
+    from .packet import ip_to_bytes
+    try:
+        ip_to_bytes(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return text
+
+
+def _vlan_id(text: str) -> int:
+    from .packet import check_vlan
+    try:
+        return check_vlan(int(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid VLAN id: {text!r} (need 0-4095)") from None
+
+
 def _timed_args(p) -> None:
     p.add_argument("--speed", type=float, default=1.0, metavar="X",
                    help="timed + wall clock: run X times faster than real "
@@ -962,10 +1067,31 @@ def _timed_args(p) -> None:
                         "synthetic captures)")
 
 
+def _redact_argv(argv) -> list:
+    """``argv`` with the --api-token value masked, for the run manifest.
+    Covers ``--api-token X``, ``--api-token=X`` and the abbreviations
+    argparse accepts (``--api-t`` is the shortest unambiguous one)."""
+    out: list = []
+    hide = False
+    for arg in argv:
+        if hide:
+            out.append("<redacted>")
+            hide = False
+            continue
+        name, eq, _ = arg.partition("=")
+        if len(name) >= len("--api-t") and "--api-token".startswith(name):
+            if eq:
+                arg = f"{name}=<redacted>"
+            else:
+                hide = True
+        out.append(arg)
+    return out
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.argv = list(sys.argv[1:] if argv is None else argv)
+    args.argv = _redact_argv(sys.argv[1:] if argv is None else argv)
     if args.command not in ("iface", "ctl"):
         # plugins (TGT_PLUGIN_PATH / ~/.config/tgt/plugins) first, so env
         # files may use plugin protocols; then env files in TGT_ENV_PATH /
@@ -984,7 +1110,7 @@ def main(argv=None) -> int:
         "list": cmd_list, "env": cmd_env, "iface": cmd_iface, "run": cmd_run,
         "inventory": cmd_inventory,
         "score": cmd_score, "campaign": cmd_campaign, "ctl": cmd_ctl,
-        "bench": cmd_bench,
+        "bench": cmd_bench, "edr": cmd_edr,
     }[args.command](args)
 
 

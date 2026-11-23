@@ -7,6 +7,7 @@ fall back to pcap-only output, which needs nothing at all.
 from __future__ import annotations
 
 import errno
+import math
 import socket
 import threading
 import time
@@ -153,6 +154,18 @@ class RawSender:
         self.close()
 
 
+def check_rate(pps: Optional[float]) -> None:
+    """ValueError unless ``pps`` is a finite number >= 0 (None = unpaced)."""
+    if pps is None:
+        return
+    try:
+        ok = math.isfinite(pps) and pps >= 0
+    except (TypeError, OverflowError):
+        ok = False
+    if not ok:
+        raise ValueError(f"rate must be a finite number >= 0, got {pps!r}")
+
+
 class RateLimiter:
     """Simple pacing to approximate a target packets-per-second."""
 
@@ -160,30 +173,64 @@ class RateLimiter:
     MAX_BACKLOG = 0.1
 
     def __init__(self, pps: float):
+        check_rate(pps)
         self.pps = pps
         self.interval = 1.0 / pps if pps and pps > 0 else 0.0
         self._next = time.perf_counter()
+        self._cond = threading.Condition()
+        self._armed = False             # a wait has claimed the slot at _next
 
     def set_rate(self, pps: float) -> None:
-        """Change the pace of a running limiter (no burst to catch up)."""
-        self.pps = pps
-        self.interval = 1.0 / pps if pps and pps > 0 else 0.0
-        self._next = time.perf_counter()
+        """Change the pace of a running limiter (no burst to catch up); a
+        blocked :meth:`wait` wakes and waits one interval of the new rate."""
+        check_rate(pps)
+        with self._cond:
+            self.pps = pps
+            self.interval = 1.0 / pps if pps and pps > 0 else 0.0
+            now = time.perf_counter()
+            self._next = now + self.interval if self._armed else now
+            self._cond.notify_all()
 
-    def wait(self, stop: Optional[threading.Event] = None) -> None:
-        """Block until the next send slot; with ``stop``, long waits (slow
-        rates) return early once the event is set."""
-        if self.interval <= 0:
-            return
-        self._next += self.interval
-        now = time.perf_counter()
-        delay = self._next - now
-        if delay > 0:
-            if stop is not None and delay > 0.05:
-                stop.wait(delay)
-            else:
-                time.sleep(delay)
-        elif delay < -self.MAX_BACKLOG:
-            # fell behind (a stall, a slow rebuild): resync instead of
-            # bursting the whole backlog onto the wire
-            self._next = now
+    def carry_from(self, prev: "RateLimiter") -> None:
+        """Count this limiter's first slot from the last slot of ``prev``, so
+        a cap slower than one campaign phase still gets to send."""
+        with prev._cond:
+            if prev.interval <= 0:
+                return
+            last = prev._next - prev.interval if prev._armed else prev._next
+        if math.isfinite(last):
+            self._next = last
+
+    def wait(self, stop: Optional[threading.Event] = None,
+             deadline: Optional[float] = None) -> bool:
+        """Block until the next send slot (True); with ``stop``, long waits
+        (slow rates) return False early once the event is set. With
+        ``deadline`` (a ``perf_counter`` time) it returns False there if the
+        slot is later; the slot stays claimed for the next call."""
+        with self._cond:
+            if self.interval <= 0:
+                return True
+            if not self._armed:
+                self._next += self.interval
+                self._armed = True
+            while self.interval > 0:
+                now = time.perf_counter()
+                if deadline is not None and now >= deadline:
+                    return False
+                delay = self._next - now
+                if delay <= 0:
+                    if delay < -self.MAX_BACKLOG:
+                        # fell behind (a stall, a slow rebuild): resync
+                        # instead of bursting the whole backlog onto the wire
+                        self._next = now
+                    break
+                if deadline is not None:
+                    delay = min(delay, deadline - now)
+                if stop is None:
+                    self._cond.wait(delay)
+                elif stop.is_set():
+                    return False
+                else:                   # an Event cannot wake a Condition
+                    self._cond.wait(min(delay, 0.05))
+            self._armed = False
+            return True

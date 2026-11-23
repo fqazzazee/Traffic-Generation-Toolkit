@@ -63,7 +63,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from . import enterprise, envfile, schedule, timing
+from . import edr, enterprise, envfile, schedule, timing
 
 _PLAN_KEYS = {"name", "description", "env", "env_file", "start_time", "seed",
               "day_profile", "utc_offset", "span", "rate",
@@ -117,6 +117,16 @@ class Phase:
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
+def _check_rate(value: Any, path: str) -> None:
+    """A plan or phase ``rate``: a finite number >= 0 (null = not set)."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or \
+            not 0 <= value <= sys.float_info.max:
+        raise CampaignError(f"{path}: rate: expected a finite number >= 0, "
+                            f"got {value!r}")
+
+
 class Plan:
     def __init__(self, doc: Any, source: str = "<plan>") -> None:
         self.source = source
@@ -153,6 +163,7 @@ class Plan:
             raise CampaignError(f"{source}: span: {self.span!r} is not one "
                                 f"of {', '.join(enterprise.SPAN_VIEWS)}")
         self.rate = doc.get("rate")
+        _check_rate(self.rate, source)
         self.sprinkle_messages = int(doc.get("sprinkle_messages", 2))
         phases = doc.get("phases")
         if not isinstance(phases, list) or not phases:
@@ -176,6 +187,7 @@ class Plan:
                 raise CampaignError(f"{path}.duration: {e}") from None
             if dur <= 0:
                 raise CampaignError(f"{path}.duration: must be > 0")
+            _check_rate(p.get("rate"), path)
             if p.get("day_profile") and \
                     p["day_profile"] not in timing.DAY_PROFILES:
                 raise CampaignError(f"{path}.day_profile: unknown profile "
@@ -186,16 +198,26 @@ class Plan:
                     raise CampaignError(f"{path}.{k}: expected a list")
             self.phases.append(dict(p, duration=dur))
 
+    # --edr: an "edr" block replacing the environment's for this run
+    edr_block: Optional[Dict[str, Any]] = None
+
     def base_env(self) -> enterprise.Environment:
         if self.env_file:
             try:
-                return envfile.load(self.env_file)
+                env = envfile.load(self.env_file)
             except envfile.EnvFileError as e:
                 raise CampaignError(f"{self.source}: env_file: {e}") from None
-        if self.env_key not in enterprise.ENVIRONMENTS:
+        elif self.env_key not in enterprise.ENVIRONMENTS:
             raise CampaignError(f"{self.source}: env: unknown environment "
                                 f"{self.env_key!r} (see 'tgt list')")
-        return enterprise.get(self.env_key)
+        else:
+            env = enterprise.get(self.env_key)
+        if self.edr_block is None:
+            return env
+        try:
+            return edr.applied(env, self.edr_block)
+        except edr.EdrError as e:
+            raise CampaignError(f"{self.source}: --edr: {e}") from None
 
     @property
     def duration(self) -> float:
@@ -488,8 +510,8 @@ def build(plan: Plan) -> List[Phase]:
                                                               plan.rate),
                    spec.get("day_profile") or plan.day_profile or
                    env.options.get("day_profile"),
-                   plan.utc_offset or float(env.options.get("utc_offset",
-                                                            0.0)),
+                   plan.utc_offset if "utc_offset" in plan.doc else
+                   float(env.options.get("utc_offset", 0.0)),
                    str(spec.get("description", "")),
                    changes, diff, events, label=f"{name} ({env.key})",
                    plan=plan)
@@ -621,8 +643,10 @@ def phases_for(cfg) -> List[Phase]:
         cached = _PLAN_CACHE.get(cfg.campaign)
         if cached is not None:
             return cached
-        return build(load(cfg.campaign))
-    env = enterprise.get(cfg.env) if cfg.env else None
+        plan = load(cfg.campaign)
+        plan.edr_block = cfg.edr
+        return build(plan)
+    env = enterprise.for_run(cfg) if cfg.env else None
     sprinkle = list(cfg.sprinkle)
     if cfg.sprinkle_random:
         from . import incidents
