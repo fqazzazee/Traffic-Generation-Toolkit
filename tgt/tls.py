@@ -136,12 +136,15 @@ ISSUERS = {
     "digicert": (("C", "US"), ("O", "DigiCert Inc"),
                  ("CN", "DigiCert Global G2 TLS RSA SHA256 2020 CA1")),
     "letsencrypt": (("C", "US"), ("O", "Let's Encrypt"), ("CN", "R11")),
+    "example": (("O", "Example EDR Lab"), ("CN", "Example EDR Lab CA")),
 }
 
 
 def issuer_for(cn: str) -> Tuple[Tuple[str, str], ...]:
     if cn.endswith((".cloudsink.net", ".crowdstrike.com")):
         return ISSUERS["digicert"]
+    if cn.endswith(".edr.example"):        # RFC 2606: no real CA issues it
+        return ISSUERS["example"]
     if cn.endswith(".local") or "." not in cn:
         return ISSUERS["corp"]
     return ISSUERS["letsencrypt"]
@@ -354,6 +357,17 @@ TEMPLATES: Dict[str, ClientTemplate] = {t.key: t for t in (
         record=0x0303, groups=(0x0017, 0x0018),
         sigalgs=(0x0401, 0x0501, 0x0601, 0x0403, 0x0503, 0x0603, 0x0804,
                  0x0805, 0x0806),
+        sid_len=0, upload=(200, 1400), download=(60, 400)),
+    # A vendor-neutral EDR agent on a stock TLS 1.2 library (tgt.edr)
+    ClientTemplate(
+        "edr-generic", "Generic EDR sensor", 0x0303,
+        (0xC02C, 0xC030, 0xC02B, 0xC02F, 0x009F, 0x009E, 0xC024, 0xC028,
+         0xC023, 0xC027, 0x009D, 0x009C, 0x003D, 0x003C),
+        ("server_name", "ec_point_formats", "supported_groups",
+         "signature_algorithms", "extended_master_secret"),
+        record=0x0303, groups=(0x001D, 0x0017, 0x0018),
+        sigalgs=(0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401,
+                 0x0501, 0x0601),
         sid_len=0, upload=(200, 1400), download=(60, 400)),
 )}
 

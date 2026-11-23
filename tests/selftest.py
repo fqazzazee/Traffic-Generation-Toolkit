@@ -10321,6 +10321,68 @@ def test_r22_residual_ctl_token_and_bad_replies() -> None:
                 check("classic pcap" in str(e), f"pcap range error: {e}")
 
 
+def test_r22_edr_catalogue() -> None:
+    import ipaddress
+    from tgt import edr, enterprise, incidents, tls
+    check(sorted(edr.PROFILES) == ["crowdstrike", "generic"],
+          f"built-in EDR profiles: {sorted(edr.PROFILES)}")
+    cs = edr.PROFILES["crowdstrike"]
+    check(list(cs.regions) == ["us-1", "us-2", "eu-1", "us-gov-1"],
+          f"crowdstrike regions: {list(cs.regions)}")
+    check(cs.vendor == "CrowdStrike" and cs.tls_client == "falcon",
+          "crowdstrike vendor / TLS template")
+    want = {
+        "us-1": ("ts01-b.cloudsink.net", "lfoup01-b.cloudsink.net",
+                 "lfodown01-b.cloudsink.net", "api.crowdstrike.com"),
+        "us-2": ("ts01-gyr-maverick.cloudsink.net",
+                 "lfoup01-gyr-maverick.cloudsink.net",
+                 "lfodown01-gyr-maverick.cloudsink.net",
+                 "api.us-2.crowdstrike.com"),
+        "us-gov-1": ("ts01-laggar-gcw.cloudsink.net",
+                     "lfoup01-laggar-gcw.cloudsink.net",
+                     "lfodown01-laggar-gcw.cloudsink.net",
+                     "api.laggar.gcw.crowdstrike.com")}
+    for key, names in want.items():
+        got = tuple(cs.regions[key].fqdns[c] for c in edr.CHANNELS)
+        check(got == names, f"{key} hostnames: {got}")
+    eu = cs.regions["eu-1"]
+    fq = enterprise.CROWDSTRIKE_FQDNS
+    check((eu.fqdns["sensor"], eu.fqdns["upload"], eu.fqdns["download"],
+           eu.fqdns["api"]) == (fq["ts"], fq["up"], fq["down"], fq["api"]),
+          "eu-1 hostnames differ from CROWDSTRIKE_FQDNS")
+    check(list(eu.ips) == list(enterprise.CROWDSTRIKE_CLOUD_IPS),
+          "eu-1 IPs differ from CROWDSTRIKE_CLOUD_IPS (or their order)")
+    check(eu.ip_provenance == "published", "eu-1 IP provenance")
+    for key, reg in cs.regions.items():
+        check(reg.host_provenance["api"] == "vendor-docs",
+              f"{key}: API host provenance")
+        sensor = "unverified" if key == "us-gov-1" else "mirrored-docs"
+        for c in ("sensor", "upload", "download"):
+            check(reg.host_provenance[c] == sensor,
+                  f"{key}: {c} host provenance {reg.host_provenance[c]}")
+    doc = [ipaddress.ip_network(n) for n in
+           ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+    gen = edr.PROFILES["generic"]
+    check("crowdstrike" not in gen.tls_client and "falcon" not in gen.tls_client
+          and gen.tls_client in tls.TEMPLATES, "generic TLS template")
+    pools = [(k, r) for k, r in cs.regions.items() if k != "eu-1"] + \
+        list(gen.regions.items())
+    seen: set = set()
+    c2 = {h.ip for i in incidents.INCIDENTS.values() for h in i.hosts}
+    for key, reg in pools:
+        check(reg.ip_provenance == "documentation", f"{key}: IP provenance")
+        check(len(reg.ips) >= 3, f"{key}: pool too small")
+        for ip in reg.ips:
+            a = ipaddress.ip_address(ip)
+            check(any(a in n for n in doc), f"{key}: {ip} not RFC 5737")
+            check(ip not in seen, f"{key}: {ip} reused across regions")
+            check(ip not in c2, f"{key}: {ip} is an incident's address")
+            seen.add(ip)
+    for reg in gen.regions.values():
+        check(all(n.endswith(".edr.example") for n in reg.fqdns.values()),
+              "generic hostnames are not RFC 2606 names under edr.example")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

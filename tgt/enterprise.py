@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import devices, protocols, stacks, tls
+from .edr import CROWDSTRIKE_CLOUD_IPS, CROWDSTRIKE_FQDNS  # noqa: F401
 from .packet import (ETH_P_ARP, Endpoints, arp, bytes_to_mac, ethernet,
                      frame_ips, mac_to_bytes, rewrite_ips, rewrite_l2,
                      set_ip_id)
@@ -191,29 +192,7 @@ class Host:
 # ---------------------------------------------------------------------------
 # CrowdStrike Falcon EDR — the cloud every Windows host beacons to
 # ---------------------------------------------------------------------------
-# The sensor reaches the Security Cloud by FQDN — the SNI is the authoritative
-# EDR tell — and each name resolves to many AWS IPs. These are CrowdStrike's
-# EU-1 cloud (AWS eu-central-1 / Frankfurt): the FQDNs below and the published
-# egress IP set the fleet's beacons are spread across.
-CROWDSTRIKE_FQDNS = {
-    "ts": "ts01-lanner-lion.cloudsink.net",        # sensor channel (C2)
-    "up": "lfoup01-lanner-lion.cloudsink.net",     # telemetry upload
-    "down": "lfodown01-lanner-lion.cloudsink.net",  # content / policy download
-    "api": "api.eu-1.crowdstrike.com",             # OAuth2 API / console
-}
-
-CROWDSTRIKE_CLOUD_IPS = [
-    "18.158.187.80", "18.198.53.88", "3.121.187.176", "3.121.238.86",
-    "3.121.6.180", "3.125.15.130", "18.194.222.197", "18.197.35.253",
-    "3.122.135.178", "35.157.198.104", "63.179.114.102", "63.179.203.249",
-    "18.196.94.202", "3.121.28.37", "52.29.26.172", "18.158.141.230",
-    "18.184.139.200", "18.195.129.87", "3.64.87.158", "3.73.169.253",
-    "3.79.224.18", "52.28.120.115", "52.57.246.231", "3.123.89.179",
-    "3.126.96.195", "3.69.129.49", "18.184.114.155", "18.194.8.224",
-    "3.121.13.180", "3.123.240.202", "3.78.32.129", "35.156.219.65",
-    "3.69.184.79", "3.76.143.53", "3.77.82.22",
-]
-
+# The catalogue (FQDNs, published EU-1 IP set, other regions) is tgt.edr.
 # Falcon runs on modern Windows (Win7 SP1+ / Server 2012+) and Linux servers;
 # the EOL Win2000/XP hosts and embedded OT devices (PLC/RTU/relay/drive/meter
 # and BACnet/JACE firmware, identified by their tgt.devices model) cannot, so they
