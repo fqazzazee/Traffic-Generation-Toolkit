@@ -1,11 +1,58 @@
 # Changelog
 
-## Unreleased
+## 2.2.0 — 2026-11-22
 
-### Docs
+### EDR traffic
+- **EDR profiles**: `tgt run` and `tgt campaign` take `--edr PROFILE[:REGION]`, `--edr off`
+  and `--edr-proxy HOST`. `tgt edr list` shows each profile's regions, hostnames and where
+  they came from. With no EDR option, generated traffic is byte-identical to 2.1.0.
+- **CrowdStrike Falcon cloud servers**: US-1, US-2, EU-1 and US-GOV-1, with sensor, upload,
+  download and API channels, DNS lookups and region-matched certificates. Only EU-1 uses a
+  real address list. The other regions use RFC 5737 documentation addresses, and the
+  US-GOV-1 sensor hostnames are marked unverified.
+- **Proxied sensors**: HTTP CONNECT to a named host, TLS inside the tunnel and an upstream leg
+  to the cloud, with no direct egress from proxied hosts.
+- **Other vendors**: a neutral `generic` profile, plus a `custom` profile in an env file's
+  `edr` block. Payloads are opaque simulated bytes. See `docs/edr.md`.
+
+### Changed behavior
+- A run that crashes now exits 1 and reports the error. It used to exit 0.
+- `--once` with `--schedule timed` is rejected. It used to run until the disk filled.
+- `tgt campaign --rate` now caps a plan's own rate, and a live `/rate` change lasts across
+  phases.
+- Invalid rates, IPv4 addresses, VLAN IDs and out-of-range `--start-time` values are rejected
+  instead of being reinterpreted or crashing mid-run.
+- Bench fingerprints now cover run parameters and plan and environment contents, so bundles
+  from earlier versions will show as different in `tgt bench compare`.
+- Bench stages inherit a referenced plan's settings, which changes traffic for those stages.
+- Alert scoring is stricter: an event naming hosts needs an alert on one of them, each alert
+  credits one event, and alerts with no host are reported separately.
+
+### Fixed
+- **Security**: the API token no longer appears in manifests, and `tgt ctl` no longer sends
+  it through an HTTP proxy or to a redirect target.
+- **Scoring**: a perfect monitor now scores 100% on NAT sites. New assets that never reached
+  the wire no longer count as missed, and SNMP traps, NetBIOS datagrams, server broadcasts
+  and CIP setup sessions are no longer reported as unexpected flows.
+- **Bench**: an interrupted or failed run can no longer receive a PASS or reuse the previous
+  run's manifests.
+- **Ground truth**: a reused IP is credited to its current owner in campaigns, and
+  `--remap-env` no longer writes contradictory ARP when one MAC owns several IPs.
+- **Pacing**: `--duration` ends on time at low rates, live rate changes apply immediately and
+  appear in synthetic timestamps, and NaN or negative rates can no longer remove the limit.
+- **Control**: unfinished injections are closed when a run ends, duplicate injections can no
+  longer race, and `tgt ctl` reports bad replies and addresses cleanly.
+- **Service**: `tgtctl` checks that the hardened service can read its files, deletes only veth
+  pairs it created, finds a root daemon's files without root, and no longer starts an
+  unmanaged daemon on systemd hosts. The container entrypoint accepts comma-separated
+  `TGT_IFACE`.
+- **CI**: fixed the intermittent rolling-rate test failure.
+
+### Docs and tooling
 - The README is now a short overview for OT security practitioners: what TGT tests, a quick
   start, the five-step evaluation and the packaged plants. The full reference moved to
   `docs/` (evaluating, networks, protocols, attacks, usage, deployment), unchanged.
+- Added `AGENTS.md` and the `to-spec` and `implement` agent skills.
 
 ## 2.1.0 — 2026-11-05
 
