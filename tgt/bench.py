@@ -526,6 +526,7 @@ def _clear_bundle(out: str, suite: Suite) -> None:
     manifest and each stage's plan, manifest and pcap, for the stages of
     this suite and of the bundle being replaced. Other files stay."""
     ids = {st.id for st in suite.stages}
+    owned = os.path.exists(os.path.join(out, "bench.json"))
     try:
         old = _read_json(os.path.join(out, "bench.json"), "bench index")
         rows = old.get("stages")
@@ -534,7 +535,13 @@ def _clear_bundle(out: str, suite: Suite) -> None:
             if isinstance(rows, list) else set()
     except (BenchError, AttributeError):  # missing or damaged index
         pass
-    names = ["bench.json", "manifest.json"]
+    if not owned:                         # no index: is it a merged manifest?
+        try:
+            owned = bool(_read_json(os.path.join(out, "manifest.json"),
+                                    "manifest").get("bench"))
+        except BenchError:
+            pass
+    names = ["bench.json"] + (["manifest.json"] if owned else [])
     for sid in sorted(ids):
         names += [os.path.join("stages", f"{sid}{ext}") for ext in (
             ".plan.json", ".manifest.json", ".pcap")]

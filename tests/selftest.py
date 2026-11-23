@@ -9026,6 +9026,31 @@ def test_r22_evaluation_alert_host_must_match_named_event() -> None:
     check(det["detected"] == 1, "an alert naming the host by name matches")
 
 
+def test_r22_evaluation_overwrite_keeps_foreign_manifest() -> None:
+    """--overwrite on a directory that holds no bench bundle leaves a
+    manifest.json the bench did not write, but clears its own."""
+    import json
+    from tgt import bench
+    suite = bench.Suite({"name": "tiny", "env": "ot-plant", "stages": [
+        {"id": "one", "kind": "baseline", "duration": "1m"}]}, "tiny.json")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "manifest.json")
+        with open(path, "w") as f:
+            json.dump({"mine": 1}, f)
+        bench._clear_bundle(d, suite)
+        check(os.path.exists(path), "--overwrite removed a foreign manifest")
+        with open(path, "w") as f:
+            json.dump({"bench": {"suite": "tiny"}}, f)
+        bench._clear_bundle(d, suite)
+        check(not os.path.exists(path), "a merged manifest was not cleared")
+        with open(path, "w") as f:
+            json.dump({"mine": 1}, f)
+        with open(os.path.join(d, "bench.json"), "w") as f:
+            json.dump({"stages": []}, f)
+        bench._clear_bundle(d, suite)
+        check(not os.path.exists(path), "a bundle's manifest was not cleared")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
