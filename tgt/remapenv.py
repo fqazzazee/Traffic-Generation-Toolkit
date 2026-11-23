@@ -821,7 +821,7 @@ def _l2(dst: bytes, src: bytes, vlan: Optional[int], prio: int, etype: int,
         body: bytes) -> bytes:
     if vlan or prio:
         return dst + src + struct.pack("!HHH", 0x8100,
-                                       prio | ((vlan or 0) & 0x0FFF),
+                                       prio | P.check_vlan(vlan or 0),
                                        etype) + body
     return dst + src + struct.pack("!H", etype) + body
 

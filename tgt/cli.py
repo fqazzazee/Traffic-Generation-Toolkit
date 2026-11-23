@@ -501,7 +501,8 @@ def _start_api(args, eng):
     server.start()
     print(f"  [api] control API on {server.url} "
           f"({'token required' if token else 'no token'}) — "
-          f"try: tgt ctl --api {host}:{server.port} status", flush=True)
+          f"try: tgt ctl --api {api.host_port(host, server.port)} status",
+          flush=True)
     return server
 
 
@@ -863,10 +864,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--once", action="store_true",
                    help="send one cycle then stop (do not loop)")
     r.add_argument("--client-mac", default="02:00:00:00:00:01")
-    r.add_argument("--client-ip", default="10.10.10.10")
+    r.add_argument("--client-ip", type=_ipv4, default="10.10.10.10")
     r.add_argument("--server-mac", default="02:00:00:00:00:02")
-    r.add_argument("--server-ip", default="10.10.10.20")
-    r.add_argument("--vlan", type=int, default=None,
+    r.add_argument("--server-ip", type=_ipv4, default="10.10.10.20")
+    r.add_argument("--vlan", type=_vlan_id, default=None,
                    help="802.1Q VLAN id (with --replay: retag every frame, "
                         "0 = strip the tag)")
     r.add_argument("--seed", type=int, default=None,
@@ -975,6 +976,24 @@ def _duration(text: str) -> float:
         raise argparse.ArgumentTypeError(str(e)) from None
 
 
+def _ipv4(text: str) -> str:
+    from .packet import ip_to_bytes
+    try:
+        ip_to_bytes(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return text
+
+
+def _vlan_id(text: str) -> int:
+    from .packet import check_vlan
+    try:
+        return check_vlan(int(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid VLAN id: {text!r} (need 0-4095)") from None
+
+
 def _timed_args(p) -> None:
     p.add_argument("--speed", type=float, default=1.0, metavar="X",
                    help="timed + wall clock: run X times faster than real "
@@ -986,10 +1005,31 @@ def _timed_args(p) -> None:
                         "synthetic captures)")
 
 
+def _redact_argv(argv) -> list:
+    """``argv`` with the --api-token value masked, for the run manifest.
+    Covers ``--api-token X``, ``--api-token=X`` and the abbreviations
+    argparse accepts (``--api-t`` is the shortest unambiguous one)."""
+    out: list = []
+    hide = False
+    for arg in argv:
+        if hide:
+            out.append("<redacted>")
+            hide = False
+            continue
+        name, eq, _ = arg.partition("=")
+        if len(name) >= len("--api-t") and "--api-token".startswith(name):
+            if eq:
+                arg = f"{name}=<redacted>"
+            else:
+                hide = True
+        out.append(arg)
+    return out
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.argv = list(sys.argv[1:] if argv is None else argv)
+    args.argv = _redact_argv(sys.argv[1:] if argv is None else argv)
     if args.command not in ("iface", "ctl"):
         # plugins (TGT_PLUGIN_PATH / ~/.config/tgt/plugins) first, so env
         # files may use plugin protocols; then env files in TGT_ENV_PATH /

@@ -8999,6 +8999,377 @@ def test_r22_engine_once_past_clock_range() -> None:
         rc, _ = _r22_cli(args + ["--rate", "0"])
         check(rc == 0 and len(_pcap_records(pcap)) > 2,
               f"--once inside the range: rc={rc}")
+def test_r22_control_manifest_redacts_api_token() -> None:
+    """--api-token never reaches the manifest's argv, in any spelling
+    argparse accepts (separate value, =value, unique abbreviation)."""
+    import contextlib
+    import io
+    import json
+    from tgt import cli
+    forms = (["--api-token", "SECRET123"], ["--api-token=SECRET123"],
+             ["--api-tok", "SECRET123"], ["--api-t=SECRET123"])
+    with tempfile.TemporaryDirectory() as d:
+        for form in forms:
+            m = os.path.join(d, "m.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(["run", "-p", "modbus", "--once", "--rate", "0",
+                               "--messages", "1", "--seed", "1",
+                               "--pcap", os.path.join(d, "x.pcap"),
+                               "--manifest", m,
+                               "--api", "127.0.0.1:0"] + form)
+            with open(m, encoding="utf-8") as f:
+                text = f.read()
+            argv = json.loads(text).get("argv", [])
+            check(rc == 0 and "SECRET123" not in text,
+                  f"manifest leaks the API token for {form}: {argv}")
+            check("--api" in argv and "127.0.0.1:0" in argv,
+                  f"redaction removed other arguments: {argv}")
+
+
+def test_r22_control_client_ignores_proxy() -> None:
+    """tgt ctl talks to the API directly: http_proxy never sees the call
+    or its bearer token."""
+    import json
+    import threading
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from tgt import api
+    hits = {"proxy": 0, "api": 0}
+
+    def handler(name):
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits[name] += 1
+                body = json.dumps({"ok": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        return H
+    target = HTTPServer(("127.0.0.1", 0), handler("api"))
+    proxy = HTTPServer(("127.0.0.1", 0), handler("proxy"))
+    for s in (target, proxy):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    names = ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY", "all_proxy",
+             "ALL_PROXY")
+    saved = {k: os.environ.get(k) for k in names}
+    opener = urllib.request._opener     # urlopen caches env proxies here
+    try:
+        for k in names:
+            os.environ.pop(k, None)
+        os.environ["http_proxy"] = f"http://127.0.0.1:{proxy.server_port}"
+        urllib.request._opener = None
+        code, _ = api.request(f"127.0.0.1:{target.server_port}", "GET",
+                              "/status", token="SECRET123")
+        check(code == 200 and hits == {"proxy": 0, "api": 1},
+              f"tgt ctl went through http_proxy: {code} {hits}")
+    finally:
+        urllib.request._opener = opener
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for s in (target, proxy):
+            s.shutdown()
+            s.server_close()
+
+
+def test_r22_control_rate_must_be_finite() -> None:
+    """POST /rate refuses nan/inf with a 4xx, keeps the current rate, and
+    /status stays strict JSON."""
+    import json
+    import time
+    import urllib.request
+    from tgt import api
+    from tgt.engine import Engine
+
+    def strict(text):
+        def bad(c):
+            raise ValueError(c)
+        return json.loads(text, parse_constant=bad)
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(profiles=["modbus"], rate=200, duration=15,
+                        pcap_path=os.path.join(d, "r.pcap"), seed=1)
+        eng = Engine(cfg)
+        srv = api.ControlServer(eng, "127.0.0.1", 0).start()
+        a = f"127.0.0.1:{srv.port}"
+        eng.start()
+        try:
+            for _ in range(100):
+                if getattr(eng, "limiter", None) is not None:
+                    break
+                time.sleep(0.02)
+            for bad in ("nan", "NaN", "inf", "-inf", "1e999", "-1"):
+                code, _ = api.request(a, "POST", "/rate", {"pps": bad})
+                check(400 <= code < 500, f"/rate pps={bad} -> {code}")
+                check(cfg.rate == 200, f"/rate pps={bad} set {cfg.rate}")
+            with urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})).open(
+                        f"http://{a}/status", timeout=5) as r:
+                doc = strict(r.read().decode())
+            check(doc["rate"] == 200, f"/status rate {doc['rate']}")
+            code, _ = api.request(a, "POST", "/rate", {"pps": 0})
+            check(code == 200, f"/rate pps=0 -> {code}")
+        finally:
+            eng.stop()
+            eng.join(5)
+            srv.close()
+
+
+def test_r22_control_client_non_http_is_api_error() -> None:
+    """A port that does not speak the API gives ApiError (a clean tgt ctl
+    message), not a traceback."""
+    import socket
+    import threading
+    from tgt import api
+    replies = (b"SSH-2.0-x\r\n",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nnot json!",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n[1]",
+               b"HTTP/1.1 500 Oops\r\nContent-Length: 3\r\n\r\n[1]",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n\xff\xfe")
+    for reply in replies:
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+
+        def serve():
+            c, _ = ls.accept()
+            c.recv(4096)
+            c.sendall(reply)
+            c.close()
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            code, doc = api.request(f"127.0.0.1:{ls.getsockname()[1]}", "GET",
+                                    "/status", timeout=3)
+            check(code >= 400 and isinstance(doc, dict),
+                  f"ctl accepted {reply[:20]!r}: {code} {doc!r}")
+        except api.ApiError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            check(False, f"ctl raised {type(e).__name__} on {reply[:20]!r}")
+        t.join(3)
+        ls.close()
+
+
+def test_r22_control_ctl_hint_brackets_ipv6() -> None:
+    """The printed 'tgt ctl --api' works for an IPv6 bind (CLI and TUI)."""
+    import contextlib
+    import io
+    import re
+    import socket
+    import types
+    from tgt import api, cli, tui
+    from tgt.engine import Engine
+    check(api.host_port("::1", 8787) == "[::1]:8787" and
+          api.host_port("127.0.0.1", 8787) == "127.0.0.1:8787",
+          "host_port formatting")
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(("::1", 0))
+    except OSError:
+        _skipped.append("test_r22_control_ctl_hint_brackets_ipv6")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engine(RunConfig(profiles=["modbus"],
+                               pcap_path=os.path.join(d, "x.pcap")))
+        args = types.SimpleNamespace(api="[::1]:0", api_token=None,
+                                     api_allow_remote=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            srv = cli._start_api(args, eng)
+        try:
+            m = re.search(r"tgt ctl --api (\S+) status", out.getvalue())
+            check(m is not None and api.parse_bind(m.group(1)) ==
+                  ("::1", srv.port), f"CLI ctl hint: {out.getvalue()!r}")
+        finally:
+            srv.close()
+        logs = []
+        ui = types.SimpleNamespace(api="[::1]:0", api_server=None,
+                                   close_api=lambda: None,
+                                   add_log=logs.append)
+        check(tui.UI._start_api(ui, eng), f"TUI API start: {logs}")
+        try:
+            m = re.search(r"tgt ctl --api (\S+) status", logs[-1])
+            check(m is not None and api.parse_bind(m.group(1)) ==
+                  ("::1", ui.api_server.port), f"TUI ctl hint: {logs}")
+        finally:
+            ui.api_server.close()
+
+
+def test_r22_control_close_finalizes_injections() -> None:
+    """An injection outlasting the run ends with it: no active/pending
+    state or countdown after the engine exits, and no new one is queued."""
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engine(RunConfig(profiles=["modbus"], rate=300, duration=1.0,
+                               pcap_path=os.path.join(d, "x.pcap"), seed=3))
+        eng.control.inject("wannacry", 60, 0.3)
+        eng.start()
+        eng.join(20)
+        check(not eng.is_alive(), "engine did not finish")
+        row = eng.control.status()[0]
+        check(row["state"] == "stopped" and "remaining" not in row,
+              f"injection after the run: {row}")
+        check(not eng.control._pending and not eng.control._active,
+              "injection still queued after close()")
+        try:
+            eng.control.inject("stuxnet", 5)
+            check(False, "inject accepted after the run closed")
+        except ValueError:
+            pass
+        check(len(eng.control.status()) == 1, "late injection recorded")
+
+
+def test_r22_control_inject_duplicate_blocked_during_start() -> None:
+    """While the engine moves an injection from pending to active, a second
+    injection of that incident is still refused."""
+    import types
+    from concurrent.futures import Future
+    from tgt.control import RunControl
+    eng = types.SimpleNamespace(cfg=RunConfig(profiles=["modbus"]),
+                                log=lambda m: None, recorder=None)
+    rc = RunControl(eng)
+    accepted = []
+
+    def probe():
+        try:
+            accepted.append(rc.inject("wannacry", 5, 0.5))
+        except ValueError:
+            pass
+
+    def submit(inj, n):
+        if n > 1:
+            probe()             # _start prefetches the next pass here
+        fut = Future()
+        fut.set_result([(0, b"x", inj.label)])
+        return fut
+    take = rc._take
+
+    def probing_take(inj, fut):
+        probe()
+        return take(inj, fut)
+    rc._submit, rc._take = submit, probing_take
+    rc.inject("wannacry", 5, 0.5)
+    rc._extras()                # submits pass 1
+    rc._extras()                # pending -> active
+    check(not accepted and len(rc.injections) == 1 and len(rc._active) == 1,
+          f"duplicate accepted during the move: {len(rc.injections)}")
+
+
+def test_r22_control_rejects_bad_ip_and_vlan() -> None:
+    """Bad octets and VLAN ids are refused, never wrapped onto another
+    address or VLAN; the CLI reports them without a traceback."""
+    import contextlib
+    import io
+    from tgt import cli, protocols_site
+    for bad in ("10.0.0.300", "10.0.0.-1", "256.1.1.1", "1.2.3.1_0",
+                "1.2.3. 4", "1.2.3.+4"):
+        P.ip_to_bytes.cache_clear()
+        try:
+            got = P.ip_to_bytes(bad)
+            check(False, f"ip_to_bytes({bad!r}) -> {got!r}")
+        except ValueError:
+            pass
+    check(P.ip_to_bytes("255.0.0.1") == b"\xff\x00\x00\x01", "valid IP")
+    mac = "02:00:00:00:00:01"
+    tagged = P.ethernet(mac, mac, P.ETH_P_IP, b"\x45", vlan=7)
+    prio = tagged[:14] + struct.pack("!H", 0x6007) + tagged[16:]
+    for vid in (5000, 4096, -1):
+        for name, fn in (
+                ("ethernet", lambda: P.ethernet(mac, mac, P.ETH_P_IP, b"",
+                                                vlan=vid)),
+                ("rewrite_l2", lambda: P.rewrite_l2(prio, mac, mac, vid)),
+                ("site _l2", lambda: protocols_site._l2(mac, mac, 0x88B8, b"",
+                                                        vid, 4))):
+            try:
+                fn()
+                check(False, f"{name} accepted VLAN {vid}")
+            except ValueError:
+                pass
+    for vid in (0, 4095):
+        f = P.ethernet(mac, mac, P.ETH_P_IP, b"", vlan=vid)
+        check(struct.unpack("!H", f[14:16])[0] == vid, f"VLAN {vid} changed")
+    base = ["run", "-p", "modbus", "--once", "--rate", "0"]
+    for flag, val in (("--client-ip", "10.0.0.300"),
+                      ("--server-ip", "10.0.0.-1"),
+                      ("--vlan", "5000"), ("--vlan", "-1")):
+        err = io.StringIO()
+        code = None
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                with contextlib.redirect_stderr(err), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = cli.main(base + ["--pcap", os.path.join(d, "x"),
+                                            f"{flag}={val}"])
+            except SystemExit as e:
+                code = e.code
+            except Exception as e:  # noqa: BLE001
+                code = repr(e)
+        check(code == 2 and flag in err.getvalue() and
+              "Traceback" not in err.getvalue(),
+              f"{flag} {val}: exit {code} {err.getvalue()[-80:]!r}")
+
+
+def test_r22_control_client_deep_json_is_api_error() -> None:
+    """JSON nested past the parser's limit is a bad reply like any other,
+    on a success status and on an error status."""
+    import socket
+    import threading
+    from tgt import api
+    body = b"[" * 200000
+    for status, want_error in ((b"200 OK", True), (b"500 Oops", False)):
+        reply = (b"HTTP/1.1 " + status + b"\r\nContent-Length: " +
+                 str(len(body)).encode() + b"\r\n\r\n" + body)
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+
+        def serve():
+            c, _ = ls.accept()
+            c.recv(4096)
+            c.sendall(reply)
+            c.close()
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            code, doc = api.request(f"127.0.0.1:{ls.getsockname()[1]}", "GET",
+                                    "/status", timeout=5)
+            check(not want_error and code == 500 and doc.get("ok") is False,
+                  f"deep JSON accepted: {code}")
+        except api.ApiError:
+            check(want_error, "error status with deep JSON raised ApiError")
+        except RecursionError:
+            check(False, "deep JSON raised RecursionError")
+        t.join(5)
+        ls.close()
+
+
+def test_r22_control_tagged_l2_builders_reject_bad_vlan() -> None:
+    """The PCP-tagging builders refuse a bad VLAN id instead of masking it,
+    and keep valid ids intact."""
+    from tgt import protocols_ind, remapenv
+    mac = "02:00:00:00:00:01"
+    raw = P.mac_to_bytes(mac)
+    builders = (
+        ("ind _l2", lambda v: protocols_ind._l2(mac, mac, 0x8892, b"x",
+                                                vlan=v, pcp=6), 0xC000),
+        ("remapenv _l2", lambda v: remapenv._l2(raw, raw, v, 0x2000, 0x0800,
+                                                b"x"), 0x2000))
+    for name, fn, prio in builders:
+        for vid in (5000, 4096, -1):
+            try:
+                fn(vid)
+                check(False, f"{name} accepted VLAN {vid}")
+            except ValueError:
+                pass
+        for vid in (1, 4095):
+            tci = struct.unpack("!H", fn(vid)[14:16])[0]
+            check(tci == prio | vid, f"{name} VLAN {vid}: TCI {tci:#x}")
 
 
 def main() -> int:
