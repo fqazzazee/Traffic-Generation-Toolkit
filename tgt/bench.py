@@ -335,11 +335,33 @@ class Suite:
                          for p in campaign.validate(phases, mp)]
         return problems
 
-    def fingerprint(self) -> str:
-        """What fixes the traffic: the suite document and its seeds."""
-        blob = json.dumps({"suite": self.doc,
-                           "seeds": [st.seed for st in self.stages]},
-                          sort_keys=True, default=str)
+    def fingerprint(self, min_period: Optional[float] = None,
+                    rate: Optional[float] = None,
+                    start_time: Optional[str] = None,
+                    clock: str = "synthetic", speed: float = 1.0) -> str:
+        """What fixes the traffic: the suite document, its seeds, the
+        effective run parameters and the resolved stage plans and
+        environment."""
+        from . import enterprise, envfile
+        wall = clock == "wall"
+        try:
+            env = envfile.to_dict(enterprise.get(self.env))
+        except KeyError:                  # reported by check()
+            env = None
+        blob = json.dumps({
+            "suite": self.doc, "seeds": [st.seed for st in self.stages],
+            "run": {"min_period": float(self.min_period if min_period is None
+                                        else min_period),
+                    "rate": float(rate) if rate and rate > 0 else 0.0,
+                    "clock": clock,
+                    "start_time": None if wall else
+                    (start_time or self.start_time),
+                    "speed": float(speed) if wall else None},
+            # the plan's name comes from the suite's file name
+            "plans": [{k: v for k, v in st.plan_doc.items()
+                       if k not in ("name", "description")}
+                      for st in self.stages],
+            "environment": env}, sort_keys=True, default=str)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -547,7 +569,7 @@ def run(suite: Suite, out: str, iface: Optional[str] = None,
         "schema": SCHEMA,
         "suite": {"name": suite.name, "description": suite.description,
                   "source": suite.source, "doc": suite.doc},
-        "fingerprint": suite.fingerprint(),
+        "fingerprint": suite.fingerprint(mp, rate, start_time, clock, speed),
         "tool": {"name": "tgt", "version": __version__, "git": _git_sha()},
         "created": _iso(time.time()), "env": suite.env, "clock": clock,
         "speed": speed, "min_period": mp, "iface": iface,
@@ -1376,9 +1398,13 @@ def main(args) -> int:
             return 1 if bad else 0
         if cmd == "run":
             suite = load(find(args.suite))
+            fp = suite.fingerprint(
+                args.min_period, args.rate, args.start_time,
+                args.clock or ("wall" if args.iface else "synthetic"),
+                args.speed)
             print(f"suite {suite.name}: env {suite.env}, "
                   f"{len(suite.stages)} stages, {_fmt(suite.duration)} "
-                  f"simulated, fingerprint {suite.fingerprint()}")
+                  f"simulated, fingerprint {fp}")
             _print_stages(suite)
             probs = suite.check(args.min_period)
             for pr in probs:

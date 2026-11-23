@@ -8672,6 +8672,77 @@ def test_r22_evaluation_verdict_needs_complete_bundle() -> None:
               "bundle missing a suite stage got a verdict")
 
 
+def test_r22_evaluation_fingerprint_covers_effective_run() -> None:
+    """The fingerprint follows what changes the traffic: run parameters and
+    the contents of referenced plans and the environment."""
+    import json
+    from tgt import bench, enterprise, envfile
+    q = bench.load(bench.find("quick"))
+    fp = q.fingerprint()
+    check(fp == bench.load(bench.find("quick")).fingerprint(),
+          "fingerprint is not stable")
+    for kw in ({"min_period": 30}, {"min_period": 90}, {"rate": 500.0},
+               {"start_time": "2027-01-01T00:00:00Z"}, {"clock": "wall"}):
+        check(q.fingerprint(**kw) != fp, f"fingerprint ignores {kw}")
+    check(q.fingerprint(min_period=30) != q.fingerprint(min_period=90),
+          "fingerprint ignores --min-period")
+    check(q.fingerprint(start_time=q.start_time) == fp,
+          "the suite's own start time is not the default")
+    check(q.fingerprint(clock="wall", speed=2.0) !=
+          q.fingerprint(clock="wall", speed=4.0),
+          "wall-clock fingerprint ignores --speed")
+    base = envfile.to_dict(enterprise.get("ot-plant"))
+    key = "r22-fingerprint-env"
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            pp = os.path.join(d, "plan.json")
+
+            def suite():
+                return bench.Suite({"name": "s", "env": key, "stages": [
+                    {"id": "c", "kind": "campaign", "plan": pp}]}, "s.json")
+
+            def plan(dur):
+                with open(pp, "w") as f:
+                    json.dump({"env": key, "phases": [
+                        {"name": "a", "duration": dur}]}, f)
+
+            def env(ip):
+                doc = json.loads(json.dumps(dict(base, key=key)))
+                doc["hosts"][0]["ip"] = ip
+                envfile.register(envfile.from_dict(doc, "r22"))
+            first = base["hosts"][0]["ip"]
+            env(first)
+            plan("10m")
+            a = suite().fingerprint()
+            check(a == suite().fingerprint(), "plan fingerprint unstable")
+            plan("20m")
+            b = suite().fingerprint()
+            check(a != b, "fingerprint ignores the referenced plan")
+            env(first.rsplit(".", 1)[0] + ".250")
+            check(suite().fingerprint() != b,
+                  "fingerprint ignores the environment's contents")
+    finally:
+        enterprise.ENVIRONMENTS.pop(key, None)
+    # and the bundle records the effective value
+    tiny = {"name": "tiny", "env": "ot-plant", "seed": 9,
+            "start_time": "2026-11-02T08:00:00Z", "stages": [
+                {"id": "one", "kind": "baseline", "duration": "1m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "tiny.json")
+        with open(path, "w") as f:
+            json.dump(tiny, f)
+        fps = []
+        for mp in ("30", "90"):
+            b = os.path.join(d, mp)
+            p = _cli(["bench", "run", path, "--out", b, "--min-period", mp,
+                      "--force"])
+            out, _ = p.communicate(timeout=120)
+            check(p.returncode == 0, f"run rc={p.returncode} {out[-300:]}")
+            with open(os.path.join(b, "bench.json")) as f:
+                fps.append(json.load(f)["fingerprint"])
+        check(fps[0] != fps[1], f"bundles share a fingerprint {fps}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
