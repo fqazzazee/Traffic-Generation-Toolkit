@@ -60,7 +60,16 @@ def ip_to_bytes(ip: str) -> bytes:
     parts = ip.split(".")
     if len(parts) != 4:
         raise ValueError(f"invalid IPv4 address: {ip!r}")
-    return bytes(int(p) & 0xFF for p in parts)
+    if not all(p.isascii() and p.isdigit() and int(p) <= 255 for p in parts):
+        raise ValueError(f"invalid IPv4 address: {ip!r}")
+    return bytes(int(p) for p in parts)
+
+
+def check_vlan(vlan: int) -> int:
+    """``vlan`` if it fits the 12-bit 802.1Q VID, else ValueError."""
+    if not 0 <= vlan <= 0x0FFF:
+        raise ValueError(f"invalid VLAN id: {vlan!r} (need 0-4095)")
+    return vlan
 
 
 def checksum16(data: bytes) -> int:
@@ -85,7 +94,7 @@ def ethernet(dst_mac: str, src_mac: str, ethertype: int, payload: bytes,
     hdr = mac_to_bytes(dst_mac) + mac_to_bytes(src_mac)
     if vlan is not None:
         # 802.1Q tag: TPID + PCP/DEI/VID
-        hdr += struct.pack("!HH", ETH_P_VLAN, vlan & 0x0FFF)
+        hdr += struct.pack("!HH", ETH_P_VLAN, check_vlan(vlan))
     hdr += struct.pack("!H", ethertype)
     return hdr + payload
 
@@ -244,7 +253,7 @@ def rewrite_l2(frame: bytes, src_mac: str, dst_mac: str, vlan: int | None,
         body = bytes(hdr) + body[ihl:]
     if prio:
         return (mac_to_bytes(dst_mac) + mac_to_bytes(src_mac) +
-                struct.pack("!HHH", ETH_P_VLAN, prio | ((vlan or 0) & 0x0FFF),
+                struct.pack("!HHH", ETH_P_VLAN, prio | check_vlan(vlan or 0),
                             etype) + body)
     return ethernet(dst_mac, src_mac, etype, body, vlan=vlan)
 

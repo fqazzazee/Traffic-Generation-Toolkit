@@ -8856,6 +8856,60 @@ def test_r22_control_inject_duplicate_blocked_during_start() -> None:
           f"duplicate accepted during the move: {len(rc.injections)}")
 
 
+def test_r22_control_rejects_bad_ip_and_vlan() -> None:
+    """Bad octets and VLAN ids are refused, never wrapped onto another
+    address or VLAN; the CLI reports them without a traceback."""
+    import contextlib
+    import io
+    from tgt import cli, protocols_site
+    for bad in ("10.0.0.300", "10.0.0.-1", "256.1.1.1", "1.2.3.1_0",
+                "1.2.3. 4", "1.2.3.+4"):
+        P.ip_to_bytes.cache_clear()
+        try:
+            got = P.ip_to_bytes(bad)
+            check(False, f"ip_to_bytes({bad!r}) -> {got!r}")
+        except ValueError:
+            pass
+    check(P.ip_to_bytes("255.0.0.1") == b"\xff\x00\x00\x01", "valid IP")
+    mac = "02:00:00:00:00:01"
+    tagged = P.ethernet(mac, mac, P.ETH_P_IP, b"\x45", vlan=7)
+    prio = tagged[:14] + struct.pack("!H", 0x6007) + tagged[16:]
+    for vid in (5000, 4096, -1):
+        for name, fn in (
+                ("ethernet", lambda: P.ethernet(mac, mac, P.ETH_P_IP, b"",
+                                                vlan=vid)),
+                ("rewrite_l2", lambda: P.rewrite_l2(prio, mac, mac, vid)),
+                ("site _l2", lambda: protocols_site._l2(mac, mac, 0x88B8, b"",
+                                                        vid, 4))):
+            try:
+                fn()
+                check(False, f"{name} accepted VLAN {vid}")
+            except ValueError:
+                pass
+    for vid in (0, 4095):
+        f = P.ethernet(mac, mac, P.ETH_P_IP, b"", vlan=vid)
+        check(struct.unpack("!H", f[14:16])[0] == vid, f"VLAN {vid} changed")
+    base = ["run", "-p", "modbus", "--once", "--rate", "0"]
+    for flag, val in (("--client-ip", "10.0.0.300"),
+                      ("--server-ip", "10.0.0.-1"),
+                      ("--vlan", "5000"), ("--vlan", "-1")):
+        err = io.StringIO()
+        code = None
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                with contextlib.redirect_stderr(err), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = cli.main(base + ["--pcap", os.path.join(d, "x"),
+                                            f"{flag}={val}"])
+            except SystemExit as e:
+                code = e.code
+            except Exception as e:  # noqa: BLE001
+                code = repr(e)
+        check(code == 2 and flag in err.getvalue() and
+              "Traceback" not in err.getvalue(),
+              f"{flag} {val}: exit {code} {err.getvalue()[-80:]!r}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

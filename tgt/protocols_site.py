@@ -71,7 +71,7 @@ def _l2(dst: str, src: str, ethertype: int, payload: bytes,
     padded to the 60-byte minimum."""
     frame = (P.mac_to_bytes(dst) + P.mac_to_bytes(src) +
              struct.pack("!HHH", P.ETH_P_VLAN,
-                         ((pcp & 7) << 13) | ((vlan or 0) & 0x0FFF),
+                         ((pcp & 7) << 13) | P.check_vlan(vlan or 0),
                          ethertype) + payload)
     return frame.ljust(60, b"\x00")
 

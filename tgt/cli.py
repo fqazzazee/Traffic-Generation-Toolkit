@@ -840,10 +840,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--once", action="store_true",
                    help="send one cycle then stop (do not loop)")
     r.add_argument("--client-mac", default="02:00:00:00:00:01")
-    r.add_argument("--client-ip", default="10.10.10.10")
+    r.add_argument("--client-ip", type=_ipv4, default="10.10.10.10")
     r.add_argument("--server-mac", default="02:00:00:00:00:02")
-    r.add_argument("--server-ip", default="10.10.10.20")
-    r.add_argument("--vlan", type=int, default=None,
+    r.add_argument("--server-ip", type=_ipv4, default="10.10.10.20")
+    r.add_argument("--vlan", type=_vlan_id, default=None,
                    help="802.1Q VLAN id (with --replay: retag every frame, "
                         "0 = strip the tag)")
     r.add_argument("--seed", type=int, default=None,
@@ -950,6 +950,24 @@ def _duration(text: str) -> float:
         return parse_duration(text)
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _ipv4(text: str) -> str:
+    from .packet import ip_to_bytes
+    try:
+        ip_to_bytes(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return text
+
+
+def _vlan_id(text: str) -> int:
+    from .packet import check_vlan
+    try:
+        return check_vlan(int(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid VLAN id: {text!r} (need 0-4095)") from None
 
 
 def _timed_args(p) -> None:
