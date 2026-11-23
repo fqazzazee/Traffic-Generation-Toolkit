@@ -588,7 +588,25 @@ def _truth_asset(h: Dict, new: bool = False) -> Dict[str, Any]:
         # nor does a serial / LoRaWAN device behind a gateway (no IP / MAC)
         "emitted": not (h.get("nat_hidden") or h.get("behind")),
         "first_seen": None,
+        "nat_ip": norm_ip(h.get("nat_ip") or ""),
+        "nat_hidden": bool(h.get("nat_hidden")),
     }
+
+
+def _wire_views(c: Dict[str, Any],
+                s: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The (client, server) address pairs a flow can show on the capture,
+    primary first. A flow leaving a NAT site carries the outside address; a
+    site with ``local: true`` also shows the inside pair. Empty when the flow
+    stays inside a hidden site and so never reaches the capture."""
+    cn, sn = c.get("nat_ip") or "", s.get("nat_ip") or ""
+    hidden = c.get("nat_hidden") or s.get("nat_hidden")
+    if not cn and not sn:
+        return [(c["ip"], s["ip"])]
+    if cn == sn:
+        return [] if hidden else [(c["ip"], s["ip"])]
+    outside = (cn or c["ip"], sn or s["ip"])
+    return [outside] if hidden else [outside, (c["ip"], s["ip"])]
 
 
 class Truth:
@@ -675,9 +693,13 @@ class Truth:
                     or ports.get(proto) or _proto_port(proto))
             if not c or not s or not c.get("ip") or transport == "l2":
                 continue
+            views = _wire_views(c, s)
+            if not views:
+                continue
             self.flows.append({
                 "client": c["name"], "server": s["name"], "protocol": proto,
-                "cip": c["ip"], "sip": s["ip"], "dport": dport,
+                "cip": views[0][0], "sip": views[0][1], "views": views,
+                "dport": dport,
                 "transport": "icmp" if transport == "ip" else transport,
                 "self": c["id"] == s["id"]})
         for ip, e in self.external.items():       # EDR beacons to the cloud
@@ -686,10 +708,11 @@ class Truth:
             for t in e.get("talkers") or []:
                 c = by_name.get(t)
                 if c and c.get("ip"):
+                    views = _wire_views(c, {"ip": ip})
                     self.flows.append({
                         "client": c["name"], "server": ip, "protocol": "edr",
-                        "cip": c["ip"], "sip": ip, "dport": 443,
-                        "transport": "tcp", "self": False})
+                        "cip": views[0][0], "sip": ip, "views": views,
+                        "dport": 443, "transport": "tcp", "self": False})
 
     def population(self) -> List[Dict[str, Any]]:
         return [a for a in self.assets if a["emitted"]]
@@ -870,16 +893,37 @@ def _conns(path: str) -> List[Dict[str, Any]]:
     return out
 
 
+# Other well-known (port, transport) a protocol's flow also uses: SNMP
+# notifications, NetBIOS browser datagrams, and the TCP session that sets up
+# CIP class-1 I/O (Forward_Open) in the clear or over TLS.
+_COMPANION_PORTS = {"snmp": ((162, "udp"),), "netbios": ((138, "udp"),),
+                    "enip-io": ((44818, "tcp"),), "enip-dtls": ((2221, "tcp"),)}
+
+
+def _flow_views(fl: Dict) -> List[Tuple[str, str]]:
+    return fl.get("views") or [(fl["cip"], fl["sip"])]
+
+
 def _flow_hits(fl: Dict, c: Dict) -> bool:
-    if fl["transport"] != c["proto"]:
+    extra = {p for p, t in _COMPANION_PORTS.get(fl["protocol"], ())
+             if t == c["proto"]}
+    primary = fl["transport"] == c["proto"]
+    if not primary and not extra:
         return False
     port = fl["dport"]
-    fwd = (c["o"] == fl["cip"] and (port is None or c["dp"] == port) and
-           (c["d"] == fl["sip"] or ((fl["self"] or fl["transport"] == "udp")
-                                    and _is_group(c["d"]))))
-    rev = (c["o"] == fl["sip"] and c["d"] == fl["cip"] and
-           (port is None or c["op"] == port))
-    return fwd or rev
+    to_port = (primary and (port is None or c["dp"] == port)) or \
+        c["dp"] in extra
+    udp_group = c["proto"] == "udp" and _is_group(c["d"])
+    for cip, sip in _flow_views(fl):
+        fwd = c["o"] == cip and to_port and (
+            c["d"] == sip or (fl["self"] and _is_group(c["d"])) or udp_group)
+        rev = (c["o"] == sip and c["d"] == cip and
+               ((primary and (port is None or c["op"] == port)) or
+                c["dp"] in extra))
+        announce = c["o"] == sip and udp_group and to_port   # e.g. BACnet I-Am
+        if fwd or rev or announce:
+            return True
+    return False
 
 
 def baseline(truth: Truth, zeek: str) -> Dict[str, Any]:
@@ -892,8 +936,8 @@ def baseline(truth: Truth, zeek: str) -> Dict[str, Any]:
     hit = [False] * len(flows)
     by_cip: Dict[str, List[int]] = defaultdict(list)
     for i, fl in enumerate(flows):
-        by_cip[fl["cip"]].append(i)
-        by_cip[fl["sip"]].append(i)
+        for ip in {a for view in _flow_views(fl) for a in view}:
+            by_cip[ip].append(i)
     unexpected: Dict[Tuple, int] = defaultdict(int)
     known_ports = {(fl["dport"], fl["transport"]) for fl in flows}
     for c in conns:

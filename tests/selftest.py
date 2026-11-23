@@ -11015,6 +11015,79 @@ def test_r22_edr_setup_replaces_declared_flows() -> None:
               f"{block}: export dropped the declared flow")
 
 
+def test_r22_score_flows_use_the_nat_wire_view() -> None:
+    """A flow leaving a NAT site is expected at its outside address, and one
+    kept inside a hidden site is not expected on the capture at all."""
+    from tgt import score
+    hosts = [
+        {"name": "SCADA", "ip": "10.0.0.10"},
+        {"name": "RTU1", "ip": "192.168.1.21", "nat_ip": "10.250.0.11",
+         "nat_hidden": True},
+        {"name": "RTU2", "ip": "192.168.1.22", "nat_ip": "10.250.0.11",
+         "nat_hidden": True},
+        {"name": "PLC", "ip": "192.168.2.5", "nat_ip": "10.250.0.12",
+         "nat_hidden": False},
+    ]
+    flows = [
+        {"client": "SCADA", "server": "RTU1", "protocol": "dnp3",
+         "dport": 20000, "transport": "tcp"},
+        {"client": "RTU1", "server": "RTU2", "protocol": "modbus",
+         "dport": 502, "transport": "tcp"},
+        {"client": "SCADA", "server": "PLC", "protocol": "modbus",
+         "dport": 502, "transport": "tcp"},
+    ]
+    truth = score.Truth({"hosts": hosts, "flows": flows}, "t")
+    check(len(truth.flows) == 2, f"hidden intra-site flow: {truth.flows}")
+    check((truth.flows[0]["cip"], truth.flows[0]["sip"]) ==
+          ("10.0.0.10", "10.250.0.11"), f"NAT view: {truth.flows[0]}")
+    head = "#fields\tid.orig_h\tid.orig_p\tid.resp_h\tid.resp_p\tproto\n"
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "conn.log")
+        with open(log, "w") as f:
+            f.write(head + "10.0.0.10\t40000\t10.250.0.11\t20000\ttcp\n"
+                    "10.0.0.10\t40001\t192.168.2.5\t502\ttcp\n")
+        b = score.baseline(truth, log)
+    check(b["coverage"] == 1.0 and not b["unexpected"],
+          f"perfect NAT capture scored {b['coverage']}: {b['unexpected']}")
+
+
+def test_r22_score_flows_accept_real_companion_traffic() -> None:
+    """SNMP traps, NetBIOS datagrams and a server's UDP broadcast belong to
+    their flow; an unrelated port between the same hosts does not."""
+    from tgt import score
+    hosts = [{"name": "NMS", "ip": "10.0.0.5"}, {"name": "SW", "ip": "10.0.0.2"},
+             {"name": "WS", "ip": "10.0.0.20"}, {"name": "AHU", "ip": "10.0.0.21"}]
+    flows = [
+        {"client": "NMS", "server": "SW", "protocol": "snmp", "dport": 161,
+         "transport": "udp"},
+        {"client": "WS", "server": "NMS", "protocol": "netbios", "dport": 137,
+         "transport": "udp"},
+        {"client": "NMS", "server": "AHU", "protocol": "bacnet",
+         "dport": 47808, "transport": "udp"},
+        {"client": "NMS", "server": "WS", "protocol": "enip-io",
+         "dport": 2222, "transport": "udp"},
+    ]
+    truth = score.Truth({"hosts": hosts, "flows": flows}, "t")
+    rows = ("10.0.0.5\t40004\t10.0.0.20\t44818\ttcp",
+            "10.0.0.5\t2222\t10.0.0.20\t2222\tudp",
+            "10.0.0.5\t40000\t10.0.0.2\t161\tudp",
+            "10.0.0.2\t40001\t10.0.0.5\t162\tudp",
+            "10.0.0.20\t138\t10.0.0.255\t138\tudp",
+            "10.0.0.20\t40002\t10.0.0.5\t137\tudp",
+            "10.0.0.5\t47808\t10.0.0.21\t47808\tudp",
+            "10.0.0.21\t47808\t10.0.0.255\t47808\tudp",
+            "10.0.0.2\t40003\t10.0.0.5\t9999\tudp")
+    head = "#fields\tid.orig_h\tid.orig_p\tid.resp_h\tid.resp_p\tproto\n"
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "conn.log")
+        with open(log, "w") as f:
+            f.write(head + "\n".join(rows) + "\n")
+        b = score.baseline(truth, log)
+    check(b["coverage"] == 1.0, f"companion coverage {b['coverage']}")
+    check([u["dport"] for u in b["unexpected"]] == [9999],
+          f"unexpected: {b['unexpected']}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
