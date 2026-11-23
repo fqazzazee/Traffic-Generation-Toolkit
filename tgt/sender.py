@@ -163,27 +163,42 @@ class RateLimiter:
         self.pps = pps
         self.interval = 1.0 / pps if pps and pps > 0 else 0.0
         self._next = time.perf_counter()
+        self._cond = threading.Condition()
+        self._armed = False             # a wait has claimed the slot at _next
 
     def set_rate(self, pps: float) -> None:
-        """Change the pace of a running limiter (no burst to catch up)."""
-        self.pps = pps
-        self.interval = 1.0 / pps if pps and pps > 0 else 0.0
-        self._next = time.perf_counter()
+        """Change the pace of a running limiter (no burst to catch up); a
+        blocked :meth:`wait` wakes and waits one interval of the new rate."""
+        with self._cond:
+            self.pps = pps
+            self.interval = 1.0 / pps if pps and pps > 0 else 0.0
+            now = time.perf_counter()
+            self._next = now + self.interval if self._armed else now
+            self._cond.notify_all()
 
-    def wait(self, stop: Optional[threading.Event] = None) -> None:
-        """Block until the next send slot; with ``stop``, long waits (slow
-        rates) return early once the event is set."""
-        if self.interval <= 0:
-            return
-        self._next += self.interval
-        now = time.perf_counter()
-        delay = self._next - now
-        if delay > 0:
-            if stop is not None and delay > 0.05:
-                stop.wait(delay)
-            else:
-                time.sleep(delay)
-        elif delay < -self.MAX_BACKLOG:
-            # fell behind (a stall, a slow rebuild): resync instead of
-            # bursting the whole backlog onto the wire
-            self._next = now
+    def wait(self, stop: Optional[threading.Event] = None) -> bool:
+        """Block until the next send slot (True); with ``stop``, long waits
+        (slow rates) return False early once the event is set."""
+        with self._cond:
+            if self.interval <= 0:
+                return True
+            if not self._armed:
+                self._next += self.interval
+                self._armed = True
+            while self.interval > 0:
+                now = time.perf_counter()
+                delay = self._next - now
+                if delay <= 0:
+                    if delay < -self.MAX_BACKLOG:
+                        # fell behind (a stall, a slow rebuild): resync
+                        # instead of bursting the whole backlog onto the wire
+                        self._next = now
+                    break
+                if stop is None:
+                    self._cond.wait(delay)
+                elif stop.is_set():
+                    return False
+                else:                   # an Event cannot wake a Condition
+                    self._cond.wait(min(delay, 0.05))
+            self._armed = False
+            return True

@@ -8646,6 +8646,40 @@ def test_r22_engine_once_rejected_with_timed() -> None:
         check(not os.path.exists(pcap), "--once timed wrote a pcap")
 
 
+def test_r22_engine_limiter_wakes_on_rate_change() -> None:
+    """A rate change wakes a blocked wait and recomputes its deadline."""
+    import threading
+    import time
+    from tgt.sender import RateLimiter
+    for new in (1000, 0):
+        for stop in (None, threading.Event()):
+            lim = RateLimiter(0.2)
+            done = []
+
+            def waiter():
+                lim.wait(stop)
+                done.append(time.perf_counter())
+            th = threading.Thread(target=waiter, daemon=True)
+            t0 = time.perf_counter()
+            th.start()
+            time.sleep(0.2)
+            lim.set_rate(new)
+            th.join(1.5)
+            took = done[0] - t0 if done else None
+            check(took is not None and took < 0.6,
+                  f"set_rate({new}) with stop={stop is not None}: {took}")
+            if not done:                # release the daemon thread
+                lim.set_rate(0)
+                th.join(6)
+    lim = RateLimiter(100)              # a rate decrease re-paces as well
+    lim.wait()
+    lim.set_rate(10)
+    t0 = time.perf_counter()
+    lim.wait()
+    took = time.perf_counter() - t0
+    check(0.07 <= took <= 0.3, f"slower rate waited {took:.3f}s")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
