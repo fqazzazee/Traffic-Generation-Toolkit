@@ -495,6 +495,82 @@ class ArpStream(Stream):
         return frames, [i * self.rtt for i in range(len(frames))]
 
 
+class EdrStream(Stream):
+    """One EDR channel: its TCP leg(s), plus the DNS lookups that precede a
+    new connection. A proxied channel has a client leg (HTTP CONNECT, then
+    TLS in the tunnel) and an upstream leg the proxy holds to the cloud.
+    Occurrences are (time, copies, first?, key): lookups are keyed ``dns``."""
+
+    LOOKUP_GAP = 0.002
+
+    def __init__(self, sid, legs: List[Stream], lookups, period, jitter, cls,
+                 fp) -> None:
+        lead = legs[0]
+        super().__init__(sid, "edr", "baseline", lead.builder, lead.ep,
+                         lead.place, period, jitter, lead.count, cls, "wan",
+                         fp=fp)
+        self.legs, self.lookups = legs, lookups
+
+    def bind(self, seed: int, gen: int = 0) -> None:
+        super().bind(seed, gen)
+        for leg in self.legs:
+            leg.bind(seed, gen)
+        for leg in self.legs[1:]:       # a tunnel's legs live and die together
+            leg.lifetime = self.legs[0].lifetime
+
+    def release(self, sched) -> None:
+        for leg in self.legs:
+            leg.release(sched)
+
+    def _lookup(self, ep, place, t: float) -> List[tuple]:
+        with protocols.BUILD_LOCK:      # see Stream._build
+            protocols.begin_build(self.seed, self.builds, sport_stride=8)
+            self.builds += 1
+            frames = protocols.get("dns").build(ep, 1)
+        return [(t + i * self.LOOKUP_GAP, place(f), False, "dns")
+                for i, f in enumerate(frames)]
+
+    def occur(self, t: float, sched=None):
+        self.occ += 1
+        lead = self.legs[0]
+        fresh = lead.dead or not lead.persistent or lead.conn is None
+        out: List[tuple] = []
+        late = []
+        if fresh and not lead.dead:
+            for own, ep, place in self.lookups:
+                if not own:             # the proxy looks up on CONNECT
+                    late.append((ep, place))
+                    continue
+                out += self._lookup(ep, place, t)
+                t += 3 * self.LOOKUP_GAP
+        client = lead.occur(t, sched)
+        if len(self.legs) > 1 and client:
+            client = self._relay(client, fresh, late, out, sched)
+        out += [(ft, c, first, "edr") for ft, c, first in client]
+        return out
+
+    def _relay(self, client, fresh, late, out, sched):
+        """Run the upstream leg off the client leg's request: the frames of
+        the client leg that answer it wait for the upstream side."""
+        at = min(3 if fresh else 0, len(client) - 1)
+        t = client[at][0] + 0.001
+        for ep, place in late:
+            out += self._lookup(ep, place, t)
+            t += 3 * self.LOOKUP_GAP
+        up = self.legs[1].occur(t, sched)
+        if not up:
+            return client
+        ready = up[min(2, len(up) - 1)][0] if fresh else up[-1][0]
+        delay = 0.0
+        if at + 1 < len(client):
+            delay = max(0.0, ready + 0.001 - client[at + 1][0])
+        if fresh:
+            up = up[:3] + [(ft + delay, c, x) for ft, c, x in up[3:]]
+        out += [(ft, c, first, "edr") for ft, c, first in up]
+        return client[:at + 1] + [(ft + delay, c, x)
+                                  for ft, c, x in client[at + 1:]]
+
+
 def _tuple(frames: List[bytes], cmac: bytes) -> Optional[tuple]:
     """(client IP, server IP, client port, server port) of the first TCP
     segment the client sends in ``frames``, else ``None``."""
@@ -553,7 +629,9 @@ def env_streams(env, span: str = "access", offline=(),
             _fp(client, server, env.host_meta.get(cname),
                 env.host_meta.get(sname), dead, span, tm), dead))
     from .enterprise import _cs_cloud_host
-    for h, ip, fqdn, bulk in env.edr_plan():
+    if env.edr is not None:
+        out += edr_streams(env, span, offline)
+    for h, ip, fqdn, bulk in (() if env.edr is not None else env.edr_plan()):
         if h.name in offline:
             continue
         cloud = _cs_cloud_host(ip, fqdn)
@@ -586,6 +664,54 @@ def env_streams(env, span: str = "access", offline=(),
                 _fp(h, [p.ip for p in peers[h.name]]),
                 gratuitous=h.name in dhcp or i % 8 == 0))
     out += sprinkle_streams(env, sprinkle, sprinkle_messages, span)
+    return out
+
+
+def edr_streams(env, span: str, offline) -> List[Stream]:
+    """The channels of an explicit EDR setup. The sensor channel is one
+    long-lived connection with a heartbeat per period; the others are a
+    session per occurrence. A channel whose proxy is offline retries it."""
+    from . import edr as edrmod
+    setup, seg = env.edr, env.segment_or_none
+    life = timing.PERSISTENT["edr"][2]
+    hs = edrmod.setup_exchanges(setup)
+    out: List[Stream] = []
+
+    def placer(c, s):
+        return lambda f, c=c, s=s: env.place(f, c, s, span, seg)
+
+    for p in env.edr_paths():
+        if p.host.name in offline:
+            continue
+        cloud = edrmod.cloud_host(setup, p.ip, p.fqdn)
+        beat = p.channel == "sensor"
+        lo, hi, jit, _, cls = timing.spec("edr" if beat else "edr-bulk")
+        period = timing.pick(lo, hi, p.host.name, p.ip, p.fqdn)
+        count = edrmod.BULK_MESSAGES if p.bulk else 1
+        sid = ("edr", p.host.name, p.channel, p.ip, p.fqdn)
+        fp = _fp(p.host, p.proxy, p.ip, p.fqdn, p.dns, span, setup.block)
+
+        def leg(tag, ep, c, s, setup_n, dead=False):
+            return Stream(sid + (tag,), "edr", "baseline", edrmod.channel_flow,
+                          ep, placer(c, s), period, jit, count, cls,
+                          timing.path_kind(seg(c), seg(s)), False,
+                          (setup_n, 1, life) if beat else None, fp, dead)
+
+        if p.proxy is None:
+            legs = [leg("direct", edrmod.endpoints(setup, p, p.host, cloud),
+                        p.host, cloud, hs)]
+        else:
+            down = p.proxy.name in offline
+            legs = [leg("client", edrmod.endpoints(
+                setup, p, p.host, p.proxy, setup.proxy_port, connect=True),
+                p.host, p.proxy, hs + 1, dead=down)]
+            if not down:
+                legs.append(leg("upstream", edrmod.endpoints(
+                    setup, p, p.proxy, cloud), p.proxy, cloud, hs))
+        lookups = [(c is p.host, edrmod.dns_endpoints(env, c, r, n, a),
+                    placer(c, r)) for c, r, n, a in p.dns
+                   if c.name not in offline and r.name not in offline]
+        out.append(EdrStream(sid, legs, lookups, period, jit, cls, fp))
     return out
 
 
@@ -834,9 +960,11 @@ class Scheduler:
                 if not s.alive or t != s.next_t:
                     continue
                 spr = s.source.startswith("sprinkle:")
-                for ft, copies, occ in s.occur(t, self):
+                for item in s.occur(t, self):
+                    ft, copies, occ = item[:3]
+                    key = item[3] if len(item) > 3 else s.key   # EdrStream
                     self._n += 1
-                    push(fheap, (ft, self._n, s.key, copies, s.source, occ))
+                    push(fheap, (ft, self._n, key, copies, s.source, occ))
                     self.wire[spr] += len(copies)
                     if spr:
                         s.wire += len(copies)

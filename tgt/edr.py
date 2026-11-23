@@ -23,7 +23,7 @@ import copy
 import ipaddress
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 CHANNELS = ("sensor", "upload", "download", "api")
@@ -310,3 +310,229 @@ def applied(env, raw: Any):
     if hit is None:
         hit = _APPLIED.setdefault(key, (env, apply(env, raw)))
     return hit[1]
+
+
+# ---------------------------------------------------------------------------
+# Who connects where
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Path:
+    """One EDR channel of one host. ``proxy`` is the host relaying it, and
+    ``dns`` the lookups it needs: (client, resolver, name, answer)."""
+    host: Any
+    channel: str
+    fqdn: str
+    ip: str
+    bulk: bool
+    proxy: Any = None
+    dns: Tuple[Tuple[Any, Any, str, str], ...] = ()
+
+
+def _resolver(env, host):
+    """The DNS server ``host`` uses: its own DNS flow's, else the nearest
+    server in the site (same segment, same zone, any). ``None`` without one,
+    or when ``host`` is the only one."""
+    names = {h.name for h in env.hosts}
+    for c, sv, proto in env.conversations:
+        if proto == "dns" and c == host.name and sv != c and sv in names:
+            return env.host(sv)
+    served = {sv for _, sv, p in env.conversations if p == "dns"}
+    pool = [h for h in env.hosts if h.name != host.name
+            and (h.role == "dns" or h.name in served)]
+    if not pool:
+        return None
+    seg = env.segment_of(host)
+    return next((h for h in pool if env.segment_of(h) is seg),
+                next((h for h in pool if env.segment_of(h).zone == seg.zone),
+                     pool[0]))
+
+
+def paths(env) -> List[Path]:
+    """Every EDR channel of the fleet: one sensor flow per host spread over
+    the region's pool; one anchor host also uploads, downloads and is the
+    only one that touches the management API."""
+    from .enterprise import DNS_DOMAIN
+    setup = env.edr
+    fleet = env.edr_hosts()
+    if setup is None or not setup.enabled or not fleet:
+        return []
+    fq, ips = setup.region.fqdns, setup.region.ips
+    via = env.host(setup.proxy) if setup.proxy else None
+
+    def path(h, channel: str, ip: str) -> Path:
+        name = fq[channel]
+        proxy = via if via is not None and via.name != h.name else None
+        dns = []
+        own = _resolver(env, h)
+        if proxy is None:
+            if own is not None:
+                dns.append((h, own, name, ip))
+        else:
+            if own is not None:
+                dns.append((h, own, f"{proxy.name.lower()}.{DNS_DOMAIN}",
+                            proxy.ip))
+            up = _resolver(env, proxy)
+            if up is not None:
+                dns.append((proxy, up, name, ip))
+        return Path(h, channel, name, ip, channel in ("upload", "download"),
+                    proxy, tuple(dns))
+
+    out = [path(h, "sensor", ips[i % len(ips)]) for i, h in enumerate(fleet)]
+    anchor = next((h for h in fleet
+                   if h.role in ("hist", "file", "dc", "scada")), fleet[0])
+    out += [path(anchor, "upload", ips[-1 % len(ips)]),
+            path(anchor, "download", ips[-2 % len(ips)]),
+            path(anchor, "api", ips[-3 % len(ips)])]
+    return out
+
+
+def cloud_host(setup: Setup, ip: str, fqdn: str):
+    """An on-the-fly cloud endpoint; its MAC is cosmetic (``place`` rewrites
+    it to the gateway as it egresses)."""
+    from .enterprise import Host
+    o = [int(x) for x in ip.split(".")]
+    return Host(f"EDR-CLOUD-{ip}", ip,
+                "02:00:5c:%02x:%02x:%02x" % tuple(o[1:]), "edr", "linux",
+                setup.profile.vendor, fqdn, fqdn=fqdn)
+
+
+# ---------------------------------------------------------------------------
+# Frames
+# ---------------------------------------------------------------------------
+# Application record sizes per channel: (client, server) byte ranges
+_SHAPES = {"sensor": ((60, 220), (60, 160)),
+           "upload": ((1000, 1400), (60, 180)),
+           "download": ((120, 320), (1000, 1400)),
+           "api": ((220, 520), (400, 900))}
+BULK_MESSAGES = 3      # enough records for the channel's shape to dominate
+
+
+def endpoints(setup: Setup, path: Path, client, server, dport: int = 443,
+              connect: bool = False):
+    """Endpoints of one TCP leg of ``path``. Both legs of a proxied channel
+    carry one TLS session, so they share its seed."""
+    from .packet import Endpoints
+    meta = {"sni": path.fqdn, "tls_client": setup.profile.tls_client,
+            "edr_channel": path.channel, "edr_dport": dport,
+            "edr_seed": f"{path.host.ip}|{path.ip}|{path.fqdn}|{path.channel}"}
+    if connect:
+        meta["edr_connect"] = f"{path.fqdn}:443"
+    return Endpoints(client_mac=client.mac, client_ip=client.ip,
+                     server_mac=server.mac, server_ip=server.ip,
+                     ttl_client=client.fp.ttl, ttl_server=server.fp.ttl,
+                     meta=meta, stack_client=client.stack,
+                     stack_server=server.stack)
+
+
+def channel_flow(ep, count: int) -> List[bytes]:
+    """One TCP connection of a channel. With ``edr_connect`` it opens with
+    HTTP CONNECT; the TLS session follows inside the tunnel. Application
+    records are opaque seeded bytes. Callers hold ``protocols.BUILD_LOCK``."""
+    from . import protocols, tls
+    m = ep.meta
+    up, down = _SHAPES[m["edr_channel"]]
+    tpl = replace(tls.TEMPLATES[m["tls_client"]], upload=up, download=down)
+    seed = ("edr", m["edr_seed"], protocols.build_context().cycle)
+    exchanges, hs = tls.session(tpl, tls.SERVERS["openssl"], m["sni"], count,
+                                seed)
+    target = m.get("edr_connect")
+    if target:
+        req = (f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+               "Proxy-Connection: Keep-Alive\r\n\r\n").encode()
+        exchanges.insert(0, (req, b"HTTP/1.1 200 Connection established"
+                                  b"\r\n\r\n"))
+        hs += 1
+    return protocols._tcp_flow(ep, protocols._sport(), m["edr_dport"],
+                               exchanges, idle_from=hs)
+
+
+def setup_exchanges(setup: Setup) -> int:
+    """Exchanges that open a direct channel: TCP plus the TLS handshake."""
+    from . import tls
+    tpl = tls.TEMPLATES[setup.profile.tls_client]
+    return 1 + tls.session(tpl, tls.SERVERS["openssl"], "probe.edr.example",
+                           1, ("edr-probe",))[1]
+
+
+def dns_endpoints(env, client, resolver, name: str, ip: str):
+    ep = env.conv_endpoints(client, resolver, "dns")
+    ep.meta["dns_names"] = [(name, ip)]
+    return ep
+
+
+def _halves(group: List[bytes], cmac: bytes):
+    """One exchange cut at the server's first data segment."""
+    from .schedule import view
+    for i, f in enumerate(group):
+        frm, _, plen = view(f, cmac)[:3]
+        if not frm and plen > 0:
+            return group[:i], group[i:]
+    return group, []
+
+
+def _interleave(client: List[bytes], upstream: List[bytes], ccmac: bytes,
+                ucmac: bytes, lookup: List[bytes]):
+    """The two legs of a tunnel in causal order, as (leg, frame): CONNECT,
+    the proxy's lookup and upstream handshake, its 200, then each request
+    relayed up and each response relayed back."""
+    from .schedule import exchanges
+    cg, ug = exchanges(client, ccmac), exchanges(upstream, ucmac)
+    out = [("c", f) for f in cg[0]]
+    req, rsp = _halves(cg[1], ccmac)
+    out += [("c", f) for f in req] + [("d", f) for f in lookup]
+    out += [("u", f) for f in ug[0]] + [("c", f) for f in rsp]
+    for c, u in zip(cg[2:-1], ug[1:-1]):
+        creq, crsp = _halves(c, ccmac)
+        ureq, ursp = _halves(u, ucmac)
+        out += [("c", f) for f in creq] + [("u", f) for f in ureq]
+        out += [("u", f) for f in ursp] + [("c", f) for f in crsp]
+    out += [("c", f) for f in cg[-1]] + [("u", f) for f in ug[-1]]
+    return out
+
+
+def cycle_streams(env, messages: int, span: str):
+    """The cycle builder's EDR streams; each is one channel, its lookups
+    first, and a proxied channel's two legs in causal order. Runs inside the
+    caller's build (``protocols.BUILD_LOCK``)."""
+    from . import protocols
+    from .packet import mac_to_bytes
+    setup = env.edr
+    seg = env.segment_or_none
+    dns = protocols.get("dns").build
+    out = []
+
+    def placed(key, frames, c, s):
+        return [(key, g) for g in (env.place(f, c, s, span, seg)
+                                   for f in frames) if g]
+
+    for p in env.edr_paths():
+        n = max(BULK_MESSAGES, messages) if p.bulk else 1
+        cloud = cloud_host(setup, p.ip, p.fqdn)
+        items = []
+        for c, r, name, ip in p.dns:
+            if c is p.host:
+                items += placed("dns", dns(dns_endpoints(env, c, r, name, ip),
+                                           1), c, r)
+        if p.proxy is None:
+            ep = endpoints(setup, p, p.host, cloud)
+            items += placed("edr", channel_flow(ep, n), p.host, cloud)
+        else:
+            cl = channel_flow(endpoints(setup, p, p.host, p.proxy,
+                                        setup.proxy_port, connect=True), n)
+            up = channel_flow(endpoints(setup, p, p.proxy, cloud), n)
+            look: List[bytes] = []
+            lookup_ends = None
+            for c, r, name, ip in p.dns:
+                if c is p.proxy:
+                    look = dns(dns_endpoints(env, c, r, name, ip), 1)
+                    lookup_ends = (c, r)
+            for leg, f in _interleave(cl, up, mac_to_bytes(p.host.mac),
+                                      mac_to_bytes(p.proxy.mac), look):
+                if leg == "c":
+                    items += placed("edr", [f], p.host, p.proxy)
+                elif leg == "u":
+                    items += placed("edr", [f], p.proxy, cloud)
+                else:
+                    items += placed("dns", [f], *lookup_ends)
+        out.append(items)
+    return out

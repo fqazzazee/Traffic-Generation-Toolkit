@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import devices, protocols, stacks, tls
+from . import edr as _edr
 from .edr import CROWDSTRIKE_CLOUD_IPS, CROWDSTRIKE_FQDNS  # noqa: F401
 from .packet import (ETH_P_ARP, Endpoints, arp, bytes_to_mac, ethernet,
                      frame_ips, mac_to_bytes, rewrite_ips, rewrite_l2,
@@ -543,6 +544,7 @@ class Environment:
         # what was declared, before options rewrite it (env export uses this)
         self.spec = (list(self.hosts), list(self.conversations),
                      list(self.segments))
+        self._edr_cache = None                 # tgt.edr.paths, once computed
         self._alias: Dict[str, str] = {}       # second-NIC twin -> host name
         self._apply_options()
         vlans = [s.vlan for s in self.segments]
@@ -991,7 +993,11 @@ class Environment:
         channel open to the CrowdStrike sensor cloud, egressing via its own
         gateway (like any internet-bound flow). Beacons spread across the EU-1
         cloud IP pool; a representative host also exercises the upload / download
-        / API FQDNs so all of them appear on the wire."""
+        / API FQDNs so all of them appear on the wire. An explicit EDR setup
+        builds its channels in :mod:`tgt.edr`."""
+        if self.edr is not None:
+            return _edr.cycle_streams(self, messages, span)
+
         def flow(host: Host, ip: str, fqdn: str, n: int):
             cloud = _cs_cloud_host(ip, fqdn)
             ep = self._edr_endpoints(host, cloud)
@@ -1007,6 +1013,8 @@ class Environment:
     def edr_plan(self) -> List[Tuple[Host, str, str, bool]]:
         """Who beacons where: (host, cloud IP, FQDN, bulk) per Falcon flow;
         ``bulk`` flows carry ``messages`` exchanges, the rest one beacon."""
+        if self.edr is not None:
+            return [(p.host, p.ip, p.fqdn, p.bulk) for p in self.edr_paths()]
         fleet = self.edr_hosts()
         if not fleet:
             return []
@@ -1022,6 +1030,14 @@ class Environment:
                  (anchor, ips[-2], fq["down"], True),
                  (anchor, ips[-3], fq["api"], False)]
         return plan
+
+    def edr_paths(self) -> List["_edr.Path"]:
+        """The channels of an explicit EDR setup (empty without one)."""
+        if self.edr is None:
+            return []
+        if self._edr_cache is None:
+            self._edr_cache = _edr.paths(self)
+        return self._edr_cache
 
     def build(self, messages: int, span: str = "access",
               edr: bool = True) -> List[Tuple[str, bytes]]:

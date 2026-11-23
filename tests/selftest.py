@@ -10468,6 +10468,219 @@ def test_r22_edr_off_removes_declared_flows() -> None:
           "off: export dropped the declared flow")
 
 
+def _edr_parse(frame: bytes):
+    """(src ip, dst ip, proto, sport, dport, L4 payload) or None."""
+    off = 18 if frame[12:14] == b"\x81\x00" else 14
+    if frame[off - 2:off] != b"\x08\x00":
+        return None
+    ihl = (frame[off] & 15) * 4
+    total = struct.unpack_from("!H", frame, off + 2)[0]
+    src = ".".join(map(str, frame[off + 12:off + 16]))
+    dst = ".".join(map(str, frame[off + 16:off + 20]))
+    proto, l4 = frame[off + 9], off + ihl
+    if proto == 6:
+        doff = (frame[l4 + 12] >> 4) * 4
+        data = frame[l4 + doff:off + total]
+    elif proto == 17:
+        data = frame[l4 + 8:off + total]
+    else:
+        return None
+    sp, dp = struct.unpack_from("!HH", frame, l4)
+    return src, dst, proto, sp, dp, data
+
+
+def _edr_dns_answers(frames) -> list:
+    """(resolver client ip, resolver ip, name, answer) of DNS responses."""
+    out = []
+    for f in frames:
+        p = _edr_parse(f)
+        if p is None or p[2] != 17 or p[3] != 53 or len(p[5]) < 16:
+            continue
+        d, i, labels = p[5], 12, []
+        while d[i]:
+            labels.append(d[i + 1:i + 1 + d[i]].decode())
+            i += 1 + d[i]
+        out.append((p[1], p[0], ".".join(labels),
+                    ".".join(map(str, d[-4:]))))
+    return out
+
+
+def _edr_wire(env, messages: int = 3):
+    protocols.begin_build(7, 0)
+    return [(k, f) for k, f in env.build(messages)]
+
+
+def test_r22_edr_channels_on_wire() -> None:
+    for block in ({"profile": "crowdstrike", "region": "us-2"},
+                  {"profile": "generic"}, _EDR_CUSTOM):
+        env = _edr_env(block, "enterprise-mixed")
+        reg, fleet = env.edr.region, env.edr_hosts()
+        wire = [f for k, f in _edr_wire(env) if k == "edr"]
+        parsed = [p for p in map(_edr_parse, wire) if p]
+        check(all(p[1] in reg.ips or p[0] in reg.ips for p in parsed),
+              f"{block}: edr frame outside the region's pool")
+        blob = b"".join(p[5] for p in parsed)
+        for c, name in reg.fqdns.items():
+            check(name.encode() in blob, f"{block}: {c} SNI {name} missing")
+        # certificates are presented for the requested name
+        for name in reg.fqdns.values():
+            check(blob.count(name.encode()) >= 2,
+                  f"{block}: no certificate naming {name}")
+        plan = env.edr_plan()
+        sensors = [x for x in plan if x[2] == reg.fqdns["sensor"]]
+        check(sorted(x[0].name for x in sensors) ==
+              sorted(h.name for h in fleet), f"{block}: one sensor per host")
+        check(len({x[1] for x in sensors}) == min(len(fleet), len(reg.ips)),
+              f"{block}: sensors not spread over the pool")
+        api = [x for x in plan if x[2] == reg.fqdns["api"]]
+        check(len(api) == 1, f"{block}: api from {len(api)} hosts")
+        bytes_of = {}
+        for x in plan:
+            cs = sum(len(p[5]) for p in parsed
+                     if p[0] == x[0].ip and p[1] == x[1])
+            sc = sum(len(p[5]) for p in parsed
+                     if p[1] == x[0].ip and p[0] == x[1])
+            bytes_of[x[2]] = bytes_of.get(x[2], (0, 0))
+            bytes_of[x[2]] = (bytes_of[x[2]][0] + cs, bytes_of[x[2]][1] + sc)
+        up, down = bytes_of[reg.fqdns["upload"]], bytes_of[reg.fqdns["download"]]
+        check(up[0] > up[1], f"{block}: upload not client-heavy {up}")
+        check(down[1] > down[0], f"{block}: download not server-heavy {down}")
+
+
+def test_r22_edr_dns_matches_connection() -> None:
+    env = _edr_env({"profile": "crowdstrike", "region": "us-1"},
+                   "enterprise-mixed")
+    frames = [f for _, f in _edr_wire(env)]
+    answers = _edr_dns_answers(frames)
+    resolved = {(c, n): a for c, _, n, a in answers}
+    for p in env.edr_paths():
+        if not p.dns:
+            continue
+        check(resolved.get((p.host.ip, p.fqdn)) == p.ip,
+              f"{p.host.name}: {p.fqdn} answer {resolved.get((p.host.ip, p.fqdn))}"
+              f" != {p.ip}")
+        ans = next((i for i, f in enumerate(frames)
+                    if _edr_dns_answers([f]) and
+                    _edr_dns_answers([f])[0][0] == p.host.ip and
+                    _edr_dns_answers([f])[0][2] == p.fqdn), None)
+        syn = next((i for i, f in enumerate(frames)
+                    if (_edr_parse(f) or ())[:2] == (p.host.ip, p.ip)), None)
+        check(ans is not None and syn is not None and ans < syn,
+              f"{p.host.name}: {p.channel} DNS answer not before connect")
+    check(any(p.dns for p in env.edr_paths()), "no host resolved anything")
+    # no DNS server in the environment: no invented resolver
+    from tgt import enterprise, envfile
+    doc = envfile.to_dict(enterprise.get("ot-plant"))
+    doc["flows"] = [f for f in doc["flows"] if f["proto"] != "dns"]
+    for h in doc["hosts"]:
+        if h.get("role") == "dns":
+            h["role"] = "file"
+    doc["edr"] = {"profile": "generic"}
+    bare = envfile.from_dict(doc, "bare.json")
+    check(not any(p.dns for p in bare.edr_paths()),
+          "resolver invented for an environment without DNS")
+
+
+def _edr_proxy_env(key: str = "enterprise-mixed", block=None):
+    from tgt import enterprise
+    base = enterprise.get(key)
+    proxy = next((h for h in base.hosts if h.role == "proxy"),
+                 base.edr_hosts()[0])
+    env = _edr_env(dict(block or {"profile": "crowdstrike", "region": "us-2"},
+                        proxy=proxy.name), key)
+    return env, proxy
+
+
+def test_r22_edr_proxy_path() -> None:
+    env, proxy = _edr_proxy_env()
+    reg = env.edr.region
+    wire = _edr_wire(env)
+    parsed = [p for p in (_edr_parse(f) for k, f in wire if k == "edr") if p]
+    for h in env.edr_hosts():
+        if h.name == proxy.name:
+            continue
+        check(not any(h.ip in p[:2] and (p[0] in reg.ips or p[1] in reg.ips)
+                      for p in parsed), f"{h.name}: direct egress when proxied")
+    to_proxy = [p for p in parsed if p[1] == proxy.ip and p[4] == 8080]
+    connects = {p[5].split(b" ")[1].decode() for p in to_proxy
+                if p[5].startswith(b"CONNECT ")}
+    check(connects == {f"{n}:443" for n in reg.fqdns.values()},
+          f"CONNECT targets: {connects}")
+    check(any(p[0] == proxy.ip and p[3] == 8080 and
+              p[5].startswith(b"HTTP/1.1 200") for p in parsed),
+          "proxy never answered 200")
+    upstream = [p for p in parsed if p[0] == proxy.ip and p[1] in reg.ips]
+    check({p[4] for p in upstream} == {443}, "upstream leg not on 443")
+    # the ClientHello inside the tunnel is the one the proxy relays upstream
+    inner = {p[5] for p in to_proxy if p[5][:1] == b"\x16"
+             and reg.fqdns["sensor"].encode() in p[5]}
+    relayed = {p[5] for p in upstream if p[5][:1] == b"\x16"}
+    check(inner and inner <= relayed, "tunnelled ClientHello not relayed")
+    # order on the wire: CONNECT, upstream handshake, 200
+    pk = [p for p in (_edr_parse(f) for _, f in wire) if p]
+    i = next(n for n, p in enumerate(pk) if p[5].startswith(b"CONNECT "))
+    host = pk[i][0]
+    target = pk[i][5].split(b" ")[1].decode().split(":")[0]
+    ok = next(n for n, p in enumerate(pk) if n > i and p[1] == host
+              and p[5].startswith(b"HTTP/1.1 200"))
+    ip = next(x[1] for x in env.edr_plan()
+              if x[0].ip == host and x[2] == target)
+    check(any(p[0] == proxy.ip and p[1] == ip for p in pk[i:ok]),
+          "proxy did not open the upstream leg before its 200")
+    # DNS: the sensor resolves the proxy, the proxy resolves the cloud name
+    answers = _edr_dns_answers([f for _, f in wire])
+    for x in env.edr_paths():
+        if x.proxy is None:
+            continue
+        for c, _, n, a in answers:
+            if c == x.host.ip and n in reg.fqdns.values() and \
+                    x.host.name != proxy.name:
+                check(False, f"{x.host.name} resolved {n} despite the proxy")
+                break
+        if x.dns:
+            check(any(c == x.host.ip and a == proxy.ip
+                      for c, _, _, a in answers),
+                  f"{x.host.name}: proxy name not resolved to the proxy")
+    check(any(c == proxy.ip and n == reg.fqdns["sensor"] and a in reg.ips
+              for c, _, n, a in answers), "proxy did not resolve the cloud")
+
+
+def test_r22_edr_timed_schedule() -> None:
+    from tgt import schedule
+    for env, proxy in ((_edr_env({"profile": "generic"}, "ot-plant"), None),
+                       _edr_proxy_env("ot-plant", {"profile": "generic"})):
+        reg = env.edr.region
+        sched = schedule.Scheduler(7)
+        sched.load(schedule.env_streams(env), 0.0, env.hosts, initial=True)
+        items = list(sched.run(4000.0))
+        edr = [_edr_parse(it[3][0]) for it in items if it[2] == "edr"]
+        edr = [p for p in edr if p]
+        blob = b"".join(p[5] for p in edr)
+        for name in reg.fqdns.values():
+            check(name.encode() in blob, f"timed: {name} missing")
+        dns = _edr_dns_answers([it[3][0] for it in items if it[2] == "dns"])
+        planned = {(c.ip, n, a) for x in env.edr_paths()
+                   for c, _, n, a in x.dns}      # a DNS server asks nobody
+        check(bool(planned) and planned <= {(c, n, a) for c, _, n, a in dns},
+              f"timed: planned lookups missing: {sorted(planned)[:3]}")
+        # the heartbeat rides one long-lived connection
+        h = next(x for x in env.edr_paths() if x.channel == "sensor"
+                 and (proxy is None or x.host.name != proxy.name))
+        dst = proxy.ip if proxy else h.ip
+        syns = [it for it in items if it[2] == "edr" and
+                (_edr_parse(it[3][0]) or ())[:2] == (h.host.ip, dst) and
+                it[3][0][(18 if it[3][0][12:14] == b"\x81\x00" else 14)
+                         + 20 + 13] == 0x02]
+        check(len(syns) == 1, f"timed: {len(syns)} sensor connections")
+        if proxy:
+            check(not any(p[0] == h.host.ip and p[1] in reg.ips for p in edr),
+                  "timed: direct egress when proxied")
+            check(any(p[5].startswith(b"CONNECT ") for p in edr),
+                  "timed: no CONNECT")
+            check(any(p[0] == proxy.ip and p[1] in reg.ips for p in edr),
+                  "timed: no upstream leg")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
