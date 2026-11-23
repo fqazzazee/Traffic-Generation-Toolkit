@@ -311,6 +311,21 @@ class Engine:
         elif delay > 0:
             time.sleep(delay)
 
+    def _await_slot(self, limiter: RateLimiter,
+                    deadline: Callable[[], float]) -> bool:
+        """Wait for a send slot before ``deadline()`` (which moves with a
+        pause). False when the deadline passed first or the run stopped."""
+        while not self._stop.is_set():
+            if (limiter.wait(self._stop, deadline())
+                    and time.perf_counter() < deadline()):
+                return True
+            # a pause holds the deadline back: wait it out, then re-check
+            if not self.control.gate(self._stop):
+                return False
+            if time.perf_counter() >= deadline():
+                return False
+        return False
+
     def _run(self) -> None:
         cfg = self.cfg
         sender: Optional[RawSender] = None
@@ -399,7 +414,15 @@ class Engine:
                         batch, self._stop):
                     if self._stop.is_set():
                         break
-                    limiter.wait(self._stop)
+                    if pace and cfg.duration:
+                        # time spent paused does not count toward --duration
+                        if not self._await_slot(
+                                limiter, lambda: self.stats.started
+                                + cfg.duration + self.control.paused_for()):
+                            self._stop.set()
+                            break
+                    else:
+                        limiter.wait(self._stop)
                     # a pause that began while this frame waited holds it
                     if not self.control.gate(self._stop):
                         break
@@ -527,6 +550,10 @@ class Engine:
             # (campaign.phases_for)
             t_end = t + ph.duration if ph.duration else float("inf")
             ft = t
+            held = 0                    # frames a rate cap kept past the phase
+
+            def phase_end() -> float:
+                return wall0 + self.control.paused_for() + t_end / speed
             # the control API gates this stream (pause) and splices injected
             # incident frames in after the scheduled ones (tgt.control)
             for _, item in self.control.feed(sched.run(t_end), self._stop):
@@ -542,8 +569,12 @@ class Engine:
                     # backlog on resume (tgt.control.RunControl.paused_total)
                     self._sleep_until(wall0 + self.control.paused_total
                                       + ft / speed)
-                    if limiter.interval:
-                        limiter.wait(self._stop)
+                    # a cap never stretches the phase: frames it cannot fit
+                    # are dropped, so the scheduler still advances to t_end
+                    if limiter.interval and not self._await_slot(limiter,
+                                                                 phase_end):
+                        held += len(copies)
+                        continue
                     # a pause that began during the sleep holds this frame
                     if not self.control.gate(self._stop):
                         break
@@ -580,6 +611,9 @@ class Engine:
                 if recorder is not None:
                     recorder.end_phase(None)
                 break
+            if held:
+                self.log(f"phase {ph.id}: rate cap dropped {held} frames "
+                         "that did not fit before the phase ended")
             t = t_end
             if t == float("inf"):
                 break

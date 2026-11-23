@@ -8719,6 +8719,61 @@ def test_r22_engine_rate_validated() -> None:
                 check(not os.path.exists(pcap), f"--rate {val} wrote a pcap")
 
 
+def test_r22_engine_duration_bounds_slow_rate() -> None:
+    """--duration ends a slow run on time, without sending past it, and time
+    spent paused still does not count."""
+    import time
+    from tgt.engine import Engine
+    from tgt.sender import RateLimiter
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        eng = Engine(RunConfig(profiles=["modbus"], rate=0.2, duration=0.5,
+                               pcap_path=pcap))
+        t0 = time.perf_counter()
+        eng.start()
+        eng.join(4)
+        took = time.perf_counter() - t0
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive and took < 1.5, f"--duration 0.5 took {took:.2f}s")
+        check(eng.stats.packets == 0,
+              f"sent {eng.stats.packets} frames past the deadline")
+
+        eng = Engine(RunConfig(profiles=["modbus"], rate=0.2, duration=0.6,
+                               pcap_path=pcap))
+        eng.start()
+        time.sleep(0.1)
+        eng.control.pause()
+        time.sleep(0.8)
+        check(eng.is_alive(), "a pause counted toward --duration")
+        eng.control.resume()
+        eng.join(3)
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive, "run did not end after the pause")
+
+        # timed: a cap below the schedule cannot stretch the phase
+        eng = Engine(RunConfig(profiles=["modbus"], schedule="timed", rate=0.2,
+                               duration=0.5, seed=1, pcap_path=pcap))
+        t0 = time.perf_counter()
+        eng.start()
+        eng.join(4)
+        took = time.perf_counter() - t0
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive and took < 1.5, f"timed cap overran: {took:.2f}s")
+
+    lim = RateLimiter(0.2)
+    t0 = time.perf_counter()
+    ok = lim.wait(deadline=t0 + 0.1)
+    took = time.perf_counter() - t0
+    check(ok is False and 0.08 <= took < 0.5,
+          f"limiter deadline: {ok} after {took:.3f}s")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

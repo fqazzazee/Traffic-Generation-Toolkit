@@ -191,9 +191,12 @@ class RateLimiter:
             self._next = now + self.interval if self._armed else now
             self._cond.notify_all()
 
-    def wait(self, stop: Optional[threading.Event] = None) -> bool:
+    def wait(self, stop: Optional[threading.Event] = None,
+             deadline: Optional[float] = None) -> bool:
         """Block until the next send slot (True); with ``stop``, long waits
-        (slow rates) return False early once the event is set."""
+        (slow rates) return False early once the event is set. With
+        ``deadline`` (a ``perf_counter`` time) it returns False there if the
+        slot is later; the slot stays claimed for the next call."""
         with self._cond:
             if self.interval <= 0:
                 return True
@@ -202,6 +205,8 @@ class RateLimiter:
                 self._armed = True
             while self.interval > 0:
                 now = time.perf_counter()
+                if deadline is not None and now >= deadline:
+                    return False
                 delay = self._next - now
                 if delay <= 0:
                     if delay < -self.MAX_BACKLOG:
@@ -209,6 +214,8 @@ class RateLimiter:
                         # instead of bursting the whole backlog onto the wire
                         self._next = now
                     break
+                if deadline is not None:
+                    delay = min(delay, deadline - now)
                 if stop is None:
                     self._cond.wait(delay)
                 elif stop.is_set():
