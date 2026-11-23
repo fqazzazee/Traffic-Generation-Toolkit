@@ -111,6 +111,7 @@ class RunControl:
         self.injections: List[Injection] = []
         self.paused_total = 0.0
         self._paused_at: Optional[float] = None
+        self.live_rate: Optional[float] = None  # last set_rate; outlives phases
         self._pool = None               # injection pass builder (lazy)
 
     # -- pause / rate ----------------------------------------------------------
@@ -135,15 +136,18 @@ class RunControl:
     def set_rate(self, pps: float) -> None:
         """Re-pace a rate-limited run; ValueError when the run's pacing is
         not rate based (realtime replay, synthetic-clock pcap-only)."""
-        if pps < 0:
-            raise ValueError("rate must be >= 0")
+        from .sender import check_rate
+        check_rate(pps)
         eng = self.engine
         lim = getattr(eng, "limiter", None) if eng is not None else None
         if lim is None:
             raise ValueError("this run is not paced by --rate (realtime "
                              "replay or a synthetic-clock pcap-only run)")
+        # set before touching the limiter: a phase starting now either sees
+        # live_rate or has its new limiter updated here
+        self.live_rate = pps
         eng.cfg.rate = pps
-        lim.set_rate(pps)
+        eng.limiter.set_rate(pps)
 
     # -- injection -----------------------------------------------------------
     def inject(self, incident: str, duration: float = 60.0,

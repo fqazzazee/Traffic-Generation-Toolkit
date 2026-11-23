@@ -8594,6 +8594,413 @@ def test_review_injection_worker_ends_with_run() -> None:
           "injection worker outlived close() and clobbered the context")
 
 
+def _r22_cli(args: list, timeout: float = 20.0) -> tuple:
+    """Run ``python3 -m tgt`` -> (exit code, stdout + stderr)."""
+    import subprocess
+    p = subprocess.run([sys.executable, "-m", "tgt"] + args, cwd=_REPO,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True, timeout=timeout)
+    return p.returncode, p.stdout
+
+
+def _r22_plan(d: str, name: str = "plan.json", **kw) -> str:
+    """Write a small two-phase campaign plan; keyword args override keys."""
+    import json
+    doc = {"env": "it-org", "phases": [{"name": "a", "duration": 1},
+                                       {"name": "b", "duration": 1}]}
+    doc.update(kw)
+    path = os.path.join(d, name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    return path
+
+
+def test_r22_engine_crash_reports_failure() -> None:
+    """An exception in the engine thread is a failed run: counted, reported
+    and a non-zero exit, with no thread traceback."""
+    with tempfile.TemporaryDirectory() as d:
+        for extra in (["--pcap", os.path.join(d, "missing", "x.pcap")],
+                      ["--client-ip", "nope",
+                       "--pcap", os.path.join(d, "x.pcap")]):
+            rc, out = _r22_cli(["run", "-p", "modbus", "--count", "5",
+                                "--rate", "0"] + extra)
+            check(rc != 0, f"crashed run exited {rc}: {extra}")
+            check("Traceback" not in out, f"crash traceback: {extra}")
+            check("1 errors" in out and "last error:" in out,
+                  f"crash not reported: {extra}: {out[-200:]}")
+
+
+def test_r22_engine_once_rejected_with_timed() -> None:
+    """--once has no meaning on the timed schedule, which would otherwise
+    run (and write) forever."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        try:
+            rc, out = _r22_cli(["run", "-p", "modbus", "--schedule", "timed",
+                                "--clock", "synthetic", "--once",
+                                "--pcap", pcap], timeout=5)
+        except Exception as e:  # noqa: BLE001 - subprocess timeout
+            check(False, f"--once with timed did not exit: {type(e).__name__}")
+            return
+        check(rc == 2 and "--once" in out, f"--once timed: rc={rc}")
+        check(not os.path.exists(pcap), "--once timed wrote a pcap")
+
+
+def test_r22_engine_limiter_wakes_on_rate_change() -> None:
+    """A rate change wakes a blocked wait and recomputes its deadline."""
+    import threading
+    import time
+    from tgt.sender import RateLimiter
+    for new in (1000, 0):
+        for stop in (None, threading.Event()):
+            lim = RateLimiter(0.2)
+            done = []
+
+            def waiter():
+                lim.wait(stop)
+                done.append(time.perf_counter())
+            th = threading.Thread(target=waiter, daemon=True)
+            t0 = time.perf_counter()
+            th.start()
+            time.sleep(0.2)
+            lim.set_rate(new)
+            th.join(1.5)
+            took = done[0] - t0 if done else None
+            check(took is not None and took < 0.6,
+                  f"set_rate({new}) with stop={stop is not None}: {took}")
+            if not done:                # release the daemon thread
+                lim.set_rate(0)
+                th.join(6)
+    lim = RateLimiter(100)              # a rate decrease re-paces as well
+    lim.wait()
+    lim.set_rate(10)
+    t0 = time.perf_counter()
+    lim.wait()
+    took = time.perf_counter() - t0
+    check(0.07 <= took <= 0.3, f"slower rate waited {took:.3f}s")
+
+
+def test_r22_engine_rate_validated() -> None:
+    """The CLI and the limiter accept only a finite rate >= 0."""
+    from tgt.config import RunConfig as RC
+    from tgt.engine import Engine
+    from tgt.sender import RateLimiter
+    nan = float("nan")
+    for bad in (-5, nan, float("inf"), -float("inf")):
+        try:
+            RateLimiter(bad)
+            check(False, f"RateLimiter({bad}) accepted")
+        except ValueError:
+            pass
+        lim = RateLimiter(10)
+        try:
+            lim.set_rate(bad)
+            check(False, f"set_rate({bad}) accepted")
+        except ValueError:
+            check(lim.pps == 10 and lim.interval == 0.1,
+                  f"set_rate({bad}) changed the limiter")
+    check(RateLimiter(0).interval == 0, "rate 0 must mean unpaced")
+    eng = Engine(RC(profiles=["modbus"], rate=10))
+    eng.limiter = RateLimiter(10)
+    try:
+        eng.control.set_rate(nan)
+        check(False, "control accepted a NaN rate")
+    except ValueError:
+        check(eng.cfg.rate == 10, "a rejected rate changed cfg.rate")
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        plan = _r22_plan(d)
+        for val in ("-5", "nan", "inf"):
+            for cmd in (["run", "-p", "modbus", "--count", "1"],
+                        ["campaign", plan, "--force"]):
+                rc, out = _r22_cli(cmd + ["--rate=" + val, "--pcap", pcap])
+                check(rc == 2 and "--rate" in out,
+                      f"{cmd[0]} --rate {val}: rc={rc}")
+                check(not os.path.exists(pcap), f"--rate {val} wrote a pcap")
+
+
+def test_r22_engine_duration_bounds_slow_rate() -> None:
+    """--duration ends a slow run on time, without sending past it, and time
+    spent paused still does not count."""
+    import time
+    from tgt.engine import Engine
+    from tgt.sender import RateLimiter
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        eng = Engine(RunConfig(profiles=["modbus"], rate=0.2, duration=0.5,
+                               pcap_path=pcap))
+        t0 = time.perf_counter()
+        eng.start()
+        eng.join(4)
+        took = time.perf_counter() - t0
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive and took < 1.5, f"--duration 0.5 took {took:.2f}s")
+        check(eng.stats.packets == 0,
+              f"sent {eng.stats.packets} frames past the deadline")
+
+        eng = Engine(RunConfig(profiles=["modbus"], rate=0.2, duration=0.6,
+                               pcap_path=pcap))
+        eng.start()
+        time.sleep(0.1)
+        eng.control.pause()
+        time.sleep(0.8)
+        check(eng.is_alive(), "a pause counted toward --duration")
+        eng.control.resume()
+        eng.join(3)
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive, "run did not end after the pause")
+
+        # timed: a cap below the schedule cannot stretch the phase
+        eng = Engine(RunConfig(profiles=["modbus"], schedule="timed", rate=0.2,
+                               duration=0.5, seed=1, pcap_path=pcap))
+        t0 = time.perf_counter()
+        eng.start()
+        eng.join(4)
+        took = time.perf_counter() - t0
+        alive = eng.is_alive()
+        eng.stop()
+        eng.join(6)
+        check(not alive and took < 1.5, f"timed cap overran: {took:.2f}s")
+
+    lim = RateLimiter(0.2)
+    t0 = time.perf_counter()
+    ok = lim.wait(deadline=t0 + 0.1)
+    took = time.perf_counter() - t0
+    check(ok is False and 0.08 <= took < 0.5,
+          f"limiter deadline: {ok} after {took:.3f}s")
+
+
+def test_r22_engine_campaign_rate_caps() -> None:
+    """The lower of the plan and operator caps applies, and a live rate
+    change survives the next phase."""
+    import time
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        plan = _r22_plan(d, rate=2000)
+        pcap = os.path.join(d, "cap.pcap")
+        rc, out = _r22_cli(["campaign", plan, "--pcap", pcap, "--rate", "2",
+                            "--force"], timeout=20)
+        n = len(_pcap_records(pcap))
+        check(rc == 0 and n <= 6, f"campaign --rate 2: rc={rc}, {n} packets")
+
+        for plan_rate, op, want in ((2000, 50, 50), (40, 1000, 40),
+                                    (0, 30, 30), (30, 0, 30)):
+            path = _r22_plan(d, "p.json", rate=plan_rate)
+            eng = Engine(RunConfig(env="it-org", schedule="timed", rate=op,
+                                   campaign=path, seed=1, pcap_path=pcap))
+            eng.start()
+            end = time.monotonic() + 3
+            while eng.limiter is None and time.monotonic() < end:
+                time.sleep(0.01)
+            got = eng.limiter.pps if eng.limiter else None
+            eng.stop()
+            eng.join(5)
+            check(got == want, f"cap plan={plan_rate} op={op}: {got}")
+
+        # a live change, up or down, holds through the next phase
+        for live in (500.0, 5.0):
+            path = _r22_plan(d, "p.json", rate=40)
+            eng = Engine(RunConfig(env="it-org", schedule="timed", rate=0,
+                                   campaign=path, seed=1, pcap_path=pcap))
+            eng.start()
+            end = time.monotonic() + 3
+            while eng.limiter is None and time.monotonic() < end:
+                time.sleep(0.01)
+            eng.control.set_rate(live)
+            end = time.monotonic() + 4
+            while eng.stats.cycles < 2 and eng.is_alive() \
+                    and time.monotonic() < end:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            got = eng.limiter.pps if eng.limiter else None
+            phase = eng.stats.cycles
+            eng.stop()
+            eng.join(5)
+            check(phase == 2 and got == live,
+                  f"live rate {live} in phase {phase}: limiter {got}")
+
+
+def test_r22_engine_synthetic_follows_live_rate() -> None:
+    """Synthetic timestamps use the rate in force when each frame leaves."""
+    import threading
+    import time
+    from tgt import engine as E
+
+    class Sink:
+        counters: dict = {}
+        open_errors = ()
+
+        def __init__(self, iface):
+            pass
+
+        def open(self):
+            pass
+
+        def send(self, frame):
+            return len(frame)
+
+        def close(self):
+            pass
+
+    real, E.RawSender = E.RawSender, Sink
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            pcap = os.path.join(d, "x.pcap")
+            eng = E.Engine(RunConfig(
+                profiles=["modbus"], iface="fake0", rate=200, count=30,
+                clock="synthetic", start_time="2026-01-01T00:00:00Z",
+                pcap_path=pcap))
+
+            def retune():
+                end = time.monotonic() + 3
+                while eng.stats.packets < 10 and time.monotonic() < end:
+                    time.sleep(0.001)
+                eng.control.set_rate(50)
+            th = threading.Thread(target=retune)
+            eng.start()
+            th.start()
+            eng.join(5)
+            th.join(4)
+            ts = [r[0] for r in _pcap_records(pcap)]
+            gaps = [b - a for a, b in zip(ts, ts[1:])]
+            check(len(ts) == 30, f"synthetic live rate: {len(ts)} frames")
+            check(gaps and abs(gaps[0] - 0.005) < 1e-4
+                  and abs(gaps[-1] - 0.02) < 1e-4,
+                  f"synthetic gaps {gaps[:1]} .. {gaps[-1:]}")
+            check(all(g > 0 for g in gaps), "synthetic time went backwards")
+    finally:
+        E.RawSender = real
+
+
+def test_r22_engine_synthetic_clock_range() -> None:
+    """A synthetic clock outside classic pcap's range fails before the run."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        for start, extra in (("2200-01-01T00:00:00Z", ["--count", "3"]),
+                             ("1969-12-31T23:59:59Z", ["--count", "3"]),
+                             ("2106-02-07T06:28:00Z", ["--duration", "1h"]),
+                             ("2106-02-07T06:28:15Z", ["--count", "5"])):
+            rc, out = _r22_cli(["run", "-p", "modbus", "--clock", "synthetic",
+                                "--start-time", start, "--rate", "1",
+                                "--pcap", pcap] + extra)
+            check(rc == 2 and "start-time" in out and "pcap" in out,
+                  f"{start} {extra}: rc={rc}")
+            check(not os.path.exists(pcap), f"{start}: wrote a pcap")
+        for start in ("1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z"):
+            rc, _ = _r22_cli(["run", "-p", "modbus", "--clock", "synthetic",
+                              "--start-time", start, "--rate", "0",
+                              "--count", "3", "--pcap", pcap])
+            check(rc == 0 and len(_pcap_records(pcap)) == 3,
+                  f"valid start {start}: rc={rc}")
+        plan = _r22_plan(d, start_time="2106-02-07T06:28:15Z")
+        rc, out = _r22_cli(["campaign", plan, "--clock", "synthetic",
+                            "--force", "--pcap", os.path.join(d, "c.pcap")])
+        check(rc == 2 and "start-time" in out, f"campaign span: rc={rc}")
+        check(not os.path.exists(os.path.join(d, "c.pcap")),
+              "out-of-range campaign wrote a pcap")
+
+
+def test_r22_engine_plan_rate_validated() -> None:
+    """Plan and phase rates must be finite, non-negative numbers."""
+    from tgt import campaign
+
+    def doc(plan=None, phase=None):
+        p = {"name": "a", "duration": 1}
+        if phase is not None:
+            p["rate"] = phase
+        d = {"env": "it-org", "phases": [p]}
+        if plan is not None:
+            d["rate"] = plan
+        return d
+    for bad in ("fast", -1, float("nan"), float("inf"), True, [5]):
+        for kw in ({"plan": bad}, {"phase": bad}):
+            try:
+                campaign.Plan(doc(**kw))
+                check(False, f"plan accepted rate {kw}")
+            except campaign.CampaignError as e:
+                check("rate" in str(e), f"rate error unclear: {e}")
+    for good in (0, 2, 2.5):
+        campaign.Plan(doc(plan=good, phase=good))
+    with tempfile.TemporaryDirectory() as d:
+        path = _r22_plan(d, rate="fast")
+        rc, out = _r22_cli(["campaign", path, "--force", "--pcap",
+                            os.path.join(d, "x.pcap")])
+        check(rc == 2 and "rate" in out, f"bad plan rate: rc={rc}")
+
+
+def test_r22_engine_plan_utc_offset_zero() -> None:
+    """A plan's utc_offset 0 overrides an environment default."""
+    from tgt import campaign, enterprise
+    env = enterprise.get("it-org")
+    had = "utc_offset" in env.options
+    old = env.options.get("utc_offset")
+    env.options["utc_offset"] = 5.0
+    try:
+        for doc_extra, want in (({"utc_offset": 0}, 0.0),
+                                ({"utc_offset": 3}, 3.0), ({}, 5.0)):
+            doc = dict({"env": "it-org",
+                        "phases": [{"name": "a", "duration": 1}]}, **doc_extra)
+            got = campaign.build(campaign.Plan(doc))[0].utc_offset
+            check(got == want, f"utc_offset {doc_extra}: {got}, want {want}")
+    finally:
+        if had:
+            env.options["utc_offset"] = old
+        else:
+            del env.options["utc_offset"]
+
+
+def test_r22_engine_slow_cap_spans_short_phases() -> None:
+    """A cap slower than one phase still sends: pacing carries across phase
+    boundaries, including when the phases have different rates."""
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        plan = os.path.join(d, "short.json")
+        with open(plan, "w") as f:
+            json.dump({"env": "ot-plant", "phases": [
+                {"name": f"p{i}", "duration": 0.5,
+                 "rate": 1.0 if i % 2 else 0.9} for i in range(6)]}, f)
+        pcap = os.path.join(d, "short.pcap")
+        rc, out = _r22_cli(["campaign", plan, "--pcap", pcap, "--force"],
+                           timeout=20)
+        n = len(_pcap_records(pcap))
+        check(rc == 0 and 2 <= n <= 4,
+              f"1 pps cap over 6 x 0.5 s phases: rc={rc}, {n} packets")
+
+
+def test_r22_engine_check_rate_huge_int() -> None:
+    """An integer too large for a float is a ValueError like any bad rate."""
+    from tgt.sender import RateLimiter, check_rate
+    for call in (check_rate, RateLimiter, RateLimiter(1).set_rate):
+        try:
+            call(10 ** 400)
+            check(False, f"{call}: accepted 10**400")
+        except ValueError:
+            pass
+
+
+def test_r22_engine_once_past_clock_range() -> None:
+    """--once whose frames would pass 2106 fails with the clock error, before
+    any frame is written; the same cycle that fits still runs."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "once.pcap")
+        args = ["run", "-p", "modbus", "--clock", "synthetic", "--once",
+                "--pcap", pcap, "--start-time", "2106-02-07T06:28:14Z"]
+        rc, out = _r22_cli(args + ["--rate", "1"])
+        check(rc != 0 and "classic pcap range" in out,
+              f"--once past 2106: rc={rc}")
+        check(not _pcap_records(pcap), "--once past 2106 wrote frames")
+        rc, _ = _r22_cli(args + ["--rate", "1", "--count", "2"])
+        check(rc == 0 and len(_pcap_records(pcap)) == 2,
+              f"--once bounded by --count inside the range: rc={rc}")
+        rc, _ = _r22_cli(args + ["--rate", "0"])
+        check(rc == 0 and len(_pcap_records(pcap)) > 2,
+              f"--once inside the range: rc={rc}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

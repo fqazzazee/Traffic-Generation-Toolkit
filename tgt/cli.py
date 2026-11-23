@@ -285,6 +285,8 @@ def cmd_run(args) -> int:
             print(f"unknown protocol: {e}. Try 'tgt list'.", file=sys.stderr)
             return 2
 
+    if _bad_rate(args.rate):
+        return 2
     schedule = getattr(args, "schedule", "cycle") or "cycle"
     rate = args.rate
     if rate is None:            # timed: the schedule paces, no cap by default
@@ -327,6 +329,10 @@ def cmd_run(args) -> int:
               "capture's own timing (use --replay-realtime).",
               file=sys.stderr)
         return 2
+    if schedule == "timed" and args.once:
+        print("--once needs --schedule cycle: a timed run has no cycles; "
+              "bound it with --duration or --count.", file=sys.stderr)
+        return 2
     if replay:
         from .replay import rewriter_for
         from .rewrite import RewriteError
@@ -354,6 +360,17 @@ def cmd_run(args) -> int:
     return _run_engine(cfg, args)
 
 
+def _bad_rate(rate) -> bool:
+    """Report a --rate that is not a finite number >= 0."""
+    from .sender import check_rate
+    try:
+        check_rate(rate)
+    except ValueError as e:
+        print(f"--rate: {e}", file=sys.stderr)
+        return True
+    return False
+
+
 def _run_engine(cfg: RunConfig, args) -> int:
     """Validate the output/clock options of ``cfg``, run the engine to the
     end (Ctrl-C / SIGTERM stop it cleanly) and print the summary."""
@@ -369,6 +386,11 @@ def _run_engine(cfg: RunConfig, args) -> int:
             print(f"bad --start-time {cfg.start_time!r}: use ISO-8601, e.g. "
                   "2026-11-05T14:00:00Z", file=sys.stderr)
             return 2
+    from .engine import synthetic_range_error
+    bad_clock = synthetic_range_error(cfg)
+    if bad_clock:
+        print(bad_clock, file=sys.stderr)
+        return 2
     if cfg.seed is None:                # chosen now so it is printed + logged
         from .engine import new_seed
         cfg.seed = new_seed()
@@ -569,6 +591,8 @@ def cmd_campaign(args) -> int:
             except campaign.CampaignError as e:
                 print(f"  {os.path.basename(p):32} (invalid: {e})")
         return 0 if args.list else 2
+    if _bad_rate(args.rate):
+        return 2
     path = campaign.find(args.plan)
     try:
         plan = campaign.load(path)
