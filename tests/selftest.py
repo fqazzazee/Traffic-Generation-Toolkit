@@ -8715,6 +8715,42 @@ def test_r22_control_rate_must_be_finite() -> None:
             srv.close()
 
 
+def test_r22_control_client_non_http_is_api_error() -> None:
+    """A port that does not speak the API gives ApiError (a clean tgt ctl
+    message), not a traceback."""
+    import socket
+    import threading
+    from tgt import api
+    replies = (b"SSH-2.0-x\r\n",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nnot json!",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n[1]",
+               b"HTTP/1.1 500 Oops\r\nContent-Length: 3\r\n\r\n[1]",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n\xff\xfe")
+    for reply in replies:
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+
+        def serve():
+            c, _ = ls.accept()
+            c.recv(4096)
+            c.sendall(reply)
+            c.close()
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            code, doc = api.request(f"127.0.0.1:{ls.getsockname()[1]}", "GET",
+                                    "/status", timeout=3)
+            check(code >= 400 and isinstance(doc, dict),
+                  f"ctl accepted {reply[:20]!r}: {code} {doc!r}")
+        except api.ApiError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            check(False, f"ctl raised {type(e).__name__} on {reply[:20]!r}")
+        t.join(3)
+        ls.close()
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

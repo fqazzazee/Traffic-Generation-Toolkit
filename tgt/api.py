@@ -348,6 +348,7 @@ def request(api: str, method: str, path: str,
             timeout: float = 10.0) -> Tuple[int, Dict]:
     """Call the control API at ``api`` ([HOST:]PORT or a URL); returns
     (HTTP status, JSON reply). Raises ApiError when it cannot connect."""
+    import http.client
     import urllib.error
     import urllib.request
     from urllib.parse import urlencode
@@ -376,13 +377,20 @@ def request(api: str, method: str, path: str,
         # never via http_proxy: the call and its bearer token stay direct
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode() or "{}")
+            doc = json.loads(r.read().decode() or "{}")
+            if not isinstance(doc, dict):
+                raise ValueError("reply is not a JSON object")
+            return r.status, doc
     except urllib.error.HTTPError as e:
         try:
             doc = json.loads(e.read().decode() or "{}")
-        except ValueError:
+        except (ValueError, http.client.HTTPException, OSError):
+            doc = None
+        if not isinstance(doc, dict):
             doc = {"ok": False, "error": str(e)}
         return e.code, doc
+    except (http.client.HTTPException, ValueError) as e:
+        raise ApiError(f"{base} did not answer as the control API: {e}")
     except (urllib.error.URLError, OSError) as e:
         raise ApiError(f"cannot reach the control API at {base}: "
                        f"{getattr(e, 'reason', e)}")
