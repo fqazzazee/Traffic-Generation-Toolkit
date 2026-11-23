@@ -286,11 +286,19 @@ daemon_running() {
 # picks /tmp even though a root daemon used /run and /var/log. Search both.
 find_daemon_files() {
     chosen=$PID_FILE
+    live=""
     for f in /run/tgt.pid /tmp/tgt.pid; do
         PID_FILE=$f
-        if daemon_running; then chosen=$f; break; fi
+        if daemon_running; then chosen=$f; live=$f; break; fi
     done
     PID_FILE=$chosen
+    # A live daemon's log sits with its PID file, whatever else is newer.
+    case "$live" in
+        /run/tgt.pid) f=/var/log/tgt.log ;;
+        /tmp/tgt.pid) f=/tmp/tgt.log ;;
+        *) f="" ;;
+    esac
+    if [ -n "$f" ] && [ -r "$f" ]; then LOG_FILE=$f; return 0; fi
     for f in /var/log/tgt.log /tmp/tgt.log; do
         [ -r "$f" ] || continue
         if [ ! -r "$LOG_FILE" ] || [ -n "$(find "$f" -newer "$LOG_FILE" 2>/dev/null)" ]; then

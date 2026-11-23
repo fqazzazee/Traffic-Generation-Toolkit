@@ -8986,6 +8986,25 @@ def test_r22_ops_preflight_checks_installed_unit_python() -> None:
               f"start with access: rc={rc} {out}")
 
 
+def test_r22_ops_logs_follow_live_daemon() -> None:
+    """logs reads the live daemon's log even when the other location holds
+    a newer, unrelated file."""
+    for pid_dir, log_rel, other_rel in (("run", "var/log/tgt.log", "tmp/tgt.log"),
+                                        ("tmp", "tmp/tgt.log", "var/log/tgt.log")):
+        with tempfile.TemporaryDirectory() as d:
+            box = _r22_ops_sandbox(d, systemd=False)
+            with open(os.path.join(box["root"], pid_dir, "tgt.pid"), "w") as fh:
+                fh.write(f"{os.getpid()}\n")
+            log, other = (os.path.join(box["root"], r) for r in (log_rel, other_rel))
+            for path in (log, other):
+                with open(path, "w") as fh:
+                    fh.write("line\n")
+            os.utime(log, (1000, 1000))
+            rc, out, _ = _r22_ops_run(box, "logs")
+            check(rc == 0 and log in out and other not in out,
+                  f"logs with a live {pid_dir} daemon: rc={rc} {out}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
