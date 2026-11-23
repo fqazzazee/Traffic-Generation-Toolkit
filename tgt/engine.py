@@ -543,9 +543,16 @@ class Engine:
                 # included), like end_phase
                 recorder.begin_phase(ph, ts_of(t) if synthetic or not pace
                                      else time.time())
-            cap = ph.rate if ph.rate is not None else cfg.rate
-            limiter = RateLimiter(cap if pace and cap and cap > 0 else 0)
+            # the lower of the plan's and the operator's caps (0 = none),
+            # unless a live /rate change replaced them
+            live = self.control.live_rate
+            cap = live if live is not None else min(
+                [c for c in (ph.rate, cfg.rate) if c], default=0)
+            limiter = RateLimiter(cap if pace else 0)
             self.limiter = limiter if pace else None     # /rate adjusts it
+            live = self.control.live_rate    # changed while this phase set up
+            if pace and live is not None and live != limiter.pps:
+                limiter.set_rate(live)
             # a plain timed run's --duration is its one phase's duration
             # (campaign.phases_for)
             t_end = t + ph.duration if ph.duration else float("inf")

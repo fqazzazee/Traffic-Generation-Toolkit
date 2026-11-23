@@ -111,6 +111,7 @@ class RunControl:
         self.injections: List[Injection] = []
         self.paused_total = 0.0
         self._paused_at: Optional[float] = None
+        self.live_rate: Optional[float] = None  # last set_rate; outlives phases
         self._pool = None               # injection pass builder (lazy)
 
     # -- pause / rate ----------------------------------------------------------
@@ -142,8 +143,11 @@ class RunControl:
         if lim is None:
             raise ValueError("this run is not paced by --rate (realtime "
                              "replay or a synthetic-clock pcap-only run)")
+        # set before touching the limiter: a phase starting now either sees
+        # live_rate or has its new limiter updated here
+        self.live_rate = pps
         eng.cfg.rate = pps
-        lim.set_rate(pps)
+        eng.limiter.set_rate(pps)
 
     # -- injection -----------------------------------------------------------
     def inject(self, incident: str, duration: float = 60.0,

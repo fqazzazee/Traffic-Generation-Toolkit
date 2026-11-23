@@ -8774,6 +8774,56 @@ def test_r22_engine_duration_bounds_slow_rate() -> None:
           f"limiter deadline: {ok} after {took:.3f}s")
 
 
+def test_r22_engine_campaign_rate_caps() -> None:
+    """The lower of the plan and operator caps applies, and a live rate
+    change survives the next phase."""
+    import time
+    from tgt.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        plan = _r22_plan(d, rate=2000)
+        pcap = os.path.join(d, "cap.pcap")
+        rc, out = _r22_cli(["campaign", plan, "--pcap", pcap, "--rate", "2",
+                            "--force"], timeout=20)
+        n = len(_pcap_records(pcap))
+        check(rc == 0 and n <= 6, f"campaign --rate 2: rc={rc}, {n} packets")
+
+        for plan_rate, op, want in ((2000, 50, 50), (40, 1000, 40),
+                                    (0, 30, 30), (30, 0, 30)):
+            path = _r22_plan(d, "p.json", rate=plan_rate)
+            eng = Engine(RunConfig(env="it-org", schedule="timed", rate=op,
+                                   campaign=path, seed=1, pcap_path=pcap))
+            eng.start()
+            end = time.monotonic() + 3
+            while eng.limiter is None and time.monotonic() < end:
+                time.sleep(0.01)
+            got = eng.limiter.pps if eng.limiter else None
+            eng.stop()
+            eng.join(5)
+            check(got == want, f"cap plan={plan_rate} op={op}: {got}")
+
+        # a live change, up or down, holds through the next phase
+        for live in (500.0, 5.0):
+            path = _r22_plan(d, "p.json", rate=40)
+            eng = Engine(RunConfig(env="it-org", schedule="timed", rate=0,
+                                   campaign=path, seed=1, pcap_path=pcap))
+            eng.start()
+            end = time.monotonic() + 3
+            while eng.limiter is None and time.monotonic() < end:
+                time.sleep(0.01)
+            eng.control.set_rate(live)
+            end = time.monotonic() + 4
+            while eng.stats.cycles < 2 and eng.is_alive() \
+                    and time.monotonic() < end:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            got = eng.limiter.pps if eng.limiter else None
+            phase = eng.stats.cycles
+            eng.stop()
+            eng.join(5)
+            check(phase == 2 and got == live,
+                  f"live rate {live} in phase {phase}: limiter {got}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
