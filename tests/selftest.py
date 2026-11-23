@@ -8944,6 +8944,29 @@ def test_r22_control_client_deep_json_is_api_error() -> None:
         ls.close()
 
 
+def test_r22_control_tagged_l2_builders_reject_bad_vlan() -> None:
+    """The PCP-tagging builders refuse a bad VLAN id instead of masking it,
+    and keep valid ids intact."""
+    from tgt import protocols_ind, remapenv
+    mac = "02:00:00:00:00:01"
+    raw = P.mac_to_bytes(mac)
+    builders = (
+        ("ind _l2", lambda v: protocols_ind._l2(mac, mac, 0x8892, b"x",
+                                                vlan=v, pcp=6), 0xC000),
+        ("remapenv _l2", lambda v: remapenv._l2(raw, raw, v, 0x2000, 0x0800,
+                                                b"x"), 0x2000))
+    for name, fn, prio in builders:
+        for vid in (5000, 4096, -1):
+            try:
+                fn(vid)
+                check(False, f"{name} accepted VLAN {vid}")
+            except ValueError:
+                pass
+        for vid in (1, 4095):
+            tci = struct.unpack("!H", fn(vid)[14:16])[0]
+            check(tci == prio | vid, f"{name} VLAN {vid}: TCI {tci:#x}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
