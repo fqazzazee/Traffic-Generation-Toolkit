@@ -10433,6 +10433,7 @@ def test_r22_edr_env_block() -> None:
         (dict(_EDR_CUSTOM, ips=["1.2.3"]), "edr.ips[0]"),
         (dict(_EDR_CUSTOM, ips=["224.0.0.5"]), "edr.ips[0]"),
         (dict(_EDR_CUSTOM, ips=[base.hosts[0].ip]), "edr.ips"),
+        (dict(_EDR_CUSTOM, ips=["198.51.100.20"]), "edr.ips"),   # incident C2
         (dict(_EDR_CUSTOM, fqdns={"sensor": "s.acme.example"}), "edr.fqdns"),
         (dict(_EDR_CUSTOM, fqdns=dict(_EDR_CUSTOM["fqdns"], api="no spaces")),
          "edr.fqdns.api"),

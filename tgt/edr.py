@@ -274,7 +274,14 @@ def check(env, setup: Setup) -> None:
             not any(h.name == setup.proxy for h in env.hosts):
         raise EdrError("proxy", f"no host named {setup.proxy!r} in "
                        f"environment {env.key}")
-    taken = {h.ip: h.name for h in list(env.hosts) + list(env.external)}
+    from .incidents import INCIDENTS
+    # an attack's address never doubles as an EDR endpoint: its traffic would
+    # read as EDR in the ground truth
+    taken = {h.ip: f"incident {i.key}" for i in INCIDENTS.values()
+             for h in i.hosts}
+    taken.update({s.nat["outside_ip"]: f"the NAT of {s.name}"
+                  for s in env.segments if s.nat})
+    taken.update({h.ip: h.name for h in list(env.hosts) + list(env.external)})
     path = "ips" if setup.profile.key == "custom" else "region"
     for ip in setup.region.ips:
         if ip in taken:

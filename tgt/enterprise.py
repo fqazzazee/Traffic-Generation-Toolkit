@@ -1113,6 +1113,7 @@ class Environment:
         used = {proto for _, _, proto in self.conversations}
         if self.edr_hosts():
             used.add("edr")
+        used.update(leg[2] for leg in _edr.legs(self))  # lookups it adds
         if self.arp_enabled and self.hosts:
             used.add("arp")
         return [k for k in protocols.PROFILES if k in used]
