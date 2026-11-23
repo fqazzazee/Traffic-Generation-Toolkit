@@ -65,6 +65,87 @@ preflight_check() {
     fi
 }
 
+# The unit runs as root with only CAP_NET_ADMIN and CAP_NET_RAW, so unlike this
+# script it is bound by ordinary file permissions. Run a command the same way.
+as_service() {
+    setpriv --reuid=0 --regid=0 --clear-groups \
+        --inh-caps=-all,+net_admin,+net_raw \
+        --ambient-caps=-all,+net_admin,+net_raw \
+        --bounding-set=-all,+net_admin,+net_raw "$@"
+}
+
+# Can the service do this? $1: r (read), x (enter a directory), e (execute).
+# Uses real opens under setpriv, else the mode bits as root without DAC caps
+# (the fallback cannot see ACLs).
+service_can() {
+    if [ "$SERVICE_PROBE" = setpriv ]; then
+        # shellcheck disable=SC2016  # $1 expands in the inner shell
+        case "$1" in
+            r) as_service /bin/sh -c ': < "$1"' sh "$2" ;;
+            x) as_service /bin/sh -c 'cd -- "$1"' sh "$2" ;;
+            e) as_service "$2" -c '' ;;
+        esac >/dev/null 2>&1
+        return
+    fi
+    mode_info=$(stat -Lc '%u %g %a' "$2" 2>/dev/null) || return 1
+    # shellcheck disable=SC2086
+    set -- "$1" $mode_info
+    case "$1" in r) want=4 ;; *) want=1 ;; esac
+    if [ "$2" -eq 0 ]; then bits=6; elif [ "$3" -eq 0 ]; then bits=3; else bits=0; fi
+    [ $(( (0$4 >> bits) & want )) -ne 0 ]
+}
+
+# Print the first component of path $2 the service cannot reach, if any.
+service_blocked() {
+    walked=""
+    rest=${2#/}
+    while [ "$rest" != "${rest#*/}" ]; do
+        walked="$walked/${rest%%/*}"
+        rest=${rest#*/}
+        service_can x "$walked" || { printf '%s\n' "$walked"; return 0; }
+    done
+    service_can "$1" "$2" || printf '%s\n' "$2"
+}
+
+# Fail before systemd does when the service could not read the checkout $1,
+# the config, or run the interpreter $2 (optional).
+service_preflight() {
+    if command -v setpriv >/dev/null 2>&1 && as_service /bin/sh -c : >/dev/null 2>&1; then
+        SERVICE_PROBE=setpriv
+    elif command -v stat >/dev/null 2>&1; then
+        SERVICE_PROBE=stat
+    else
+        return 0
+    fi
+    blocked=$(service_blocked x "$1")
+    [ -n "$blocked" ] || blocked=$(service_blocked r "$1")
+    if [ -z "$blocked" ]; then
+        real_root=$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")
+        blocked=$(service_blocked x "$real_root")
+    fi
+    if [ -z "$blocked" ]; then
+        blocked=$(find "$1/tgt" -name __pycache__ -prune -o \
+                \( -type d -o -name '*.py' -o -name '*.json' -o -name '*.toml' \) -print |
+            while IFS= read -r f; do
+                if [ -d "$f" ] && ! service_can x "$f"; then printf '%s\n' "$f"; break; fi
+                if ! service_can r "$f"; then printf '%s\n' "$f"; break; fi
+            done)
+    fi
+    if [ -z "$blocked" ] && [ -f "$CONF_FILE" ]; then
+        blocked=$(service_blocked r "$CONF_FILE")
+    fi
+    if [ -z "$blocked" ] && [ -n "${2:-}" ]; then
+        blocked=$(service_blocked e "$2")
+    fi
+    [ -z "$blocked" ] || die "the tgt service cannot access $blocked: it runs as root without CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH, so normal file permissions apply. Move the checkout somewhere world-readable such as /opt/tgt, or grant access (a parent directory: chmod o+x; inside the checkout: chmod -R o+rX), then retry."
+}
+
+# The checkout an installed unit runs from, which may not be this one.
+unit_repo_root() {
+    unit_root=$(sed -n 's/^Environment=PYTHONPATH=//p' "$UNIT_FILE" | head -n 1)
+    printf '%s\n' "${unit_root:-$REPO_ROOT}"
+}
+
 # --- dependency install -----------------------------------------------------
 detect_pm() {
     for pm in apt-get dnf yum apk pacman zypper; do
@@ -257,6 +338,7 @@ cmd_register() {
     preflight_check
     write_default_config
     if have_systemd; then
+        service_preflight "$REPO_ROOT" "$PY"
         write_unit
         systemctl daemon-reload
         systemctl enable tgt.service >/dev/null 2>&1 || true
@@ -278,6 +360,7 @@ cmd_start() {
         cmd_register
     fi
     if use_systemd; then
+        service_preflight "$(unit_repo_root)"
         systemctl start tgt.service && ok "service started"
     else
         daemon_start
@@ -296,6 +379,7 @@ cmd_stop() {
 cmd_restart() {
     need_root
     if use_systemd; then
+        service_preflight "$(unit_repo_root)"
         systemctl restart tgt.service && ok "service restarted"
     else
         daemon_stop; cmd_start

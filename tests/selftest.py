@@ -8828,6 +8828,55 @@ def test_r22_ops_service_uses_same_mode_as_tgtctl() -> None:
             service.PID_PATHS = saved_paths
 
 
+def test_r22_ops_preflight_uses_service_capabilities() -> None:
+    """register fails before writing a unit when the service, which has no
+    DAC capabilities, cannot read the checkout; the message names the path
+    and the remedy, and the unit's capabilities stay narrow."""
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        denied = os.path.join(box["repo"], "tgt")
+        rc, out, calls = _r22_ops_run(box, "register", STUB_DENY=denied)
+        check(rc != 0 and denied in out and "/opt" in out and
+              "CAP_DAC" in out, f"preflight message: rc={rc} {out}")
+        check(not os.path.exists(box["unit"]) and "systemctl" not in calls,
+              f"unit written despite failed preflight: {calls}")
+        rc, out, _ = _r22_ops_run(box, "register")
+        check(rc == 0 and os.path.exists(box["unit"]),
+              f"register with access: rc={rc} {out}")
+        with open(box["unit"]) as fh:
+            unit = fh.read()
+        check("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\n" in unit and
+              "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\n" in unit,
+              "service capabilities changed")
+        rc, out, calls = _r22_ops_run(box, "start", STUB_DENY=denied)
+        check(rc != 0 and denied in out and
+              "systemctl start" not in calls,
+              f"start with an unreadable checkout: rc={rc} {out}")
+    with tempfile.TemporaryDirectory() as d:     # daemon mode keeps full root
+        box = _r22_ops_sandbox(d, systemd=False)
+        rc, out, _ = _r22_ops_run(box, "register",
+                                  STUB_DENY=os.path.join(box["repo"], "tgt"))
+        check(rc == 0, f"daemon-mode register blocked: rc={rc} {out}")
+
+
+def test_r22_ops_preflight_walks_permissions_without_setpriv() -> None:
+    """When setpriv cannot run, mode bits decide what root without
+    CAP_DAC_* could read."""
+    base = "/dev/shm" if os.access("/dev/shm", os.W_OK) else "/tmp"
+    with tempfile.TemporaryDirectory(dir=base) as d:
+        os.chmod(d, 0o755)
+        box = _r22_ops_sandbox(d)
+        rc, out, _ = _r22_ops_run(box, "register", STUB_SETPRIV_FAIL="1")
+        check(rc == 0, f"walk rejected a readable checkout: rc={rc} {out}")
+        os.unlink(box["unit"])
+        secret = os.path.join(box["repo"], "tgt", "data.json")
+        open(secret, "w").close()
+        os.chmod(secret, 0)
+        rc, out, _ = _r22_ops_run(box, "register", STUB_SETPRIV_FAIL="1")
+        check(rc != 0 and secret in out and not os.path.exists(box["unit"]),
+              f"walk missed an unreadable file: rc={rc} {out}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
