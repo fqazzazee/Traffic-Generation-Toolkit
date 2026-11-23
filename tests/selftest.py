@@ -8877,6 +8877,36 @@ def test_r22_ops_preflight_walks_permissions_without_setpriv() -> None:
               f"walk missed an unreadable file: rc={rc} {out}")
 
 
+def test_r22_ops_entrypoint_splits_interfaces() -> None:
+    """docker-entrypoint.sh creates one veth pair per comma-separated name
+    and leaves an existing interface alone."""
+    import stat
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d, systemd=False)
+        py = os.path.join(box["bin"], "python3")
+        with open(py, "w") as fh:
+            fh.write('#!/bin/sh\necho "python3 $*"\n')
+        os.chmod(py, os.stat(py).st_mode | stat.S_IXUSR)
+        open(os.path.join(box["links"], "tgt2"), "w").close()
+        r = subprocess.run(
+            ["sh", os.path.join(_REPO, "docker-entrypoint.sh"), "list"],
+            env=dict(box["env"], TGT_IFACE="tgt0,tgt1,tgt2"),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, timeout=10)
+        with open(box["log"]) as fh:
+            calls = fh.read()
+        for name in ("tgt0", "tgt1"):
+            check(f"ip link add {name} type veth peer name {name}-mon" in calls
+                  and f"ip link set {name} up" in calls
+                  and f"ip link set {name}-mon up" in calls,
+                  f"entrypoint: no pair for {name}: {calls}")
+        check("link add tgt2" not in calls and "tgt0,tgt1" not in calls,
+              f"entrypoint: wrong interface handling: {calls}")
+        check(r.returncode == 0 and "python3 -m tgt list" in r.stdout,
+              f"entrypoint: no hand-off: {r.stdout}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
