@@ -399,6 +399,8 @@ class Engine:
                          f"{time.perf_counter() - tb:.2f}s (seed {seed})")
             self.stats.cycle_frames = len(batch)
 
+            # synthetic time: frames since the last rate change, at its step
+            mark_ts, mark_n, cur_step = t0, 0, step
             cycle = 0
             while not self._stop.is_set():
                 self.stats.cycles = cycle + 1
@@ -437,8 +439,18 @@ class Engine:
                     # only frames that really left (or are file-only) count and
                     # land in the pcap, so the pcap stays ground truth
                     if sent:
-                        ts = (t0 + self.stats.packets * step if synthetic
-                              else time.time())
+                        if synthetic:
+                            live = self.limiter
+                            now_step = (live.interval if live is not None
+                                        else step) or 0.001
+                            if now_step != cur_step:
+                                mark_ts += (self.stats.packets - mark_n
+                                            ) * cur_step
+                                mark_n, cur_step = self.stats.packets, now_step
+                            ts = mark_ts + (self.stats.packets - mark_n
+                                            ) * cur_step
+                        else:
+                            ts = time.time()
                         if pcap is not None:
                             pcap.write(frame, ts=ts)
                         if recorder is not None:

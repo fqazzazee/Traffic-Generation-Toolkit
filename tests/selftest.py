@@ -8824,6 +8824,58 @@ def test_r22_engine_campaign_rate_caps() -> None:
                   f"live rate {live} in phase {phase}: limiter {got}")
 
 
+def test_r22_engine_synthetic_follows_live_rate() -> None:
+    """Synthetic timestamps use the rate in force when each frame leaves."""
+    import threading
+    import time
+    from tgt import engine as E
+
+    class Sink:
+        counters: dict = {}
+        open_errors = ()
+
+        def __init__(self, iface):
+            pass
+
+        def open(self):
+            pass
+
+        def send(self, frame):
+            return len(frame)
+
+        def close(self):
+            pass
+
+    real, E.RawSender = E.RawSender, Sink
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            pcap = os.path.join(d, "x.pcap")
+            eng = E.Engine(RunConfig(
+                profiles=["modbus"], iface="fake0", rate=200, count=30,
+                clock="synthetic", start_time="2026-01-01T00:00:00Z",
+                pcap_path=pcap))
+
+            def retune():
+                end = time.monotonic() + 3
+                while eng.stats.packets < 10 and time.monotonic() < end:
+                    time.sleep(0.001)
+                eng.control.set_rate(50)
+            th = threading.Thread(target=retune)
+            eng.start()
+            th.start()
+            eng.join(5)
+            th.join(4)
+            ts = [r[0] for r in _pcap_records(pcap)]
+            gaps = [b - a for a, b in zip(ts, ts[1:])]
+            check(len(ts) == 30, f"synthetic live rate: {len(ts)} frames")
+            check(gaps and abs(gaps[0] - 0.005) < 1e-4
+                  and abs(gaps[-1] - 0.02) < 1e-4,
+                  f"synthetic gaps {gaps[:1]} .. {gaps[-1:]}")
+            check(all(g > 0 for g in gaps), "synthetic time went backwards")
+    finally:
+        E.RawSender = real
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
