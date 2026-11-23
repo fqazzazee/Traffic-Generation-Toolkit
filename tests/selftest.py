@@ -8972,6 +8972,23 @@ def test_r22_evaluation_remap_arp_macs_follow_ip() -> None:
           "ARP request: broadcast and empty target MAC must stay")
 
 
+def test_r22_evaluation_ftp_backup_class() -> None:
+    """FTP to a file share or historian is a backup, like the same SMB flow;
+    other FTP keeps its engineering class."""
+    from tgt import timing
+    for server in ("file", "hist"):
+        check(timing.activity_class("ftp", "hist", server) == "backup",
+              f"ftp hist -> {server}")
+        check(timing.activity_class("smb", "hist", server) == "backup",
+              f"smb hist -> {server}")
+    check(timing.activity_class("ftp", "ws", "file") == "eng",
+          "ftp from a workstation is not a backup")
+    check(timing.activity_class("ftp", "eng", "plc") == "eng",
+          "ftp to a PLC is not a backup")
+    check(timing.activity_class("smb", "hmi", "plc") == "operator",
+          "the office-class refinement must still apply")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
