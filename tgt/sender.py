@@ -160,7 +160,7 @@ def check_rate(pps: Optional[float]) -> None:
         return
     try:
         ok = math.isfinite(pps) and pps >= 0
-    except TypeError:
+    except (TypeError, OverflowError):
         ok = False
     if not ok:
         raise ValueError(f"rate must be a finite number >= 0, got {pps!r}")

@@ -8953,6 +8953,17 @@ def test_r22_engine_plan_utc_offset_zero() -> None:
             del env.options["utc_offset"]
 
 
+def test_r22_engine_check_rate_huge_int() -> None:
+    """An integer too large for a float is a ValueError like any bad rate."""
+    from tgt.sender import RateLimiter, check_rate
+    for call in (check_rate, RateLimiter, RateLimiter(1).set_rate):
+        try:
+            call(10 ** 400)
+            check(False, f"{call}: accepted 10**400")
+        except ValueError:
+            pass
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
