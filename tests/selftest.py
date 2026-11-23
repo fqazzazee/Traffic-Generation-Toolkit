@@ -8932,6 +8932,27 @@ def test_r22_engine_plan_rate_validated() -> None:
         check(rc == 2 and "rate" in out, f"bad plan rate: rc={rc}")
 
 
+def test_r22_engine_plan_utc_offset_zero() -> None:
+    """A plan's utc_offset 0 overrides an environment default."""
+    from tgt import campaign, enterprise
+    env = enterprise.get("it-org")
+    had = "utc_offset" in env.options
+    old = env.options.get("utc_offset")
+    env.options["utc_offset"] = 5.0
+    try:
+        for doc_extra, want in (({"utc_offset": 0}, 0.0),
+                                ({"utc_offset": 3}, 3.0), ({}, 5.0)):
+            doc = dict({"env": "it-org",
+                        "phases": [{"name": "a", "duration": 1}]}, **doc_extra)
+            got = campaign.build(campaign.Plan(doc))[0].utc_offset
+            check(got == want, f"utc_offset {doc_extra}: {got}, want {want}")
+    finally:
+        if had:
+            env.options["utc_offset"] = old
+        else:
+            del env.options["utc_offset"]
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

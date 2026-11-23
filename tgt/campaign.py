@@ -500,8 +500,8 @@ def build(plan: Plan) -> List[Phase]:
                                                               plan.rate),
                    spec.get("day_profile") or plan.day_profile or
                    env.options.get("day_profile"),
-                   plan.utc_offset or float(env.options.get("utc_offset",
-                                                            0.0)),
+                   plan.utc_offset if "utc_offset" in plan.doc else
+                   float(env.options.get("utc_offset", 0.0)),
                    str(spec.get("description", "")),
                    changes, diff, events, label=f"{name} ({env.key})",
                    plan=plan)
