@@ -48,6 +48,12 @@ have_systemd() {
         [ -d /run/systemd/system ] 2>/dev/null
 }
 
+# The service is managed by systemd only once its unit exists. tgt/service.py
+# (_use_systemd) makes the same check.
+use_systemd() {
+    have_systemd && [ -f "$UNIT_FILE" ]
+}
+
 # Verify the tgt package is importable from REPO_ROOT before we register/start,
 # so a wrong path or incomplete checkout fails loudly instead of crash-looping.
 preflight_check() {
@@ -264,8 +270,14 @@ cmd_register() {
 
 cmd_start() {
     need_root
-    [ -f "$CONF_FILE" ] || cmd_register
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if have_systemd && [ ! -f "$UNIT_FILE" ] && daemon_running; then
+        warn "already running unmanaged (pid $(cat "$PID_FILE")); run '$0 stop', then start it under systemd"
+        return 0
+    fi
+    if [ ! -f "$CONF_FILE" ] || { have_systemd && [ ! -f "$UNIT_FILE" ]; }; then
+        cmd_register
+    fi
+    if use_systemd; then
         systemctl start tgt.service && ok "service started"
     else
         daemon_start
@@ -274,7 +286,7 @@ cmd_start() {
 
 cmd_stop() {
     need_root
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         systemctl stop tgt.service && ok "service stopped"
     else
         daemon_stop
@@ -283,15 +295,15 @@ cmd_stop() {
 
 cmd_restart() {
     need_root
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         systemctl restart tgt.service && ok "service restarted"
     else
-        daemon_stop; daemon_start
+        daemon_stop; cmd_start
     fi
 }
 
 cmd_status() {
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         systemctl status tgt.service --no-pager || true
     else
         find_daemon_files
@@ -305,7 +317,7 @@ cmd_status() {
 }
 
 cmd_logs() {
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         journalctl -u tgt.service -f --no-pager
     else
         find_daemon_files
@@ -316,7 +328,7 @@ cmd_logs() {
 
 cmd_unregister() {
     need_root
-    if have_systemd && [ -f "$UNIT_FILE" ]; then
+    if use_systemd; then
         systemctl stop tgt.service 2>/dev/null || true
         systemctl disable tgt.service 2>/dev/null || true
         rm -f "$UNIT_FILE"

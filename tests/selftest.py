@@ -8763,6 +8763,71 @@ def test_r22_ops_status_logs_find_root_daemon_files() -> None:
             os.chmod(log_dir, 0o755)
 
 
+def test_r22_ops_start_registers_missing_unit() -> None:
+    """On a systemd host an existing config no longer skips registration:
+    start and restart go through a unit, never an unmanaged daemon. A legacy
+    daemon that is already running is not doubled up."""
+    for action in ("start", "restart"):
+        with tempfile.TemporaryDirectory() as d:
+            box = _r22_ops_sandbox(d)
+            _r22_ops_conf(box)
+            rc, out, calls = _r22_ops_run(box, action)
+            pid_file = os.path.join(box["root"], "run", "tgt.pid")
+            check(rc == 0 and os.path.exists(box["unit"]),
+                  f"{action}: unit not registered: rc={rc} {out}")
+            check(f"systemctl {action} tgt.service" in calls or
+                  "systemctl start tgt.service" in calls,
+                  f"{action}: systemctl not used: {calls}")
+            check(not os.path.exists(pid_file),
+                  f"{action}: launched an unmanaged daemon")
+    with tempfile.TemporaryDirectory() as d:
+        box = _r22_ops_sandbox(d)
+        _r22_ops_conf(box)
+        with open(os.path.join(box["root"], "run", "tgt.pid"), "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        rc, out, calls = _r22_ops_run(box, "start")
+        check(rc == 0 and not os.path.exists(box["unit"]) and
+              "systemctl start" not in calls,
+              f"start doubled a running daemon: rc={rc} {out} {calls}")
+
+
+def test_r22_ops_service_uses_same_mode_as_tgtctl() -> None:
+    """tgt.service picks systemctl only when the unit exists, like tgtctl;
+    otherwise the action goes through tgtctl, which registers it."""
+    import subprocess
+    from tgt import service
+    saved = service._have_systemd, service.UNIT_PATH, service.subprocess.run
+    saved_paths = service.PID_PATHS
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "active\n", "")
+    with tempfile.TemporaryDirectory() as d:
+        unit = os.path.join(d, "tgt.service")
+        try:
+            service._have_systemd = lambda: True
+            service.UNIT_PATH = unit
+            service.PID_PATHS = (os.path.join(d, "none.pid"),)
+            service.subprocess.run = fake_run
+            service.service_action("start")
+            check(not any("systemctl" in c for c in calls) and
+                  any(str(x).endswith("tgtctl.sh") for x in calls[-1]),
+                  f"no unit: action should use tgtctl: {calls}")
+            st = service.service_state()
+            check(st.status == "not-installed" and st.mode == "systemd",
+                  f"no unit: state {st}")
+            calls.clear()
+            open(unit, "w").close()
+            service.service_action("start")
+            check(any("systemctl" in c for c in calls),
+                  f"unit present: action should use systemctl: {calls}")
+        finally:
+            service._have_systemd, service.UNIT_PATH = saved[:2]
+            service.subprocess.run = saved[2]
+            service.PID_PATHS = saved_paths
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -35,6 +35,12 @@ def _have_systemd() -> bool:
         "/run/systemd/system")
 
 
+def _use_systemd() -> bool:
+    """systemd manages the service only once its unit exists (the same check
+    as use_systemd in tgtctl.sh, which registers a missing unit on start)."""
+    return _have_systemd() and os.path.isfile(UNIT_PATH)
+
+
 def read_config(path: str = CONF_PATH) -> dict:
     """Parse the shell-style config into {TGT_IFACE, TGT_RUN_ARGS}."""
     out: dict[str, str] = {}
@@ -94,7 +100,7 @@ def unit_runs_command(path: str = UNIT_PATH) -> bool:
 
 
 def service_state() -> ServiceState:
-    if _have_systemd():
+    if _use_systemd():
         try:
             r = subprocess.run(["systemctl", "is-active", "tgt.service"],
                                capture_output=True, text=True, timeout=5)
@@ -127,12 +133,13 @@ def service_state() -> ServiceState:
             return ServiceState(True, "daemon", "active", f"pid {pid}")
     if found:
         return ServiceState(True, "daemon", "inactive")
-    return ServiceState(False, "none", "not-installed")
+    return ServiceState(False, "systemd" if _have_systemd() else "none",
+                        "not-installed")
 
 
 def service_action(action: str) -> tuple[bool, str]:
     """action in {start, stop, restart}. Uses systemctl or tgtctl.sh."""
-    if _have_systemd():
+    if _use_systemd():
         cmd = ["systemctl", action, "tgt.service"]
     else:
         script = _find_tgtctl()
