@@ -225,7 +225,8 @@ class Suite:
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise BenchError(f"{path}.seed: expected an integer")
         desc = str(raw.get("description", ""))
-        allowed = {"baseline": {"duration"}, "incidents": {"duration",
+        inherited: Dict[str, Any] = {}
+        allowed ={"baseline": {"duration"}, "incidents": {"duration",
                                                             "inject"},
                    "campaign": {"plan", "phases"}}[kind]
         extra = sorted(set(raw) & {"duration", "inject", "plan", "phases"}
@@ -260,6 +261,9 @@ class Suite:
                         f"{self.env!r} (every stage shares one environment)")
                 phases = [dict(ph) for ph in plan.doc["phases"]]
                 desc = desc or plan.description
+                inherited = {k: plan.doc[k] for k in (
+                    "day_profile", "utc_offset", "span", "rate",
+                    "sprinkle_messages") if plan.doc.get(k) is not None}
             else:
                 phases = raw["phases"]
                 if not isinstance(phases, list) or not phases:
@@ -268,6 +272,7 @@ class Suite:
         doc: Dict[str, Any] = {
             "name": f"{self.name}-{sid}", "description": desc,
             "env": self.env, "seed": seed, "phases": phases}
+        doc.update(inherited)             # suite and stage values override
         for k in ("day_profile", "utc_offset", "span", "sprinkle_messages"):
             if self.doc.get(k) is not None:
                 doc[k] = self.doc[k]

@@ -8743,6 +8743,43 @@ def test_r22_evaluation_fingerprint_covers_effective_run() -> None:
         check(fps[0] != fps[1], f"bundles share a fingerprint {fps}")
 
 
+def test_r22_evaluation_stage_inherits_plan_settings() -> None:
+    """A stage referencing a plan keeps the plan's run settings; explicit
+    suite and stage values override them."""
+    import json
+    from tgt import bench
+    s = bench.Suite({"name": "s", "env": "ot-plant", "stages": [
+        {"id": "c", "kind": "campaign", "plan": "ot-plant-drift"}]}, "s.json")
+    check(s.stages[0].plan_doc.get("day_profile") == "shift",
+          f"packaged plan day_profile {s.stages[0].plan_doc.get('day_profile')}")
+    with tempfile.TemporaryDirectory() as d:
+        pp = os.path.join(d, "plan.json")
+        with open(pp, "w") as f:
+            json.dump({"env": "ot-plant", "day_profile": "shift",
+                       "utc_offset": 2, "span": "core", "rate": 50,
+                       "sprinkle_messages": 5,
+                       "phases": [{"name": "a", "duration": "10m"}]}, f)
+        stage = {"id": "c", "kind": "campaign", "plan": pp}
+        doc = bench.Suite({"env": "ot-plant", "stages": [stage]},
+                          "s.json").stages[0].plan_doc
+        got = {k: doc.get(k) for k in ("day_profile", "utc_offset", "span",
+                                       "rate", "sprinkle_messages")}
+        check(got == {"day_profile": "shift", "utc_offset": 2, "span": "core",
+                      "rate": 50, "sprinkle_messages": 5},
+              f"inherited plan settings {got}")
+        doc = bench.Suite({"env": "ot-plant", "utc_offset": 0, "span":
+                           "access", "day_profile": "flat",
+                           "stages": [stage]}, "s.json").stages[0].plan_doc
+        check(doc["utc_offset"] == 0 and doc["span"] == "access" and
+              doc["day_profile"] == "flat" and doc["rate"] == 50,
+              f"suite values must override the plan: {doc}")
+        doc = bench.Suite({"env": "ot-plant", "day_profile": "flat",
+                           "stages": [dict(stage, day_profile="shift")]},
+                          "s.json").stages[0].plan_doc
+        check(doc["day_profile"] == "shift",
+              f"stage value must win: {doc['day_profile']}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
