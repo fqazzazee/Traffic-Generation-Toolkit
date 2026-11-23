@@ -8982,6 +8982,25 @@ def test_r22_engine_check_rate_huge_int() -> None:
             pass
 
 
+def test_r22_engine_once_past_clock_range() -> None:
+    """--once whose frames would pass 2106 fails with the clock error, before
+    any frame is written; the same cycle that fits still runs."""
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "once.pcap")
+        args = ["run", "-p", "modbus", "--clock", "synthetic", "--once",
+                "--pcap", pcap, "--start-time", "2106-02-07T06:28:14Z"]
+        rc, out = _r22_cli(args + ["--rate", "1"])
+        check(rc != 0 and "classic pcap range" in out,
+              f"--once past 2106: rc={rc}")
+        check(not _pcap_records(pcap), "--once past 2106 wrote frames")
+        rc, _ = _r22_cli(args + ["--rate", "1", "--count", "2"])
+        check(rc == 0 and len(_pcap_records(pcap)) == 2,
+              f"--once bounded by --count inside the range: rc={rc}")
+        rc, _ = _r22_cli(args + ["--rate", "0"])
+        check(rc == 0 and len(_pcap_records(pcap)) > 2,
+              f"--once inside the range: rc={rc}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

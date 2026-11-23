@@ -401,6 +401,17 @@ class Engine:
                 self.log(f"built {len(batch)} frames/cycle for [{what}] in "
                          f"{time.perf_counter() - tb:.2f}s (seed {seed})")
             self.stats.cycle_frames = len(batch)
+            if synthetic and not cfg.loop:
+                # one cycle: its size is known only now that it is built
+                frames = min(len(batch), cfg.count or len(batch))
+                span = max(frames - 1, 0) * step
+                if cfg.duration:
+                    span = min(span, cfg.duration)
+                if t0 + span >= 2 ** 32:
+                    raise ValueError(
+                        f"--start-time {cfg.start_time}: the synthetic clock "
+                        "must stay within the classic pcap range (1970-01-01 "
+                        f"to 2106-02-07 UTC), including this run's {span:g} s")
 
             # synthetic time: frames since the last rate change, at its step
             mark_ts, mark_n, cur_step = t0, 0, step
