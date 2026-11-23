@@ -962,10 +962,31 @@ def _timed_args(p) -> None:
                         "synthetic captures)")
 
 
+def _redact_argv(argv) -> list:
+    """``argv`` with the --api-token value masked, for the run manifest.
+    Covers ``--api-token X``, ``--api-token=X`` and the abbreviations
+    argparse accepts (``--api-t`` is the shortest unambiguous one)."""
+    out: list = []
+    hide = False
+    for arg in argv:
+        if hide:
+            out.append("<redacted>")
+            hide = False
+            continue
+        name, eq, _ = arg.partition("=")
+        if len(name) >= len("--api-t") and "--api-token".startswith(name):
+            if eq:
+                arg = f"{name}=<redacted>"
+            else:
+                hide = True
+        out.append(arg)
+    return out
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.argv = list(sys.argv[1:] if argv is None else argv)
+    args.argv = _redact_argv(sys.argv[1:] if argv is None else argv)
     if args.command not in ("iface", "ctl"):
         # plugins (TGT_PLUGIN_PATH / ~/.config/tgt/plugins) first, so env
         # files may use plugin protocols; then env files in TGT_ENV_PATH /

@@ -8594,6 +8594,33 @@ def test_review_injection_worker_ends_with_run() -> None:
           "injection worker outlived close() and clobbered the context")
 
 
+def test_r22_control_manifest_redacts_api_token() -> None:
+    """--api-token never reaches the manifest's argv, in any spelling
+    argparse accepts (separate value, =value, unique abbreviation)."""
+    import contextlib
+    import io
+    import json
+    from tgt import cli
+    forms = (["--api-token", "SECRET123"], ["--api-token=SECRET123"],
+             ["--api-tok", "SECRET123"], ["--api-t=SECRET123"])
+    with tempfile.TemporaryDirectory() as d:
+        for form in forms:
+            m = os.path.join(d, "m.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(["run", "-p", "modbus", "--once", "--rate", "0",
+                               "--messages", "1", "--seed", "1",
+                               "--pcap", os.path.join(d, "x.pcap"),
+                               "--manifest", m,
+                               "--api", "127.0.0.1:0"] + form)
+            with open(m, encoding="utf-8") as f:
+                text = f.read()
+            argv = json.loads(text).get("argv", [])
+            check(rc == 0 and "SECRET123" not in text,
+                  f"manifest leaks the API token for {form}: {argv}")
+            check("--api" in argv and "127.0.0.1:0" in argv,
+                  f"redaction removed other arguments: {argv}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
