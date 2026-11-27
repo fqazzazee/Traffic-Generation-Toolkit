@@ -16,7 +16,6 @@ tgt-*.pcap
 *.log
 
 # Local-only files (not tracked)
-local-only/
 
 # Editor / OS
 .vscode/
@@ -26,3 +25,18 @@ local-only/
 
 # Test fixtures (Zeek logs) are data, not runtime logs
 !tests/fixtures/**/*.log
+
+# AI agent instructions, skills and planning notes stay on the maintainer's
+# machine. People who run the software don't need them.
+/CLAUDE.md
+/CLAUDE.local.md
+/AGENTS.md
+/GEMINI.md
+/.claude/
+/.agents/
+/.codex/
+/.cursor/
+/.gemini/
+/.windsurf/
+/.mcp.json
+/local-only/
