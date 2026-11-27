@@ -346,10 +346,12 @@ def check(env, setup: Setup) -> None:
              for h in i.hosts}
     taken.update({s.nat["outside_ip"]: f"the NAT of {s.name}"
                   for s in env.segments if s.nat})
-    # a declared edr endpoint is replaced by this setup, so its address is free
+    # a declared edr endpoint is replaced by this setup, so its address is
+    # free. An env file's own block has already dropped those flows from
+    # env.conversations, so they are read from what was declared too.
     other = {n for c, s, p in env.conversations if p != "edr" for n in (c, s)}
-    replaced = {n for c, s, p in env.conversations if p == "edr"
-                for n in (c, s)} - other
+    replaced = {n for c, s, p in list(env.spec[1]) + list(env.conversations)
+                if p == "edr" for n in (c, s)} - other
     taken.update({h.ip: h.name for h in env.hosts})
     taken.update({h.ip: h.name for h in env.external
                   if h.name not in replaced})
@@ -442,15 +444,16 @@ def cli_block(current: Optional[Dict[str, Any]], spec: Optional[str],
         else:
             key, _, region = spec.partition(":")
             if key == "custom":
-                own = next((c.partition(":")[2] or "custom"
-                            for c in base.get("clouds", ())
-                            if c.split(":")[0] == "custom"),
-                           str(base.get("region", "custom")))
+                named = [c.partition(":")[2] for c in base.get("clouds", ())
+                         if c.split(":")[0] == "custom"]
+                if "region" in base:
+                    named = [str(base["region"])]
+                own = (named[0] if named else "") or "custom"
                 if region and region != own:
                     raise EdrError("region", f"unknown region {region!r} for "
                                    f"profile 'custom' (its region is "
                                    f"{own!r})")
-                region = region or (own if "region" in base else "")
+                region = region or (named[0] if named else "")
             block["profile"] = key
             if region:
                 block["region"] = region

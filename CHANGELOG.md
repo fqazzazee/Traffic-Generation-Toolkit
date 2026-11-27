@@ -16,6 +16,9 @@
   answers to the sensor before the cloud has sent them, and its upstream requests follow the
   sensor's. The tunnel and the upstream leg now carry the same TLS bytes even after a leg
   rebuilds for a free port.
+- **`--edr` over an env file's own block**: an override may now reuse the address of a declared
+  `edr` endpoint the block already replaced, as the block itself may. `--edr custom` keeps the
+  custom cloud's region when the block lists it under `clouds`.
 
 ## 2.2.0 — 2026-11-22
 

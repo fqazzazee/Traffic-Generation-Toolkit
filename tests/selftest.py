@@ -11397,6 +11397,52 @@ def test_edr_proxy_relay_is_causal() -> None:
             t += s.interval()
 
 
+def _edr_declared_doc(block=None):
+    """enterprise-mixed plus an external Falcon endpoint at an EU-1 address
+    that one Windows host has a declared edr flow to: (doc, host)."""
+    from tgt import enterprise, envfile
+    base = enterprise.get("enterprise-mixed")
+    host = next(h for h in base.edr_hosts() if h.os.startswith("win"))
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-declared"
+    doc["external"] = [{"name": "CS-EU", "ip": "18.158.187.80",
+                        "role": "broker", "os": "linux",
+                        "fqdn": "ts01-lanner-lion.cloudsink.net"}]
+    doc["flows"] = list(doc["flows"]) + [
+        {"client": host.name, "server": "CS-EU", "proto": "edr"}]
+    if block is not None:
+        doc["edr"] = block
+    return doc, host
+
+
+def test_edr_override_and_custom_region() -> None:
+    """A --edr override may take over the address of a declared edr
+    endpoint the env file's own block already replaced, as the block itself
+    may; --edr custom keeps the custom cloud's region from a clouds list."""
+    from tgt import edr, envfile
+    doc, _ = _edr_declared_doc({"profile": "generic"})
+    env = envfile.from_dict(doc, "blocked.json")
+    try:
+        got = edr.applied(env, {"profile": "crowdstrike"})
+        check(got.edr.region.key == "eu-1", "override region")
+    except edr.EdrError as e:
+        check(False, f"--edr override refused: {e}")
+    with tempfile.TemporaryDirectory() as d:
+        rc, pcap, _ = _edr_run(doc, d, "--edr", "crowdstrike:eu-1")
+        check(rc == 0 and b"ts01-lanner-lion" in open(pcap, "rb").read(),
+              f"--edr crowdstrike:eu-1 over the file's block: rc={rc}")
+    custom = {k: v for k, v in _EDR_CUSTOM.items()
+              if k not in ("profile", "region")}
+    for block, region in ((dict(custom, clouds=["custom:acme", "generic"]),
+                           "acme"),
+                          (dict(custom, clouds=["custom", "generic"]),
+                           "custom"),
+                          (_EDR_CUSTOM, "lab-a")):
+        got = edr.resolve(edr.cli_block(block, "custom", None))
+        check(got.region.key == region,
+              f"--edr custom on {block.get('clouds')}: {got.region.key}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
