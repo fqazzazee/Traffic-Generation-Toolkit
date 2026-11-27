@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### EDR traffic
+- **EDR clouds in the TUI**: with an environment selected, the Run tab's **EDR** row opens a
+  checklist of every EDR profile and region, including an *all regions* row per vendor. The row's
+  help shows which clouds are on the wire, their sensor hostnames and how many hosts report to
+  each one.
 - **Several clouds per run**: `--edr crowdstrike:all`, `--edr crowdstrike:us-1,generic` and an
   env file's `"clouds"` list split the covered fleet between clouds, one host group per cloud.
   Single-cloud runs are unchanged.

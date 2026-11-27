@@ -11275,6 +11275,67 @@ def test_edr_clouds_split_the_fleet() -> None:
               b"ts01-lanner-lion" in raw, f"--edr list run rc={rc} {err}")
 
 
+def test_tui_edr_cloud_picker() -> None:
+    """The Run tab's EDR row: env mode only, the env's own clouds by
+    default, a checklist with an all-regions group, and the choice reaching
+    the run config, the service args, the wire and the help."""
+    import shlex
+    from tgt import enterprise, tui
+    ui = _tui_ui(tui)
+    check("EDR" not in _tui_labels(tui, ui), "tui: EDR row outside an env")
+    tui._apply_preset(None, ui, ("e", "ot-plant"))
+    row = next(f for f in tui._fields(ui) if f.label == "EDR")
+    check(ui.edr_default() == ["crowdstrike:eu-1"] and
+          "env default" in row.value(ui)[0] and
+          "ts01-lanner-lion" in row.help(ui),
+          f"tui: default EDR {row.value(ui)}")
+    items = tui._edr_items(ui)
+    group = next(it for it in items if it[0] == "crowdstrike:all")
+    regions = [it[0] for it in items if it[0].startswith("crowdstrike:")
+               and len(it) == 2]
+    check(group[2] == regions and len(regions) == 4 and
+          any(it[0] == "generic:lab" for it in items),
+          f"tui: picker rows {items}")
+    on = tui._toggle_checked({"crowdstrike:eu-1"}, group)
+    check(on == set(regions), "tui: group row does not check every region")
+    check(tui._toggle_checked(on, group) == set(),
+          "tui: group row does not clear its regions")
+    check(tui._toggle_checked(set(), items[-1]) == {items[-1][0]},
+          "tui: plain row toggle")
+
+    check(ui.set_edr(regions + ["generic:lab"]) is None, "tui: set_edr")
+    cfg = ui.build_config()
+    check(cfg.edr == {"clouds": ["crowdstrike:all", "generic:lab"]},
+          f"tui: config edr {cfg.edr}")
+    argv = shlex.split(ui.run_args())
+    check(argv[argv.index("--edr") + 1] == "crowdstrike:all,generic:lab",
+          f"tui: service args {argv}")
+    env = enterprise.for_run(cfg)
+    blob = b"".join(f for k, f in _edr_wire(env) if k == "edr")
+    help_ = row.help(ui)
+    for _, region, hosts in tui.edr.fleets(env):
+        if hosts:
+            check(region.fqdns["sensor"].encode() in blob and
+                  region.fqdns["sensor"] in help_,
+                  f"tui: {region.key} missing from the wire or the help")
+    check("all regions" in row.value(ui)[0], f"tui: {row.value(ui)}")
+
+    err = ui.set_edr(["crowdstrike:mars"])
+    check(err and "mars" in err and ui.edr_spec() ==
+          "crowdstrike:all,generic:lab", "tui: a bad cloud replaced the pick")
+    ui.set_edr([])
+    check(ui.build_config().edr == {"enabled": False} and
+          "--edr off" in ui.run_args() and row.value(ui)[0] == "off",
+          "tui: none checked is not EDR off")
+    _tui_exercise(tui, ui, "edr")
+    row.space(None, ui, 0)
+    check(ui.edr_clouds is None and ui.build_config().edr is None and
+          "--edr" not in ui.run_args(), "tui: Space does not restore default")
+    ui.set_edr(["generic:lab"])
+    tui._apply_preset(None, ui, ("e", "enterprise-mixed"))
+    check(ui.edr_clouds is None, "tui: a new preset keeps the old EDR pick")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

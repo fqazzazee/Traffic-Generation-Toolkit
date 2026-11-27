@@ -127,6 +127,15 @@ For several clouds, list them in `clouds` instead of `profile` and `region`:
 Each entry is `PROFILE[:REGION]`, or `PROFILE:all`. A `custom` entry, at most one, takes its
 region from the entry (`custom:lab-a`) and its other keys from the block.
 
+### TUI
+
+With an environment selected, the Run tab has an **EDR** row. It shows the environment's own
+setting until you change it. Enter opens a checklist of every profile and region, with an
+*all regions* row that checks or clears a whole vendor, and the environment's custom cloud if it
+has one. Leaving every box unchecked turns EDR off, and Space on the row goes back to the
+environment's setting. The row's help lists each selected cloud, its sensor hostname and how many
+hosts report to it. The choice reaches the Service tab's command line as `--edr`.
+
 ### Your own vendor
 
 Use `"profile": "custom"`. No code change is needed.

@@ -30,8 +30,8 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
-from . import (enterprise, incidents, net, protocols, scenarios, service,
-               techniques)
+from . import (edr, enterprise, incidents, net, protocols, scenarios,
+               service, techniques)
 from .config import RunConfig
 from .engine import Engine
 from .packet import Endpoints
@@ -124,6 +124,9 @@ class UI:
         self.selected: List[str] = ["modbus", "s7comm"]
         self.scenario: Optional[str] = None
         self.env: Optional[str] = None       # modeled environment (overrides protos)
+        # EDR clouds (PROFILE:REGION) the env's fleet reports to: None = the
+        # environment's own setting, [] = EDR off
+        self.edr_clouds: Optional[List[str]] = None
         self.span = "access"                 # env capture point: access | core
         self.incident: Optional[str] = None  # attack scenario (overrides protos)
         self.replay: Optional[str] = None    # pcap to replay (overrides all)
@@ -279,6 +282,7 @@ class UI:
             self.rate = self._cycle_rate or 20.0   # leaving a campaign
         self.scenario = self.env = self.incident = self.replay = None
         self.campaign = None
+        self.edr_clouds = None
 
     def plan(self, path: Optional[str] = None):
         """(Plan, error) for a campaign file (cached; error is a string)."""
@@ -311,10 +315,57 @@ class UI:
         if self.scenario:
             return list(scenarios.get(self.scenario).profiles)
         if self.env:
-            return enterprise.get(self.env).protocols()
+            return self.env_view().protocols()
         if self.incident:
             return incidents.get(self.incident).protocols()
         return None
+
+    # -- EDR -----------------------------------------------------------------
+    def edr_default(self) -> List[str]:
+        """The clouds the selected environment reports to on its own."""
+        env = enterprise.get(self.env)
+        if env.edr is None:           # the built-in Falcon EU-1 beacons
+            return ["crowdstrike:eu-1"] if env.edr_hosts() else []
+        return edr.cloud_specs(env.edr.block) or []
+
+    def edr_spec(self) -> Optional[str]:
+        """The ``--edr`` value for the EDR row (None = the env's own)."""
+        if self.edr_clouds is None or self.mode() != "env":
+            return None
+        return edr.compact(self.edr_clouds) if self.edr_clouds else "off"
+
+    def edr_block(self) -> Optional[dict]:
+        """The ``edr`` block replacing the environment's (None = keep it).
+        Raises :class:`tgt.edr.EdrError` when it does not apply."""
+        spec = self.edr_spec()
+        if spec is None:
+            return None
+        env = enterprise.get(self.env)
+        block = edr.cli_block(env.edr.block if env.edr is not None else None,
+                              spec, None)
+        edr.apply(env, block)
+        return block
+
+    def set_edr(self, clouds: Optional[List[str]]) -> Optional[str]:
+        """Select EDR clouds (None = the env's own, [] = off); returns the
+        error and keeps the old selection when they do not apply."""
+        old, self.edr_clouds = self.edr_clouds, clouds
+        try:
+            self.edr_block()
+        except edr.EdrError as e:
+            self.edr_clouds = old
+            return str(e)
+        return None
+
+    def env_view(self):
+        """The selected environment as a run would see it (with the EDR row's
+        clouds)."""
+        env = enterprise.get(self.env)
+        try:
+            block = self.edr_block()
+        except edr.EdrError:
+            return env
+        return env if block is None else edr.applied(env, block)
 
     def preset_extras(self) -> List[str]:
         """Attack-only traffic an incident preset adds (no registry protocol)."""
@@ -410,7 +461,7 @@ class UI:
         replay = bool(self.replay)
         return RunConfig(
             profiles=list(self.selected) or ["modbus"], env=self.env,
-            span=self.span, incident=self.incident,
+            edr=self.edr_block(), span=self.span, incident=self.incident,
             sprinkle=self.sprinkle_list(),
             sprinkle_random=self.sprinkle_on and self.sprinkle_random,
             sprinkle_ratio=self.sprinkle_ratio if self.sprinkle_on else 0.0,
@@ -490,7 +541,7 @@ class UI:
             remap_ip=self.remap_list("ip"),
             remap_subnet=self.remap_list("subnet"),
             remap_mac=self.remap_list("mac"), vlan=self.replay_vlan,
-            remap_env=self.remap_env)
+            remap_env=self.remap_env, edr=self.edr_spec())
 
     def _check_start(self, cfg: RunConfig) -> Optional[str]:
         """Why ``cfg`` cannot start (None when it can) — the checks the CLI
@@ -644,7 +695,7 @@ class UI:
         from . import inventory
         key = self.env or self.campaign_env_key
         env = (self.campaign_env() if self.campaign else
-               enterprise.get(key) if key else None)
+               self.env_view() if key else None)
         if env is None:
             raise ValueError("no environment selected")
         for ext in (".csv", ".json"):
@@ -1829,6 +1880,104 @@ def _timed_plain(ui: UI) -> bool:
     return ui.timed() and ui.mode() != "campaign"
 
 
+def _edr_text(specs: List[str], env) -> str:
+    """'CrowdStrike US-1, EU-1 · Generic EDR' for PROFILE:REGION clouds."""
+    if not specs:
+        return "off"
+    by: Dict[str, List[str]] = {}
+    for spec in specs:
+        key, _, region = spec.partition(":")
+        by.setdefault(key, []).append(region)
+    parts = []
+    for key, regions in by.items():
+        prof = edr.PROFILES.get(key)
+        if prof is None:                   # custom: the env file's vendor
+            prof = next((p for p, _ in getattr(env.edr, "clouds", ())
+                         if p.key == key), None)
+            parts.append(f"{prof.vendor if prof else key} {regions[0]}")
+        elif len(prof.regions) == 1:
+            parts.append(prof.vendor)
+        elif len(regions) == len(prof.regions):
+            parts.append(f"{prof.vendor} (all regions)")
+        else:
+            parts.append(f"{prof.vendor} "
+                         + ", ".join(r.upper() for r in regions))
+    return " · ".join(parts)
+
+
+def _edr_value(ui: UI) -> Value:
+    env = enterprise.get(ui.env)
+    if ui.edr_clouds is None:
+        return f"{_edr_text(ui.edr_default(), env)} (env default)", C_DIM
+    if not ui.edr_clouds:
+        return "off", C_YELLOW
+    return _edr_text(ui.edr_clouds, env), C_CYAN
+
+
+def _edr_help(ui: UI) -> str:
+    env = ui.env_view()
+    lines = ["EDR clouds the sensors report to; several split the fleet, "
+             "none = EDR off. On the wire now:"]
+    if env.edr is None:                    # the built-in Falcon EU-1 beacons
+        fl = [(edr.PROFILES["crowdstrike"],
+               edr.PROFILES["crowdstrike"].regions["eu-1"], env.edr_hosts())]
+    else:
+        fl = edr.fleets(env)
+    if not fl or not any(hosts for _, _, hosts in fl):
+        lines.append("• none: no EDR traffic on the wire")
+    for prof, region, hosts in fl:
+        lines.append(f"• {prof.vendor} {region.key} · {len(hosts)} host"
+                     f"{'s' * (len(hosts) != 1)} · {region.fqdns['sensor']}")
+    if env.edr is not None and env.edr.proxy:
+        lines.append(f"• via proxy {env.edr.proxy}:{env.edr.proxy_port}")
+    return "\n".join(lines)
+
+
+def _edr_items(ui: UI) -> list:
+    """Checklist rows: each profile's regions, under an 'all regions' group
+    row for a vendor with several, plus the env file's custom cloud."""
+    items: list = []
+    for prof in edr.PROFILES.values():
+        regs = list(prof.regions.values())
+        many = len(regs) > 1
+        if many:
+            items.append((f"{prof.key}:all", f"{prof.label} — all regions",
+                          [f"{prof.key}:{r.key}" for r in regs]))
+        for r in regs:
+            name = f"    {r.key.upper():9}" if many else \
+                f"{prof.vendor} — {r.key} "
+            items.append((f"{prof.key}:{r.key}",
+                          f"{name} {r.fqdns['sensor']}  {_ip_note(r)}"))
+    env = enterprise.get(ui.env)
+    for prof, r in getattr(env.edr, "clouds", ()):
+        if prof.key == "custom":
+            items.append((f"custom:{r.key}", f"{prof.vendor} — {r.key} "
+                          f" {r.fqdns['sensor']}  env file"))
+    return items
+
+
+def _ip_note(region) -> str:
+    return "published IPs" if region.ip_provenance == "published" \
+        else "RFC 5737 IPs"
+
+
+def _act_edr(stdscr, ui: UI, step: int):
+    if step:
+        return
+    env = enterprise.get(ui.env)
+    cur = ui.edr_clouds if ui.edr_clouds is not None else ui.edr_default()
+    got = _pick_multi(stdscr, "EDR clouds — Space check · none = EDR off",
+                      _edr_items(ui), cur)
+    if got is None or (ui.edr_clouds is None and got == cur):
+        return
+    err = ui.set_edr(got)
+    ui.add_log(f"edr: {err}" if err else f"EDR: {_edr_text(got, env)}")
+
+
+def _act_edr_default(stdscr, ui: UI, step: int):
+    ui.set_edr(None)
+
+
 def _has_env(ui: UI) -> bool:
     return ui.mode() == "env" or (ui.mode() == "campaign" and
                                   ui.campaign_env() is not None)
@@ -1856,6 +2005,9 @@ RUN_FIELDS = [
           show=lambda ui: ui.mode() == "env" or (_is_replay(ui) and
                                                   bool(ui.remap_env)),
           toggle=True, keys="←→/Space switch"),
+    Field("EDR", _edr_value, _act_edr, _edr_help,
+          show=lambda ui: ui.mode() == "env", long_help=True,
+          keys="Enter pick · Space env default", space=_act_edr_default),
     Field("Findings", _findings_value, None, _findings_help,
           show=lambda ui: _has_env(ui) and bool(ui.findings()),
           long_help=True),
@@ -2527,8 +2679,10 @@ def _pick(stdscr, title: str, items: list, current=None):
 
 
 def _pick_multi(stdscr, title: str, items: list, checked) -> Optional[list]:
-    """Modal checklist: items are (value, label). ↑↓ move, Space toggles,
-    Enter accepts, Esc cancels. Returns the checked values or None."""
+    """Modal checklist: items are (value, label), or (value, label, members)
+    for a group row that checks / clears all its members at once (◐ when
+    some are on; it is never returned itself). ↑↓ move, Space toggles, Enter
+    accepts, Esc cancels. Returns the checked values or None."""
     if stdscr is None:
         return None
     on = set(checked or ())
@@ -2547,14 +2701,17 @@ def _pick_multi(stdscr, title: str, items: list, checked) -> Optional[list]:
         win.attroff(_cattr(C_CYAN))
         _put(win, 0, 2, _fit(f" {title} ", width - 4),
              _cattr(C_CYAN, curses.A_BOLD))
-        for j, (val, label) in enumerate(items[first:first + list_h]):
+        for j, it in enumerate(items[first:first + list_h]):
             i = first + j
-            mark = "◉" if val in on else "○"
-            text = _fit(f"{'▸' if i == sel else ' '} {mark} {label}",
+            members = it[2] if len(it) > 2 else None
+            hits = sum(m in on for m in members) if members else 0
+            lit = (hits == len(members)) if members else it[0] in on
+            mark = "◉" if lit else "◐" if hits else "○"
+            text = _fit(f"{'▸' if i == sel else ' '} {mark} {it[1]}",
                         width - 4)
             _put(win, 1 + j, 2, text.ljust(width - 4) if i == sel else text,
                  _cattr(C_CYAN, curses.A_REVERSE) if i == sel else
-                 _cattr(C_GREEN) if val in on else 0)
+                 _cattr(C_GREEN) if lit else 0)
         _put(win, height - 1, 2, " ↑↓ move · Space toggle · Enter done · "
              "Esc cancel ", _cattr(C_CYAN))
         win.refresh()
@@ -2562,13 +2719,24 @@ def _pick_multi(stdscr, title: str, items: list, checked) -> Optional[list]:
         if c == 27:
             return None
         if c in (curses.KEY_ENTER, 10, 13):
-            return [v for v, _ in items if v in on]
+            return [it[0] for it in items if len(it) == 2 and it[0] in on]
         if c in (curses.KEY_UP, ord('k')):
             sel = (sel - 1) % max(1, len(items))
         elif c in (curses.KEY_DOWN, ord('j'), 9):
             sel = (sel + 1) % max(1, len(items))
         elif c == ord(' ') and items:
-            on ^= {items[sel][0]}
+            on = _toggle_checked(on, items[sel])
+
+
+def _toggle_checked(on: set, item) -> set:
+    """Space on a checklist row: a plain row flips; a group row checks all
+    its members unless they all are, then clears them."""
+    members = item[2] if len(item) > 2 else None
+    if not members:
+        return on ^ {item[0]}
+    if all(m in on for m in members):
+        return on - set(members)
+    return on | set(members)
 
 
 def _cleared(v: Optional[str]) -> bool:

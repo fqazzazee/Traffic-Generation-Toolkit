@@ -192,7 +192,8 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
                    remap_subnet: Optional[List[str]] = None,
                    remap_mac: Optional[List[str]] = None,
                    vlan: Optional[int] = None,
-                   remap_env: Optional[str] = None) -> str:
+                   remap_env: Optional[str] = None,
+                   edr: Optional[str] = None) -> str:
     """Serialize a selection into a `tgt run` argument string for the service.
 
     The result is shell-quoted (``shlex.split`` gives the argv back), so
@@ -201,7 +202,8 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
     truth; ``schedule="timed"`` (with ``speed``, ``day_profile``,
     ``min_period``) selects the time model, in which ``rate`` is only a cap.
     ``clock="synthetic"`` stamps from ``start_time``; ``api`` serves the
-    control API (``tgt ctl``) at [HOST:]PORT. The replay options
+    control API (``tgt ctl``) at [HOST:]PORT. ``edr`` is an ``--edr``
+    SPEC (or ``off``) for an environment. The replay options
     (``replay_speed``, ``replay_loop``, ``remap_*``, ``vlan`` = retag,
     ``remap_env`` with ``span``) only apply with ``replay``. The send
     interface(s) are not part of the string: they go in TGT_IFACE (see
@@ -234,6 +236,8 @@ def build_run_args(scenario: Optional[str], profiles: List[str], rate: float,
         parts += ["--env", env]
         if span and span != "access":
             parts += ["--span", span]
+        if edr:
+            parts += ["--edr", edr]
     elif scenario:
         parts += ["--scenario", scenario]
     elif profiles:
