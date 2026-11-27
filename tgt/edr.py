@@ -693,7 +693,10 @@ def channel_flow(ep, count: int) -> List[bytes]:
     m = ep.meta
     up, down = _SHAPES[m["edr_channel"]]
     tpl = replace(tls.TEMPLATES[m["tls_client"]], upload=up, download=down)
-    seed = ("edr", m["edr_seed"], protocols.build_context().cycle)
+    # both legs of a tunnel carry one session: the timed scheduler hands
+    # them a shared generation, as their own build counts can drift apart
+    seed = ("edr", m["edr_seed"],
+            m.get("edr_gen", protocols.build_context().cycle))
     exchanges, hs = tls.session(tpl, tls.SERVERS["openssl"], m["sni"], count,
                                 seed)
     target = m.get("edr_connect")

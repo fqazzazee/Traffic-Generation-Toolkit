@@ -11336,6 +11336,67 @@ def test_tui_edr_cloud_picker() -> None:
     check(ui.edr_clouds is None, "tui: a new preset keeps the old EDR pick")
 
 
+def _relay_legs(env, stream, occurrences):
+    """The data segments of a proxied EDR stream's occurrences, per leg and
+    direction: {('c'|'u', from client?): [(time, payload)]} in time order."""
+    proxy = stream.legs[0].ep.server_ip
+    cloud_port = stream.legs[1].ep.meta["edr_dport"]
+    out = {}
+    for t, copies, _, key in occurrences:
+        p = _edr_parse(copies[0])
+        if key != "edr" or not p or p[2] != 6 or not p[5]:
+            continue
+        leg = "u" if cloud_port in (p[3], p[4]) and proxy in (p[0], p[1]) \
+            and stream.legs[1].ep.server_ip in (p[0], p[1]) else "c"
+        srv_port = cloud_port if leg == "u" else \
+            stream.legs[0].ep.meta["edr_dport"]
+        out.setdefault((leg, p[3] != srv_port), []).append((t, p[5]))
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def test_edr_proxy_relay_is_causal() -> None:
+    """Timed scheduler, proxied sensor: the proxy relays the same TLS bytes
+    both ways, each one only after it has it (upstream request after the
+    client's, the client's answer after the cloud's), on a fresh tunnel, on
+    an open one and after a leg rebuilt for a free port."""
+    from tgt import edr, enterprise, schedule
+    base = enterprise.get("enterprise-mixed")
+    proxy = next(h.name for h in base.hosts if h.role == "proxy")
+    env = edr.apply(base, {"profile": "crowdstrike", "proxy": proxy})
+    streams = [s for s in schedule.edr_streams(env, "access", set())
+               if len(s.legs) > 1]
+    check(any(s.sid[2] == "sensor" for s in streams) and
+          any(s.sid[2] != "sensor" for s in streams), "relay: no tunnels")
+    for s in streams:
+        s.bind(7)
+        t = 10.0
+        for n in range(6):
+            if n == 3:                    # a port-collision rebuild
+                s.legs[0].builds += 1
+            occ = s.occur(t)
+            legs = _relay_legs(env, s, occ)
+            creq, crsp = legs.get(("c", True), []), legs.get(("c", False), [])
+            ureq, ursp = legs.get(("u", True), []), legs.get(("u", False), [])
+            if creq and creq[0][1].startswith(b"CONNECT"):
+                connect, creq = creq[0], creq[1:]
+                ok, crsp = crsp[0], crsp[1:]
+                check(ok[1].startswith(b"HTTP/1.1 200") and ureq and
+                      ok[0] > connect[0], f"{s.sid}: 200 before CONNECT")
+                check(ok[0] > min(ft for ft, c, _, k in occ if k == "edr"
+                                  and _edr_parse(c[0])[0] ==
+                                  s.legs[1].ep.server_ip),
+                      f"{s.sid}: 200 before the upstream connection")
+            what = f"{s.sid[2]} occurrence {n}"
+            check([p for _, p in creq] == [p for _, p in ureq] and
+                  [p for _, p in crsp] == [p for _, p in ursp],
+                  f"relay {what}: tunnel bytes differ from the upstream leg")
+            check(all(u[0] > c[0] for c, u in zip(creq, ureq)),
+                  f"relay {what}: upstream request before the client's")
+            check(all(c[0] > u[0] for c, u in zip(crsp, ursp)),
+                  f"relay {what}: client answer before the cloud's")
+            t += s.interval()
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -11,6 +11,12 @@
   env file's `"clouds"` list split the covered fleet between clouds, one host group per cloud.
   Single-cloud runs are unchanged.
 
+### Fixed
+- **Proxied EDR timing**: under `--schedule timed`, a proxy no longer passes the cloud's
+  answers to the sensor before the cloud has sent them, and its upstream requests follow the
+  sensor's. The tunnel and the upstream leg now carry the same TLS bytes even after a leg
+  rebuilds for a free port.
+
 ## 2.2.0 — 2026-11-22
 
 ### EDR traffic
