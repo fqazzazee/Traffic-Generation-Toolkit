@@ -21,6 +21,8 @@
   custom cloud's region when the block lists it under `clouds`.
 - **Declared `edr` flows** now carry the Falcon sensor's TLS fingerprint instead of the host
   OS's, and an `edr` flow given only a `domain` uses it as its SNI.
+- The inventory's probe build now holds the build lock and leaves a running engine's build
+  context as it was.
 
 ## 2.2.0 — 2026-11-22
 

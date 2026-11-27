@@ -11469,6 +11469,18 @@ def test_edr_declared_flow_looks_like_the_sensor() -> None:
           "edr flow with only a domain lost its cloud SNI")
 
 
+def test_inventory_probe_build_is_isolated() -> None:
+    """inventory.external builds a cycle to find endpoints on the wire; it
+    does so under the build lock and leaves the caller's context alone."""
+    from tgt import edr, enterprise, inventory
+    protocols.begin_build(99, 3, sport_stride=8)
+    before = (protocols.build_context(), protocols._next_sport)
+    inventory.external(edr.apply(enterprise.get("enterprise-mixed"),
+                                 {"profile": "generic"}))
+    check((protocols.build_context(), protocols._next_sport) == before,
+          "inventory.external changed the caller's build context")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
