@@ -261,9 +261,9 @@ def external(env: Environment) -> List[Dict]:
     for p in env.edr_paths():           # the host that really reaches it
         e = plan.setdefault(p.ip, {
             "ip": p.ip, "fqdns": set(), "talkers": set(), "kind": "edr-cloud",
-            "vendor": env.edr.profile.vendor, "profile": env.edr.profile.key,
-            "region": env.edr.region.key,
-            "ip_provenance": env.edr.region.ip_provenance, "channels": {}})
+            "vendor": p.profile.vendor, "profile": p.profile.key,
+            "region": p.region.key,
+            "ip_provenance": p.region.ip_provenance, "channels": {}})
         e["fqdns"].add(p.fqdn)
         e["talkers"].add((p.proxy or p.host).name)
         e["channels"][p.channel] = p.fqdn
@@ -302,8 +302,8 @@ def external(env: Environment) -> List[Dict]:
                        "kind": "unknown", "vendor": ""}
             if b in by_ip:
                 plan[a]["talkers"].add(by_ip[b])
-    pool = env.edr.region.ips if env.edr is not None and env.edr.enabled \
-        else CROWDSTRIKE_CLOUD_IPS
+    pool = [ip for _, r in env.edr.clouds for ip in r.ips] \
+        if env.edr is not None and env.edr.enabled else CROWDSTRIKE_CLOUD_IPS
     order = {ip: i for i, ip in enumerate(pool)}
     return [{**e, "fqdns": sorted(e["fqdns"]), "talkers": sorted(e["talkers"])}
             for e in sorted(plan.values(),

@@ -11180,6 +11180,101 @@ def test_r22_final_ops_daemon_never_runs_beside_service() -> None:
                 proc.wait()
 
 
+def test_edr_clouds_split_the_fleet() -> None:
+    """An edr block's "clouds" list: several profile:region clouds at once,
+    the covered fleet split into one contiguous group per cloud, each with
+    its own anchor, pool, SNI and ground truth."""
+    from tgt import edr, envfile, inventory, schedule
+    env = _edr_env({"clouds": ["crowdstrike:all", "generic"]},
+                   "enterprise-mixed")
+    want = ["crowdstrike:us-1", "crowdstrike:us-2", "crowdstrike:eu-1",
+            "crowdstrike:us-gov-1", "generic:lab"]
+    check([f"{p.key}:{r.key}" for p, r in env.edr.clouds] == want,
+          f"clouds: {env.edr.clouds}")
+    groups = edr.fleets(env)
+    fleet = [h.name for h in env.edr_hosts()]
+    check([h.name for _, _, hs in groups for h in hs] == fleet and
+          all(hs for _, _, hs in groups),
+          "clouds: the fleet is not split into one group per cloud")
+    paths = env.edr_paths()
+    for prof, region, hosts in groups:
+        mine = [p for p in paths if p.region is region]
+        check(sorted(p.host.name for p in mine if p.channel == "sensor") ==
+              sorted(h.name for h in hosts),
+              f"{prof.key}:{region.key}: sensors not from its own group")
+        check(all(p.ip in region.ips and p.fqdn == region.fqdns[p.channel]
+                  for p in mine), f"{region.key}: path outside its cloud")
+        check(sorted(p.channel for p in mine if p.channel != "sensor") ==
+              ["api", "download", "upload"],
+              f"{region.key}: no anchor of its own")
+    wire = [f for k, f in _edr_wire(env) if k == "edr"]
+    blob = b"".join(p[5] for p in map(_edr_parse, wire) if p)
+    for _, region, _ in groups:
+        check(region.fqdns["sensor"].encode() in blob,
+              f"clouds: {region.fqdns['sensor']} not on the wire")
+    doc = inventory.to_json(env)
+    check([(c["profile"], c["region"], len(c["hosts"]))
+           for c in doc["edr"]["clouds"]] ==
+          [(p.key, r.key, len(hs)) for p, r, hs in groups]
+          and "profile" not in doc["edr"], f"clouds summary {doc['edr']}")
+    ext = {e["ip"]: e for e in doc["external"] if e["kind"] == "edr-cloud"}
+    for p in paths:
+        check(ext[p.ip]["region"] == p.region.key and
+              ext[p.ip]["vendor"] == p.profile.vendor,
+              f"clouds: external {p.ip} credits the wrong cloud")
+    check(len(schedule.edr_streams(env, "access", set())) == len(paths),
+          "clouds: timed streams")
+    check(envfile.to_dict(env)["edr"] == {"clouds": ["crowdstrike:all",
+                                                     "generic"]},
+          "clouds: export does not keep the block")
+    # a custom cloud beside built-in ones; the block's custom keys define it
+    custom = {k: v for k, v in _EDR_CUSTOM.items()
+              if k not in ("profile", "region")}
+    env = _edr_env(dict(custom, clouds=["custom:lab-a", "generic"]))
+    check([(p.key, r.key) for p, r in env.edr.clouds] ==
+          [("custom", "lab-a"), ("generic", "lab")], "clouds: custom entry")
+
+    for block, where in (
+            ({"clouds": []}, "edr.clouds"),
+            ({"clouds": "generic"}, "edr.clouds"),
+            ({"clouds": ["generic", "generic:lab"]}, "edr.clouds[1]"),
+            ({"clouds": ["crowdstrike:mars"]}, "edr.clouds[0]"),
+            ({"clouds": ["nope"]}, "edr.clouds[0]"),
+            ({"clouds": ["generic"], "profile": "generic"}, "edr.profile"),
+            ({"clouds": ["generic"], "vendor": "Acme"}, "edr.vendor"),
+            ({"clouds": ["custom"]}, "edr")):
+        try:
+            _edr_env(block)
+            check(False, f"{block}: accepted")
+        except envfile.EnvFileError as e:
+            check(where in str(e), f"{block}: {e}")
+
+    # --edr SPEC: comma lists and PROFILE:all become clouds; one stays flat
+    check(edr.cli_block(None, "crowdstrike:us-1,generic", None) ==
+          {"clouds": ["crowdstrike:us-1", "generic"]}, "cli: list")
+    check(edr.cli_block({"proxy": "P"}, "crowdstrike:all", None) ==
+          {"proxy": "P", "clouds": ["crowdstrike:all"]}, "cli: all")
+    check(edr.cli_block(None, "crowdstrike:us-2", None) ==
+          {"profile": "crowdstrike", "region": "us-2"}, "cli: one cloud")
+    for bad in ("off,generic", "generic,", "crowdstrike:,generic"):
+        try:
+            edr.cli_block(None, bad, None)
+            check(False, f"cli {bad!r} accepted")
+        except edr.EdrError:
+            pass
+    check(edr.compact(want) == "crowdstrike:all,generic:lab" and
+          edr.compact(want[:2]) == "crowdstrike:us-1,crowdstrike:us-2",
+          "compact")
+    with tempfile.TemporaryDirectory() as d:
+        pcap = os.path.join(d, "x.pcap")
+        rc, _, err = _edr_cli("run", "-e", "ot-plant", "--once", "--rate",
+                              "0", "--pcap", pcap, "--edr",
+                              "crowdstrike:us-1,crowdstrike:eu-1")
+        raw = open(pcap, "rb").read()
+        check(rc == 0 and b"ts01-b.cloudsink.net" in raw and
+              b"ts01-lanner-lion" in raw, f"--edr list run rc={rc} {err}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

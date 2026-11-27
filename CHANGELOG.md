@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### EDR traffic
+- **Several clouds per run**: `--edr crowdstrike:all`, `--edr crowdstrike:us-1,generic` and an
+  env file's `"clouds"` list split the covered fleet between clouds, one host group per cloud.
+  Single-cloud runs are unchanged.
+
 ## 2.2.0 — 2026-11-22
 
 ### EDR traffic

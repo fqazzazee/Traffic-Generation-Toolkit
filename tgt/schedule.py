@@ -681,7 +681,6 @@ def edr_streams(env, span: str, offline) -> List[Stream]:
     if not setup.enabled:
         return []
     life = timing.PERSISTENT["edr"][2]
-    hs = edrmod.setup_exchanges(setup)
     out: List[Stream] = []
 
     def placer(c, s):
@@ -690,7 +689,8 @@ def edr_streams(env, span: str, offline) -> List[Stream]:
     for p in env.edr_paths():
         if p.host.name in offline:
             continue
-        cloud = edrmod.cloud_host(setup, p.ip, p.fqdn)
+        cloud = edrmod.cloud_host(p.profile, p.ip, p.fqdn)
+        hs = edrmod.setup_exchanges(p.profile)
         beat = p.channel == "sensor"
         lo, hi, jit, _, cls = timing.spec("edr" if beat else "edr-bulk")
         period = timing.pick(lo, hi, p.host.name, p.ip, p.fqdn)
@@ -708,16 +708,16 @@ def edr_streams(env, span: str, offline) -> List[Stream]:
                           (setup_n, 1, life) if beat else None, fp, dead)
 
         if p.proxy is None:
-            legs = [leg("direct", edrmod.endpoints(setup, p, p.host, cloud),
+            legs = [leg("direct", edrmod.endpoints(p, p.host, cloud),
                         p.host, cloud, hs)]
         else:
             down = p.proxy.name in offline
             legs = [leg("client", edrmod.endpoints(
-                setup, p, p.host, p.proxy, setup.proxy_port, connect=True),
+                p, p.host, p.proxy, setup.proxy_port, connect=True),
                 p.host, p.proxy, hs + 1, dead=down)]
             if not down:
                 legs.append(leg("upstream", edrmod.endpoints(
-                    setup, p, p.proxy, cloud), p.proxy, cloud, hs))
+                    p, p.proxy, cloud), p.proxy, cloud, hs))
         lookups = [(c is p.host, edrmod.dns_endpoints(env, c, r, n, a),
                     placer(c, r)) for c, r, n, a in p.dns
                    if c.name not in offline and r.name not in offline]
