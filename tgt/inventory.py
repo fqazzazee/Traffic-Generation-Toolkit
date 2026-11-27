@@ -289,7 +289,11 @@ def external(env: Environment) -> List[Dict]:
     for h in env.hosts:                 # remote sites seen through NAT
         if env.nat_address(h):
             by_ip.setdefault(env.nat_address(h), h.name)
-    for _, frame in env.build(1):
+    # a build of its own: under the build lock, and leaving a running
+    # engine's seeded context and port allocator as they were
+    with protocols.isolated_build(0):
+        frames = env.build(1)
+    for _, frame in frames:
         ips = packet.frame_ips(frame)
         if not ips:
             continue

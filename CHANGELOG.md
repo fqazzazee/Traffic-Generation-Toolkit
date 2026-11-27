@@ -11,6 +11,19 @@
   env file's `"clouds"` list split the covered fleet between clouds, one host group per cloud.
   Single-cloud runs are unchanged.
 
+### Fixed
+- **Proxied EDR timing**: under `--schedule timed`, a proxy no longer passes the cloud's
+  answers to the sensor before the cloud has sent them, and its upstream requests follow the
+  sensor's. The tunnel and the upstream leg now carry the same TLS bytes even after a leg
+  rebuilds for a free port.
+- **`--edr` over an env file's own block**: an override may now reuse the address of a declared
+  `edr` endpoint the block already replaced, as the block itself may. `--edr custom` keeps the
+  custom cloud's region when the block lists it under `clouds`.
+- **Declared `edr` flows** now carry the Falcon sensor's TLS fingerprint instead of the host
+  OS's, and an `edr` flow given only a `domain` uses it as its SNI.
+- The inventory's probe build now holds the build lock and leaves a running engine's build
+  context as it was.
+
 ## 2.2.0 — 2026-11-22
 
 ### EDR traffic

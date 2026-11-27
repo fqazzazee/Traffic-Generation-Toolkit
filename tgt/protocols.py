@@ -1072,11 +1072,11 @@ def edr_flow(ep: Endpoints, count: int) -> List[bytes]:
     cloud host (``*.cloudsink.net`` for the sensor channel, ``*.crowdstrike.com``
     for API/console). CrowdStrike publishes connectivity by FQDN (its cloud is
     AWS-hosted with dynamic IPs), so the SNI is what a sensor fingerprints EDR
-    traffic on. Set the host via ``ep.meta['sni']``; defaults to the US-1 sensor
-    proxy."""
+    traffic on. Set the host via ``ep.meta['sni']`` (or ``domain``); defaults
+    to the US-1 sensor proxy."""
     meta = dict(ep.meta)
-    if not meta.get("sni") and not meta.get("domain"):
-        meta["sni"] = "ts01-b.cloudsink.net"
+    meta["sni"] = meta.get("sni") or meta.get("domain") or \
+        "ts01-b.cloudsink.net"
     meta.setdefault("tls_client", "falcon")
     return https_flow(replace(ep, meta=meta), count)
 

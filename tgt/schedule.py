@@ -63,11 +63,17 @@ def exchanges(frames: List[bytes], cmac: bytes) -> List[List[bytes]]:
     """Cut one flow into exchanges: the TCP handshake, then a new exchange at
     each client segment with data that follows the server's data (or the
     handshake), and the teardown from the first FIN/RST on."""
-    groups: List[List[bytes]] = []
+    return [[frames[i] for i in g]
+            for g in cut([view(f, cmac) for f in frames])]
+
+
+def cut(views: List[tuple]) -> List[List[int]]:
+    """:func:`exchanges` on frame views (:func:`view` tuples): the indexes
+    of each exchange."""
+    groups: List[List[int]] = []
     last = None            # side that sent the previous data
     after_syn = closing = False
-    for f in frames:
-        frm, flags, plen, _, _, tcp = view(f, cmac)
+    for i, (frm, flags, plen, _, _, tcp) in enumerate(views):
         new = not groups
         if tcp and flags & (FIN | RST) and not closing:
             new = closing = True
@@ -81,8 +87,18 @@ def exchanges(frames: List[bytes], cmac: bytes) -> List[List[bytes]]:
             last = frm
         if new:
             groups.append([])
-        groups[-1].append(f)
+        groups[-1].append(i)
     return groups
+
+
+def wire_view(frame: bytes, server_port: int) -> tuple:
+    """:func:`view` of a frame already placed on the wire, whose MACs may be
+    a gateway's: a TCP segment is from the client unless it leaves
+    ``server_port``."""
+    v = view(frame, b"")
+    if not v[5]:
+        return v
+    return (struct.unpack_from("!H", frame, v[4])[0] != server_port,) + v[1:]
 
 
 def _ts_offset(frame: bytes, l4: int) -> int:
@@ -543,6 +559,11 @@ class EdrStream(Stream):
                     continue
                 out += self._lookup(ep, place, t)
                 t += 3 * self.LOOKUP_GAP
+        if len(self.legs) > 1:
+            # one TLS session in the tunnel and on the upstream leg, even
+            # when a leg rebuilds for a free port (Stream._build)
+            for leg in self.legs:
+                leg.ep.meta["edr_gen"] = self.occ
         client = lead.occur(t, sched)
         if len(self.legs) > 1 and client:
             client = self._relay(client, fresh, late, out, sched)
@@ -550,30 +571,81 @@ class EdrStream(Stream):
         return out
 
     def _relay(self, client, fresh, late, out, sched):
-        """Run the upstream leg off the client leg's request: the frames of
-        the client leg that answer it wait for the upstream side."""
-        at = min(3 if fresh else 0, len(client) - 1)
-        t = client[at][0] + 0.001
+        """Run the upstream leg off the client leg's request, then line the
+        legs up as a relay would: the CONNECT is answered once the upstream
+        connection is open, each request reaches the cloud after the client
+        sent it, and each answer reaches the client after the cloud sent it.
+        Each half of an exchange keeps its own spacing."""
+        lead, leg = self.legs
+        cv = [wire_view(c[0], lead.ep.meta["edr_dport"]) for _, c, _ in client]
+        cg = cut(cv)
+        tunnel = fresh and len(cg) > 1           # cg[1] is the CONNECT
+        t = client[cg[1][0] if tunnel else 0][0] + 0.001
         for ep, place in late:
             out += self._lookup(ep, place, t)
             t += 3 * self.LOOKUP_GAP
-        leg = self.legs[1]
-        closing = bool(self.legs[0].persistent) and self.legs[0].conn is None
+        closing = bool(lead.persistent) and lead.conn is None
         if closing:                     # the tunnel ends on both sides at once
             leg.lifetime = 1e-9
         up = leg.occur(t, sched)
         leg.lifetime = 0.0
         if not up:
             return client
-        ready = up[min(2, len(up) - 1)][0] if fresh else up[-1][0]
-        delay = 0.0
-        if at + 1 < len(client):
-            delay = max(0.0, ready + 0.001 - client[at + 1][0])
-        if fresh:
-            up = up[:3] + [(ft + delay, c, x) for ft, c, x in up[3:]]
-        out += [(ft, c, first, "edr") for ft, c, first in up]
-        return client[:at + 1] + [(ft + delay, c, x)
-                                  for ft, c, x in client[at + 1:]]
+        uv = [wire_view(c[0], leg.ep.meta["edr_dport"]) for _, c, _ in up]
+        ug = cut(uv)
+        old = {"c": [x[0] for x in client], "u": [x[0] for x in up]}
+        new = {k: list(v) for k, v in old.items()}
+        # (leg, frame indexes, when its first frame is due: None keeps the
+        # leg's running shift) in causal order
+        steps: List[tuple] = []
+        if tunnel:
+            req, rsp = _split(cg[1], cv)
+            steps += [("c", cg[0], None), ("c", req, None),
+                      ("u", ug[0], None),
+                      ("c", rsp, lambda: new["u"][ug[0][-1]] + RELAY_GAP)]
+            pairs = list(zip(cg[2:], ug[1:]))
+            rest = (cg[2 + len(pairs):], ug[1 + len(pairs):])
+        else:
+            pairs = list(zip(cg, ug))
+            rest = (cg[len(pairs):], ug[len(pairs):])
+        for c, u in pairs:
+            creq, crsp = _split(c, cv)
+            ureq, ursp = _split(u, uv)
+            back = ursp or ureq
+            steps += [("c", creq, None),
+                      ("u", ureq, lambda i=creq[0]: new["c"][i] + RELAY_GAP),
+                      ("u", ursp, None),
+                      ("c", crsp, lambda i=back[0]: new["u"][i] + RELAY_GAP)]
+        steps += [("c", g, None) for g in rest[0]]
+        steps += [("u", g, None) for g in rest[1]]
+        shift = {"c": 0.0, "u": 0.0}
+        last = {"c": -INF, "u": -INF}
+        for side, idx, due in steps:
+            if not idx:
+                continue
+            first = old[side][idx[0]]
+            if due is not None:
+                shift[side] = due() - first
+            # a leg's frames never overtake one another
+            shift[side] = max(shift[side], last[side] - first)
+            for i in idx:
+                new[side][i] = old[side][i] + shift[side]
+            last[side] = new[side][idx[-1]]
+        out += [(ft, c, x, "edr") for ft, (_, c, x) in zip(new["u"], up)]
+        return [(ft, c, x) for ft, (_, c, x) in zip(new["c"], client)]
+
+
+RELAY_GAP = 0.0003     # a proxy forwarding a segment it just received
+
+
+def _split(idx: List[int], views: List[tuple]) -> Tuple[List[int], List[int]]:
+    """An exchange's frame indexes cut at the server's first data segment:
+    (the request half, the answer half)."""
+    for n, i in enumerate(idx):
+        frm, _, plen = views[i][:3]
+        if not frm and plen > 0:
+            return idx[:n], idx[n:]
+    return idx, []
 
 
 def _tuple(frames: List[bytes], cmac: bytes) -> Optional[tuple]:

@@ -11336,6 +11336,151 @@ def test_tui_edr_cloud_picker() -> None:
     check(ui.edr_clouds is None, "tui: a new preset keeps the old EDR pick")
 
 
+def _relay_legs(env, stream, occurrences):
+    """The data segments of a proxied EDR stream's occurrences, per leg and
+    direction: {('c'|'u', from client?): [(time, payload)]} in time order."""
+    proxy = stream.legs[0].ep.server_ip
+    cloud_port = stream.legs[1].ep.meta["edr_dport"]
+    out = {}
+    for t, copies, _, key in occurrences:
+        p = _edr_parse(copies[0])
+        if key != "edr" or not p or p[2] != 6 or not p[5]:
+            continue
+        leg = "u" if cloud_port in (p[3], p[4]) and proxy in (p[0], p[1]) \
+            and stream.legs[1].ep.server_ip in (p[0], p[1]) else "c"
+        srv_port = cloud_port if leg == "u" else \
+            stream.legs[0].ep.meta["edr_dport"]
+        out.setdefault((leg, p[3] != srv_port), []).append((t, p[5]))
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def test_edr_proxy_relay_is_causal() -> None:
+    """Timed scheduler, proxied sensor: the proxy relays the same TLS bytes
+    both ways, each one only after it has it (upstream request after the
+    client's, the client's answer after the cloud's), on a fresh tunnel, on
+    an open one and after a leg rebuilt for a free port."""
+    from tgt import edr, enterprise, schedule
+    base = enterprise.get("enterprise-mixed")
+    proxy = next(h.name for h in base.hosts if h.role == "proxy")
+    env = edr.apply(base, {"profile": "crowdstrike", "proxy": proxy})
+    streams = [s for s in schedule.edr_streams(env, "access", set())
+               if len(s.legs) > 1]
+    check(any(s.sid[2] == "sensor" for s in streams) and
+          any(s.sid[2] != "sensor" for s in streams), "relay: no tunnels")
+    for s in streams:
+        s.bind(7)
+        t = 10.0
+        for n in range(6):
+            if n == 3:                    # a port-collision rebuild
+                s.legs[0].builds += 1
+            occ = s.occur(t)
+            legs = _relay_legs(env, s, occ)
+            creq, crsp = legs.get(("c", True), []), legs.get(("c", False), [])
+            ureq, ursp = legs.get(("u", True), []), legs.get(("u", False), [])
+            if creq and creq[0][1].startswith(b"CONNECT"):
+                connect, creq = creq[0], creq[1:]
+                ok, crsp = crsp[0], crsp[1:]
+                check(ok[1].startswith(b"HTTP/1.1 200") and ureq and
+                      ok[0] > connect[0], f"{s.sid}: 200 before CONNECT")
+                check(ok[0] > min(ft for ft, c, _, k in occ if k == "edr"
+                                  and _edr_parse(c[0])[0] ==
+                                  s.legs[1].ep.server_ip),
+                      f"{s.sid}: 200 before the upstream connection")
+            what = f"{s.sid[2]} occurrence {n}"
+            check([p for _, p in creq] == [p for _, p in ureq] and
+                  [p for _, p in crsp] == [p for _, p in ursp],
+                  f"relay {what}: tunnel bytes differ from the upstream leg")
+            check(all(u[0] > c[0] for c, u in zip(creq, ureq)),
+                  f"relay {what}: upstream request before the client's")
+            check(all(c[0] > u[0] for c, u in zip(crsp, ursp)),
+                  f"relay {what}: client answer before the cloud's")
+            t += s.interval()
+
+
+def _edr_declared_doc(block=None):
+    """enterprise-mixed plus an external Falcon endpoint at an EU-1 address
+    that one Windows host has a declared edr flow to: (doc, host)."""
+    from tgt import enterprise, envfile
+    base = enterprise.get("enterprise-mixed")
+    host = next(h for h in base.edr_hosts() if h.os.startswith("win"))
+    doc = envfile.to_dict(base)
+    doc["key"] = "edr-declared"
+    doc["external"] = [{"name": "CS-EU", "ip": "18.158.187.80",
+                        "role": "broker", "os": "linux",
+                        "fqdn": "ts01-lanner-lion.cloudsink.net"}]
+    doc["flows"] = list(doc["flows"]) + [
+        {"client": host.name, "server": "CS-EU", "proto": "edr"}]
+    if block is not None:
+        doc["edr"] = block
+    return doc, host
+
+
+def test_edr_override_and_custom_region() -> None:
+    """A --edr override may take over the address of a declared edr
+    endpoint the env file's own block already replaced, as the block itself
+    may; --edr custom keeps the custom cloud's region from a clouds list."""
+    from tgt import edr, envfile
+    doc, _ = _edr_declared_doc({"profile": "generic"})
+    env = envfile.from_dict(doc, "blocked.json")
+    try:
+        got = edr.applied(env, {"profile": "crowdstrike"})
+        check(got.edr.region.key == "eu-1", "override region")
+    except edr.EdrError as e:
+        check(False, f"--edr override refused: {e}")
+    with tempfile.TemporaryDirectory() as d:
+        rc, pcap, _ = _edr_run(doc, d, "--edr", "crowdstrike:eu-1")
+        check(rc == 0 and b"ts01-lanner-lion" in open(pcap, "rb").read(),
+              f"--edr crowdstrike:eu-1 over the file's block: rc={rc}")
+    custom = {k: v for k, v in _EDR_CUSTOM.items()
+              if k not in ("profile", "region")}
+    for block, region in ((dict(custom, clouds=["custom:acme", "generic"]),
+                           "acme"),
+                          (dict(custom, clouds=["custom", "generic"]),
+                           "custom"),
+                          (_EDR_CUSTOM, "lab-a")):
+        got = edr.resolve(edr.cli_block(block, "custom", None))
+        check(got.region.key == region,
+              f"--edr custom on {block.get('clouds')}: {got.region.key}")
+
+
+def _suites(hello: bytes) -> tuple:
+    """Cipher suites of a ClientHello record."""
+    sid = hello[43]
+    n = struct.unpack_from("!H", hello, 44 + sid)[0]
+    return struct.unpack_from(f"!{n // 2}H", hello, 46 + sid)
+
+
+def test_edr_declared_flow_looks_like_the_sensor() -> None:
+    """A declared edr flow carries the Falcon sensor's ClientHello (not the
+    host OS's) and a cloud SNI, also when only a domain is given."""
+    from tgt import envfile, tls
+    doc, host = _edr_declared_doc()
+    env = envfile.from_dict(doc, "declared.json")
+    ep = env.conv_endpoints(host, env.host("CS-EU"), "edr")
+    protocols.begin_build(7, 0)
+    hello = _hello(protocols.get("edr").build(ep, 1))
+    check(hello and _suites(hello) == tls.TEMPLATES["falcon"].ciphers and
+          b"ts01-lanner-lion.cloudsink.net" in hello,
+          "declared edr flow does not use the Falcon TLS client")
+    protocols.begin_build(7, 0)
+    hello = _hello(protocols.get("edr").build(
+        Endpoints(meta={"domain": "ts01-lanner-lion.cloudsink.net"}), 1))
+    check(b"ts01-lanner-lion.cloudsink.net" in hello,
+          "edr flow with only a domain lost its cloud SNI")
+
+
+def test_inventory_probe_build_is_isolated() -> None:
+    """inventory.external builds a cycle to find endpoints on the wire; it
+    does so under the build lock and leaves the caller's context alone."""
+    from tgt import edr, enterprise, inventory
+    protocols.begin_build(99, 3, sport_stride=8)
+    before = (protocols.build_context(), protocols._next_sport)
+    inventory.external(edr.apply(enterprise.get("enterprise-mixed"),
+                                 {"profile": "generic"}))
+    check((protocols.build_context(), protocols._next_sport) == before,
+          "inventory.external changed the caller's build context")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
