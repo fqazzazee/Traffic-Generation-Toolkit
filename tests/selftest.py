@@ -11443,6 +11443,32 @@ def test_edr_override_and_custom_region() -> None:
               f"--edr custom on {block.get('clouds')}: {got.region.key}")
 
 
+def _suites(hello: bytes) -> tuple:
+    """Cipher suites of a ClientHello record."""
+    sid = hello[43]
+    n = struct.unpack_from("!H", hello, 44 + sid)[0]
+    return struct.unpack_from(f"!{n // 2}H", hello, 46 + sid)
+
+
+def test_edr_declared_flow_looks_like_the_sensor() -> None:
+    """A declared edr flow carries the Falcon sensor's ClientHello (not the
+    host OS's) and a cloud SNI, also when only a domain is given."""
+    from tgt import envfile, tls
+    doc, host = _edr_declared_doc()
+    env = envfile.from_dict(doc, "declared.json")
+    ep = env.conv_endpoints(host, env.host("CS-EU"), "edr")
+    protocols.begin_build(7, 0)
+    hello = _hello(protocols.get("edr").build(ep, 1))
+    check(hello and _suites(hello) == tls.TEMPLATES["falcon"].ciphers and
+          b"ts01-lanner-lion.cloudsink.net" in hello,
+          "declared edr flow does not use the Falcon TLS client")
+    protocols.begin_build(7, 0)
+    hello = _hello(protocols.get("edr").build(
+        Endpoints(meta={"domain": "ts01-lanner-lion.cloudsink.net"}), 1))
+    check(b"ts01-lanner-lion.cloudsink.net" in hello,
+          "edr flow with only a domain lost its cloud SNI")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

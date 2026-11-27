@@ -19,6 +19,8 @@
 - **`--edr` over an env file's own block**: an override may now reuse the address of a declared
   `edr` endpoint the block already replaced, as the block itself may. `--edr custom` keeps the
   custom cloud's region when the block lists it under `clouds`.
+- **Declared `edr` flows** now carry the Falcon sensor's TLS fingerprint instead of the host
+  OS's, and an `edr` flow given only a `domain` uses it as its SNI.
 
 ## 2.2.0 — 2026-11-22
 

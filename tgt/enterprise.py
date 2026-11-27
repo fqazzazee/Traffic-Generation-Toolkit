@@ -856,6 +856,10 @@ class Environment:
             return {"dns_names": [(h.fqdn if h.name in self._ext else
                                    f"{h.name.lower()}.{DNS_DOMAIN}", h.ip)
                                   for h in peers or [server]]}
+        if proto == "edr":
+            # the sensor's own TLS stack, not the host OS's (host meta can
+            # still override it)
+            return {"tls_client": "falcon"}
         if proto in ("bacnet-id", "enip-list", "codesys-disc"):
             # discovery broadcast to the client's subnet when the device
             # shares it; a routed device is browsed by unicast
