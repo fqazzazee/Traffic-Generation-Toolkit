@@ -126,7 +126,9 @@ scheduler's diurnal activity, see :mod:`tgt.timing`) and ``utc_offset``
 ``{"enabled"?: bool, "profile"?: crowdstrike|generic|custom, "region"?,
 "proxy"?: HOST, "proxy_port"?}``; profile ``custom`` also takes ``vendor``,
 ``fqdns`` (``sensor``, ``upload``, ``download``, ``api``), ``ips`` and
-optional ``label`` and ``tls_client``.
+optional ``label`` and ``tls_client``. ``"clouds": ["crowdstrike:us-1",
+"crowdstrike:all", "generic", "custom"?]`` replaces ``profile`` and
+``region`` to split the fleet over several clouds.
 """
 from __future__ import annotations
 

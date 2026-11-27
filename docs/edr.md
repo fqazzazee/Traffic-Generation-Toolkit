@@ -65,6 +65,17 @@ disagree on them. The `generic` names and every `custom` hostname are also `unve
 The anchor is the first historian, file server, domain controller or SCADA server that is
 covered, otherwise the first covered host.
 
+### Several clouds at once
+
+A run can report to more than one cloud, for example every CrowdStrike region, or CrowdStrike
+US-1 next to the `generic` profile. The covered fleet is split into contiguous groups, one per
+cloud, in the order the clouds are listed, as a company with several tenants would be. Each
+group gets its own anchor, so every cloud has all four channels. With fewer covered hosts
+than clouds, some clouds get no host and send nothing. The proxy, when set, serves every cloud.
+
+The inventory's `edr` summary then lists each cloud under `clouds`, with the hosts it covers,
+and every `edr-cloud` external endpoint names its own profile and region.
+
 ## Configuration
 
 ### Command line
@@ -74,11 +85,14 @@ tgt edr list
 tgt run -e ot-plant --edr crowdstrike:us-2 --once --rate 0 --pcap edr.pcap
 tgt run -e enterprise-mixed --edr generic --edr-proxy PROXY01 --once --rate 0 --pcap proxy.pcap
 tgt run -e ot-plant --edr off --once --rate 0 --pcap no-edr.pcap
+tgt run -e enterprise-mixed --edr crowdstrike:all,generic --once --rate 0 --pcap clouds.pcap
 tgt campaign PLAN --edr crowdstrike:eu-1 --pcap run.pcap --manifest run.json
 ```
 
 - `--edr PROFILE[:REGION]` selects a profile, and its default region if none is named.
 - `--edr off` removes EDR from the wire and from all ground truth.
+- `--edr A,B,...` runs several clouds, and `--edr PROFILE:all` runs every region of a profile.
+  A single cloud keeps the flat `profile`/`region` block.
 - `--edr-proxy HOST` routes sensors through an environment host.
 - `--edr custom` uses the custom profile in the environment file.
 
@@ -103,6 +117,24 @@ a command-line override, take the ground truth from `--manifest`.
 All keys are optional. `profile` defaults to `crowdstrike`, `region` to the profile's default,
 and `proxy_port` to 8080. `{"enabled": false}` turns EDR off. `tgt env export` writes the block
 back, and omits it when unset.
+
+For several clouds, list them in `clouds` instead of `profile` and `region`:
+
+```json
+"edr": {"clouds": ["crowdstrike:us-1", "crowdstrike:eu-1", "generic"]}
+```
+
+Each entry is `PROFILE[:REGION]`, or `PROFILE:all`. A `custom` entry, at most one, takes its
+region from the entry (`custom:lab-a`) and its other keys from the block.
+
+### TUI
+
+With an environment selected, the Run tab has an **EDR** row. It shows the environment's own
+setting until you change it. Enter opens a checklist of every profile and region, with an
+*all regions* row that checks or clears a whole vendor, and the environment's custom cloud if it
+has one. Leaving every box unchecked turns EDR off, and Space on the row goes back to the
+environment's setting. The row's help lists each selected cloud, its sensor hostname and how many
+hosts report to it. The choice reaches the Service tab's command line as `--edr`.
 
 ### Your own vendor
 

@@ -175,7 +175,9 @@ def _edr_block(args, env):
 def _add_edr_options(p) -> None:
     p.add_argument("--edr", dest="edr_spec", metavar="PROFILE[:REGION]",
                    help="EDR traffic profile and region, or 'off' (see 'tgt "
-                   "edr list'; needs an environment)")
+                   "edr list'; needs an environment). Comma-separate several "
+                   "clouds, or use PROFILE:all, to split the fleet between "
+                   "them")
     p.add_argument("--edr-proxy", metavar="HOST",
                    help="environment host the sensors reach the EDR cloud "
                    "through (HTTP CONNECT)")

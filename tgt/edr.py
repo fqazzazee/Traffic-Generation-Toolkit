@@ -9,6 +9,10 @@ channel and a cloud IP pool, and records where each came from:
 * ``host_provenance``: per channel, ``vendor-docs``, ``mirrored-docs`` or
   ``unverified``.
 
+A setup runs one or more *clouds* (a profile and one of its regions). With
+several, the covered fleet is split into contiguous groups, one per cloud, as
+a company with several tenants would be.
+
 Channels: ``sensor`` (a long-lived, low-rate heartbeat on every covered host),
 ``upload`` (client-heavy telemetry), ``download`` (server-heavy content and
 policy) and ``api`` (management, from one anchor host only).
@@ -134,7 +138,8 @@ PROFILES: Dict[str, Profile] = {
 # ---------------------------------------------------------------------------
 # The "edr" block (env file, CLI)
 # ---------------------------------------------------------------------------
-_BLOCK_KEYS = {"enabled", "profile", "region", "proxy", "proxy_port"}
+_BLOCK_KEYS = {"enabled", "profile", "region", "clouds", "proxy",
+               "proxy_port"}
 _CUSTOM_KEYS = {"vendor", "label", "fqdns", "ips", "tls_client"}
 _HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+"
                        r"[a-z]([a-z0-9-]{0,61}[a-z0-9])?", re.I)
@@ -151,13 +156,15 @@ class EdrError(ValueError):
 @dataclass(frozen=True)
 class Setup:
     """An explicit EDR configuration, resolved. ``block`` is what the env
-    file holds and what an export writes back."""
+    file holds and what an export writes back. ``clouds`` is every (profile,
+    region) the fleet reports to; ``profile`` and ``region`` are the first."""
     enabled: bool
     block: Dict[str, Any]
     profile: Optional[Profile] = None
     region: Optional[Region] = None
     proxy: Optional[str] = None
     proxy_port: int = DEFAULT_PROXY_PORT
+    clouds: Tuple[Tuple[Profile, Region], ...] = ()
 
 
 def _text(block: Dict[str, Any], key: str) -> str:
@@ -167,7 +174,7 @@ def _text(block: Dict[str, Any], key: str) -> str:
     return v
 
 
-def _custom_region(block: Dict[str, Any]) -> Region:
+def _custom_region(block: Dict[str, Any], rkey: str) -> Region:
     for k in ("vendor", "fqdns", "ips"):
         if k not in block:
             raise EdrError("", f"profile 'custom' needs {k!r}")
@@ -202,15 +209,14 @@ def _custom_region(block: Dict[str, Any]) -> Region:
             raise EdrError(p, f"duplicate address {ip}")
     doc = all(any(ipaddress.ip_address(ip) in n for n in _RFC5737)
               for ip in ips)
-    return Region(str(block.get("region", "custom")),
-                  {c: fqdns[c] for c in CHANNELS}, tuple(ips),
+    return Region(rkey, {c: fqdns[c] for c in CHANNELS}, tuple(ips),
                   "documentation" if doc else "published",
                   {c: "unverified" for c in CHANNELS})
 
 
-def _custom_profile(block: Dict[str, Any]) -> Profile:
+def _custom_profile(block: Dict[str, Any], rkey: str) -> Profile:
     from . import tls
-    region = _custom_region(block)
+    region = _custom_region(block, rkey)
     vendor = _text(block, "vendor")
     label = _text(block, "label") if "label" in block else f"{vendor} (custom)"
     key = _text(block, "tls_client") if "tls_client" in block \
@@ -225,6 +231,76 @@ def _custom_profile(block: Dict[str, Any]) -> Profile:
                        "current server")
     return Profile("custom", label, vendor, key, {region.key: region},
                    region.key)
+
+
+def _clouds(block: Dict[str, Any]) -> List[Tuple[Profile, Region]]:
+    """The (profile, region) list of a block: its ``clouds`` entries
+    (``PROFILE[:REGION|all]``), else its ``profile`` and ``region``."""
+    if "clouds" not in block:
+        key = _text(block, "profile") if "profile" in block \
+            else DEFAULT_PROFILE
+        custom = key == "custom"
+        if custom:
+            profile = _custom_profile(block, str(block.get("region", "custom")))
+        elif key not in PROFILES:
+            raise EdrError("profile", f"{key!r} is not one of "
+                           f"{', '.join(list(PROFILES) + ['custom'])}")
+        else:
+            profile = PROFILES[key]
+        rkey = _text(block, "region") if "region" in block \
+            else profile.default_region
+        if rkey not in profile.regions:
+            raise EdrError("region", f"{rkey!r} is not a region of {key} "
+                           f"(use {', '.join(profile.regions)})")
+        out = [(profile, profile.regions[rkey])]
+    else:
+        for k in ("profile", "region"):
+            if k in block:
+                raise EdrError(k, "not valid with 'clouds' (name each cloud "
+                               "as PROFILE[:REGION] there)")
+        specs = block["clouds"]
+        if not isinstance(specs, list) or not specs:
+            raise EdrError("clouds", "expected a non-empty list of "
+                           "PROFILE[:REGION] strings")
+        out, custom = [], False
+        for i, spec in enumerate(specs):
+            p = f"clouds[{i}]"
+            if not isinstance(spec, str) or not spec:
+                raise EdrError(p, f"expected PROFILE[:REGION], got {spec!r}")
+            key, colon, rkey = spec.partition(":")
+            if colon and not rkey:
+                raise EdrError(p, f"{spec!r}: empty region")
+            if key == "custom":
+                if custom:
+                    raise EdrError(p, "only one custom cloud per block")
+                custom = True
+                profile = _custom_profile(block, rkey or "custom")
+            elif key in PROFILES:
+                profile = PROFILES[key]
+            else:
+                raise EdrError(p, f"{key!r} is not one of "
+                               f"{', '.join(list(PROFILES) + ['custom'])}")
+            if rkey == "all":
+                regions = list(profile.regions.values())
+            elif rkey and key != "custom":
+                if rkey not in profile.regions:
+                    raise EdrError(p, f"{rkey!r} is not a region of {key} "
+                                   f"(use {', '.join(profile.regions)} or "
+                                   "all)")
+                regions = [profile.regions[rkey]]
+            else:
+                regions = [profile.regions[profile.default_region]]
+            for r in regions:
+                if any(q.key == profile.key and x.key == r.key
+                       for q, x in out):
+                    raise EdrError(p, f"{profile.key}:{r.key} is listed "
+                                   "twice")
+                out.append((profile, r))
+    if not custom:
+        stray = sorted(set(block) & _CUSTOM_KEYS)
+        if stray:
+            raise EdrError(stray[0], "only valid with profile 'custom'")
+    return out
 
 
 def resolve(raw: Any) -> Setup:
@@ -242,22 +318,7 @@ def resolve(raw: Any) -> Setup:
         raise EdrError("enabled", f"expected true or false, got {enabled!r}")
     if not enabled:
         return Setup(False, block)
-    key = _text(block, "profile") if "profile" in block else DEFAULT_PROFILE
-    if key == "custom":
-        profile = _custom_profile(block)
-    else:
-        if key not in PROFILES:
-            raise EdrError("profile", f"{key!r} is not one of "
-                           f"{', '.join(list(PROFILES) + ['custom'])}")
-        stray = sorted(set(block) & _CUSTOM_KEYS)
-        if stray:
-            raise EdrError(stray[0], "only valid with profile 'custom'")
-        profile = PROFILES[key]
-    rkey = _text(block, "region") if "region" in block \
-        else profile.default_region
-    if rkey not in profile.regions:
-        raise EdrError("region", f"{rkey!r} is not a region of {key} (use "
-                       f"{', '.join(profile.regions)})")
+    clouds = _clouds(block)
     proxy = _text(block, "proxy") if "proxy" in block else None
     port = block.get("proxy_port", DEFAULT_PROXY_PORT)
     if isinstance(port, bool) or not isinstance(port, int) \
@@ -266,7 +327,8 @@ def resolve(raw: Any) -> Setup:
                        f"expected an integer 1..65535, got {port!r}")
     if "proxy_port" in block and proxy is None:
         raise EdrError("proxy_port", "needs 'proxy'")
-    return Setup(True, block, profile, profile.regions[rkey], proxy, port)
+    return Setup(True, block, clouds[0][0], clouds[0][1], proxy, port,
+                 tuple(clouds))
 
 
 def check(env, setup: Setup) -> None:
@@ -291,15 +353,21 @@ def check(env, setup: Setup) -> None:
     taken.update({h.ip: h.name for h in env.hosts})
     taken.update({h.ip: h.name for h in env.external
                   if h.name not in replaced})
-    path = "ips" if setup.profile.key == "custom" else "region"
-    for ip in setup.region.ips:
-        if ip in taken:
-            raise EdrError(path, f"cloud address {ip} is already used by "
-                           f"{taken[ip]}")
-        seg = next((s for s in env.segments if s.contains(ip)), None)
-        if seg is not None:
-            raise EdrError(path, f"cloud address {ip} is inside segment "
-                           f"{seg.name}")
+    multi = len(setup.clouds) > 1
+    for profile, region in setup.clouds:
+        path = "clouds" if multi else \
+            "ips" if profile.key == "custom" else "region"
+        for ip in region.ips:
+            if ip in taken:
+                raise EdrError(path, f"cloud address {ip} is already used by "
+                               f"{taken[ip]}")
+            seg = next((s for s in env.segments if s.contains(ip)), None)
+            if seg is not None:
+                raise EdrError(path, f"cloud address {ip} is inside segment "
+                               f"{seg.name}")
+        # two clouds never share an address: its traffic would be ambiguous
+        taken.update({ip: f"cloud {profile.key}:{region.key}"
+                      for ip in region.ips})
 
 
 def apply(env, raw: Any):
@@ -328,12 +396,16 @@ def applied(env, raw: Any):
     return hit[1]
 
 
+_CUSTOM_BLOCK = ("vendor", "label", "fqdns", "ips", "tls_client")
+
+
 def cli_block(current: Optional[Dict[str, Any]], spec: Optional[str],
               proxy: Optional[str]) -> Dict[str, Any]:
-    """The ``edr`` block for ``--edr PROFILE[:REGION]|off`` and
-    ``--edr-proxy HOST`` over the environment's own block (``current``).
-    A new profile keeps the block's proxy. Only the block can define a
-    custom profile, so ``--edr custom`` needs one."""
+    """The ``edr`` block for ``--edr SPEC|off`` and ``--edr-proxy HOST``
+    over the environment's own block (``current``). SPEC is one or more
+    comma-separated ``PROFILE[:REGION]`` clouds (``PROFILE:all`` = every
+    region). A new profile keeps the block's proxy. Only the block can define
+    a custom profile, so ``--edr custom`` needs one."""
     base = copy.deepcopy(current or {})
     if spec == "off":
         if proxy:
@@ -345,28 +417,71 @@ def cli_block(current: Optional[Dict[str, Any]], spec: Optional[str],
                            "has it off; add --edr PROFILE")
         block = base
     else:
-        key, colon, region = spec.partition(":")
-        if colon and not region:
-            raise EdrError("", f"{spec!r}: empty region, use PROFILE[:REGION]")
-        if key == "custom":
-            if base.get("profile") != "custom":
+        specs = spec.split(",")
+        for one in specs:
+            key, colon, region = one.partition(":")
+            if not key:
+                raise EdrError("", f"{spec!r}: empty cloud, use "
+                               "PROFILE[:REGION][,PROFILE[:REGION]...]")
+            if colon and not region:
+                raise EdrError("", f"{one!r}: empty region, use "
+                               "PROFILE[:REGION]")
+            if key == "off":
+                raise EdrError("", "'off' cannot be combined with a cloud")
+            if key == "custom" and base.get("profile") != "custom" and \
+                    not any(c.split(":")[0] == "custom"
+                            for c in base.get("clouds", ())):
                 raise EdrError("", "profile 'custom' is defined by the "
                                "environment file's edr block, and this "
                                "environment has none")
-            own = str(base.get("region", "custom"))
-            if region and region != own:
-                raise EdrError("region", f"unknown region {region!r} for "
-                               f"profile 'custom' (its region is {own!r})")
-            block = base
-            block.pop("enabled", None)
+        block = {k: base[k] for k in ("proxy", "proxy_port") if k in base}
+        if any(one.split(":")[0] == "custom" for one in specs):
+            block.update({k: base[k] for k in _CUSTOM_BLOCK if k in base})
+        if len(specs) > 1 or specs[0].endswith(":all"):
+            block["clouds"] = specs
         else:
-            block = {k: base[k] for k in ("proxy", "proxy_port") if k in base}
+            key, _, region = spec.partition(":")
+            if key == "custom":
+                own = next((c.partition(":")[2] or "custom"
+                            for c in base.get("clouds", ())
+                            if c.split(":")[0] == "custom"),
+                           str(base.get("region", "custom")))
+                if region and region != own:
+                    raise EdrError("region", f"unknown region {region!r} for "
+                                   f"profile 'custom' (its region is "
+                                   f"{own!r})")
+                region = region or (own if "region" in base else "")
             block["profile"] = key
-        if region:
-            block["region"] = region
+            if region:
+                block["region"] = region
     if proxy is not None:
         block["proxy"] = proxy
     return block
+
+
+def compact(specs: List[str]) -> str:
+    """The ``--edr`` SPEC for ``PROFILE:REGION`` clouds, a built-in profile
+    with every region checked written once as ``PROFILE:all``."""
+    out: List[str] = []
+    for spec in specs:
+        key = spec.partition(":")[0]
+        prof = PROFILES.get(key)
+        whole = prof is not None and len(prof.regions) > 1 and \
+            {f"{key}:{r}" for r in prof.regions} <= set(specs)
+        one = f"{key}:all" if whole else spec
+        if one not in out:
+            out.append(one)
+    return ",".join(out)
+
+
+def cloud_specs(block: Optional[Dict[str, Any]]) -> Optional[List[str]]:
+    """The ``PROFILE:REGION`` clouds an ``edr`` block runs, expanded (``[]``
+    when it is off, ``None`` when it does not resolve)."""
+    try:
+        setup = resolve(block if block is not None else {})
+    except EdrError:
+        return None
+    return [f"{p.key}:{r.key}" for p, r in setup.clouds]
 
 
 def describe() -> List[str]:
@@ -385,6 +500,9 @@ def describe() -> List[str]:
                              f"[{r.host_provenance[c]}]")
     lines.append("custom: bring your own through the env file's edr block "
                  "(docs/edr.md)")
+    lines.append("Several clouds at once: --edr crowdstrike:us-1,generic, or "
+                 "PROFILE:all for every region; the fleet is split between "
+                 "them.")
     return lines
 
 
@@ -402,6 +520,8 @@ class Path:
     bulk: bool
     proxy: Any = None
     dns: Tuple[Tuple[Any, Any, str, str], ...] = ()
+    profile: Optional[Profile] = None
+    region: Optional[Region] = None
 
 
 def _resolver(env, host):
@@ -423,17 +543,37 @@ def _resolver(env, host):
                      pool[0]))
 
 
+def fleets(env) -> List[Tuple[Profile, Region, List[Any]]]:
+    """(profile, region, hosts) per cloud: the covered fleet split into
+    contiguous groups, one per cloud, in the setup's order. A cloud left
+    without a host (fewer hosts than clouds) gets an empty list."""
+    setup, fleet = env.edr, env.edr_hosts()
+    if setup is None or not setup.enabled:
+        return []
+    n = len(setup.clouds)
+    return [(p, r, fleet[i * len(fleet) // n:(i + 1) * len(fleet) // n])
+            for i, (p, r) in enumerate(setup.clouds)]
+
+
 def paths(env) -> List[Path]:
     """Every EDR channel of the fleet: one sensor flow per host spread over
-    the region's pool; one anchor host also uploads, downloads and is the
-    only one that touches the management API."""
+    its cloud's pool; in each cloud one anchor host also uploads, downloads
+    and is the only one that touches the management API."""
     from .enterprise import DNS_DOMAIN
     setup = env.edr
-    fleet = env.edr_hosts()
-    if setup is None or not setup.enabled or not fleet:
+    if setup is None or not setup.enabled:
         return []
-    fq, ips = setup.region.fqdns, setup.region.ips
     via = env.host(setup.proxy) if setup.proxy else None
+    out: List[Path] = []
+    for profile, region, fleet in fleets(env):
+        if fleet:
+            out += _cloud_paths(env, profile, region, fleet, via, DNS_DOMAIN)
+    return out
+
+
+def _cloud_paths(env, profile: Profile, region: Region, fleet, via,
+                 domain: str) -> List[Path]:
+    fq, ips = region.fqdns, region.ips
 
     def path(h, channel: str, ip: str) -> Path:
         name = fq[channel]
@@ -446,13 +586,13 @@ def paths(env) -> List[Path]:
         else:
             if own is not None:
                 # the address h really connects to (a NAT site's outside IP)
-                dns.append((h, own, f"{proxy.name.lower()}.{DNS_DOMAIN}",
+                dns.append((h, own, f"{proxy.name.lower()}.{domain}",
                             env.nat_view(h, proxy)[1].ip))
             up = _resolver(env, proxy)
             if up is not None:
                 dns.append((proxy, up, name, ip))
         return Path(h, channel, name, ip, channel in ("upload", "download"),
-                    proxy, tuple(dns))
+                    proxy, tuple(dns), profile, region)
 
     out = [path(h, "sensor", ips[i % len(ips)]) for i, h in enumerate(fleet)]
     anchor = next((h for h in fleet
@@ -472,7 +612,7 @@ def legs(env) -> List[Tuple[Any, Any, str, Optional[str], int]]:
         out.setdefault((c.name, s.name, proto), (c, s, proto, ip, port))
 
     for p in env.edr_paths():
-        cloud = cloud_host(env.edr, p.ip, p.fqdn)
+        cloud = cloud_host(p.profile, p.ip, p.fqdn)
         if p.proxy is None:
             add(p.host, cloud, "edr", p.ip, 443)
         else:
@@ -483,26 +623,38 @@ def legs(env) -> List[Tuple[Any, Any, str, Optional[str], int]]:
     return list(out.values())
 
 
+def _cloud_summary(profile: Profile, region: Region) -> Dict[str, Any]:
+    return {"profile": profile.key, "label": profile.label,
+            "vendor": profile.vendor, "region": region.key,
+            "fqdns": dict(region.fqdns),
+            "ip_provenance": region.ip_provenance,
+            "host_provenance": dict(region.host_provenance)}
+
+
 def summary(env) -> Dict[str, Any]:
-    """The active setup as the inventory reports it."""
+    """The active setup as the inventory reports it. One cloud keeps the
+    flat form; several list each, with the hosts it covers, under
+    ``clouds``."""
     s = env.edr
-    return {"profile": s.profile.key, "label": s.profile.label,
-            "vendor": s.profile.vendor, "region": s.region.key,
-            "fqdns": dict(s.region.fqdns),
-            "ip_provenance": s.region.ip_provenance,
-            "host_provenance": dict(s.region.host_provenance),
-            "proxy": s.proxy,
-            "proxy_port": s.proxy_port if s.proxy else None}
+    out: Dict[str, Any] = {}
+    if len(s.clouds) == 1:
+        out.update(_cloud_summary(s.profile, s.region))
+    else:
+        out["clouds"] = [dict(_cloud_summary(p, r),
+                              hosts=sorted(h.name for h in hosts))
+                         for p, r, hosts in fleets(env)]
+    out.update(proxy=s.proxy, proxy_port=s.proxy_port if s.proxy else None)
+    return out
 
 
-def cloud_host(setup: Setup, ip: str, fqdn: str):
-    """An on-the-fly cloud endpoint; its MAC is cosmetic (``place`` rewrites
-    it to the gateway as it egresses)."""
+def cloud_host(profile: Profile, ip: str, fqdn: str):
+    """An on-the-fly cloud endpoint of ``profile``; its MAC is cosmetic
+    (``place`` rewrites it to the gateway as it egresses)."""
     from .enterprise import Host
     o = [int(x) for x in ip.split(".")]
     return Host(f"EDR-CLOUD-{ip}", ip,
                 "02:00:5c:%02x:%02x:%02x" % tuple(o[1:]), "edr", "linux",
-                setup.profile.vendor, fqdn, fqdn=fqdn)
+                profile.vendor, fqdn, fqdn=fqdn)
 
 
 # ---------------------------------------------------------------------------
@@ -516,12 +668,12 @@ _SHAPES = {"sensor": ((60, 220), (60, 160)),
 BULK_MESSAGES = 3      # enough records for the channel's shape to dominate
 
 
-def endpoints(setup: Setup, path: Path, client, server, dport: int = 443,
+def endpoints(path: Path, client, server, dport: int = 443,
               connect: bool = False):
     """Endpoints of one TCP leg of ``path``. Both legs of a proxied channel
     carry one TLS session, so they share its seed."""
     from .packet import Endpoints
-    meta = {"sni": path.fqdn, "tls_client": setup.profile.tls_client,
+    meta = {"sni": path.fqdn, "tls_client": path.profile.tls_client,
             "edr_channel": path.channel, "edr_dport": dport,
             "edr_seed": f"{path.host.ip}|{path.ip}|{path.fqdn}|{path.channel}"}
     if connect:
@@ -555,10 +707,11 @@ def channel_flow(ep, count: int) -> List[bytes]:
                                exchanges, idle_from=hs)
 
 
-def setup_exchanges(setup: Setup) -> int:
-    """Exchanges that open a direct channel: TCP plus the TLS handshake."""
+def setup_exchanges(profile: Profile) -> int:
+    """Exchanges that open a direct channel of ``profile``: TCP plus the TLS
+    handshake."""
     from . import tls
-    tpl = tls.TEMPLATES[setup.profile.tls_client]
+    tpl = tls.TEMPLATES[profile.tls_client]
     return 1 + tls.session(tpl, tls.SERVERS["openssl"], "probe.edr.example",
                            1, ("edr-probe",))[1]
 
@@ -616,19 +769,19 @@ def cycle_streams(env, messages: int, span: str):
 
     for p in env.edr_paths():
         n = max(BULK_MESSAGES, messages) if p.bulk else 1
-        cloud = cloud_host(setup, p.ip, p.fqdn)
+        cloud = cloud_host(p.profile, p.ip, p.fqdn)
         items = []
         for c, r, name, ip in p.dns:
             if c is p.host:
                 items += placed("dns", dns(dns_endpoints(env, c, r, name, ip),
                                            1), c, r)
         if p.proxy is None:
-            ep = endpoints(setup, p, p.host, cloud)
+            ep = endpoints(p, p.host, cloud)
             items += placed("edr", channel_flow(ep, n), p.host, cloud)
         else:
-            cl = channel_flow(endpoints(setup, p, p.host, p.proxy,
+            cl = channel_flow(endpoints(p, p.host, p.proxy,
                                         setup.proxy_port, connect=True), n)
-            up = channel_flow(endpoints(setup, p, p.proxy, cloud), n)
+            up = channel_flow(endpoints(p, p.proxy, cloud), n)
             look: List[bytes] = []
             lookup_ends = None
             for c, r, name, ip in p.dns:
